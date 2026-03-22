@@ -9,3 +9,6 @@ input: MCTS tree with value labels
 3. perception + action + value
 loss: MCTS-based action + value evolution
 input: all-time game history (including current situation)
+additional features:
+    - player id
+    - player augmentation with different action/value biases    

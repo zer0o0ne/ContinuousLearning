@@ -1,1 +1,23 @@
-{}
+{
+    "d_model": 128,
+    "n_heads": 4,
+    "d_ff": 512,
+    "dropout": 0.1,
+    "n_encoder_layers": 3,
+    "n_decoder_layers": 3,
+    "n_value_layers": 2,
+    "n_action_layers": 2,
+    "max_seq_len": 256,
+    "n_actions": 13,
+    "max_players": 6,
+    "memory": {
+        "n_levels": 3,
+        "cluster_size": 8,
+        "beam_width": 4,
+        "n_results": 8
+    },
+    "action": {
+        "max_gen_steps": 4
+    },
+    "lr": 1e-4
+}

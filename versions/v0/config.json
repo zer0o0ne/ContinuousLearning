@@ -1,8 +1,8 @@
 {
     "d_model": 128,
     "n_heads": 4,
+    "n_kv_heads": 2,
     "d_ff": 512,
-    "dropout": 0.1,
     "n_encoder_layers": 3,
     "n_decoder_layers": 3,
     "n_value_layers": 2,

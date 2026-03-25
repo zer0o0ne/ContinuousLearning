@@ -30,24 +30,28 @@ class ASI(nn.Module):
         d_model = config.get("d_model", 128)
         n_actions = config.get("n_actions", 13)
         max_players = config.get("max_players", 6)
+        n_heads = config.get("n_heads", 4)
+        n_kv_heads = config.get("n_kv_heads", n_heads // 2)
         mem_cfg = config.get("memory", {})
         act_cfg = config.get("action", {})
 
         self.perception = Perception(config)
         self.value_head = ValueHead(
             d_model=d_model,
-            n_heads=config.get("n_heads", 4),
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
             n_layers=config.get("n_value_layers", 2),
             d_ff=config.get("d_ff", 512),
-            dropout=config.get("dropout", 0.1),
+            max_seq_len=mem_cfg.get("n_results", 8) + 1 + 64,
         )
         self.action_head = ActionHead(
             d_model=d_model,
             n_actions=n_actions,
-            n_heads=config.get("n_heads", 4),
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
             n_layers=config.get("n_action_layers", 2),
             d_ff=config.get("d_ff", 512),
-            dropout=config.get("dropout", 0.1),
+            max_seq_len=act_cfg.get("max_gen_steps", 4) + 1,
             max_gen_steps=act_cfg.get("max_gen_steps", 4),
         )
 

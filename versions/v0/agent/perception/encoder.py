@@ -1,23 +1,30 @@
 import torch
 import torch.nn as nn
-import math
+from transformers import Qwen3Config
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm
 
 
 class Encoder(nn.Module):
-    def __init__(self, d_model, n_heads, n_layers, d_ff, dropout, max_seq_len):
+    def __init__(self, d_model, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len):
         super().__init__()
         self.d_model = d_model
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        self.register_buffer("pos_encoding", self._sinusoidal_encoding(max_seq_len + 1, d_model))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_ff,
-            dropout=dropout,
-            batch_first=True,
+
+        self.config = Qwen3Config(
+            hidden_size=d_model,
+            num_attention_heads=n_heads,
+            num_key_value_heads=n_kv_heads,
+            intermediate_size=d_ff,
+            num_hidden_layers=n_layers,
+            max_position_embeddings=max_seq_len + 1,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm = nn.LayerNorm(d_model)
+        self.config._attn_implementation = "eager"
+
+        self.rope = Qwen3RotaryEmbedding(config=self.config)
+        self.layers = nn.ModuleList(
+            [Qwen3DecoderLayer(self.config, layer_idx=i) for i in range(n_layers)]
+        )
+        self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
 
     def forward(self, x):
         """
@@ -27,15 +34,13 @@ class Encoder(nn.Module):
         batch_size = x.size(0)
         cls = self.cls_token.expand(batch_size, -1, -1)
         x = torch.cat([cls, x], dim=1)
-        x = x + self.pos_encoding[:, :x.size(1), :]
-        x = self.encoder(x)
-        return self.norm(x[:, 0])
 
-    @staticmethod
-    def _sinusoidal_encoding(max_len, d_model):
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe.unsqueeze(0)
+        seq_len = x.size(1)
+        position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        position_embeddings = self.rope(x, position_ids)
+
+        for layer in self.layers:
+            x = layer(x, position_ids=position_ids, position_embeddings=position_embeddings)
+
+        x = self.norm(x)
+        return x[:, 0]

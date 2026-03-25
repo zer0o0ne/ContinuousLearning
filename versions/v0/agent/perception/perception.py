@@ -112,13 +112,16 @@ class Perception(nn.Module):
         max_players = config.get("max_players", 6)
         mem_cfg = config["memory"]
 
+        n_heads = config["n_heads"]
+        n_kv_heads = config.get("n_kv_heads", n_heads // 2)
+
         self.embedder = StateEmbedder(d_model, n_actions, max_players)
         self.encoder = Encoder(
             d_model=d_model,
-            n_heads=config["n_heads"],
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
             n_layers=config["n_encoder_layers"],
             d_ff=config["d_ff"],
-            dropout=config["dropout"],
             max_seq_len=config["max_seq_len"],
         )
         self.memory = HierarchicalMemory(
@@ -130,10 +133,10 @@ class Perception(nn.Module):
         )
         self.decoder = Decoder(
             d_model=d_model,
-            n_heads=config["n_heads"],
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
             n_layers=config["n_decoder_layers"],
             d_ff=config["d_ff"],
-            dropout=config["dropout"],
             max_seq_len=mem_cfg["n_results"] + 1 + 64,
         )
 

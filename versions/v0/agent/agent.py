@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from perception.perception import Perception
-from value.value import ValueHead
-from action.action import ActionHead
+from agent.perception.perception import Perception
+from agent.value.value import ValueHead
+from agent.action.action import ActionHead
 
 
 class AgentMemory:
@@ -27,22 +27,24 @@ class ASI(nn.Module):
         self.log = log
         self.config = config or {}
 
-        d_model = config.get("d_model", 128)
-        n_actions = config.get("n_actions", 13)
-        max_players = config.get("max_players", 6)
-        n_heads = config.get("n_heads", 4)
-        n_kv_heads = config.get("n_kv_heads", n_heads // 2)
-        mem_cfg = config.get("memory", {})
-        act_cfg = config.get("action", {})
+        arch = config.get("architecture", config)
 
-        self.perception = Perception(config)
+        d_model = arch.get("d_model", 128)
+        n_actions = arch.get("n_actions", 13)
+        max_players = arch.get("max_players", 6)
+        n_heads = arch.get("n_heads", 4)
+        n_kv_heads = arch.get("n_kv_heads", n_heads // 2)
+        mem_cfg = arch.get("memory", {})
+        act_cfg = arch.get("action", {})
+
+        self.perception = Perception(arch)
         self.value_head = ValueHead(
             d_model=d_model,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             n_layers=config.get("n_value_layers", 2),
             d_ff=config.get("d_ff", 512),
-            max_seq_len=mem_cfg.get("n_results", 8) + 1 + 64,
+            max_seq_len=mem_cfg.get("beam_width", 4) + 1 + 64,
         )
         self.action_head = ActionHead(
             d_model=d_model,
@@ -64,16 +66,48 @@ class ASI(nn.Module):
         self.optimizer = None
         self.loss_buffer = []
 
-    def forward(self, env_state):
+    def forward(self, env_state, skip_memory=False, store=False):
         """
         Full forward pass through all components.
 
-        Args: env_state dict from dealer
+        Args: env_state dict from dealer, skip_memory bypasses memory retrieval,
+              store writes encoded vector to memory (value encoded in last dim)
         Returns: {"action_logits": (1, n_actions), "value": (1, 1)}
         """
-        perception_out = self.perception(env_state, device=self.device_)
+        perception_out, encoded = self.perception(env_state, device=self.device_,
+                                                   skip_memory=skip_memory)
         value = self.value_head(perception_out)
         action_logits = self.action_head(perception_out)
+
+        if store:
+            # Encode predicted value into the last dimension before storing
+            vec = encoded.squeeze(0).detach().clone()
+            vec[-1] = value.detach().squeeze()
+            self.perception.memory.insert(vec)
+
+        return {"action_logits": action_logits, "value": value}
+
+    def forward_batch(self, env_states, skip_memory=False, store=False):
+        """
+        Batch-parallel forward pass.
+
+        Args:
+            env_states: list of env_state dicts
+            skip_memory: bypass memory retrieval
+            store: write encoded vectors to memory
+        Returns: {"action_logits": (B, n_actions), "value": (B, 1)}
+        """
+        perception_out, encoded = self.perception.forward_batch(
+            env_states, device=self.device_, skip_memory=skip_memory
+        )
+        value = self.value_head(perception_out)
+        action_logits = self.action_head(perception_out)
+
+        if store:
+            vecs = encoded.detach().clone()  # (B, d_model)
+            vecs[:, -1] = value.detach().squeeze(-1)
+            self.perception.memory.insert_batch(vecs)
+
         return {"action_logits": action_logits, "value": value}
 
     def sit(self, n_players, with_human=False):

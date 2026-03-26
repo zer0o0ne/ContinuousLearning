@@ -1,23 +1,40 @@
 {
-    "d_model": 128,
-    "n_heads": 4,
-    "n_kv_heads": 2,
-    "d_ff": 512,
-    "n_encoder_layers": 3,
-    "n_decoder_layers": 3,
-    "n_value_layers": 2,
-    "n_action_layers": 2,
-    "max_seq_len": 256,
-    "n_actions": 13,
-    "max_players": 6,
-    "memory": {
-        "n_levels": 3,
-        "cluster_size": 8,
-        "beam_width": 4,
-        "n_results": 8
+    "name": "experiment_1",
+    "architecture": {
+        "d_model": 128,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "d_ff": 512,
+        "n_encoder_layers": 3,
+        "n_decoder_layers": 3,
+        "n_value_layers": 2,
+        "n_action_layers": 2,
+        "max_seq_len": 256,
+        "n_actions": 13,
+        "max_players": 6,
+        "memory": {
+            "n_levels": 2,
+            "max_cluster_size": 256,
+            "max_cluster_size_after": 128,
+            "beam_width": 32
+        },
+        "action": {
+            "max_gen_steps": 4
+        }
     },
-    "action": {
-        "max_gen_steps": 4
-    },
-    "lr": 1e-4
+    "gto_ev_train": {
+        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v0/experiment_1/gto_ev_predict/2026_03_25_17_55_26",
+        "lr": 3e-4,
+        "batch_size": 64,
+        "epochs": 1,
+        "n_scenarios": 25000,
+        "mc_iterations": 10000,
+        "opponent_range_pct": 50,
+        "default_stack": 1000,
+        "big_blind": 10,
+        "val_split": 0.1,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "checkpoint_every": 50
+    }
 }

@@ -111,9 +111,8 @@ class SimpleDealer:
         os.makedirs(self.checkpoint_name, exist_ok=True)
 
     def checkpoint__(self, n):
-        file = self.checkpoint_name + "/" + str(n + 1) + ".pickle"
-        with open(file, 'wb') as f:
-            pickle.dump(self.brain, f)
+        file = self.checkpoint_name + "/" + str(n + 1) + ".pt"
+        torch.save(self.brain.state_dict(), file)
 
     def log_start__(self, n, with_human = False):
         lengths = np.array([len(history) for history in self.brain.memory.stories])

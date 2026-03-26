@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from perception.encoder import Encoder
-from perception.decoder import Decoder
-from perception.memory import HierarchicalMemory
+from agent.perception.encoder import Encoder
+from agent.perception.decoder import Decoder
+from agent.perception.memory import HierarchicalMemory
 
 
 class StateEmbedder(nn.Module):
@@ -25,49 +25,81 @@ class StateEmbedder(nn.Module):
 
     def forward(self, env_state, device="cpu"):
         """
-        Args: env_state dict with "table_state" (history) and "now" (current state)
-        Returns: (1, seq_len, d_model)
+        Args: env_state dict with "now" (current state)
+        Returns: (1, d_model)
         """
-        tokens = []
-
-        for step in env_state["table_state"]:
-            token = self._embed_step(step, device)
-            tokens.append(token)
-
         now = env_state["now"]
-        now_token = self._embed_now(now, device)
-        tokens.append(now_token)
+        return self._embed_now(now, device)
 
-        if len(tokens) == 0:
-            return torch.zeros(1, 1, self.d_model, device=device)
+    def forward_batch(self, env_states, device="cpu"):
+        """Batch-parallel embedding of multiple env_states.
 
-        return torch.stack(tokens, dim=1)
+        Args:
+            env_states: list of env_state dicts
+            device: torch device
 
-    def _embed_step(self, step, device):
-        """Embed a single history step: {pos, pot, action, table}."""
-        table_cards = self._cards_to_tensor(step["table"], device)
-        card_emb = self.card_embed(table_cards).mean(dim=0)
+        Returns: (B, d_model)
+        """
+        B = len(env_states)
 
-        pos_emb = self.pos_embed(torch.tensor(step["pos"], device=device))
+        # --- Cards: pad to max length, embed, masked mean-pool ---
+        card_seqs = []
+        card_lengths = []
+        for es in env_states:
+            now = es["now"]
+            table_cards = [int(c) if int(c) >= 0 else 52 for c in now["table"]]
+            hand_cards = [int(c) if int(c) >= 0 else 52 for c in now["hand"]]
+            seq = table_cards + hand_cards
+            card_seqs.append(seq)
+            card_lengths.append(len(seq))
 
-        pot_val = step["pot"] if isinstance(step["pot"], (int, float)) else step["pot"]
-        scalars = torch.tensor([float(pot_val), 0.0], dtype=torch.float, device=device)
-        scalar_emb = self.scalar_proj(scalars)
+        max_len = max(card_lengths)
+        padded = torch.full((B, max_len), 52, dtype=torch.long, device=device)
+        mask = torch.zeros(B, max_len, dtype=torch.float, device=device)
+        for i, seq in enumerate(card_seqs):
+            padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+            mask[i, :len(seq)] = 1.0
 
-        bets = torch.zeros(self.max_players, dtype=torch.float, device=device)
-        bet_emb = self.bet_proj(bets)
+        card_embs = self.card_embed(padded)  # (B, max_len, d_model)
+        # Masked mean: zero out padding, sum, divide by actual length
+        card_embs = card_embs * mask.unsqueeze(-1)
+        card_emb = card_embs.sum(dim=1) / torch.tensor(
+            card_lengths, dtype=torch.float, device=device
+        ).unsqueeze(-1)  # (B, d_model)
 
-        action = step["action"]
-        if isinstance(action, torch.Tensor):
-            action_vec = action.float().to(device)
-        else:
-            action_vec = torch.zeros(self.n_actions, dtype=torch.float, device=device)
-        if action_vec.dim() > 1:
-            action_vec = action_vec.squeeze(0)
-        action_emb = self.action_proj(action_vec)
+        # --- Positions ---
+        positions = torch.tensor(
+            [int(es["now"]["pos"]) for es in env_states],
+            dtype=torch.long, device=device
+        )
+        pos_emb = self.pos_embed(positions)  # (B, d_model)
 
-        combined = torch.cat([card_emb, pos_emb, scalar_emb, bet_emb, action_emb])
-        return self.combine(combined).unsqueeze(0)
+        # --- Scalars (pot, bank) ---
+        scalars = torch.tensor(
+            [[float(es["now"]["pot"]), float(es["now"]["bank"])] for es in env_states],
+            dtype=torch.float, device=device
+        )
+        scalar_emb = self.scalar_proj(scalars)  # (B, d_model)
+
+        # --- Bets ---
+        bets = torch.zeros(B, self.max_players, dtype=torch.float, device=device)
+        for i, es in enumerate(env_states):
+            raw_bets = es["now"]["bets"]
+            if isinstance(raw_bets, np.ndarray):
+                raw_bets = raw_bets.tolist()
+            for j, b in enumerate(raw_bets):
+                if j < self.max_players:
+                    bets[i, j] = float(b)
+        bet_emb = self.bet_proj(bets)  # (B, d_model)
+
+        # --- Action (placeholder zeros) ---
+        action_emb = self.action_proj(
+            torch.zeros(B, self.n_actions, dtype=torch.float, device=device)
+        )  # (B, d_model)
+
+        # --- Combine ---
+        combined = torch.cat([card_emb, pos_emb, scalar_emb, bet_emb, action_emb], dim=-1)
+        return self.combine(combined)  # (B, d_model)
 
     def _embed_now(self, now, device):
         """Embed the current state: {pos, pot, bank, hand, table, bets, active_positions}."""
@@ -118,17 +150,14 @@ class Perception(nn.Module):
         self.embedder = StateEmbedder(d_model, n_actions, max_players)
         self.encoder = Encoder(
             d_model=d_model,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
             n_layers=config["n_encoder_layers"],
             d_ff=config["d_ff"],
-            max_seq_len=config["max_seq_len"],
         )
         self.memory = HierarchicalMemory(
             n_levels=mem_cfg["n_levels"],
-            cluster_size=mem_cfg["cluster_size"],
+            max_cluster_size=mem_cfg["max_cluster_size"],
+            max_cluster_size_after=mem_cfg["max_cluster_size_after"],
             beam_width=mem_cfg["beam_width"],
-            n_results=mem_cfg["n_results"],
             d_model=d_model,
         )
         self.decoder = Decoder(
@@ -137,26 +166,52 @@ class Perception(nn.Module):
             n_kv_heads=n_kv_heads,
             n_layers=config["n_decoder_layers"],
             d_ff=config["d_ff"],
-            max_seq_len=mem_cfg["n_results"] + 1 + 64,
+            max_seq_len=mem_cfg["beam_width"] + 1 + 64,
         )
 
-    def forward(self, env_state, device="cpu"):
+    def forward(self, env_state, device="cpu", skip_memory=False):
         """
-        Full perception pipeline.
+        Single-sample forward. Kept for inference compatibility.
 
-        Args: env_state dict from dealer
-        Returns: (1, n_mem+1, d_model)
+        Returns: tuple (output, encoded)
+            output: (1, seq_len, d_model)
+            encoded: (1, d_model)
         """
         embedded = self.embedder(env_state, device=device)
         encoded = self.encoder(embedded)
 
-        mem_result = self.memory.search(encoded.squeeze(0))
-        mem_vectors = mem_result["vectors"].unsqueeze(0).to(encoded.device)
+        if skip_memory:
+            decoder_input = encoded.unsqueeze(1)
+        else:
+            mem_result = self.memory.search(encoded.squeeze(0))
+            mem_vectors = mem_result["vectors"].unsqueeze(0).to(encoded.device)
+            decoder_input = torch.cat([mem_vectors, encoded.unsqueeze(1)], dim=1)
 
-        decoder_input = torch.cat([mem_vectors, encoded.unsqueeze(1)], dim=1)
         output = self.decoder(decoder_input)
-        return output
+        return output, encoded
 
-    def store(self, encoded_vector):
-        """Store encoder output in memory for future retrieval."""
-        self.memory.insert(encoded_vector)
+    def forward_batch(self, env_states, device="cpu", skip_memory=False):
+        """
+        Batch-parallel forward.
+
+        Args:
+            env_states: list of env_state dicts
+            device: torch device
+            skip_memory: bypass memory retrieval
+
+        Returns: tuple (output, encoded)
+            output: (B, seq_len, d_model)
+            encoded: (B, d_model)
+        """
+        embedded = self.embedder.forward_batch(env_states, device=device)  # (B, d_model)
+        encoded = self.encoder(embedded)  # (B, d_model)
+
+        if skip_memory:
+            decoder_input = encoded.unsqueeze(1)  # (B, 1, d_model)
+        else:
+            mem_vectors = self.memory.search_batch(encoded)  # (B, beam_width, d_model)
+            mem_vectors = mem_vectors.to(encoded.device)
+            decoder_input = torch.cat([mem_vectors, encoded.unsqueeze(1)], dim=1)
+
+        output = self.decoder(decoder_input)
+        return output, encoded

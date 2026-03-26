@@ -82,7 +82,8 @@ def train_gto_ev(agent, train_cfg, device, log):
 
     # Cosine annealing scheduler
     total_steps = epochs * len(train_loader)
-    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
+    eta_min = train_cfg.get("scheduler_eta_min", 1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
 
     ckpt_dir = run_dir
 

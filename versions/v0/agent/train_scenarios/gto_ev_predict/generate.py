@@ -26,11 +26,29 @@ from env.table import Table
 _gto_utils_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "gto_utils")
 if _gto_utils_dir not in sys.path:
     sys.path.insert(0, _gto_utils_dir)
-from gpu_solver import gpu_equity, compute_ev
 
 
-MAX_PLAYERS = 6
-GTO_TEMPERATURE = 1.0
+def _get_solver(solver_name):
+    """Import and return solver functions based on config choice.
+
+    Args:
+        solver_name: "v1" (random ranges), "v2" (range-aware)
+
+    Returns:
+        (gpu_equity_fn, compute_ev_fn, extra_modules_dict)
+    """
+    if solver_name == "v1":
+        from gpu_solver import gpu_equity, compute_ev
+        return gpu_equity, compute_ev, {}
+    elif solver_name == "v2":
+        from gpu_solver_v2 import gpu_equity_v2, compute_ev_v2, get_position_range, narrow_range, expand_range
+        return gpu_equity_v2, compute_ev_v2, {
+            "get_position_range": get_position_range,
+            "narrow_range": narrow_range,
+            "expand_range": expand_range,
+        }
+    else:
+        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1' or 'v2'.")
 
 
 def _get_board_cards(table):
@@ -57,66 +75,183 @@ def _get_table_display(table):
         return list(table.deck[:5])
 
 
-def _compute_player_ev(table, player_pos, device="mps", mc_iters=10000):
-    """Compute EV for a player at the current table state.
+def _build_opponent_ranges(table, player_pos, action_history, solver_modules):
+    """Build opponent range hand types based on positions and past actions.
 
-    Returns (equity, fold_ev, call_ev, raise_ev, best_ev, hero_invested, facing_bet)
-    or None on failure.
+    Args:
+        table: Table instance
+        player_pos: current player's position (excluded from opponents)
+        action_history: list of (position, action_type) tuples for the hand
+        solver_modules: dict with get_position_range, narrow_range (from v2 solver)
+
+    Returns:
+        list of lists of hand type strings, one per active opponent
     """
+    get_position_range = solver_modules["get_position_range"]
+    narrow_range = solver_modules["narrow_range"]
+
+    opponent_ranges = []
+    for pos in range(table.num_players):
+        if pos == player_pos:
+            continue
+        if table.players_state[pos] < 0:
+            continue  # folded
+
+        hand_types = get_position_range(pos, table.num_players)
+        for act_pos, act_type in action_history:
+            if act_pos == pos:
+                hand_types = narrow_range(hand_types, act_type)
+
+        opponent_ranges.append(hand_types)
+
+    return opponent_ranges
+
+
+def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
+                       device="mps", mc_iters=10000, n_raise_samples=3,
+                       mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10):
+    """Compute EV for a player. Supports both v1 (random range) and v2 (range-aware).
+
+    Returns dict with keys: equity, fold_ev, call_ev, raise_evs, etc.
+    Returns None on failure.
+    """
+    gpu_equity_fn, compute_ev_fn, solver_modules = _get_solver(solver_name)
+
     hand = table.deck[5 + 2 * player_pos: 7 + 2 * player_pos]
     board_ids = _get_board_cards(table)
 
     hero_t = torch.tensor(hand.tolist(), dtype=torch.long)
     board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
 
-    n_active = int((table.players_state >= 0).sum())
-    n_opponents = max(1, n_active - 1)
-
-    try:
-        eq = gpu_equity(hero_t, board_t, n_opponents, n_iters=mc_iters, device=device)
-    except Exception:
-        return None
-
-    # Hero's investment: start_credits - current credits
     hero_invested = table.start_credits - table.credits[player_pos]
-
-    # Facing bet: difference between high bet and our current bet
     facing_bet = max(0, table.high_bet - table.bets[player_pos])
-
     stack = table.credits[player_pos]
     pot = table.pot
 
-    fold_ev, call_ev, raise_ev, best_ev = compute_ev(
-        eq, pot, facing_bet, stack, hero_invested
-    )
+    n_active = int((table.players_state >= 0).sum())
+    n_opponents = max(1, n_active - 1)
 
-    return eq, fold_ev, call_ev, raise_ev, best_ev, hero_invested, facing_bet
+    if solver_name == "v1":
+        # V1: random ranges, simple EV
+        try:
+            eq = gpu_equity_fn(hero_t, board_t, n_opponents, n_iters=mc_iters, device=device)
+            fold_ev, call_ev, _, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested)
+        except Exception:
+            return None
+
+        # Raise EVs
+        raise_evs = []
+        max_bet_mult = table.max_bet
+        bins = table.bins
+        available_bins = list(range(2, bins + 2))
+        n_samples = min(n_raise_samples, len(available_bins))
+        for b in random.sample(available_bins, n_samples):
+            raise_frac = (b - 1) * max_bet_mult / bins
+            actual_raise = min(facing_bet + raise_frac * pot, stack)
+            if actual_raise >= stack:
+                continue
+            _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=raise_frac)
+            raise_evs.append((b, raise_frac, r_ev))
+
+        allin_frac = stack / max(pot + facing_bet, 1e-6)
+        _, _, allin_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=allin_frac)
+        raise_evs.append((12, allin_frac, allin_ev))
+
+    else:
+        # V2: range-aware equity + opponent response model
+        expand_range = solver_modules["expand_range"]
+        opp_range_types = _build_opponent_ranges(table, player_pos, action_history, solver_modules)
+
+        if not opp_range_types:
+            return {
+                "equity": 1.0, "fold_ev": -hero_invested,
+                "call_ev": pot - hero_invested,
+                "raise_evs": [], "hero_invested": hero_invested,
+                "facing_bet": facing_bet, "stack": stack, "pot": pot,
+            }
+
+        ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
+
+        try:
+            fold_ev, call_ev, _, _ = compute_ev_fn(
+                hero_t, board_t, opp_range_types,
+                pot, facing_bet, stack, hero_invested,
+                raise_frac=1.0, n_iters=mc_iters, device=device, **ev_extra
+            )
+            dead = set(hero_t.tolist())
+            if len(board_t) > 0:
+                dead.update(board_t.tolist())
+            opp_combos = [expand_range(ht_list, dead) for ht_list in opp_range_types]
+            eq = gpu_equity_fn(hero_t, board_t, opp_combos, mc_iters, device)
+        except Exception:
+            return None
+
+        # Raise EVs
+        raise_evs = []
+        max_bet_mult = table.max_bet
+        bins = table.bins
+        available_bins = list(range(2, bins + 2))
+        n_samples = min(n_raise_samples, len(available_bins))
+        for b in random.sample(available_bins, n_samples):
+            raise_frac = (b - 1) * max_bet_mult / bins
+            actual_raise = min(facing_bet + raise_frac * pot, stack)
+            if actual_raise >= stack:
+                continue
+            try:
+                _, _, r_ev, _ = compute_ev_fn(
+                    hero_t, board_t, opp_range_types,
+                    pot, facing_bet, stack, hero_invested,
+                    raise_frac=raise_frac, n_iters=mc_iters, device=device, **ev_extra
+                )
+                raise_evs.append((b, raise_frac, r_ev))
+            except Exception:
+                continue
+
+        allin_frac = stack / max(pot + facing_bet, 1e-6)
+        try:
+            _, _, allin_ev, _ = compute_ev_fn(
+                hero_t, board_t, opp_range_types,
+                pot, facing_bet, stack, hero_invested,
+                raise_frac=allin_frac, n_iters=mc_iters, device=device, **ev_extra
+            )
+            raise_evs.append((12, allin_frac, allin_ev))
+        except Exception:
+            pass
+
+    return {
+        "equity": eq,
+        "fold_ev": fold_ev,
+        "call_ev": call_ev,
+        "raise_evs": raise_evs,
+        "hero_invested": hero_invested,
+        "facing_bet": facing_bet,
+        "stack": stack,
+        "pot": pot,
+    }
 
 
-def _sample_gto_action(fold_ev, call_ev, raise_ev, table, player_pos):
-    """Sample an action based on GTO EV distribution.
+def _sample_gto_action(ev_result, temperature=1.0):
+    """Sample an action based on GTO EV distribution over all options.
 
-    Maps EVs to action indices: fold=0, call=1, raise(pot-size)=5, all-in=12.
+    ev_result: dict from _compute_player_ev with fold_ev, call_ev, raise_evs.
+    temperature: softmax temperature for action sampling.
     Returns one-hot action tensor (13,).
     """
-    evs = torch.tensor([fold_ev, call_ev, raise_ev], dtype=torch.float)
-    probs = F.softmax(evs / GTO_TEMPERATURE, dim=0)
+    # Build EV list: [fold, call, raise_size_1, raise_size_2, ..., all-in]
+    options = []  # (action_bin, ev)
+    options.append((0, ev_result["fold_ev"]))
+    options.append((1, ev_result["call_ev"]))
+    for action_bin, _, ev in ev_result["raise_evs"]:
+        options.append((action_bin, ev))
 
-    choice = torch.multinomial(probs, 1).item()
+    evs = torch.tensor([ev for _, ev in options], dtype=torch.float)
+    probs = F.softmax(evs / temperature, dim=0)
+
+    choice_idx = torch.multinomial(probs, 1).item()
+    chosen_bin = options[choice_idx][0]
 
     action = torch.zeros(13, dtype=torch.float32)
-    if choice == 0:
-        action[0] = 1.0  # fold
-    elif choice == 1:
-        action[1] = 1.0  # call/check
-    else:
-        # Raise: pick a random raise size bin (2-11) or all-in (12)
-        if random.random() < 0.15:
-            action[12] = 1.0  # all-in
-        else:
-            raise_bin = random.randint(2, 11)
-            action[raise_bin] = 1.0
-
+    action[chosen_bin] = 1.0
     return action
 
 
@@ -152,26 +287,35 @@ def generate_scenario(config, device="mps"):
     Returns dict with events list and ev_target, or None on failure.
     """
     mc_iters = config.get("mc_iterations", 10000)
+    n_raise_samples = config.get("n_raise_samples", 3)
     big_blind = config.get("big_blind", 10)
     small_blind = big_blind // 2
     default_stack = config.get("default_stack", 1000)
+    max_players = config.get("max_players", 9)
+    temperature = config.get("gto_temperature", 1.0)
+    table_bins = config.get("table_bins", 10)
+    table_max_bet = config.get("table_max_bet", 2)
+    solver_name = config.get("solver", "v2")
+    mdf_max_fold = config.get("mdf_max_fold", 0.7)
+    reraise_pct = config.get("reraise_pct", 0.15)
+    reraise_cap = config.get("reraise_cap", 0.10)
 
-    # Random number of players (2-6)
-    num_players = random.randint(2, MAX_PLAYERS)
+    # Random number of players (2 to max_players)
+    num_players = random.randint(2, max_players)
 
     table = Table(
         num_players=num_players,
-        bins=10,
-        max_bet=2,
+        bins=table_bins,
+        max_bet=table_max_bet,
         start_credits=default_stack,
         big_blind=big_blind,
         small_blind=small_blind,
     )
     table.start_table()
 
-    # Track all events and hero decision points
+    # Track all events and hero decision points (with stored EV results)
     all_events = []
-    hero_decision_indices = []  # indices in all_events where hero had to act
+    hero_decisions = []  # list of (event_index, ev_result) for hero turns
 
     # First event: post-blinds state (no action yet)
     hero_pos = random.randint(0, num_players - 1)
@@ -184,7 +328,16 @@ def generate_scenario(config, device="mps"):
 
     # Simulate the hand
     max_actions = 4 * num_players  # safety limit
-    hand_ended = False
+    action_history = []  # list of (position, action_type) for range narrowing
+
+    # Solver-specific params
+    ev_kwargs = {"device": device, "mc_iters": mc_iters, "n_raise_samples": n_raise_samples}
+    if solver_name == "v2":
+        ev_kwargs.update({
+            "mdf_max_fold": mdf_max_fold,
+            "reraise_pct": reraise_pct,
+            "reraise_cap": reraise_cap,
+        })
 
     for _ in range(max_actions):
         active_pos = table.active_player
@@ -193,53 +346,61 @@ def generate_scenario(config, device="mps"):
         if table.players_state[active_pos] != 1:
             break
 
-        # Compute EV for the active player to decide their action
-        ev_result = _compute_player_ev(table, active_pos, device=device, mc_iters=mc_iters)
+        # Compute EV for the active player
+        ev_result = _compute_player_ev(
+            table, active_pos, action_history, solver_name=solver_name, **ev_kwargs
+        )
         if ev_result is None:
             return None
 
-        eq, fold_ev, call_ev, raise_ev, best_ev, hero_invested, facing_bet = ev_result
-
-        # If this is the hero's turn, record it as a potential decision point
+        # If this is the hero's turn, record decision point with EV data
         if active_pos == hero_pos:
-            # Record decision event (action=zeros, hero must decide)
             decision_event = _build_event(
                 table, hero_pos, active_pos, torch.zeros(13, dtype=torch.float32),
                 num_players, big_blind, small_blind
             )
-            hero_decision_indices.append(len(all_events))
+            hero_decisions.append((len(all_events), ev_result))
             all_events.append(decision_event)
 
-        # Sample GTO action
-        action = _sample_gto_action(fold_ev, call_ev, raise_ev, table, active_pos)
+        # Sample GTO action from EV distribution (fold, call, multiple raise sizes)
+        action = _sample_gto_action(ev_result, temperature=temperature)
 
-        # Record the action event (what actually happened)
+        # Classify action for range narrowing
+        action_idx = torch.argmax(action).item()
+        if action_idx == 0:
+            act_type = None  # fold — player leaves, no range update needed
+        elif action_idx == 1:
+            act_type = "call" if table.turn == 0 else "call_postflop"
+        elif action_idx == 12:
+            act_type = "3bet" if table.turn == 0 else "bet_postflop"  # all-in as strong action
+        else:
+            act_type = "open" if table.turn == 0 else "bet_postflop"  # raise
+
+        if act_type is not None:
+            action_history.append((active_pos, act_type))
+
+        # Record the action event
         action_event = _build_event(
             table, hero_pos, active_pos, action,
             num_players, big_blind, small_blind
         )
-
-        # If this was hero's decision, replace the decision event with the action
-        # (we keep the decision event at its index, add action as next event)
         all_events.append(action_event)
 
         # Execute action on table
         end, several_all_in, state, bet = table.step(action)
 
         if end:
-            hand_ended = True
             break
 
-        # If all-in situation, table handles auto-advance
         if several_all_in:
             break
 
     # Need at least one hero decision point
-    if not hero_decision_indices:
+    if not hero_decisions:
         return None
 
     # Pick a random hero decision point
-    decision_idx = random.choice(hero_decision_indices)
+    decision_idx, ev_result = random.choice(hero_decisions)
 
     # The sequence is everything up to and including the decision event
     events = all_events[:decision_idx + 1]
@@ -247,51 +408,19 @@ def generate_scenario(config, device="mps"):
     if len(events) < 2:
         return None
 
-    # Recompute EV at the chosen decision point
-    # We need to re-simulate up to that point to get the table state
-    # Instead, we stored the state in the event — reconstruct from it
-    decision_event = events[-1]
-
-    # Use stored table state to compute EV
-    hand = decision_event["hand"]
-    hero_t = torch.tensor(hand, dtype=torch.long)
-
-    board_ids = [int(c) for c in decision_event["table"] if int(c) >= 0]
-    board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
-
-    n_active = num_players  # approximate: use all players at decision point
-    n_opponents = max(1, n_active - 1)
-
-    try:
-        eq = gpu_equity(hero_t, board_t, n_opponents, n_iters=mc_iters, device=device)
-    except Exception:
-        return None
-
-    hero_invested = default_stack - decision_event["stack"]
-    # Estimate facing bet from bets array
-    bets_arr = decision_event["bets"]
-    if isinstance(bets_arr, np.ndarray):
-        bets_arr = bets_arr.tolist()
-    max_bet = max(bets_arr) if bets_arr else 0
-    hero_bet = bets_arr[hero_pos] if hero_pos < len(bets_arr) else 0
-    facing_bet = max(0, max_bet - hero_bet)
-
-    stack = decision_event["stack"]
-    pot = decision_event["pot"]
-
-    fold_ev, call_ev, raise_ev, best_ev = compute_ev(
-        eq, pot, facing_bet, stack, hero_invested
-    )
-    ev_target = best_ev
+    # best_ev = max over fold, call, and all raise sizes
+    all_evs = [ev_result["fold_ev"], ev_result["call_ev"]]
+    all_evs.extend(ev for _, _, ev in ev_result["raise_evs"])
+    best_ev = max(all_evs)
 
     return {
         "events": events,
-        "ev_target": float(ev_target),
-        "equity": float(eq),
-        "pot": float(pot),
-        "facing_bet": float(facing_bet),
-        "stack": float(stack),
-        "hero_invested": float(hero_invested),
+        "ev_target": float(best_ev),
+        "equity": float(ev_result["equity"]),
+        "pot": float(ev_result["pot"]),
+        "facing_bet": float(ev_result["facing_bet"]),
+        "stack": float(ev_result["stack"]),
+        "hero_invested": float(ev_result["hero_invested"]),
         "num_players": num_players,
         "n_events": len(events),
     }

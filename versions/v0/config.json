@@ -23,7 +23,7 @@
         }
     },
     "gto_ev_train": {
-        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v0/experiment_1/gto_ev_predict/2026_03_25_17_55_26",
+        "dataset_dir": "",
         "lr": 3e-4,
         "batch_size": 64,
         "epochs": 1,

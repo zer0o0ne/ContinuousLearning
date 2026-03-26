@@ -2,8 +2,8 @@
 Training loop for GTO EV prediction (Recipe Step 1).
 
 Trains perception + value_head to predict GTO EV of poker situations.
-Memory is active: each encoded state is stored and retrieved via beam search.
-Action head is frozen. Memory resets each epoch.
+Memory is DISABLED: encoder processes event sequences directly.
+Action head is frozen.
 """
 
 import os
@@ -33,6 +33,7 @@ def train_gto_ev(agent, train_cfg, device, log):
     checkpoint_every = train_cfg.get("checkpoint_every", 5)
 
     log("=== GTO EV Prediction Training (Step 1) ===")
+    log("Memory: DISABLED (skip_memory=True)")
 
     # Freeze action head — only train perception + value
     for param in agent.action_head.parameters():
@@ -43,7 +44,7 @@ def train_gto_ev(agent, train_cfg, device, log):
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
     loss_fn = nn.MSELoss()
 
-    # Run directory: data/<version>/<name>/gto_ev_predict/<time>/
+    # Run directory
     run_dir = log.run_dir("gto_ev_predict")
 
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
@@ -54,10 +55,12 @@ def train_gto_ev(agent, train_cfg, device, log):
         dataset_path = os.path.join(dataset_dir, "dataset.pt")
         stats_path = os.path.join(dataset_dir, "norm_stats.pt")
         if not os.path.exists(dataset_path) or not os.path.exists(stats_path):
-            log(f"Dataset not found at {dataset_dir}. Aborting.")
-            return
-        scenarios = torch.load(dataset_path, weights_only=False)
-        norm_stats = torch.load(stats_path, weights_only=False)
+            log(f"Dataset not found at {dataset_dir}. Generating new dataset...")
+            dataset_dir = None
+
+    if dataset_dir:
+        scenarios = torch.load(os.path.join(dataset_dir, "dataset.pt"), weights_only=False)
+        norm_stats = torch.load(os.path.join(dataset_dir, "norm_stats.pt"), weights_only=False)
         log(f"Loaded dataset from {dataset_dir} ({len(scenarios)} scenarios)")
     else:
         result = generate_dataset(train_cfg, run_dir, log=log)
@@ -81,7 +84,6 @@ def train_gto_ev(agent, train_cfg, device, log):
     total_steps = epochs * len(train_loader)
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
-    # Checkpoints saved inside run_dir
     ckpt_dir = run_dir
 
     best_val_loss = float("inf")
@@ -90,15 +92,14 @@ def train_gto_ev(agent, train_cfg, device, log):
 
     for epoch in range(epochs):
         # --- Training ---
-        agent.perception.memory.clear()
         agent.train()
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (env_states, ev_targets) in enumerate(train_loader):
+        for batch_idx, (event_sequences, ev_targets) in enumerate(train_loader):
             ev_targets = ev_targets.to(device)
 
-            result = agent.forward_batch(env_states, skip_memory=False, store=True)
+            result = agent.forward_batch(event_sequences, skip_memory=True)
             predicted_ev = result["value"].squeeze(-1)  # (B,)
             batch_loss = loss_fn(predicted_ev, ev_targets)
 
@@ -112,8 +113,8 @@ def train_gto_ev(agent, train_cfg, device, log):
             history["step_loss"].append((global_step, step_loss))
             global_step += 1
 
-            train_loss_sum += step_loss * len(env_states)
-            train_count += len(env_states)
+            train_loss_sum += step_loss * len(event_sequences)
+            train_count += len(event_sequences)
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count
@@ -129,13 +130,13 @@ def train_gto_ev(agent, train_cfg, device, log):
         val_count = 0
 
         with torch.no_grad():
-            for env_states, ev_targets in val_loader:
+            for event_sequences, ev_targets in val_loader:
                 ev_targets = ev_targets.to(device)
-                result = agent.forward_batch(env_states, skip_memory=False, store=False)
+                result = agent.forward_batch(event_sequences, skip_memory=True)
                 predicted_ev = result["value"].squeeze(-1)
                 batch_loss = loss_fn(predicted_ev, ev_targets)
-                val_loss_sum += batch_loss.item() * len(env_states)
-                val_count += len(env_states)
+                val_loss_sum += batch_loss.item() * len(event_sequences)
+                val_count += len(event_sequences)
 
         val_loss_avg = val_loss_sum / max(val_count, 1)
 
@@ -150,7 +151,6 @@ def train_gto_ev(agent, train_cfg, device, log):
             torch.save({"epoch": epoch + 1, "model_state_dict": agent.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
-                        "memory_state": agent.perception.memory.state_dict(),
                         "norm_stats": norm_stats,
                         "train_loss": train_loss_avg, "val_loss": val_loss_avg}, ckpt_path)
             log(f"  Checkpoint saved: {ckpt_path}")
@@ -162,7 +162,6 @@ def train_gto_ev(agent, train_cfg, device, log):
             torch.save({"epoch": epoch + 1, "model_state_dict": agent.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
-                        "memory_state": agent.perception.memory.state_dict(),
                         "norm_stats": norm_stats,
                         "train_loss": train_loss_avg, "val_loss": val_loss_avg}, best_path)
             log(f"  New best model (val loss: {val_loss_avg:.6f})")

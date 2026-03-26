@@ -1,51 +1,68 @@
 {
-    "name": "small_sample_solver_v1",
+    "name": "small_sample_full_agent",
     "agent_dir": "",
     "architecture": {
-        "d_model": 32,
-        "n_heads": 4,
+        "d_model": 64,
+        "n_heads": 8,
         "n_kv_heads": 2,
-        "d_ff": 128,
-        "n_encoder_layers": 3,
-        "n_decoder_layers": 3,
+        "d_ff": 256,
+        "n_encoder_layers": 4,
+        "n_decoder_layers": 4,
         "n_value_layers": 2,
-        "n_action_layers": 2,
+        "n_action_layers": 4,
         "max_seq_len": 2048,
-        "n_actions": 13,
         "max_players": 9,
         "memory": {
             "n_levels": 2,
             "max_cluster_size": 128,
             "max_cluster_size_after": 64,
             "beam_width": 8
-        },
-        "action": {
-            "max_gen_steps": 128
         }
+    },
+    "game": {
+        "table_bins": 50,
+        "table_max_bet": 5,
+        "max_players": 9,
+        "max_stack": 3000,
+        "big_blind": 10
+    },
+    "solver": {
+        "type": "v2",
+        "mc_iterations": 1500,
+        "n_raise_samples": 3,
+        "gto_temperature": 1.0,
+        "mdf_max_fold": 0.7,
+        "reraise_pct": 0.15,
+        "reraise_cap": 0.10
     },
     "gto_ev_train": {
         "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v0/experiment_1/gto_ev_predict/2026_03_26_13_08_21",
-        "solver": "v2",
-        "gto_temperature": 1.0,
-        "max_players": 9,
         "lr": 3e-4,
         "batch_size": 64,
         "epochs": 5,
         "n_scenarios": 5000,
-        "mc_iterations": 3000,
-        "n_raise_samples": 3,
-        "default_stack": 1000,
-        "big_blind": 10,
-        "table_bins": 10,
-        "table_max_bet": 2,
         "val_split": 0.1,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,
         "interrupt_after_fails": 20,
-        "scheduler_eta_min": 1e-6,
-        "mdf_max_fold": 0.7,
-        "reraise_pct": 0.15,
-        "reraise_cap": 0.10
+        "scheduler_eta_min": 3e-6
+    },
+    "gto_probs_train": {
+        "dataset_dir": "",
+        "lr": 1e-4,
+        "batch_size": 64,
+        "epochs": 4,
+        "n_scenarios": 5000,
+        "val_split": 0.1,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 10,
+        "interrupt_after_fails": 20,
+        "scheduler_eta_min": 3e-6
+    },
+    "pipeline": {
+        "run_gto_ev": true,
+        "run_gto_probs": true
     }
 }

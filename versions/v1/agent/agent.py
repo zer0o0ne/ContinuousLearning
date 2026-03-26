@@ -14,34 +14,37 @@ class ASI(nn.Module):
         self.config = config or {}
 
         arch = config.get("architecture", config)
+        game = config.get("game", {})
 
         d_model = arch.get("d_model", 128)
-        n_actions = arch.get("n_actions", 13)
-        max_players = arch.get("max_players", 6)
         n_heads = arch.get("n_heads", 4)
         n_kv_heads = arch.get("n_kv_heads", n_heads // 2)
-        mem_cfg = arch.get("memory", {})
-        act_cfg = arch.get("action", {})
+        d_ff = arch.get("d_ff", 512)
         max_seq_len = arch.get("max_seq_len", 256)
+        mem_cfg = arch.get("memory", {})
 
-        self.perception = Perception(arch)
+        table_bins = game.get("table_bins", 10)
+        n_actions = table_bins + 3  # fold + call + bins + all-in
+
+        head_max_seq_len = max_seq_len + mem_cfg.get("beam_width", 4) + 64
+
+        self.perception = Perception(arch, n_actions)
         self.value_head = ValueHead(
             d_model=d_model,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
-            n_layers=config.get("n_value_layers", 2),
-            d_ff=config.get("d_ff", 512),
-            max_seq_len=max_seq_len + mem_cfg.get("beam_width", 4) + 64,
+            n_layers=arch.get("n_value_layers", 2),
+            d_ff=d_ff,
+            max_seq_len=head_max_seq_len,
         )
         self.action_head = ActionHead(
             d_model=d_model,
             n_actions=n_actions,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
-            n_layers=config.get("n_action_layers", 2),
-            d_ff=config.get("d_ff", 512),
-            max_seq_len=act_cfg.get("max_gen_steps", 4) + 1,
-            max_gen_steps=act_cfg.get("max_gen_steps", 4),
+            n_layers=arch.get("n_action_layers", 2),
+            d_ff=d_ff,
+            max_seq_len=head_max_seq_len,
         )
 
         self.device_ = "cpu"

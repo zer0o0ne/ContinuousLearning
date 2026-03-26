@@ -111,10 +111,9 @@ class EventSequenceEmbedder(nn.Module):
 
 
 class Perception(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, n_actions):
         super().__init__()
         d_model = config["d_model"]
-        n_actions = config["n_actions"]
         max_players = config.get("max_players", 6)
         mem_cfg = config["memory"]
 

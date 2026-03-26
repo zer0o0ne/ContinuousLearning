@@ -1,32 +1,45 @@
 """
-Training loop for GTO EV prediction (Recipe Step 1).
+Training loop for GTO action probability prediction (Recipe Step 2).
 
-Trains perception + value_head to predict GTO EV of poker situations.
-Memory is DISABLED: encoder processes event sequences directly.
-Action head is frozen.
+Trains action_head to predict GTO action probabilities via KL divergence.
+Perception and value_head are FROZEN — only action_head learns.
 """
 
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from agent.train_scenarios.generation.generate import generate_dataset
-from agent.train_scenarios.gto_ev_predict.dataset import GTOEVDataset, batch_collate
+from agent.train_scenarios.gto_probs_predict.dataset import GTOProbsDataset, batch_collate
 
 
-def _run_validation(agent, val_loader, loss_fn, device):
-    """Run validation and return average loss."""
+def _kl_loss(logits, target_probs):
+    """KL divergence loss: target_probs || softmax(logits).
+
+    Args:
+        logits: (B, n_actions) raw action logits
+        target_probs: (B, n_actions) target probability distribution
+
+    Returns: scalar loss
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    return F.kl_div(log_probs, target_probs, reduction="batchmean")
+
+
+def _run_validation(agent, val_loader, device):
+    """Run validation and return average KL divergence loss."""
     agent.eval()
     val_loss_sum = 0.0
     val_count = 0
     with torch.no_grad():
-        for event_sequences, ev_targets in val_loader:
-            ev_targets = ev_targets.to(device)
+        for event_sequences, target_probs in val_loader:
+            target_probs = target_probs.to(device)
             result = agent.forward_batch(event_sequences, skip_memory=True)
-            predicted_ev = result["value"].squeeze(-1)
-            batch_loss = loss_fn(predicted_ev, ev_targets)
+            action_logits = result["action_logits"]
+            batch_loss = _kl_loss(action_logits, target_probs)
             val_loss_sum += batch_loss.item() * len(event_sequences)
             val_count += len(event_sequences)
     agent.train()
@@ -66,37 +79,44 @@ def _check_val(val_loss, best_val_loss, fails_since_best, interrupt_after_fails,
     return best_val_loss, fails_since_best, False
 
 
-def train_gto_ev(agent, train_cfg, device, log):
-    """Main training entry point for GTO EV prediction.
+def train_gto_probs(agent, train_cfg, device, log):
+    """Main training entry point for GTO action probability prediction.
+
+    Freezes perception + value_head, trains only action_head with KL divergence.
 
     Args:
         agent: ASI model instance (already on device)
-        train_cfg: dict with training hyperparameters from config["gto_ev_train"]
+        train_cfg: dict with training hyperparameters (merged game + solver + gto_probs_train)
         device: torch device string
         log: logger callable
     """
-    lr = train_cfg.get("lr", 3e-4)
+    lr = train_cfg.get("lr", 1e-4)
     batch_size = train_cfg.get("batch_size", 64)
-    epochs = train_cfg.get("epochs", 50)
+    epochs = train_cfg.get("epochs", 10)
     val_split = train_cfg.get("val_split", 0.1)
     log_every = train_cfg.get("log_every", 100)
     val_every = train_cfg.get("val_every", None)
     interrupt_after_fails = train_cfg.get("interrupt_after_fails", None)
 
-    log("=== GTO EV Prediction Training (Step 1) ===")
-    log("Memory: DISABLED (skip_memory=True)")
+    log("=== GTO Action Probability Prediction Training (Step 2) ===")
+    log("Frozen: perception, value_head. Training: action_head only")
 
-    # Freeze action head — only train perception + value
-    for param in agent.action_head.parameters():
+    # Freeze perception + value_head
+    for param in agent.perception.parameters():
+        param.requires_grad = False
+    for param in agent.value_head.parameters():
         param.requires_grad = False
 
-    # Optimizer over trainable parameters only
-    trainable_params = [p for p in agent.parameters() if p.requires_grad]
+    # Ensure action_head is unfrozen
+    for param in agent.action_head.parameters():
+        param.requires_grad = True
+
+    # Optimizer over action_head parameters only
+    trainable_params = list(agent.action_head.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
-    loss_fn = nn.MSELoss()
 
     # Run directory
-    run_dir = log.run_dir("gto_ev_predict")
+    run_dir = log.run_dir("gto_probs_predict")
 
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
 
@@ -117,11 +137,11 @@ def train_gto_ev(agent, train_cfg, device, log):
         result = generate_dataset(train_cfg, run_dir, log=log)
         if not result or not result[0]:
             log("No scenarios generated. Aborting training.")
-            return None, run_dir
+            return
         scenarios, norm_stats = result
 
     # Train/val split
-    dataset = GTOEVDataset(scenarios)
+    dataset = GTOProbsDataset(scenarios)
     val_size = max(1, int(len(dataset) * val_split))
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -157,12 +177,12 @@ def train_gto_ev(agent, train_cfg, device, log):
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_sequences, ev_targets) in enumerate(train_loader):
-            ev_targets = ev_targets.to(device)
+        for batch_idx, (event_sequences, target_probs) in enumerate(train_loader):
+            target_probs = target_probs.to(device)
 
             result = agent.forward_batch(event_sequences, skip_memory=True)
-            predicted_ev = result["value"].squeeze(-1)  # (B,)
-            batch_loss = loss_fn(predicted_ev, ev_targets)
+            action_logits = result["action_logits"]  # (B, n_actions)
+            batch_loss = _kl_loss(action_logits, target_probs)
 
             optimizer.zero_grad()
             batch_loss.backward()
@@ -185,7 +205,7 @@ def train_gto_ev(agent, train_cfg, device, log):
 
             # Intra-epoch validation
             if val_every and (global_step % val_every == 0):
-                val_loss = _run_validation(agent, val_loader, loss_fn, device)
+                val_loss = _run_validation(agent, val_loader, device)
                 history["val_loss"].append((global_step, val_loss))
                 _save_history(history, run_dir)
                 log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}")
@@ -208,7 +228,7 @@ def train_gto_ev(agent, train_cfg, device, log):
             break
 
         # --- End-of-epoch validation ---
-        val_loss_avg = _run_validation(agent, val_loader, loss_fn, device)
+        val_loss_avg = _run_validation(agent, val_loader, device)
         history["val_loss"].append((global_step, val_loss_avg))
 
         history["epoch_train_loss"].append(train_loss_avg)
@@ -228,11 +248,13 @@ def train_gto_ev(agent, train_cfg, device, log):
         if should_stop:
             break
 
-    # Unfreeze action head after training
-    for param in agent.action_head.parameters():
+    # Unfreeze all modules after training
+    for param in agent.perception.parameters():
+        param.requires_grad = True
+    for param in agent.value_head.parameters():
         param.requires_grad = True
 
-    log(f"=== GTO EV Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
+    log(f"=== GTO Action Prob Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
     _save_history(history, run_dir)
 
-    return history, run_dir
+    return history

@@ -1,5 +1,5 @@
 {
-    "name": "small_sample_full_agent",
+    "name": "smallest_sample_full_agent",
     "agent_dir": "",
     "architecture": {
         "d_model": 64,
@@ -28,7 +28,7 @@
     },
     "solver": {
         "type": "v2",
-        "mc_iterations": 1500,
+        "mc_iterations": 1000,
         "n_raise_samples": 3,
         "gto_temperature": 1.0,
         "mdf_max_fold": 0.7,
@@ -36,11 +36,11 @@
         "reraise_cap": 0.10
     },
     "gto_ev_train": {
-        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v0/experiment_1/gto_ev_predict/2026_03_26_13_08_21",
+        "dataset_dir": "",
         "lr": 3e-4,
         "batch_size": 64,
         "epochs": 5,
-        "n_scenarios": 5000,
+        "n_scenarios": 700,
         "val_split": 0.1,
         "max_grad_norm": 1.0,
         "log_every": 10,
@@ -50,10 +50,10 @@
     },
     "gto_probs_train": {
         "dataset_dir": "",
-        "lr": 1e-4,
+        "lr": 3e-4,
         "batch_size": 64,
         "epochs": 4,
-        "n_scenarios": 5000,
+        "n_scenarios": 700,
         "val_split": 0.1,
         "max_grad_norm": 1.0,
         "log_every": 10,

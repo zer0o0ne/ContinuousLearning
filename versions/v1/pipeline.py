@@ -50,6 +50,14 @@ def main():
     log = Logger(base_dir)
     log(f"Version: {version}, Experiment: {name}, Device: {device}")
 
+    # Save config snapshot for this run
+    configs_dir = os.path.join(base_dir, "configs")
+    os.makedirs(configs_dir, exist_ok=True)
+    config_snapshot_path = os.path.join(configs_dir, f"{log.init_time}.json")
+    with open(config_snapshot_path, "w") as f:
+        json.dump(config, f, indent=4)
+    log(f"Config saved to {config_snapshot_path}")
+
     agent = ASI(log, config)
     agent.set_device(device)
 
@@ -60,25 +68,31 @@ def main():
         log("No agent_dir specified, agent initialized randomly")
 
     pipeline_cfg = config.get("pipeline", {})
-    ev_run_dir = None
+    ev_dataset_dir = None  # tracks where the actual dataset lives
 
     # Step 1: GTO EV prediction training
     if pipeline_cfg.get("run_gto_ev", True):
         train_cfg = _merge_train_config(config, "gto_ev_train")
         from agent.train_scenarios.gto_ev_predict.train import train_gto_ev
+        # Track the dataset directory (either external or generated in run_dir)
+        if train_cfg.get("dataset_dir"):
+            ev_dataset_dir = train_cfg["dataset_dir"]
         result = train_gto_ev(agent, train_cfg, device, log)
         if result is not None:
             _, ev_run_dir = result
+            # If no external dataset_dir, dataset was generated in run_dir
+            if not ev_dataset_dir:
+                ev_dataset_dir = ev_run_dir
 
     # Step 2: GTO action probability prediction training
     if pipeline_cfg.get("run_gto_probs", False):
         train_cfg = _merge_train_config(config, "gto_probs_train")
         # Reuse dataset from step 1 if no dataset_dir specified
-        if not train_cfg.get("dataset_dir") and ev_run_dir:
-            dataset_path = os.path.join(ev_run_dir, "dataset.pt")
+        if not train_cfg.get("dataset_dir") and ev_dataset_dir:
+            dataset_path = os.path.join(ev_dataset_dir, "dataset.pt")
             if os.path.exists(dataset_path):
-                train_cfg["dataset_dir"] = ev_run_dir
-                log(f"Reusing dataset from gto_ev_predict: {ev_run_dir}")
+                train_cfg["dataset_dir"] = ev_dataset_dir
+                log(f"Reusing dataset from gto_ev_predict: {ev_dataset_dir}")
         from agent.train_scenarios.gto_probs_predict.train import train_gto_probs
         train_gto_probs(agent, train_cfg, device, log)
 

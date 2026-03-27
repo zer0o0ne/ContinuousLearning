@@ -29,19 +29,29 @@ class ActionHead(nn.Module):
         self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
         self.output_proj = nn.Linear(d_model, n_actions, bias=False)
 
-    def forward(self, context):
+    def forward(self, context, mask=None):
         """
-        Args: context (batch, seq_len, d_model) -- perception output
+        Args:
+            context: (batch, seq_len, d_model) -- perception output
+            mask: (batch, seq_len) float — 1 for real, 0 for padding (optional)
         Returns: (batch, n_actions) action logits
         """
         batch_size, seq_len, _ = context.shape
         position_ids = torch.arange(seq_len, device=context.device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.rope(context, position_ids)
 
+        attn_mask = None
+        if mask is not None:
+            attn_mask = (1.0 - mask[:, None, None, :]) * torch.finfo(context.dtype).min
+
         x = context
         for layer in self.layers:
-            x = layer(x, position_ids=position_ids, position_embeddings=position_embeddings)
+            x = layer(x, position_ids=position_ids, position_embeddings=position_embeddings,
+                      attention_mask=attn_mask)
 
         x = self.norm(x)
-        x = x.mean(dim=1)
+        if mask is not None:
+            x = (x * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+        else:
+            x = x.mean(dim=1)
         return self.output_proj(x)

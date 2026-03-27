@@ -6,14 +6,39 @@ Perception and value_head are FROZEN — only action_head learns.
 """
 
 import os
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, random_split, Sampler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from agent.train_scenarios.generation.generate import generate_dataset
 from agent.train_scenarios.gto_probs_predict.dataset import GTOProbsDataset, batch_collate
+
+
+class LengthGroupedBatchSampler(Sampler):
+    """Sampler that groups samples by sequence length into batches."""
+
+    def __init__(self, dataset, batch_size):
+        self.batch_size = batch_size
+        indices = list(range(len(dataset)))
+        lengths = []
+        for i in indices:
+            sample = dataset[i]
+            lengths.append(len(sample[0]))
+        sorted_indices = sorted(indices, key=lambda i: lengths[i])
+        self.batches = [sorted_indices[i:i + batch_size]
+                        for i in range(0, len(sorted_indices), batch_size)]
+
+    def __iter__(self):
+        batch_order = list(range(len(self.batches)))
+        random.shuffle(batch_order)
+        for idx in batch_order:
+            yield self.batches[idx]
+
+    def __len__(self):
+        return len(self.batches)
 
 
 def _kl_loss(logits, target_probs):
@@ -146,7 +171,8 @@ def train_gto_probs(agent, train_cfg, device, log):
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=batch_collate)
+    train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=batch_collate)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=batch_collate)
 
     log(f"Train: {train_size}, Val: {val_size}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
@@ -155,10 +181,13 @@ def train_gto_probs(agent, train_cfg, device, log):
     if interrupt_after_fails:
         log(f"Early stopping after {interrupt_after_fails} failed validations")
 
-    # Cosine annealing scheduler
+    # Linear warmup + cosine annealing scheduler
     total_steps = epochs * len(train_loader)
+    warmup_steps = min(100, total_steps // 5)
     eta_min = train_cfg.get("scheduler_eta_min", 1e-6)
-    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=eta_min)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=eta_min)
+    scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
     ckpt_dir = run_dir
 

@@ -61,11 +61,11 @@ class ASI(nn.Module):
             skip_memory: bypass memory retrieval (True for gto_ev_predict)
         Returns: {"action_logits": (B, n_actions), "value": (B, 1)}
         """
-        perception_out, encoded = self.perception.forward_batch(
+        perception_out, encoded, mask = self.perception.forward_batch(
             event_sequences, device=self.device_, skip_memory=skip_memory
         )
-        value = self.value_head(perception_out)
-        action_logits = self.action_head(perception_out)
+        value = self.value_head(perception_out, mask=mask)
+        action_logits = self.action_head(perception_out, mask=mask)
 
         return {"action_logits": action_logits, "value": value}
 

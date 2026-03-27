@@ -29,18 +29,28 @@ class ValueHead(nn.Module):
         self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
         self.head = nn.Linear(d_model, 1, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """
-        Args: x (batch, seq_len, d_model) — perception output sequence
+        Args:
+            x: (batch, seq_len, d_model) — perception output sequence
+            mask: (batch, seq_len) float — 1 for real, 0 for padding (optional)
         Returns: (batch, 1)
         """
         batch_size, seq_len, _ = x.shape
         position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.rope(x, position_ids)
 
+        attn_mask = None
+        if mask is not None:
+            attn_mask = (1.0 - mask[:, None, None, :]) * torch.finfo(x.dtype).min
+
         for layer in self.layers:
-            x = layer(x, position_ids=position_ids, position_embeddings=position_embeddings)
+            x = layer(x, position_ids=position_ids, position_embeddings=position_embeddings,
+                      attention_mask=attn_mask)
 
         x = self.norm(x)
-        x = x.mean(dim=1)
+        if mask is not None:
+            x = (x * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1)
+        else:
+            x = x.mean(dim=1)
         return self.head(x)

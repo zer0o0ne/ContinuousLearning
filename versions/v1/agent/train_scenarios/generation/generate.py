@@ -18,6 +18,7 @@ Can be run standalone:
 import os
 import sys
 import json
+import copy
 import random
 import argparse
 
@@ -621,10 +622,17 @@ def generate_scenario(config, device="mps"):
 
 
 def _compute_norm_stats(scenarios):
-    """Compute mean/std for normalization across all scenarios."""
+    """Compute mean/std for normalization across all scenarios.
+
+    EV targets are first scaled by (pot + facing_bet) to remove pot-size
+    dependence, then z-score stats are computed on the ratio.
+    """
     evs, pots, stacks, all_bets, blinds = [], [], [], [], []
     for s in scenarios:
-        evs.append(s["ev_target"])
+        # Scale EV by pot + facing_bet before computing stats
+        denom = max(s.get("pot", 0) + s.get("facing_bet", 0),
+                    s["events"][-1]["big_blind"])
+        evs.append(s["ev_target"] / denom)
         for event in s["events"]:
             pots.append(event["pot"])
             stacks.append(event["stack"])
@@ -651,7 +659,10 @@ def _compute_norm_stats(scenarios):
 
 
 def _normalize_scenarios(scenarios, norm_stats):
-    """Normalize ev_target and event scalar inputs in-place."""
+    """Normalize ev_target and event scalar inputs in-place.
+
+    EV is first scaled by (pot + facing_bet), then z-scored.
+    """
     ev_m, ev_s = norm_stats["ev_mean"], norm_stats["ev_std"]
     pot_m, pot_s = norm_stats["pot_mean"], norm_stats["pot_std"]
     stack_m, stack_s = norm_stats["stack_mean"], norm_stats["stack_std"]
@@ -659,7 +670,9 @@ def _normalize_scenarios(scenarios, norm_stats):
     blind_m, blind_s = norm_stats["blind_mean"], norm_stats["blind_std"]
 
     for s in scenarios:
-        s["ev_target"] = (s["ev_target"] - ev_m) / ev_s
+        denom = max(s.get("pot", 0) + s.get("facing_bet", 0),
+                    s["events"][-1]["big_blind"])
+        s["ev_target"] = (s["ev_target"] / denom - ev_m) / ev_s
         for event in s["events"]:
             event["pot"] = (event["pot"] - pot_m) / pot_s
             event["stack"] = (event["stack"] - stack_m) / stack_s
@@ -671,10 +684,57 @@ def _normalize_scenarios(scenarios, norm_stats):
                 event["bets"] = [(b - bets_m) / bets_s for b in event["bets"]]
 
 
+def load_dataset(dataset_dir, log=None):
+    """Load a dataset from a directory, normalizing if needed.
+
+    Handles three cases:
+      1. Both dataset.pt and norm_stats.pt exist → load as-is (already normalized)
+      2. Only dataset.pt exists (interrupted run) → normalize and save norm_stats.pt
+      3. Neither exists → return None
+
+    Args:
+        dataset_dir: directory containing dataset.pt (and optionally norm_stats.pt)
+        log: optional logger
+
+    Returns:
+        (scenarios_list, norm_stats_dict) or None if dataset.pt not found
+    """
+    dataset_path = os.path.join(dataset_dir, "dataset.pt")
+    stats_path = os.path.join(dataset_dir, "norm_stats.pt")
+
+    if not os.path.exists(dataset_path):
+        return None
+
+    scenarios = torch.load(dataset_path, weights_only=False)
+
+    if os.path.exists(stats_path):
+        norm_stats = torch.load(stats_path, weights_only=False)
+        if log:
+            log(f"Loaded dataset from {dataset_dir} ({len(scenarios)} samples, already normalized)")
+        return scenarios, norm_stats
+
+    # dataset.pt exists but norm_stats.pt doesn't — interrupted generation
+    if log:
+        log(f"Loaded raw dataset from {dataset_dir} ({len(scenarios)} samples, normalizing...)")
+
+    norm_stats = _compute_norm_stats(scenarios)
+    if log:
+        log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
+    _normalize_scenarios(scenarios, norm_stats)
+
+    torch.save(scenarios, dataset_path)
+    torch.save(norm_stats, stats_path)
+    if log:
+        log(f"Normalized dataset saved to {dataset_dir}")
+
+    return scenarios, norm_stats
+
+
 def generate_dataset(config, save_dir, log=None):
     """Generate full dataset of scenarios with both EV and action prob labels.
 
     Saves incrementally every save_every samples so progress is visible on disk.
+    If a partial dataset already exists in save_dir, loads and normalizes it.
 
     Args:
         config: merged config dict (game + solver + scenario-specific)
@@ -684,6 +744,11 @@ def generate_dataset(config, save_dir, log=None):
     Returns:
         (scenarios_list, norm_stats_dict)
     """
+    # Try loading existing dataset first
+    existing = load_dataset(save_dir, log=log)
+    if existing is not None:
+        return existing
+
     n_scenarios = config.get("n_scenarios", 50000)
     batch_size = config.get("batch_size", 64)
     val_every = config.get("val_every", 10)
@@ -693,13 +758,6 @@ def generate_dataset(config, save_dir, log=None):
     device = config.get("device", _default_device)
     dataset_path = os.path.join(save_dir, "dataset.pt")
     stats_path = os.path.join(save_dir, "norm_stats.pt")
-
-    if os.path.exists(dataset_path) and os.path.exists(stats_path):
-        if log:
-            log(f"Dataset already exists at {dataset_path}, loading...")
-        scenarios = torch.load(dataset_path, weights_only=False)
-        norm_stats = torch.load(stats_path, weights_only=False)
-        return scenarios, norm_stats
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -716,12 +774,17 @@ def generate_dataset(config, save_dir, log=None):
         else:
             failed += 1
 
-        # Incremental save
+        # Incremental save with norm_stats so partial datasets are trainable
         if len(scenarios) - last_save_count >= save_every:
-            torch.save(scenarios, dataset_path)
+            norm_stats_cp = _compute_norm_stats(scenarios)
+            scenarios_cp = copy.deepcopy(scenarios)
+            _normalize_scenarios(scenarios_cp, norm_stats_cp)
+            torch.save(scenarios_cp, dataset_path)
+            torch.save(norm_stats_cp, stats_path)
+            del scenarios_cp
             last_save_count = len(scenarios)
             if log:
-                log(f"  Incremental save: {len(scenarios)} samples")
+                log(f"  Incremental save: {len(scenarios)} samples (with norm_stats)")
 
     if log:
         log(f"Generated {len(scenarios)} samples from {n_scenarios - failed} hands ({failed} failed)")

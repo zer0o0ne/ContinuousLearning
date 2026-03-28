@@ -13,7 +13,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from agent.train_scenarios.generation.generate import generate_dataset
+from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
+    _compute_norm_stats, _normalize_scenarios
 from agent.train_scenarios.gto_probs_predict.dataset import GTOProbsDataset, batch_collate
 
 
@@ -54,10 +55,31 @@ def _kl_loss(logits, target_probs):
     return F.kl_div(log_probs, target_probs, reduction="batchmean")
 
 
+def _weighted_rank_concordance(logits, target_probs):
+    """Weighted pairwise ranking concordance.
+
+    For each pair (i,j) where target[i] > target[j], checks if logits agree.
+    Weight = target[i] - target[j], so swapping high-diff actions penalizes
+    much more than swapping near-equal ones.
+
+    Returns: (B,) scores in [0, 1]. 1.0 = perfect, 0.5 = random.
+    """
+    target_diff = target_probs.unsqueeze(-1) - target_probs.unsqueeze(-2)
+    logit_diff = logits.unsqueeze(-1) - logits.unsqueeze(-2)
+    mask = target_diff > 0
+    weights = target_diff * mask
+    concordant = (logit_diff > 0).float() * mask
+    w_sum = weights.sum(dim=(-1, -2))
+    c_sum = (weights * concordant).sum(dim=(-1, -2))
+    return torch.where(w_sum > 0, c_sum / w_sum, torch.ones_like(w_sum))
+
+
 def _run_validation(agent, val_loader, device):
-    """Run validation and return average KL divergence loss."""
+    """Run validation and return (avg_loss, accuracy, wrc)."""
     agent.eval()
     val_loss_sum = 0.0
+    correct = 0
+    wrc_sum = 0.0
     val_count = 0
     with torch.no_grad():
         for event_sequences, target_probs in val_loader:
@@ -66,9 +88,12 @@ def _run_validation(agent, val_loader, device):
             action_logits = result["action_logits"]
             batch_loss = _kl_loss(action_logits, target_probs)
             val_loss_sum += batch_loss.item() * len(event_sequences)
+            correct += (action_logits.argmax(dim=-1) == target_probs.argmax(dim=-1)).sum().item()
+            wrc_sum += _weighted_rank_concordance(action_logits, target_probs).sum().item()
             val_count += len(event_sequences)
     agent.train()
-    return val_loss_sum / max(val_count, 1)
+    n = max(val_count, 1)
+    return val_loss_sum / n, correct / n, wrc_sum / n
 
 
 def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
@@ -104,7 +129,7 @@ def _check_val(val_loss, best_val_loss, fails_since_best, interrupt_after_fails,
     return best_val_loss, fails_since_best, False
 
 
-def train_gto_probs(agent, train_cfg, device, log):
+def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None):
     """Main training entry point for GTO action probability prediction.
 
     Freezes perception + value_head, trains only action_head with KL divergence.
@@ -114,6 +139,7 @@ def train_gto_probs(agent, train_cfg, device, log):
         train_cfg: dict with training hyperparameters (merged game + solver + gto_probs_train)
         device: torch device string
         log: logger callable
+        scenarios_override: if provided, use these raw scenarios instead of loading/generating
     """
     lr = train_cfg.get("lr", 1e-4)
     batch_size = train_cfg.get("batch_size", 64)
@@ -145,31 +171,29 @@ def train_gto_probs(agent, train_cfg, device, log):
 
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
 
-    # Load dataset from existing dir or generate new one
-    dataset_dir = train_cfg.get("dataset_dir", None)
-    if dataset_dir:
-        dataset_path = os.path.join(dataset_dir, "dataset.pt")
-        stats_path = os.path.join(dataset_dir, "norm_stats.pt")
-        if not os.path.exists(dataset_path) or not os.path.exists(stats_path):
-            log(f"Dataset not found at {dataset_dir}. Generating new dataset...")
-            dataset_dir = None
-
-    if dataset_dir:
-        scenarios = torch.load(os.path.join(dataset_dir, "dataset.pt"), weights_only=False)
-        norm_stats = torch.load(os.path.join(dataset_dir, "norm_stats.pt"), weights_only=False)
-        log(f"Loaded dataset from {dataset_dir} ({len(scenarios)} scenarios)")
+    # Dataset is provided by pipeline (loaded/generated there)
+    if scenarios_override is not None:
+        scenarios = scenarios_override
+        log(f"Using provided scenarios ({len(scenarios)} samples)")
     else:
-        result = generate_dataset(train_cfg, run_dir, log=log)
-        if not result or not result[0]:
+        scenarios = generate_dataset(train_cfg, run_dir, log=log)
+        if not scenarios:
             log("No scenarios generated. Aborting training.")
             return
-        scenarios, norm_stats = result
+
+    # Compute norm_stats and normalize (per-agent)
+    import copy
+    scenarios = copy.deepcopy(scenarios)
+    norm_stats = _compute_norm_stats(scenarios)
+    log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
+    _normalize_scenarios(scenarios, norm_stats)
 
     # Train/val split
     dataset = GTOProbsDataset(scenarios)
     val_size = max(1, int(len(dataset) * val_split))
     train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size],
+                                                 generator=torch.Generator().manual_seed(42))
 
     train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=batch_collate)
@@ -193,7 +217,7 @@ def train_gto_probs(agent, train_cfg, device, log):
 
     best_val_loss = float("inf")
     fails_since_best = 0
-    history = {"step_loss": [], "val_loss": [], "epoch_train_loss": [], "epoch_val_loss": []}
+    history = {"step_loss": [], "val_loss": [], "val_accuracy": [], "val_wrc": [], "epoch_train_loss": [], "epoch_val_loss": []}
     global_step = 0
     stopped_early = False
 
@@ -234,10 +258,12 @@ def train_gto_probs(agent, train_cfg, device, log):
 
             # Intra-epoch validation
             if val_every and (global_step % val_every == 0):
-                val_loss = _run_validation(agent, val_loader, device)
+                val_loss, val_acc, val_wrc = _run_validation(agent, val_loader, device)
                 history["val_loss"].append((global_step, val_loss))
+                history["val_accuracy"].append((global_step, val_acc))
+                history["val_wrc"].append((global_step, val_wrc))
                 _save_history(history, run_dir)
-                log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}")
+                log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}, Acc: {val_acc:.4f}, WRC: {val_wrc:.4f}")
 
                 prev_best = best_val_loss
                 best_val_loss, fails_since_best, should_stop = _check_val(
@@ -257,14 +283,16 @@ def train_gto_probs(agent, train_cfg, device, log):
             break
 
         # --- End-of-epoch validation ---
-        val_loss_avg = _run_validation(agent, val_loader, device)
+        val_loss_avg, val_acc, val_wrc = _run_validation(agent, val_loader, device)
         history["val_loss"].append((global_step, val_loss_avg))
+        history["val_accuracy"].append((global_step, val_acc))
+        history["val_wrc"].append((global_step, val_wrc))
 
         history["epoch_train_loss"].append(train_loss_avg)
         history["epoch_val_loss"].append(val_loss_avg)
 
         _save_history(history, run_dir)
-        log(f"Epoch {epoch+1}/{epochs} — Train Loss: {train_loss_avg:.6f}, Val Loss: {val_loss_avg:.6f}")
+        log(f"Epoch {epoch+1}/{epochs} — Train Loss: {train_loss_avg:.6f}, Val Loss: {val_loss_avg:.6f}, Acc: {val_acc:.4f}, WRC: {val_wrc:.4f}")
 
         prev_best = best_val_loss
         best_val_loss, fails_since_best, should_stop = _check_val(

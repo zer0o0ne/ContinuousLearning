@@ -1,5 +1,5 @@
 {
-    "name": "smallest_sample_full_agent",
+    "name": "medium_sample_full_agent_modifiers",
     "agent_dir": "",
     "architecture": {
         "d_model": 64,
@@ -19,6 +19,45 @@
             "beam_width": 8
         }
     },
+    "multi_agent": {
+        "save_dir": "5_test_agents",
+        "agents": [
+            {
+                "name": "gto_pure",
+                "modifiers": []
+            },
+            {
+                "name": "lag_bluffer",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "aggressive", "factor": 0.35},
+                    {"type": "action_bias", "actions": "fold", "factor": -0.25},
+                    {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.4}
+                ]
+            },
+            {
+                "name": "tight_passive",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "fold", "factor": 0.3},
+                    {"type": "action_bias", "actions": "raises", "factor": -0.2},
+                    {"type": "temperature", "value": 0.5}
+                ]
+            },
+            {
+                "name": "value_heavy",
+                "modifiers": [
+                    {"type": "conditional_bias", "condition": "equity > 0.6", "actions": "aggressive", "factor": 0.5},
+                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.3}
+                ]
+            },
+            {
+                "name": "mid_raise_specialist",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "15:35", "factor": 0.4},
+                    {"type": "action_bias", "actions": [0, 1, 52], "factor": -0.15}
+                ]
+            }
+        ]
+    },
     "game": {
         "table_bins": 50,
         "table_max_bet": 5,
@@ -35,13 +74,15 @@
         "reraise_pct": 0.15,
         "reraise_cap": 0.10
     },
-    "gto_ev_train": {
+    "dataset": {
         "dataset_dir": "",
-        "lr": 3e-4,
-        "batch_size": 64,
-        "epochs": 5,
         "n_scenarios": 700,
-        "val_split": 0.1,
+        "val_split": 0.1
+    },
+    "gto_ev_train": {
+        "lr": 3e-4,
+        "batch_size": 16,
+        "epochs": 1,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,
@@ -49,12 +90,9 @@
         "scheduler_eta_min": 3e-6
     },
     "gto_probs_train": {
-        "dataset_dir": "",
         "lr": 3e-4,
-        "batch_size": 64,
-        "epochs": 4,
-        "n_scenarios": 700,
-        "val_split": 0.1,
+        "batch_size": 16,
+        "epochs": 1,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,

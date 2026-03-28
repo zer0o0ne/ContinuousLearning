@@ -685,64 +685,40 @@ def _normalize_scenarios(scenarios, norm_stats):
 
 
 def load_dataset(dataset_dir, log=None):
-    """Load a dataset from a directory, normalizing if needed.
-
-    Handles three cases:
-      1. Both dataset.pt and norm_stats.pt exist → load as-is (already normalized)
-      2. Only dataset.pt exists (interrupted run) → normalize and save norm_stats.pt
-      3. Neither exists → return None
+    """Load a raw dataset from a directory.
 
     Args:
-        dataset_dir: directory containing dataset.pt (and optionally norm_stats.pt)
+        dataset_dir: directory containing dataset.pt
         log: optional logger
 
     Returns:
-        (scenarios_list, norm_stats_dict) or None if dataset.pt not found
+        scenarios list, or None if dataset.pt not found
     """
     dataset_path = os.path.join(dataset_dir, "dataset.pt")
-    stats_path = os.path.join(dataset_dir, "norm_stats.pt")
 
     if not os.path.exists(dataset_path):
         return None
 
     scenarios = torch.load(dataset_path, weights_only=False)
-
-    if os.path.exists(stats_path):
-        norm_stats = torch.load(stats_path, weights_only=False)
-        if log:
-            log(f"Loaded dataset from {dataset_dir} ({len(scenarios)} samples, already normalized)")
-        return scenarios, norm_stats
-
-    # dataset.pt exists but norm_stats.pt doesn't — interrupted generation
     if log:
-        log(f"Loaded raw dataset from {dataset_dir} ({len(scenarios)} samples, normalizing...)")
+        log(f"Loaded dataset from {dataset_dir} ({len(scenarios)} samples)")
 
-    norm_stats = _compute_norm_stats(scenarios)
-    if log:
-        log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
-    _normalize_scenarios(scenarios, norm_stats)
-
-    torch.save(scenarios, dataset_path)
-    torch.save(norm_stats, stats_path)
-    if log:
-        log(f"Normalized dataset saved to {dataset_dir}")
-
-    return scenarios, norm_stats
+    return scenarios
 
 
 def generate_dataset(config, save_dir, log=None):
     """Generate full dataset of scenarios with both EV and action prob labels.
 
-    Saves incrementally every save_every samples so progress is visible on disk.
-    If a partial dataset already exists in save_dir, loads and normalizes it.
+    Saves raw (unnormalized) data. Normalization is done at training time
+    per-agent so each agent can have its own norm_stats.
 
     Args:
         config: merged config dict (game + solver + scenario-specific)
-        save_dir: directory to save dataset.pt and norm_stats.pt
+        save_dir: directory to save dataset.pt
         log: optional logger
 
     Returns:
-        (scenarios_list, norm_stats_dict)
+        scenarios list
     """
     # Try loading existing dataset first
     existing = load_dataset(save_dir, log=log)
@@ -757,7 +733,6 @@ def generate_dataset(config, save_dir, log=None):
     _default_device = "cuda" if _torch.cuda.is_available() else ("mps" if _torch.backends.mps.is_available() else "cpu")
     device = config.get("device", _default_device)
     dataset_path = os.path.join(save_dir, "dataset.pt")
-    stats_path = os.path.join(save_dir, "norm_stats.pt")
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -774,17 +749,12 @@ def generate_dataset(config, save_dir, log=None):
         else:
             failed += 1
 
-        # Incremental save with norm_stats so partial datasets are trainable
+        # Incremental save (raw data)
         if len(scenarios) - last_save_count >= save_every:
-            norm_stats_cp = _compute_norm_stats(scenarios)
-            scenarios_cp = copy.deepcopy(scenarios)
-            _normalize_scenarios(scenarios_cp, norm_stats_cp)
-            torch.save(scenarios_cp, dataset_path)
-            torch.save(norm_stats_cp, stats_path)
-            del scenarios_cp
+            torch.save(scenarios, dataset_path)
             last_save_count = len(scenarios)
             if log:
-                log(f"  Incremental save: {len(scenarios)} samples (with norm_stats)")
+                log(f"  Incremental save: {len(scenarios)} samples")
 
     if log:
         log(f"Generated {len(scenarios)} samples from {n_scenarios - failed} hands ({failed} failed)")
@@ -792,18 +762,11 @@ def generate_dataset(config, save_dir, log=None):
             lengths = [s["n_events"] for s in scenarios]
             log(f"Sequence lengths: min={min(lengths)}, max={max(lengths)}, avg={sum(lengths)/len(lengths):.1f}")
 
-    # Compute normalization stats on raw data, then normalize
-    norm_stats = _compute_norm_stats(scenarios)
-    if log:
-        log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
-    _normalize_scenarios(scenarios, norm_stats)
-
     torch.save(scenarios, dataset_path)
-    torch.save(norm_stats, stats_path)
     if log:
         log(f"Dataset saved to {dataset_path}")
 
-    return scenarios, norm_stats
+    return scenarios
 
 
 if __name__ == "__main__":

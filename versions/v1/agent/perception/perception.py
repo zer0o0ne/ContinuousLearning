@@ -42,9 +42,11 @@ class EventSequenceEmbedder(nn.Module):
         Card order: [table_0, table_1, table_2, table_3, table_4, hand_0, hand_1]
         """
         # 7 card embeddings in fixed order: 5 table + 2 hand
+        # Card indices: 0-51 = real cards, -1 (or any negative) → 52 = no-card token
         table_cards = [int(c) if int(c) >= 0 else 52 for c in event["table"]]
         hand_cards = [int(c) if int(c) >= 0 else 52 for c in event["hand"]]
         card_ids = torch.tensor(table_cards + hand_cards, dtype=torch.long, device=device)
+        card_ids = card_ids.clamp(0, 52)  # safety: ensure valid embedding indices
         card_embs = self.card_embed(card_ids)  # (7, d_model)
 
         # Source embedding: 0=table (first 5), 1=hand (last 2)
@@ -91,11 +93,10 @@ class EventSequenceEmbedder(nn.Module):
         ])  # (6 * d_model,)
         context = context.unsqueeze(0).expand(7, -1)  # (7, 6 * d_model)
 
-        # Per-card: cat(card_emb, context) → Linear(7d → d) → LayerNorm → + source
+        # Per-card: cat(card_emb, context) → Linear(7d → d) → + source → LayerNorm
         combined = torch.cat([card_embs, context], dim=-1)  # (7, 7 * d_model)
-        out = self.post_embed_norm(self.combine(combined))   # (7, d_model)
-        out = out + source_embs
-        return out  # (7, d_model)
+        out = self.combine(combined) + source_embs           # (7, d_model)
+        return self.post_embed_norm(out)                     # (7, d_model)
 
     def forward_batch(self, event_sequences, device="cpu"):
         """Embed a batch of event sequences into per-card vectors.

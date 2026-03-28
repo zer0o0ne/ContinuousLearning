@@ -13,7 +13,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from agent.train_scenarios.generation.generate import generate_dataset, load_dataset
+from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
+    _compute_norm_stats, _normalize_scenarios
 from agent.train_scenarios.gto_ev_predict.dataset import GTOEVDataset, batch_collate
 
 
@@ -97,7 +98,7 @@ def _check_val(val_loss, best_val_loss, fails_since_best, interrupt_after_fails,
     return best_val_loss, fails_since_best, False
 
 
-def train_gto_ev(agent, train_cfg, device, log):
+def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None):
     """Main training entry point for GTO EV prediction.
 
     Args:
@@ -105,6 +106,7 @@ def train_gto_ev(agent, train_cfg, device, log):
         train_cfg: dict with training hyperparameters from config["gto_ev_train"]
         device: torch device string
         log: logger callable
+        scenarios_override: if provided, use these raw scenarios instead of loading/generating
     """
     lr = train_cfg.get("lr", 3e-4)
     batch_size = train_cfg.get("batch_size", 64)
@@ -131,31 +133,29 @@ def train_gto_ev(agent, train_cfg, device, log):
 
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
 
-    # Load dataset from existing dir or generate new one
-    dataset_dir = train_cfg.get("dataset_dir", None)
-    if dataset_dir:
-        dataset_path = os.path.join(dataset_dir, "dataset.pt")
-        stats_path = os.path.join(dataset_dir, "norm_stats.pt")
-        if not os.path.exists(dataset_path) or not os.path.exists(stats_path):
-            log(f"Dataset not found at {dataset_dir}. Generating new dataset...")
-            dataset_dir = None
-
-    if dataset_dir:
-        scenarios = torch.load(os.path.join(dataset_dir, "dataset.pt"), weights_only=False)
-        norm_stats = torch.load(os.path.join(dataset_dir, "norm_stats.pt"), weights_only=False)
-        log(f"Loaded dataset from {dataset_dir} ({len(scenarios)} scenarios)")
+    # Dataset is provided by pipeline (loaded/generated there)
+    if scenarios_override is not None:
+        scenarios = scenarios_override
+        log(f"Using provided scenarios ({len(scenarios)} samples)")
     else:
-        result = generate_dataset(train_cfg, run_dir, log=log)
-        if not result or not result[0]:
+        scenarios = generate_dataset(train_cfg, run_dir, log=log)
+        if not scenarios:
             log("No scenarios generated. Aborting training.")
             return None, run_dir
-        scenarios, norm_stats = result
+
+    # Compute norm_stats and normalize (per-agent)
+    import copy
+    scenarios = copy.deepcopy(scenarios)
+    norm_stats = _compute_norm_stats(scenarios)
+    log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
+    _normalize_scenarios(scenarios, norm_stats)
 
     # Train/val split
     dataset = GTOEVDataset(scenarios)
     val_size = max(1, int(len(dataset) * val_split))
     train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size],
+                                                 generator=torch.Generator().manual_seed(42))
 
     train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=batch_collate)

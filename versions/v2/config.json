@@ -1,0 +1,106 @@
+{
+    "name": "medium_sample_full_agent_modifiers",
+    "agent_dir": "",
+    "architecture": {
+        "d_model": 64,
+        "n_heads": 8,
+        "n_kv_heads": 2,
+        "d_ff": 256,
+        "n_encoder_layers": 4,
+        "n_decoder_layers": 4,
+        "n_value_layers": 2,
+        "n_action_layers": 4,
+        "max_seq_len": 2048,
+        "max_players": 9,
+        "memory": {
+            "n_levels": 2,
+            "max_cluster_size": 128,
+            "max_cluster_size_after": 64,
+            "beam_width": 8
+        }
+    },
+    "multi_agent": {
+        "save_dir": "5_test_agents",
+        "agents": [
+            {
+                "name": "gto_pure",
+                "modifiers": []
+            },
+            {
+                "name": "lag_bluffer",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "aggressive", "factor": 0.35},
+                    {"type": "action_bias", "actions": "fold", "factor": -0.25},
+                    {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.4}
+                ]
+            },
+            {
+                "name": "tight_passive",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "fold", "factor": 0.3},
+                    {"type": "action_bias", "actions": "raises", "factor": -0.2},
+                    {"type": "temperature", "value": 0.5}
+                ]
+            },
+            {
+                "name": "value_heavy",
+                "modifiers": [
+                    {"type": "conditional_bias", "condition": "equity > 0.6", "actions": "aggressive", "factor": 0.5},
+                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.3}
+                ]
+            },
+            {
+                "name": "mid_raise_specialist",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "15:35", "factor": 0.4},
+                    {"type": "action_bias", "actions": [0, 1, 52], "factor": -0.15}
+                ]
+            }
+        ]
+    },
+    "game": {
+        "table_bins": 50,
+        "table_max_bet": 5,
+        "max_players": 9,
+        "max_stack": 3000,
+        "big_blind": 10
+    },
+    "solver": {
+        "type": "v2",
+        "mc_iterations": 1000,
+        "n_raise_samples": 3,
+        "gto_temperature": 1.0,
+        "mdf_max_fold": 0.7,
+        "reraise_pct": 0.15,
+        "reraise_cap": 0.10
+    },
+    "dataset": {
+        "dataset_dir": "",
+        "n_scenarios": 700,
+        "val_split": 0.1
+    },
+    "gto_ev_train": {
+        "lr": 3e-4,
+        "batch_size": 16,
+        "epochs": 1,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 10,
+        "interrupt_after_fails": 20,
+        "scheduler_eta_min": 3e-6
+    },
+    "gto_probs_train": {
+        "lr": 3e-4,
+        "batch_size": 16,
+        "epochs": 1,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 10,
+        "interrupt_after_fails": 20,
+        "scheduler_eta_min": 3e-6
+    },
+    "pipeline": {
+        "run_gto_ev": true,
+        "run_gto_probs": true
+    }
+}

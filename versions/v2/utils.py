@@ -1,6 +1,23 @@
 import os
 from datetime import datetime
 
+import torch
+
+
+def get_amp_config(device):
+    """Return AMP configuration for the given device.
+
+    Returns:
+        (amp_enabled, device_type, amp_dtype, use_scaler)
+    """
+    device_str = str(device)
+    if device_str.startswith("cuda"):
+        return True, "cuda", torch.float16, True
+    elif device_str == "mps":
+        return True, "mps", torch.bfloat16, False
+    else:
+        return False, "cpu", torch.float32, False
+
 class Logger:
     def __init__(self, base_dir):
         """

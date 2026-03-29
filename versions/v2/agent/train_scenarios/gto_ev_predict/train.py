@@ -48,17 +48,19 @@ class LengthGroupedBatchSampler(Sampler):
         return len(self.batches)
 
 
-def _run_validation(agent, val_loader, loss_fn, device):
+def _run_validation(agent, val_loader, loss_fn, device, amp_config=None):
     """Run validation and return average loss."""
+    amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     agent.eval()
     val_loss_sum = 0.0
     val_count = 0
     with torch.no_grad():
         for event_sequences, ev_targets in val_loader:
             ev_targets = ev_targets.to(device)
-            result = agent.forward_batch(event_sequences, skip_memory=True)
-            predicted_ev = result["value"].squeeze(-1)
-            batch_loss = loss_fn(predicted_ev, ev_targets)
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                result = agent.forward_batch(event_sequences, skip_memory=True)
+                predicted_ev = result["value"].squeeze(-1)
+                batch_loss = loss_fn(predicted_ev, ev_targets)
             val_loss_sum += batch_loss.item() * len(event_sequences)
             val_count += len(event_sequences)
     agent.train()
@@ -137,6 +139,14 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None, tempera
 
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
 
+    # AMP setup
+    from utils import get_amp_config
+    amp_enabled, device_type, amp_dtype, use_scaler = get_amp_config(device)
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
+    amp_cfg = (amp_enabled, device_type, amp_dtype)
+    if amp_enabled:
+        log(f"AMP enabled: {device_type}, dtype={amp_dtype}, scaler={use_scaler}")
+
     # Dataset is provided by pipeline (loaded/generated there)
     if scenarios_override is not None:
         scenarios = scenarios_override
@@ -199,14 +209,17 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None, tempera
         for batch_idx, (event_sequences, ev_targets) in enumerate(train_loader):
             ev_targets = ev_targets.to(device)
 
-            result = agent.forward_batch(event_sequences, skip_memory=True)
-            predicted_ev = result["value"].squeeze(-1)  # (B,)
-            batch_loss = loss_fn(predicted_ev, ev_targets)
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                result = agent.forward_batch(event_sequences, skip_memory=True)
+                predicted_ev = result["value"].squeeze(-1)  # (B,)
+                batch_loss = loss_fn(predicted_ev, ev_targets)
 
             optimizer.zero_grad()
-            batch_loss.backward()
+            scaler.scale(batch_loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             step_loss = batch_loss.item()
@@ -224,7 +237,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None, tempera
 
             # Intra-epoch validation
             if val_every and (global_step % val_every == 0):
-                val_loss = _run_validation(agent, val_loader, loss_fn, device)
+                val_loss = _run_validation(agent, val_loader, loss_fn, device, amp_config=amp_cfg)
                 history["val_loss"].append((global_step, val_loss))
                 _save_history(history, run_dir)
                 log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}")
@@ -247,7 +260,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None, tempera
             break
 
         # --- End-of-epoch validation ---
-        val_loss_avg = _run_validation(agent, val_loader, loss_fn, device)
+        val_loss_avg = _run_validation(agent, val_loader, loss_fn, device, amp_config=amp_cfg)
         history["val_loss"].append((global_step, val_loss_avg))
 
         history["epoch_train_loss"].append(train_loss_avg)

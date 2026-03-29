@@ -101,6 +101,9 @@ class EventSequenceEmbedder(nn.Module):
     def forward_batch(self, event_sequences, device="cpu"):
         """Embed a batch of event sequences into per-card vectors.
 
+        Vectorized: collects all events into batch tensors, transfers to device
+        once, runs all embedding layers in batch.
+
         Args:
             event_sequences: list of lists of event dicts (B samples, variable lengths)
             device: torch device
@@ -114,14 +117,113 @@ class EventSequenceEmbedder(nn.Module):
         seq_lengths = [len(seq) for seq in event_sequences]
         max_events = max(seq_lengths)
 
-        embeddings = torch.zeros(B, max_events * C, self.d_model,
-                                 dtype=torch.float, device=device)
-        mask = torch.zeros(B, max_events * C, dtype=torch.float, device=device)
+        # --- Collect raw values from all events into Python lists ---
+        all_card_ids = []      # each: list of 7 ints
+        all_hero_pos = []
+        all_acting_pos = []
+        all_num_players = []
+        all_scalars = []       # each: [pot, stack]
+        all_bets = []          # each: list of max_players floats
+        all_actions = []       # each: list of n_actions floats
+        batch_idx_list = []    # which sample i
+        event_idx_list = []    # which event j
 
         for i, seq in enumerate(event_sequences):
             for j, event in enumerate(seq):
-                embeddings[i, j * C:(j + 1) * C] = self.embed_event(event, device=device)
-            mask[i, :len(seq) * C] = 1.0
+                # Card ids: negative → 52 (no-card)
+                table_cards = [int(c) if int(c) >= 0 else 52 for c in event["table"]]
+                hand_cards = [int(c) if int(c) >= 0 else 52 for c in event["hand"]]
+                cards = table_cards + hand_cards
+                cards = [max(0, min(c, 52)) for c in cards]  # clamp safety
+                all_card_ids.append(cards)
+
+                all_hero_pos.append(int(event["hero_pos"]))
+                all_acting_pos.append(int(event["acting_pos"]))
+                all_num_players.append(int(event["num_players"]))
+                all_scalars.append([float(event["pot"]), float(event["stack"])])
+
+                # Bets: variable length → pad to max_players
+                raw_bets = event["bets"]
+                if isinstance(raw_bets, np.ndarray):
+                    raw_bets = raw_bets.tolist()
+                padded_bets = [0.0] * self.max_players
+                for k, b in enumerate(raw_bets):
+                    if k < self.max_players:
+                        padded_bets[k] = float(b)
+                all_bets.append(padded_bets)
+
+                # Action: Tensor or list
+                action = event["action"]
+                if isinstance(action, torch.Tensor):
+                    all_actions.append(action.float().tolist())
+                else:
+                    all_actions.append([float(a) for a in action])
+
+                batch_idx_list.append(i)
+                event_idx_list.append(j)
+
+        T = len(all_card_ids)  # total events across batch
+
+        if T == 0:
+            embeddings = torch.zeros(B, max_events * C, self.d_model,
+                                     dtype=torch.float, device=device)
+            mask = torch.zeros(B, max_events * C, dtype=torch.float, device=device)
+            return embeddings, mask
+
+        # --- Build batch tensors on CPU, transfer to device once ---
+        card_ids = torch.tensor(all_card_ids, dtype=torch.long, device=device)       # (T, 7)
+        hero_pos = torch.tensor(all_hero_pos, dtype=torch.long, device=device)       # (T,)
+        acting_pos = torch.tensor(all_acting_pos, dtype=torch.long, device=device)   # (T,)
+        num_players = torch.tensor(all_num_players, dtype=torch.long, device=device) # (T,)
+        scalars = torch.tensor(all_scalars, dtype=torch.float, device=device)        # (T, 2)
+        bets = torch.tensor(all_bets, dtype=torch.float, device=device)              # (T, max_players)
+        actions = torch.tensor(all_actions, dtype=torch.float, device=device)        # (T, n_actions)
+
+        # --- Batch embedding lookups + projections ---
+        card_embs = self.card_embed(card_ids)                    # (T, 7, d_model)
+        hero_pos_emb = self.hero_pos_embed(hero_pos)             # (T, d_model)
+        acting_pos_emb = self.acting_pos_embed(acting_pos)       # (T, d_model)
+        num_players_emb = self.num_players_embed(num_players)    # (T, d_model)
+        scalar_emb = self.scalar_proj(scalars)                   # (T, d_model)
+        bet_emb = self.bet_proj(bets)                            # (T, d_model)
+        action_emb = self.action_proj(actions)                   # (T, d_model)
+
+        # Context: cat 6 embeddings, broadcast to 7 cards
+        context = torch.cat([
+            hero_pos_emb, acting_pos_emb, num_players_emb,
+            scalar_emb, bet_emb, action_emb
+        ], dim=-1)                                               # (T, 6*d_model)
+        context = context.unsqueeze(1).expand(-1, 7, -1)         # (T, 7, 6*d_model)
+
+        # Combine: cat(card_emb, context) → Linear → + source → LayerNorm
+        combined = torch.cat([card_embs, context], dim=-1)       # (T, 7, 7*d_model)
+        combined = combined.reshape(T * 7, self.d_model * 7)     # (T*7, 7*d_model)
+        out = self.combine(combined)                              # (T*7, d_model)
+        out = out.view(T, 7, self.d_model)                       # (T, 7, d_model)
+
+        # Source embedding: constant [0,0,0,0,0,1,1], same for all events
+        source_ids = torch.tensor([0, 0, 0, 0, 0, 1, 1], dtype=torch.long, device=device)
+        source_embs = self.source_embed(source_ids)              # (7, d_model)
+        out = out + source_embs.unsqueeze(0)                     # (T, 7, d_model) broadcast
+
+        out = self.post_embed_norm(out)                          # (T, 7, d_model)
+
+        # --- Scatter into (B, max_events*7, d_model) output ---
+        embeddings = torch.zeros(B, max_events * C, self.d_model,
+                                 dtype=out.dtype, device=device)
+        mask = torch.zeros(B, max_events * C, dtype=torch.float, device=device)
+
+        bi = torch.tensor(batch_idx_list, dtype=torch.long, device=device)  # (T,)
+        ei = torch.tensor(event_idx_list, dtype=torch.long, device=device)  # (T,)
+        # Expand indices for 7 cards per event
+        bi_exp = bi.unsqueeze(1).expand(-1, 7).reshape(-1)            # (T*7,)
+        offsets = torch.arange(7, device=device).unsqueeze(0).expand(T, -1)  # (T, 7)
+        col_idx = (ei.unsqueeze(1) * 7 + offsets).reshape(-1)         # (T*7,)
+
+        embeddings[bi_exp, col_idx] = out.reshape(T * 7, self.d_model)
+
+        for i, sl in enumerate(seq_lengths):
+            mask[i, :sl * C] = 1.0
 
         return embeddings, mask
 

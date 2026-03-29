@@ -7,6 +7,9 @@ and reports BB/100 for each agent.
 When len(agents) > num_players, agents rotate in/out so each gets equal
 playtime and no agent occupies more than one seat simultaneously.
 
+Uses multi-table batching: runs multiple tables in parallel and batches
+agent decisions across tables for efficient GPU utilization.
+
 Can be run standalone:
     python -m evaluation.evaluate --config config.json
 """
@@ -14,7 +17,7 @@ Can be run standalone:
 import os
 import json
 import random
-from collections import deque
+from collections import defaultdict, deque
 
 import numpy as np
 import torch
@@ -23,6 +26,7 @@ from tqdm.auto import tqdm
 
 from agent.agent import ASI
 from env.table import Table
+from utils import get_amp_config
 
 
 def _find_best_checkpoint(agent_dir):
@@ -145,11 +149,7 @@ def _rebuild_events(snapshots, deck, hero_pos, num_players, big_blind, small_bli
 
 
 def _normalize_events_inplace(events, norm_stats):
-    """Apply z-score normalization to events in-place.
-
-    Safe to call on events from _rebuild_events (which already creates
-    fresh dicts and np.copy of bets), avoiding an expensive deepcopy.
-    """
+    """Apply z-score normalization to events in-place."""
     pot_m, pot_s = norm_stats["pot_mean"], norm_stats["pot_std"]
     stack_m, stack_s = norm_stats["stack_mean"], norm_stats["stack_std"]
     bets_m, bets_s = norm_stats["bets_mean"], norm_stats["bets_std"]
@@ -166,30 +166,49 @@ def _normalize_events_inplace(events, norm_stats):
             event["bets"] = [(b - bets_m) / bets_s for b in event["bets"]]
 
 
-@torch.no_grad()
-def _select_action(agent_info, events, n_actions, device):
-    """Get action from agent: normalize → forward → per-agent temperature → sample.
+def _init_table_state(agents, agent_queue, num_players, table_bins, table_max_bet,
+                      big_blind, small_blind, n_actions):
+    """Initialize a new hand at a table. Returns table state dict."""
+    seated_indices = [agent_queue[i] for i in range(num_players)]
+    seated = [agents[idx] for idx in seated_indices]
 
-    Returns one-hot action tensor of shape (n_actions,).
-    """
-    _normalize_events_inplace(events, agent_info["norm_stats"])
-    out = agent_info["agent"].forward_batch([events], skip_memory=True)
-    logits = out["action_logits"][0]  # (n_actions,)
-    probs = F.softmax(logits / agent_info["temperature"], dim=0)
-    action_idx = torch.multinomial(probs, 1).item()
+    table = Table(
+        num_players=num_players,
+        bins=table_bins,
+        max_bet=table_max_bet,
+        start_credits=int(max(a["stack"] for a in seated)),
+        big_blind=big_blind,
+        small_blind=small_blind,
+    )
+    table.credits = [a["stack"] for a in seated]
+    table.start_table()
 
-    action = torch.zeros(n_actions, dtype=torch.float32)
-    action[action_idx] = 1.0
-    return action
+    pre_credits = [seated[i]["stack"] for i in range(num_players)]
+
+    snapshots = [{
+        "pot": table.pot,
+        "bets": np.copy(table.bets),
+        "credits": list(table.credits),
+        "turn": table.turn,
+        "active_pos": table.active_player,
+        "action": None,
+    }]
+
+    return {
+        "table": table,
+        "seated": seated,
+        "pre_credits": pre_credits,
+        "snapshots": snapshots,
+        "action_step": 0,
+        "finished": False,
+    }
 
 
 def run_evaluation(config, device, log):
-    """Run agent-vs-agent evaluation.
+    """Run agent-vs-agent evaluation with multi-table batching.
 
-    Args:
-        config: full config dict (with evaluation, game, architecture sections)
-        device: torch device string
-        log: Logger instance
+    Runs multiple tables in parallel, batching agent forward passes across
+    tables for efficient GPU utilization.
     """
     eval_cfg = config.get("evaluation", {})
     game_cfg = config.get("game", {})
@@ -212,6 +231,10 @@ def run_evaluation(config, device, log):
     table_bins = game_cfg.get("table_bins", 50)
     table_max_bet = game_cfg.get("table_max_bet", 5)
     n_actions = table_bins + 3
+    n_tables = eval_cfg.get("n_tables", 16)
+
+    # AMP config
+    amp_enabled, device_type, amp_dtype, _ = get_amp_config(device)
 
     log("=== Evaluation ===")
     log(f"Loading agents from {agents_dir}")
@@ -221,7 +244,6 @@ def run_evaluation(config, device, log):
         log("No agents loaded. Aborting evaluation.")
         return
 
-    # num_players = min(config value, number of loaded agents)
     cfg_num_players = eval_cfg.get("num_players", 0)
     if cfg_num_players <= 0:
         num_players = len(agents)
@@ -229,16 +251,18 @@ def run_evaluation(config, device, log):
         num_players = min(cfg_num_players, len(agents))
     num_players = max(2, num_players)
 
-    # Initialize per-agent stacks
     for a in agents:
         a["stack"] = float(start_stack)
 
-    log(f"Table: {num_players} seats, {len(agents)} agents, {n_hands} hands")
+    n_tables = min(n_tables, n_hands)
+
+    log(f"Table: {num_players} seats, {len(agents)} agents, {n_hands} hands, {n_tables} parallel tables")
     log(f"BB={big_blind}, start_stack={start_stack}, rebuy=[{min_rebuy},{max_rebuy}], cap={max_stack_cap}")
+    if amp_enabled:
+        log(f"AMP enabled: {device_type}, dtype={amp_dtype}")
     agent_summary = [(a["name"], a["temperature"]) for a in agents]
     log(f"Agents: {agent_summary}")
 
-    # Agent rotation queue — rotates so different subsets are seated
     agent_queue = deque(range(len(agents)))
 
     # History save path
@@ -254,140 +278,197 @@ def run_evaluation(config, device, log):
     hands_count = {a["name"]: 0 for a in agents}
     history = {"bb100": [], "profit": [], "hands": []}
 
-    for hand_idx in tqdm(range(n_hands), desc="Evaluating"):
-        # Select which agents play this hand (first num_players from queue)
-        seated_indices = [agent_queue[i] for i in range(num_players)]
-        seated = [agents[idx] for idx in seated_indices]
+    MAX_ACTIONS = 10000
+    hands_completed = 0
+    hands_started = 0
+    last_log_at = 0
 
-        # Load per-agent stacks into a fresh table
-        # Table needs a start_credits value; use max current stack as reference
-        # but we override credits immediately
-        table = Table(
-            num_players=num_players,
-            bins=table_bins,
-            max_bet=table_max_bet,
-            start_credits=int(max(a["stack"] for a in seated)),
-            big_blind=big_blind,
-            small_blind=small_blind,
-        )
-        # Set per-player credits from agent stacks
-        table.credits = [a["stack"] for a in seated]
-        table.start_table()
+    # Initialize all tables
+    table_states = []
+    for _ in range(n_tables):
+        if hands_started >= n_hands:
+            break
+        ts = _init_table_state(agents, agent_queue, num_players, table_bins,
+                               table_max_bet, big_blind, small_blind, n_actions)
+        table_states.append(ts)
+        hands_started += 1
 
-        # Record pre-hand credits (after blinds posted)
-        pre_credits = list(table.credits)
-        # But we want profit = final - initial (before blinds), so re-record
-        pre_credits = [seated[i]["stack"] for i in range(num_players)]
+    pbar = tqdm(total=n_hands, desc="Evaluating")
 
-        # Snapshots for event rebuilding
-        snapshots = [{
-            "pot": table.pot,
-            "bets": np.copy(table.bets),
-            "credits": list(table.credits),
-            "turn": table.turn,
-            "active_pos": table.active_player,
-            "action": None,
-        }]
+    dummy_action = torch.zeros(n_actions, dtype=torch.float32)
 
-        MAX_ACTIONS = 10000
-        hand_stuck = False
-        for action_step in range(MAX_ACTIONS):
-            active_pos = table.active_player
-
-            if not table.several_all_in:
-                if table.players_state[active_pos] != 1:
+    while hands_completed < n_hands and table_states:
+        # --- Phase 1: Advance all-in runouts (no model call needed) ---
+        for ts in table_states:
+            if ts["finished"]:
+                continue
+            while ts["table"].several_all_in and ts["action_step"] < MAX_ACTIONS:
+                end, several_all_in, state, bet = ts["table"].step(dummy_action)
+                ts["action_step"] += 1
+                if end:
+                    ts["finished"] = True
                     break
 
-                # Decision snapshot
-                snapshots.append({
-                    "pot": table.pot,
-                    "bets": np.copy(table.bets),
-                    "credits": list(table.credits),
-                    "turn": table.turn,
-                    "active_pos": active_pos,
-                    "action": None,
-                })
+        # --- Phase 2: Collect pending decisions ---
+        # Each active table contributes at most one decision (the current active player)
+        pending = []  # list of (table_idx, agent_info, events)
+        for ti, ts in enumerate(table_states):
+            if ts["finished"]:
+                continue
+            if ts["action_step"] >= MAX_ACTIONS:
+                log(f"WARNING: table {ti} stuck after {MAX_ACTIONS} actions, skipping hand")
+                ts["finished"] = True
+                continue
 
-                agent_info = seated[active_pos]
-                events = _rebuild_events(
-                    snapshots, table.deck, active_pos,
-                    num_players, big_blind, small_blind, n_actions,
-                    up_to=len(snapshots) - 1,
-                )
+            table = ts["table"]
+            active_pos = table.active_player
 
-                action = _select_action(agent_info, events, n_actions, device)
+            if table.players_state[active_pos] != 1:
+                ts["finished"] = True
+                continue
+
+            # Decision snapshot
+            ts["snapshots"].append({
+                "pot": table.pot,
+                "bets": np.copy(table.bets),
+                "credits": list(table.credits),
+                "turn": table.turn,
+                "active_pos": active_pos,
+                "action": None,
+            })
+
+            agent_info = ts["seated"][active_pos]
+            events = _rebuild_events(
+                ts["snapshots"], table.deck, active_pos,
+                num_players, big_blind, small_blind, n_actions,
+                up_to=len(ts["snapshots"]) - 1,
+            )
+            pending.append((ti, agent_info, events))
+
+        # --- Phase 3: Batch forward by agent model ---
+        if pending:
+            # Group by model identity for batched inference
+            groups = defaultdict(list)  # id(agent_model) → list of (pending_idx, ...)
+            for pidx, (ti, agent_info, events) in enumerate(pending):
+                model_id = id(agent_info["agent"])
+                groups[model_id].append((pidx, ti, agent_info, events))
+
+            actions_out = [None] * len(pending)
+
+            with torch.no_grad():
+                for model_id, group_items in groups.items():
+                    agent_model = group_items[0][2]["agent"]
+
+                    # Normalize events per-agent (each may have different norm_stats)
+                    all_events = []
+                    temperatures = []
+                    for pidx, ti, agent_info, events in group_items:
+                        _normalize_events_inplace(events, agent_info["norm_stats"])
+                        all_events.append(events)
+                        temperatures.append(agent_info["temperature"])
+
+                    # Batched forward pass
+                    with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                        out = agent_model.forward_batch(all_events, skip_memory=True)
+                    all_logits = out["action_logits"]  # (batch, n_actions)
+
+                    # Sample actions per item
+                    for local_idx, (pidx, ti, agent_info, events) in enumerate(group_items):
+                        logits = all_logits[local_idx]
+                        temp = temperatures[local_idx]
+                        probs = F.softmax(logits / temp, dim=0)
+                        action_idx = torch.multinomial(probs, 1).item()
+                        action = torch.zeros(n_actions, dtype=torch.float32)
+                        action[action_idx] = 1.0
+                        actions_out[pidx] = action
+
+            # Step each table with its action
+            for pidx, (ti, agent_info, events) in enumerate(pending):
+                ts = table_states[ti]
+                table = ts["table"]
+                action = actions_out[pidx]
 
                 end, several_all_in, state, bet = table.step(action)
+                ts["action_step"] += 1
 
                 # Post-action snapshot
-                snapshots.append({
+                ts["snapshots"].append({
                     "pot": table.pot,
                     "bets": np.copy(table.bets),
                     "credits": list(table.credits),
                     "turn": table.turn,
-                    "active_pos": active_pos,
+                    "active_pos": table.active_player,
                     "action": action,
                 })
-            else:
-                # All-in runout: step with dummy action to advance streets
-                dummy = torch.zeros(n_actions, dtype=torch.float32)
-                end, several_all_in, state, bet = table.step(dummy)
 
-            if end:
-                break
-        else:
-            # for-loop exhausted without break — hand did not terminate
-            hand_stuck = True
+                if end:
+                    ts["finished"] = True
 
-        if hand_stuck:
-            log(f"ERROR: hand {hand_idx} did not terminate after {MAX_ACTIONS} actions. "
-                f"Table state: turn={table.turn}, pot={table.pot}, "
-                f"players_state={table.players_state.tolist()}, "
-                f"credits={table.credits}")
-            log("Aborting evaluation early.")
-            break
+        # --- Phase 4: Finalize completed hands, start replacements ---
+        new_table_states = []
+        for ts in table_states:
+            if not ts["finished"]:
+                new_table_states.append(ts)
+                continue
 
-        # Write back credits to agent stacks and compute profit
-        for pos in range(num_players):
-            agent_info = seated[pos]
-            new_stack = table.credits[pos]
-            profit = new_stack - pre_credits[pos]
-            total_profit[agent_info["name"]] += profit
-            hands_count[agent_info["name"]] += 1
-            agent_info["stack"] = new_stack
+            # Profit accounting
+            table = ts["table"]
+            seated = ts["seated"]
+            pre_credits = ts["pre_credits"]
+            for pos in range(num_players):
+                agent_info = seated[pos]
+                new_stack = table.credits[pos]
+                profit = new_stack - pre_credits[pos]
+                total_profit[agent_info["name"]] += profit
+                hands_count[agent_info["name"]] += 1
+                agent_info["stack"] = new_stack
 
-        # Rebuy busted agents + cap oversize stacks
-        for pos in range(num_players):
-            agent_info = seated[pos]
-            if agent_info["stack"] <= 0:
-                agent_info["stack"] = float(random.randint(min_rebuy, max_rebuy))
-            elif agent_info["stack"] > max_stack_cap:
-                agent_info["stack"] = float(random.randint(min_rebuy, max_rebuy))
+            # Rebuy busted agents + cap oversize stacks
+            for pos in range(num_players):
+                agent_info = seated[pos]
+                if agent_info["stack"] <= 0:
+                    agent_info["stack"] = float(random.randint(min_rebuy, max_rebuy))
+                elif agent_info["stack"] > max_stack_cap:
+                    agent_info["stack"] = float(random.randint(min_rebuy, max_rebuy))
 
-        # Rotate dealer position + periodically shuffle relative seating
-        agent_queue.rotate(-1)
-        if (hand_idx + 1) % num_players == 0:
-            # Full orbit complete — shuffle to break fixed relative positions
-            queue_list = list(agent_queue)
-            random.shuffle(queue_list)
-            agent_queue = deque(queue_list)
+            hands_completed += 1
+            pbar.update(1)
 
-        # Periodic logging + history save
-        if (hand_idx + 1) % log_every == 0:
-            snapshot_bb100 = {}
-            log(f"  Hand {hand_idx + 1}/{n_hands}")
-            for name in sorted(total_profit.keys()):
-                n = hands_count[name]
-                bb100 = (total_profit[name] / big_blind) / (n / 100) if n > 0 else 0.0
-                snapshot_bb100[name] = round(bb100, 4)
-                log(f"    {name}: {bb100:+.2f} BB/100 ({n} hands)")
-            history["bb100"].append((hand_idx + 1, snapshot_bb100))
-            history["profit"].append((hand_idx + 1, dict(total_profit)))
-            history["hands"].append((hand_idx + 1, dict(hands_count)))
-            torch.save(history, history_path)
+            # Rotate + periodic shuffle
+            agent_queue.rotate(-1)
+            if hands_completed % num_players == 0:
+                queue_list = list(agent_queue)
+                random.shuffle(queue_list)
+                agent_queue = deque(queue_list)
+
+            # Periodic logging
+            if hands_completed >= last_log_at + log_every:
+                last_log_at = hands_completed
+                snapshot_bb100 = {}
+                log(f"  Hand {hands_completed}/{n_hands}")
+                for name in sorted(total_profit.keys()):
+                    n = hands_count[name]
+                    bb100 = (total_profit[name] / big_blind) / (n / 100) if n > 0 else 0.0
+                    snapshot_bb100[name] = round(bb100, 4)
+                    log(f"    {name}: {bb100:+.2f} BB/100 ({n} hands)")
+                history["bb100"].append((hands_completed, snapshot_bb100))
+                history["profit"].append((hands_completed, dict(total_profit)))
+                history["hands"].append((hands_completed, dict(hands_count)))
+                torch.save(history, history_path)
+
+            # Start new hand if quota not reached
+            if hands_started < n_hands:
+                new_ts = _init_table_state(agents, agent_queue, num_players, table_bins,
+                                           table_max_bet, big_blind, small_blind, n_actions)
+                new_table_states.append(new_ts)
+                hands_started += 1
+
+        table_states = new_table_states
+
+    pbar.close()
 
     # Final results
-    hands_actually_played = sum(hands_count.values()) // num_players  # total hands dealt
+    hands_actually_played = sum(hands_count.values()) // num_players
     log(f"\n=== Final Results ({hands_actually_played} hands dealt) ===")
     results = {}
     snapshot_bb100 = {}
@@ -418,6 +499,7 @@ def run_evaluation(config, device, log):
             "num_agents": len(agents),
             "big_blind": big_blind,
             "max_stack_cap": max_stack_cap,
+            "n_tables": n_tables,
             "agents": results,
             "config": eval_cfg,
         }, f, indent=4)

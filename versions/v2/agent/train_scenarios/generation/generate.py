@@ -21,6 +21,7 @@ import json
 import copy
 import random
 import argparse
+import multiprocessing as mp
 
 import numpy as np
 import torch
@@ -760,11 +761,71 @@ def load_dataset(dataset_dir, log=None):
     return scenarios
 
 
+def _get_generation_device(config_device=None):
+    """Determine the best device for solver-heavy data generation.
+
+    For MC-based solvers, CPU is faster than MPS due to overhead of many
+    small GPU transfers. CUDA is used when available (large batch MC is
+    efficient on CUDA). MPS workers always use CPU.
+
+    Args:
+        config_device: explicit device override from config, or None for auto.
+
+    Returns:
+        device string
+    """
+    if config_device and config_device != "auto":
+        return config_device
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+_shared_counter = None
+
+
+def _init_worker(counter):
+    """Initializer for pool workers — stores shared counter."""
+    global _shared_counter
+    _shared_counter = counter
+
+
+def _generate_worker(args):
+    """Worker function for multiprocessing dataset generation.
+
+    Args:
+        args: tuple of (config, device, n_hands, worker_id)
+
+    Returns:
+        list of scenario dicts (flat)
+    """
+    config, device, n_hands, worker_id = args
+    scenarios = []
+    failed = 0
+    for _ in range(n_hands):
+        result = generate_scenario(config, device=device)
+        if result is not None:
+            scenarios.extend(result)
+        else:
+            failed += 1
+        if _shared_counter is not None:
+            with _shared_counter.get_lock():
+                _shared_counter.value += 1
+    return scenarios, n_hands - failed, failed
+
+
 def generate_dataset(config, save_dir, log=None):
     """Generate full dataset of scenarios with both EV and action prob labels.
 
     Saves raw (unnormalized) data. Normalization is done at training time
     per-agent so each agent can have its own norm_stats.
+
+    Supports multiprocessing via config key 'n_workers':
+        0 = auto (min(cpu_count, 8))
+        1 = sequential (no multiprocessing)
+        N = use N worker processes
+
+    CUDA workers use GPU (via spawn). MPS workers use CPU (MPS not MP-safe).
 
     Args:
         config: merged config dict (game + solver + scenario-specific)
@@ -780,41 +841,94 @@ def generate_dataset(config, save_dir, log=None):
         return existing
 
     n_scenarios = config.get("n_scenarios", 50000)
-    batch_size = config.get("batch_size", 64)
-    val_every = config.get("val_every", 10)
-    save_every = val_every * batch_size  # incremental save interval (in samples)
-    import torch as _torch
-    _default_device = "cuda" if _torch.cuda.is_available() else ("mps" if _torch.backends.mps.is_available() else "cpu")
-    device = config.get("device", _default_device)
+    n_workers = config.get("n_workers", 0)
+    if n_workers <= 0:
+        n_workers = min(os.cpu_count() or 1, 8)
+
+    device = _get_generation_device(config.get("device"))
     dataset_path = os.path.join(save_dir, "dataset.pt")
 
     os.makedirs(save_dir, exist_ok=True)
 
-    if log:
-        log(f"Generating {n_scenarios} hands on {device} (saving every {save_every} samples)...")
+    if n_workers > 1 and n_scenarios >= n_workers * 2:
+        # --- Multiprocessing path ---
+        worker_device = _get_generation_device(config.get("device"))
+        if log:
+            log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
 
-    scenarios = []
-    failed = 0
-    last_save_count = 0
-    for _ in tqdm(range(n_scenarios), desc="Generating hands"):
-        result = generate_scenario(config, device=device)
-        if result is not None:
-            scenarios.extend(result)
-        else:
-            failed += 1
+        # Split work across workers
+        chunk = n_scenarios // n_workers
+        remainder = n_scenarios % n_workers
+        worker_args = []
+        for i in range(n_workers):
+            n_hands = chunk + (1 if i < remainder else 0)
+            worker_args.append((config, worker_device, n_hands, i))
 
-        # Incremental save (raw data)
-        if len(scenarios) - last_save_count >= save_every:
-            torch.save(scenarios, dataset_path)
-            last_save_count = len(scenarios)
-            if log:
-                log(f"  Incremental save: {len(scenarios)} samples")
+        # Use spawn for CUDA compatibility (safe on all platforms)
+        ctx = mp.get_context("spawn")
+        counter = ctx.Value("i", 0)
+        scenarios = []
+        total_ok = 0
+        total_failed = 0
 
-    if log:
-        log(f"Generated {len(scenarios)} samples from {n_scenarios - failed} hands ({failed} failed)")
-        if scenarios:
-            lengths = [s["n_events"] for s in scenarios]
-            log(f"Sequence lengths: min={min(lengths)}, max={max(lengths)}, avg={sum(lengths)/len(lengths):.1f}")
+        pbar = tqdm(total=n_scenarios, desc="Generating hands")
+
+        with ctx.Pool(n_workers, initializer=_init_worker, initargs=(counter,)) as pool:
+            async_result = pool.map_async(_generate_worker, worker_args)
+
+            # Poll shared counter for progress until all workers finish
+            while not async_result.ready():
+                async_result.wait(timeout=1.0)
+                pbar.n = counter.value
+                pbar.refresh()
+
+            pbar.n = n_scenarios
+            pbar.refresh()
+            pbar.close()
+
+            for worker_scenarios, ok, failed in async_result.get():
+                scenarios.extend(worker_scenarios)
+                total_ok += ok
+                total_failed += failed
+
+        # Save after all workers complete
+        torch.save(scenarios, dataset_path)
+        if log:
+            log(f"  All workers done: {len(scenarios)} samples")
+
+        if log:
+            log(f"Generated {len(scenarios)} samples from {total_ok} hands ({total_failed} failed)")
+
+    else:
+        # --- Sequential path (n_workers=1 or very few scenarios) ---
+        batch_size = config.get("batch_size", 64)
+        val_every = config.get("val_every", 10)
+        save_every = val_every * batch_size
+        if log:
+            log(f"Generating {n_scenarios} hands on {device} (saving every {save_every} samples)...")
+
+        scenarios = []
+        failed = 0
+        last_save_count = 0
+        for _ in tqdm(range(n_scenarios), desc="Generating hands"):
+            result = generate_scenario(config, device=device)
+            if result is not None:
+                scenarios.extend(result)
+            else:
+                failed += 1
+
+            if len(scenarios) - last_save_count >= save_every:
+                torch.save(scenarios, dataset_path)
+                last_save_count = len(scenarios)
+                if log:
+                    log(f"  Incremental save: {len(scenarios)} samples")
+
+        if log:
+            log(f"Generated {len(scenarios)} samples from {n_scenarios - failed} hands ({failed} failed)")
+
+    if log and scenarios:
+        lengths = [s["n_events"] for s in scenarios]
+        log(f"Sequence lengths: min={min(lengths)}, max={max(lengths)}, avg={sum(lengths)/len(lengths):.1f}")
 
     torch.save(scenarios, dataset_path)
     if log:

@@ -81,14 +81,15 @@
         "weighted_sampling": true
     },
     "dataset": {
-        "dataset_dir": "",
+        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v1/medium_sample_full_agent_modifiers/dataset/2026_03_28_18_32_05",
         "save_dir": "",
-        "n_scenarios": 700,
-        "val_split": 0.1
+        "n_scenarios": 60,
+        "val_split": 0.1,
+        "n_workers": 8
     },
     "gto_ev_train": {
         "lr": 3e-4,
-        "batch_size": 16,
+        "batch_size": 64,
         "epochs": 1,
         "max_grad_norm": 1.0,
         "log_every": 10,
@@ -98,7 +99,7 @@
     },
     "gto_probs_train": {
         "lr": 3e-4,
-        "batch_size": 16,
+        "batch_size": 64,
         "epochs": 1,
         "max_grad_norm": 1.0,
         "log_every": 10,
@@ -116,11 +117,12 @@
         "max_rebuy_stack": 1500,
         "max_stack_cap": 3000,
         "log_every": 1000,
-        "action_temperature": 0.3
+        "action_temperature": 0.3,
+        "n_tables": 16
     },
     "pipeline": {
-        "run_gto_ev": false,
-        "run_gto_probs": false,
+        "run_gto_ev": true,
+        "run_gto_probs": true,
         "run_evaluation": true
     }
 }

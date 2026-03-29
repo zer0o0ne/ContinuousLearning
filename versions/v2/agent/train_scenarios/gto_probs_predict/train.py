@@ -74,8 +74,9 @@ def _weighted_rank_concordance(logits, target_probs):
     return torch.where(w_sum > 0, c_sum / w_sum, torch.ones_like(w_sum))
 
 
-def _run_validation(agent, val_loader, device):
+def _run_validation(agent, val_loader, device, amp_config=None):
     """Run validation and return (avg_loss, accuracy, wrc)."""
+    amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     agent.eval()
     val_loss_sum = 0.0
     correct = 0
@@ -84,9 +85,10 @@ def _run_validation(agent, val_loader, device):
     with torch.no_grad():
         for event_sequences, target_probs in val_loader:
             target_probs = target_probs.to(device)
-            result = agent.forward_batch(event_sequences, skip_memory=True)
-            action_logits = result["action_logits"]
-            batch_loss = _kl_loss(action_logits, target_probs)
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                result = agent.forward_batch(event_sequences, skip_memory=True)
+                action_logits = result["action_logits"]
+                batch_loss = _kl_loss(action_logits, target_probs)
             val_loss_sum += batch_loss.item() * len(event_sequences)
             correct += (action_logits.argmax(dim=-1) == target_probs.argmax(dim=-1)).sum().item()
             wrc_sum += _weighted_rank_concordance(action_logits, target_probs).sum().item()
@@ -175,6 +177,14 @@ def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None, temp
 
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
 
+    # AMP setup
+    from utils import get_amp_config
+    amp_enabled, device_type, amp_dtype, use_scaler = get_amp_config(device)
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
+    amp_cfg = (amp_enabled, device_type, amp_dtype)
+    if amp_enabled:
+        log(f"AMP enabled: {device_type}, dtype={amp_dtype}, scaler={use_scaler}")
+
     # Dataset is provided by pipeline (loaded/generated there)
     if scenarios_override is not None:
         scenarios = scenarios_override
@@ -237,14 +247,17 @@ def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None, temp
         for batch_idx, (event_sequences, target_probs) in enumerate(train_loader):
             target_probs = target_probs.to(device)
 
-            result = agent.forward_batch(event_sequences, skip_memory=True)
-            action_logits = result["action_logits"]  # (B, n_actions)
-            batch_loss = _kl_loss(action_logits, target_probs)
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                result = agent.forward_batch(event_sequences, skip_memory=True)
+                action_logits = result["action_logits"]  # (B, n_actions)
+                batch_loss = _kl_loss(action_logits, target_probs)
 
             optimizer.zero_grad()
-            batch_loss.backward()
+            scaler.scale(batch_loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             step_loss = batch_loss.item()
@@ -262,7 +275,7 @@ def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None, temp
 
             # Intra-epoch validation
             if val_every and (global_step % val_every == 0):
-                val_loss, val_acc, val_wrc = _run_validation(agent, val_loader, device)
+                val_loss, val_acc, val_wrc = _run_validation(agent, val_loader, device, amp_config=amp_cfg)
                 history["val_loss"].append((global_step, val_loss))
                 history["val_accuracy"].append((global_step, val_acc))
                 history["val_wrc"].append((global_step, val_wrc))
@@ -287,7 +300,7 @@ def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None, temp
             break
 
         # --- End-of-epoch validation ---
-        val_loss_avg, val_acc, val_wrc = _run_validation(agent, val_loader, device)
+        val_loss_avg, val_acc, val_wrc = _run_validation(agent, val_loader, device, amp_config=amp_cfg)
         history["val_loss"].append((global_step, val_loss_avg))
         history["val_accuracy"].append((global_step, val_acc))
         history["val_wrc"].append((global_step, val_wrc))

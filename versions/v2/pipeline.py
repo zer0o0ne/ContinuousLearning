@@ -84,21 +84,26 @@ def main():
 
     from agent.train_scenarios.gto_ev_predict.train import train_gto_ev
     from agent.train_scenarios.gto_probs_predict.train import train_gto_probs
+    from evaluation.evaluate import run_evaluation
 
     agent_dir = config.get("agent_dir", "")
     pipeline_cfg = config.get("pipeline", {})
     multi_agent = config.get("multi_agent")
 
-    # --- Load/generate dataset once ---
-    base_scenarios = _load_or_generate_dataset(config, base_dir, device, log)
-    if not base_scenarios:
-        log("No dataset available. Aborting.")
-        return
+    needs_training = pipeline_cfg.get("run_gto_ev", True) or pipeline_cfg.get("run_gto_probs", False)
+
+    # --- Load/generate dataset only if training is enabled ---
+    base_scenarios = None
+    if needs_training:
+        base_scenarios = _load_or_generate_dataset(config, base_dir, device, log)
+        if not base_scenarios:
+            log("No dataset available. Aborting.")
+            return
 
     dataset_cfg = config.get("dataset", {})
     val_split = dataset_cfg.get("val_split", 0.1)
 
-    if multi_agent:
+    if multi_agent and needs_training:
         # --- Multi-agent training ---
         from agent.train_scenarios.modifiers import apply_modifiers
 
@@ -118,10 +123,17 @@ def main():
             agent_name = agent_cfg["name"]
             modifiers = agent_cfg.get("modifiers", [])
 
+            # Extract effective temperature for this agent
+            agent_temperature = temperature
+            for mod in modifiers:
+                if mod.get("type") == "temperature":
+                    agent_temperature = mod["value"]
+
             agent_base = os.path.join(save_base_dir, agent_name)
             agent_log = Logger(agent_base)
             agent_log(f"\n=== Agent: {agent_name} ===")
             agent_log(f"Modifiers: {json.dumps(modifiers)}")
+            agent_log(f"Effective temperature: {agent_temperature}")
 
             agent = ASI(agent_log, config)
             agent.set_device(device)
@@ -138,13 +150,13 @@ def main():
 
             if pipeline_cfg.get("run_gto_ev", True):
                 train_gto_ev(agent, ev_train_cfg, device, agent_log,
-                             scenarios_override=modified)
+                             scenarios_override=modified, temperature=agent_temperature)
 
             if pipeline_cfg.get("run_gto_probs", False):
                 train_gto_probs(agent, probs_train_cfg, device, agent_log,
-                                scenarios_override=modified)
+                                scenarios_override=modified, temperature=agent_temperature)
 
-    else:
+    elif needs_training:
         # --- Single-agent training ---
         agent = ASI(log, config)
         agent.set_device(device)
@@ -153,16 +165,21 @@ def main():
         else:
             log("No agent_dir specified, agent initialized randomly")
 
+        single_temperature = config.get("solver", {}).get("gto_temperature", 1.0)
         ev_train_cfg = _merge_train_config(config, "gto_ev_train")
 
         if pipeline_cfg.get("run_gto_ev", True):
             train_gto_ev(agent, ev_train_cfg, device, log,
-                         scenarios_override=base_scenarios)
+                         scenarios_override=base_scenarios, temperature=single_temperature)
 
         if pipeline_cfg.get("run_gto_probs", False):
             probs_train_cfg = _merge_train_config(config, "gto_probs_train")
             train_gto_probs(agent, probs_train_cfg, device, log,
-                            scenarios_override=base_scenarios)
+                            scenarios_override=base_scenarios, temperature=single_temperature)
+
+    # --- Evaluation ---
+    if pipeline_cfg.get("run_evaluation", False):
+        run_evaluation(config, device, log)
 
 
 if __name__ == "__main__":

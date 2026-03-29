@@ -105,8 +105,21 @@
         "interrupt_after_fails": 20,
         "scheduler_eta_min": 3e-6
     },
+    "evaluation": {
+        "agents_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v1/5_test_agents",
+        "num_players": 5,
+        "n_hands": 10000,
+        "big_blind": 10,
+        "start_stack": 1500,
+        "min_rebuy_stack": 500,
+        "max_rebuy_stack": 1500,
+        "max_stack_cap": 3000,
+        "log_every": 1000,
+        "action_temperature": 0.5
+    },
     "pipeline": {
-        "run_gto_ev": true,
-        "run_gto_probs": true
+        "run_gto_ev": false,
+        "run_gto_probs": false,
+        "run_evaluation": true
     }
 }

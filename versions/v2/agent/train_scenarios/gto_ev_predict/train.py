@@ -66,17 +66,20 @@ def _run_validation(agent, val_loader, loss_fn, device):
 
 
 def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
-               global_step, epoch, val_loss, log):
+               global_step, epoch, val_loss, log, temperature=None):
     """Save best model checkpoint."""
     best_path = os.path.join(ckpt_dir, "best.pt")
-    torch.save({
+    ckpt = {
         "step": global_step, "epoch": epoch + 1,
         "model_state_dict": agent.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "norm_stats": norm_stats,
         "val_loss": val_loss,
-    }, best_path)
+    }
+    if temperature is not None:
+        ckpt["temperature"] = temperature
+    torch.save(ckpt, best_path)
     log(f"  New best model (val loss: {val_loss:.6f})")
 
 
@@ -98,7 +101,7 @@ def _check_val(val_loss, best_val_loss, fails_since_best, interrupt_after_fails,
     return best_val_loss, fails_since_best, False
 
 
-def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None):
+def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None, temperature=None):
     """Main training entry point for GTO EV prediction.
 
     Args:
@@ -107,6 +110,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None):
         device: torch device string
         log: logger callable
         scenarios_override: if provided, use these raw scenarios instead of loading/generating
+        temperature: effective temperature for this agent (saved in checkpoint)
     """
     lr = train_cfg.get("lr", 3e-4)
     batch_size = train_cfg.get("batch_size", 64)
@@ -231,7 +235,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None):
                 )
                 if val_loss < prev_best:
                     _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
-                               global_step, epoch, val_loss, log)
+                               global_step, epoch, val_loss, log, temperature=temperature)
 
                 if should_stop:
                     stopped_early = True
@@ -258,7 +262,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None):
         )
         if val_loss_avg < prev_best:
             _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
-                       global_step, epoch, val_loss_avg, log)
+                       global_step, epoch, val_loss_avg, log, temperature=temperature)
 
         if should_stop:
             break

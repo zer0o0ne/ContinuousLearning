@@ -54,8 +54,15 @@ def _get_solver(solver_name):
             "narrow_range": narrow_range,
             "expand_range": expand_range,
         }
+    elif solver_name == "v3":
+        from gpu_solver_v3 import gpu_equity_v3, compute_ev_v3, get_position_range, narrow_range, expand_range
+        return gpu_equity_v3, compute_ev_v3, {
+            "get_position_range": get_position_range,
+            "narrow_range": narrow_range,
+            "expand_range": expand_range,
+        }
     else:
-        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1' or 'v2'.")
+        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1', 'v2', or 'v3'.")
 
 
 def _get_board_cards(table):
@@ -92,12 +99,15 @@ def _build_opponent_ranges(table, player_pos, action_history, solver_modules):
         solver_modules: dict with get_position_range, narrow_range (from v2 solver)
 
     Returns:
-        list of lists of hand type strings, one per active opponent
+        (opponent_ranges, opponent_positions) where:
+        - opponent_ranges: list of lists of hand type strings, one per active opponent
+        - opponent_positions: list of int seat indices for each opponent
     """
     get_position_range = solver_modules["get_position_range"]
     narrow_range = solver_modules["narrow_range"]
 
     opponent_ranges = []
+    opponent_positions = []
     for pos in range(table.num_players):
         if pos == player_pos:
             continue
@@ -110,8 +120,9 @@ def _build_opponent_ranges(table, player_pos, action_history, solver_modules):
                 hand_types = narrow_range(hand_types, act_type)
 
         opponent_ranges.append(hand_types)
+        opponent_positions.append(pos)
 
-    return opponent_ranges
+    return opponent_ranges, opponent_positions
 
 
 def _build_event(table, hero_pos, acting_pos, action, num_players, big_blind, small_blind):
@@ -164,7 +175,9 @@ def _sample_gto_action(ev_result, n_actions, big_blind=10, temperature=1.0):
 
 def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
                        device="mps", mc_iters=10000, n_raise_samples=3,
-                       mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10):
+                       mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10,
+                       eqr_enabled=True, combo_response_iters=30,
+                       reraise_threshold=0.75, weighted_sampling=True):
     """Compute EV for a player (sampled raise bins for GTO action sampling).
 
     Returns dict with keys: equity, fold_ev, call_ev, raise_evs, etc.
@@ -213,7 +226,7 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
 
     else:
         expand_range = solver_modules["expand_range"]
-        opp_range_types = _build_opponent_ranges(table, player_pos, action_history, solver_modules)
+        opp_range_types, opp_positions = _build_opponent_ranges(table, player_pos, action_history, solver_modules)
 
         if not opp_range_types:
             return {
@@ -223,7 +236,20 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
                 "facing_bet": facing_bet, "stack": stack, "pot": pot,
             }
 
-        ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
+        if solver_name == "v3":
+            ev_extra = {
+                "hero_position": player_pos,
+                "street": table.turn,
+                "n_players": table.num_players,
+                "eqr_enabled": eqr_enabled,
+                "combo_response_iters": combo_response_iters,
+                "reraise_threshold": reraise_threshold,
+                "weighted_sampling": weighted_sampling,
+                "action_history": action_history,
+                "opponent_positions": opp_positions,
+            }
+        else:
+            ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
 
         try:
             fold_ev, call_ev, _, _ = compute_ev_fn(
@@ -285,7 +311,9 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
 
 def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                             solver_name="v2", device="mps", mc_iters=10000,
-                            mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10):
+                            mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10,
+                            eqr_enabled=True, combo_response_iters=30,
+                            reraise_threshold=0.75, weighted_sampling=True):
     """Compute EV for ALL possible actions (fold, call, each raise bin, all-in).
 
     Returns:
@@ -340,7 +368,7 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
 
     else:
         expand_range = solver_modules["expand_range"]
-        opp_range_types = _build_opponent_ranges(table, player_pos, action_history, solver_modules)
+        opp_range_types, opp_positions = _build_opponent_ranges(table, player_pos, action_history, solver_modules)
 
         if not opp_range_types:
             evs[1] = pot - hero_invested
@@ -350,7 +378,20 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                     "facing_bet": facing_bet, "stack": stack, "pot": pot}
             return evs, meta
 
-        ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
+        if solver_name == "v3":
+            ev_extra = {
+                "hero_position": player_pos,
+                "street": table.turn,
+                "n_players": table.num_players,
+                "eqr_enabled": eqr_enabled,
+                "combo_response_iters": combo_response_iters,
+                "reraise_threshold": reraise_threshold,
+                "weighted_sampling": weighted_sampling,
+                "action_history": action_history,
+                "opponent_positions": opp_positions,
+            }
+        else:
+            ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
 
         try:
             _, call_ev, _, _ = compute_ev_fn(
@@ -513,12 +554,25 @@ def generate_scenario(config, device="mps"):
     max_actions = 4 * num_players
     action_history = []
 
+    # V3 solver params
+    eqr_enabled = config.get("eqr_enabled", True)
+    combo_response_iters = config.get("combo_response_iters", 30)
+    reraise_threshold = config.get("reraise_threshold", 0.75)
+    weighted_sampling = config.get("weighted_sampling", True)
+
     ev_kwargs = {"device": device, "mc_iters": mc_iters}
     if solver_name == "v2":
         ev_kwargs.update({
             "mdf_max_fold": mdf_max_fold,
             "reraise_pct": reraise_pct,
             "reraise_cap": reraise_cap,
+        })
+    elif solver_name == "v3":
+        ev_kwargs.update({
+            "eqr_enabled": eqr_enabled,
+            "combo_response_iters": combo_response_iters,
+            "reraise_threshold": reraise_threshold,
+            "weighted_sampling": weighted_sampling,
         })
 
     for _ in range(max_actions):

@@ -24,14 +24,17 @@
         "agents": [
             {
                 "name": "gto_pure",
-                "modifiers": []
+                "modifiers": [
+                    {"type": "temperature", "value": 0.3}
+                ]
             },
             {
                 "name": "lag_bluffer",
                 "modifiers": [
                     {"type": "action_bias", "actions": "aggressive", "factor": 0.35},
                     {"type": "action_bias", "actions": "fold", "factor": -0.25},
-                    {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.4}
+                    {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.4},
+                    {"type": "temperature", "value": 0.3}
                 ]
             },
             {
@@ -39,21 +42,23 @@
                 "modifiers": [
                     {"type": "action_bias", "actions": "fold", "factor": 0.3},
                     {"type": "action_bias", "actions": "raises", "factor": -0.2},
-                    {"type": "temperature", "value": 0.5}
+                    {"type": "temperature", "value": 0.1}
                 ]
             },
             {
                 "name": "value_heavy",
                 "modifiers": [
                     {"type": "conditional_bias", "condition": "equity > 0.6", "actions": "aggressive", "factor": 0.5},
-                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.3}
+                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.3},
+                    {"type": "temperature", "value": 0.3}
                 ]
             },
             {
                 "name": "mid_raise_specialist",
                 "modifiers": [
                     {"type": "action_bias", "actions": "15:35", "factor": 0.4},
-                    {"type": "action_bias", "actions": [0, 1, 52], "factor": -0.15}
+                    {"type": "action_bias", "actions": [0, 1, 52], "factor": -0.15},
+                    {"type": "temperature", "value": 0.3}
                 ]
             }
         ]
@@ -66,13 +71,14 @@
         "big_blind": 10
     },
     "solver": {
-        "type": "v2",
+        "type": "v3",
         "mc_iterations": 1000,
         "n_raise_samples": 3,
-        "gto_temperature": 1.0,
-        "mdf_max_fold": 0.7,
-        "reraise_pct": 0.15,
-        "reraise_cap": 0.10
+        "gto_temperature": 0.2,
+        "eqr_enabled": true,
+        "combo_response_iters": 30,
+        "reraise_threshold": 0.75,
+        "weighted_sampling": true
     },
     "dataset": {
         "dataset_dir": "",

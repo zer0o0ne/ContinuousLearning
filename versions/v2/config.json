@@ -1,5 +1,5 @@
 {
-    "name": "medium_sample_full_agent_modifiers",
+    "name": "eval_5_test_agents_norm_t",
     "agent_dir": "",
     "architecture": {
         "d_model": 64,
@@ -82,6 +82,7 @@
     },
     "dataset": {
         "dataset_dir": "",
+        "save_dir": "",
         "n_scenarios": 700,
         "val_split": 0.1
     },
@@ -110,12 +111,12 @@
         "num_players": 5,
         "n_hands": 10000,
         "big_blind": 10,
-        "start_stack": 1500,
+        "start_stack": 1000,
         "min_rebuy_stack": 500,
         "max_rebuy_stack": 1500,
         "max_stack_cap": 3000,
         "log_every": 1000,
-        "action_temperature": 0.5
+        "action_temperature": 0.3
     },
     "pipeline": {
         "run_gto_ev": false,

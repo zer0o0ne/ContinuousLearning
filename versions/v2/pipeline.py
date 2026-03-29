@@ -28,6 +28,7 @@ def _load_or_generate_dataset(config, base_dir, device, log):
 
     dataset_cfg = config.get("dataset", {})
     dataset_dir = dataset_cfg.get("dataset_dir", "")
+    save_dir = dataset_cfg.get("save_dir", "")
 
     # Merge generation params (game + solver + dataset)
     gen_cfg = {}
@@ -42,13 +43,17 @@ def _load_or_generate_dataset(config, base_dir, device, log):
         scenarios = load_dataset(dataset_dir, log=log)
         if scenarios is not None:
             return scenarios
-        # Not found — generate into dataset_dir
-        os.makedirs(dataset_dir, exist_ok=True)
-        log(f"Dataset not found at {dataset_dir}, generating there...")
-        return generate_dataset(gen_cfg, dataset_dir, log=log)
+        log(f"Dataset not found at {dataset_dir}, generating...")
 
-    # No dataset_dir — generate into base_dir/dataset/<timestamp>
-    dataset_save_dir = os.path.join(base_dir, "dataset", log.init_time)
+    # Determine where to save the generated dataset
+    if save_dir:
+        dataset_save_dir = save_dir
+    elif dataset_dir:
+        dataset_save_dir = dataset_dir
+    else:
+        dataset_save_dir = os.path.join(base_dir, "dataset", log.init_time)
+
+    os.makedirs(dataset_save_dir, exist_ok=True)
     return generate_dataset(gen_cfg, dataset_save_dir, log=log)
 
 

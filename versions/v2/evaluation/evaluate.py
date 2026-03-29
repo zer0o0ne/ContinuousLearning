@@ -196,8 +196,8 @@ def run_evaluation(config, device, log):
 
     agents_dir = eval_cfg.get("agents_dir", "")
     if agents_dir and not os.path.isabs(agents_dir):
-        version = os.path.basename(os.path.abspath(os.path.dirname(__file__) + "/.."))
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+        version = os.path.basename(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
         agents_dir = os.path.join(project_root, "data", version, agents_dir)
 
     n_hands = eval_cfg.get("n_hands", 10000)
@@ -242,8 +242,8 @@ def run_evaluation(config, device, log):
     agent_queue = deque(range(len(agents)))
 
     # History save path
-    version = os.path.basename(os.path.abspath(os.path.dirname(__file__) + "/.."))
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+    version = os.path.basename(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     exp_name = config.get("name", "default")
     results_dir = os.path.join(project_root, "data", version, exp_name, "evaluation")
     os.makedirs(results_dir, exist_ok=True)
@@ -364,8 +364,13 @@ def run_evaluation(config, device, log):
             elif agent_info["stack"] > max_stack_cap:
                 agent_info["stack"] = float(random.randint(min_rebuy, max_rebuy))
 
-        # Rotate agent queue: shifts which agents are seated + changes relative positions
+        # Rotate dealer position + periodically shuffle relative seating
         agent_queue.rotate(-1)
+        if (hand_idx + 1) % num_players == 0:
+            # Full orbit complete — shuffle to break fixed relative positions
+            queue_list = list(agent_queue)
+            random.shuffle(queue_list)
+            agent_queue = deque(queue_list)
 
         # Periodic logging + history save
         if (hand_idx + 1) % log_every == 0:
@@ -437,8 +442,8 @@ if __name__ == "__main__":
     else:
         device = "cpu"
 
-    version = os.path.basename(os.path.abspath(os.path.dirname(__file__) + "/.."))
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+    version = os.path.basename(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     name = config.get("name", "default")
     base_dir = os.path.join(project_root, "data", version, name)
     log = Logger(base_dir)

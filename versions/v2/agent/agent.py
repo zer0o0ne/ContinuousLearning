@@ -23,8 +23,12 @@ class ASI(nn.Module):
         max_seq_len = arch.get("max_seq_len", 256)
         mem_cfg = arch.get("memory", {})
 
-        table_bins = game.get("table_bins", 10)
-        n_actions = table_bins + 3  # fold + call + bins + all-in
+        raise_sizes = game.get("raise_sizes")
+        if raise_sizes:
+            n_raise_bins = len(next(iter(raise_sizes.values())))
+        else:
+            n_raise_bins = game.get("table_bins", 10)
+        n_actions = n_raise_bins + 3  # fold + call + raises + all-in
 
         head_max_seq_len = max_seq_len + mem_cfg.get("beam_width", 4) + 64
 

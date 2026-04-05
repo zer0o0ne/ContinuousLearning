@@ -166,7 +166,7 @@ def _normalize_events_inplace(events, norm_stats):
             event["bets"] = [(b - bets_m) / bets_s for b in event["bets"]]
 
 
-def _init_table_state(agents, agent_queue, num_players, table_bins, table_max_bet,
+def _init_table_state(agents, agent_queue, num_players, raise_sizes,
                       big_blind, small_blind, n_actions):
     """Initialize a new hand at a table. Returns table state dict."""
     seated_indices = [agent_queue[i] for i in range(num_players)]
@@ -174,8 +174,7 @@ def _init_table_state(agents, agent_queue, num_players, table_bins, table_max_be
 
     table = Table(
         num_players=num_players,
-        bins=table_bins,
-        max_bet=table_max_bet,
+        raise_sizes=raise_sizes,
         start_credits=int(max(a["stack"] for a in seated)),
         big_blind=big_blind,
         small_blind=small_blind,
@@ -228,9 +227,10 @@ def run_evaluation(config, device, log):
     max_stack_cap = eval_cfg.get("max_stack_cap", 5000)
     log_every = eval_cfg.get("log_every", 100)
     fallback_temperature = eval_cfg.get("action_temperature", 0.5)
-    table_bins = game_cfg.get("table_bins", 50)
-    table_max_bet = game_cfg.get("table_max_bet", 5)
-    n_actions = table_bins + 3
+    from agent.train_scenarios.generation.generate import _get_raise_sizes
+    raise_sizes = _get_raise_sizes(game_cfg)
+    n_raise_bins = len(raise_sizes[0])
+    n_actions = n_raise_bins + 3
     n_tables = eval_cfg.get("n_tables", 16)
 
     # AMP config
@@ -288,8 +288,8 @@ def run_evaluation(config, device, log):
     for _ in range(n_tables):
         if hands_started >= n_hands:
             break
-        ts = _init_table_state(agents, agent_queue, num_players, table_bins,
-                               table_max_bet, big_blind, small_blind, n_actions)
+        ts = _init_table_state(agents, agent_queue, num_players, raise_sizes,
+                               big_blind, small_blind, n_actions)
         table_states.append(ts)
         hands_started += 1
 
@@ -458,8 +458,8 @@ def run_evaluation(config, device, log):
 
             # Start new hand if quota not reached
             if hands_started < n_hands:
-                new_ts = _init_table_state(agents, agent_queue, num_players, table_bins,
-                                           table_max_bet, big_blind, small_blind, n_actions)
+                new_ts = _init_table_state(agents, agent_queue, num_players, raise_sizes,
+                                           big_blind, small_blind, n_actions)
                 new_table_states.append(new_ts)
                 hands_started += 1
 

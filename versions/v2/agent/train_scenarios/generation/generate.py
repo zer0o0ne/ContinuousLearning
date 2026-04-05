@@ -36,6 +36,37 @@ if _gto_utils_dir not in sys.path:
     sys.path.insert(0, _gto_utils_dir)
 
 
+STREET_NAMES = ["preflop", "flop", "turn", "river"]
+
+
+def _get_raise_sizes(config):
+    """Extract and validate per-street raise sizes from config.
+
+    Returns list of 4 lists (indexed by street: 0=preflop..3=river).
+    All streets must have the same number of raise sizes.
+    """
+    rs = config.get("raise_sizes")
+    if rs is None:
+        raise ValueError("Config missing 'raise_sizes'. Expected dict with keys: preflop, flop, turn, river")
+
+    sizes = []
+    for street_name in STREET_NAMES:
+        if street_name not in rs:
+            raise ValueError(f"raise_sizes missing '{street_name}'")
+        sizes.append(list(rs[street_name]))
+
+    lengths = [len(s) for s in sizes]
+    if len(set(lengths)) != 1:
+        raise ValueError(
+            f"All streets must have equal number of raise sizes. "
+            f"Got: {dict(zip(STREET_NAMES, lengths))}"
+        )
+    if lengths[0] == 0:
+        raise ValueError("raise_sizes must have at least 1 raise size per street")
+
+    return sizes
+
+
 def _get_solver(solver_name):
     """Import and return solver functions based on config choice.
 
@@ -200,6 +231,14 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
     n_active = int((table.players_state >= 0).sum())
     n_opponents = max(1, n_active - 1)
 
+    n_raise_bins = table.n_raise_bins
+    street_raises = table.raise_sizes[table.turn]
+    hero_bets = table.bets[player_pos]
+    effective_pot = max(pot - hero_bets, 1e-6)
+
+    def _raise_to_solver_frac(raise_pct):
+        return raise_pct * effective_pot / max(pot, 1e-6)
+
     if solver_name == "v1":
         try:
             eq = gpu_equity_fn(hero_t, board_t, n_opponents, n_iters=mc_iters, device=device)
@@ -208,21 +247,20 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
             return None
 
         raise_evs = []
-        max_bet_mult = table.max_bet
-        bins = table.bins
-        available_bins = list(range(2, bins + 2))
+        available_bins = list(range(2, n_raise_bins + 2))
         n_samples = min(n_raise_samples, len(available_bins))
         for b in random.sample(available_bins, n_samples):
-            raise_frac = (b - 1) * max_bet_mult / bins
-            actual_raise = min(facing_bet + raise_frac * pot, stack)
-            if actual_raise >= stack:
+            raise_pct = street_raises[b - 2]
+            actual_bet = facing_bet + raise_pct * effective_pot
+            if actual_bet >= stack:
                 continue
-            _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=raise_frac)
-            raise_evs.append((b, raise_frac, r_ev))
+            solver_frac = _raise_to_solver_frac(raise_pct)
+            _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=solver_frac)
+            raise_evs.append((b, solver_frac, r_ev))
 
         allin_frac = stack / max(pot + facing_bet, 1e-6)
         _, _, allin_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=allin_frac)
-        allin_idx = bins + 2
+        allin_idx = n_raise_bins + 2
         raise_evs.append((allin_idx, allin_frac, allin_ev))
 
     else:
@@ -267,22 +305,21 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
             return None
 
         raise_evs = []
-        max_bet_mult = table.max_bet
-        bins = table.bins
-        available_bins = list(range(2, bins + 2))
+        available_bins = list(range(2, n_raise_bins + 2))
         n_samples = min(n_raise_samples, len(available_bins))
         for b in random.sample(available_bins, n_samples):
-            raise_frac = (b - 1) * max_bet_mult / bins
-            actual_raise = min(facing_bet + raise_frac * pot, stack)
-            if actual_raise >= stack:
+            raise_pct = street_raises[b - 2]
+            actual_bet = facing_bet + raise_pct * effective_pot
+            if actual_bet >= stack:
                 continue
             try:
+                solver_frac = _raise_to_solver_frac(raise_pct)
                 _, _, r_ev, _ = compute_ev_fn(
                     hero_t, board_t, opp_range_types,
                     pot, facing_bet, stack, hero_invested,
-                    raise_frac=raise_frac, n_iters=mc_iters, device=device, **ev_extra
+                    raise_frac=solver_frac, n_iters=mc_iters, device=device, **ev_extra
                 )
-                raise_evs.append((b, raise_frac, r_ev))
+                raise_evs.append((b, solver_frac, r_ev))
             except Exception:
                 continue
 
@@ -293,7 +330,7 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
                 pot, facing_bet, stack, hero_invested,
                 raise_frac=allin_frac, n_iters=mc_iters, device=device, **ev_extra
             )
-            allin_idx = bins + 2
+            allin_idx = n_raise_bins + 2
             raise_evs.append((allin_idx, allin_frac, allin_ev))
         except Exception:
             pass
@@ -337,13 +374,19 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
     n_active = int((table.players_state >= 0).sum())
     n_opponents = max(1, n_active - 1)
 
-    bins = table.bins
-    max_bet_mult = table.max_bet
+    n_raise_bins = table.n_raise_bins
+    street_raises = table.raise_sizes[table.turn]
+    hero_bets = table.bets[player_pos]
+    effective_pot = max(pot - hero_bets, 1e-6)
 
     evs = torch.zeros(n_actions, dtype=torch.float)
 
     # Fold EV
     evs[0] = -hero_invested
+
+    def _raise_to_solver_frac(raise_pct):
+        """Convert per-street raise_pct (fraction of effective pot) to solver raise_frac."""
+        return raise_pct * effective_pot / max(pot, 1e-6)
 
     if solver_name == "v1":
         try:
@@ -353,19 +396,20 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
             return None, None
         evs[1] = call_ev
 
-        for b in range(2, bins + 2):
-            raise_frac = (b - 1) * max_bet_mult / bins
-            actual_raise = min(facing_bet + raise_frac * pot, stack)
-            if actual_raise >= stack:
+        for b in range(2, n_raise_bins + 2):
+            raise_pct = street_raises[b - 2]
+            actual_bet = facing_bet + raise_pct * effective_pot
+            if actual_bet >= stack:
                 allin_frac = stack / max(pot + facing_bet, 1e-6)
                 _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=allin_frac)
             else:
-                _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=raise_frac)
+                solver_frac = _raise_to_solver_frac(raise_pct)
+                _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=solver_frac)
             evs[b] = r_ev
 
         allin_frac = stack / max(pot + facing_bet, 1e-6)
         _, _, allin_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=allin_frac)
-        evs[bins + 2] = allin_ev
+        evs[n_raise_bins + 2] = allin_ev
 
     else:
         expand_range = solver_modules["expand_range"]
@@ -421,23 +465,24 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
         except Exception:
             allin_ev = evs[0]
 
-        for b in range(2, bins + 2):
-            raise_frac = (b - 1) * max_bet_mult / bins
-            actual_raise = min(facing_bet + raise_frac * pot, stack)
-            if actual_raise >= stack:
+        for b in range(2, n_raise_bins + 2):
+            raise_pct = street_raises[b - 2]
+            actual_bet = facing_bet + raise_pct * effective_pot
+            if actual_bet >= stack:
                 evs[b] = allin_ev
             else:
                 try:
+                    solver_frac = _raise_to_solver_frac(raise_pct)
                     _, _, r_ev, _ = compute_ev_fn(
                         hero_t, board_t, opp_range_types,
                         pot, facing_bet, stack, hero_invested,
-                        raise_frac=raise_frac, n_iters=mc_iters, device=device, **ev_extra
+                        raise_frac=solver_frac, n_iters=mc_iters, device=device, **ev_extra
                     )
                     evs[b] = r_ev
                 except Exception:
                     evs[b] = allin_ev
 
-        evs[bins + 2] = allin_ev
+        evs[n_raise_bins + 2] = allin_ev
 
     meta = {
         "equity": eq,
@@ -517,9 +562,9 @@ def generate_scenario(config, device="mps"):
     max_stack = config.get("max_stack", 1000)
     max_players = config.get("max_players", 9)
     temperature = config.get("gto_temperature", 1.0)
-    table_bins = config.get("table_bins", 10)
-    table_max_bet = config.get("table_max_bet", 2)
-    n_actions = table_bins + 3
+    raise_sizes = _get_raise_sizes(config)
+    n_raise_bins = len(raise_sizes[0])
+    n_actions = n_raise_bins + 3
     solver_name = config.get("solver", "v2")
     mdf_max_fold = config.get("mdf_max_fold", 0.7)
     reraise_pct = config.get("reraise_pct", 0.15)
@@ -530,8 +575,7 @@ def generate_scenario(config, device="mps"):
 
     table = Table(
         num_players=num_players,
-        bins=table_bins,
-        max_bet=table_max_bet,
+        raise_sizes=raise_sizes,
         start_credits=start_credits,
         big_blind=big_blind,
         small_blind=small_blind,
@@ -615,7 +659,7 @@ def generate_scenario(config, device="mps"):
             act_type = None
         elif choice_idx == 1:
             act_type = "call" if table.turn == 0 else "call_postflop"
-        elif choice_idx == table_bins + 2:
+        elif choice_idx == n_raise_bins + 2:
             act_type = "3bet" if table.turn == 0 else "bet_postflop"
         else:
             act_type = "open" if table.turn == 0 else "bet_postflop"
@@ -850,78 +894,78 @@ def generate_dataset(config, save_dir, log=None):
 
     os.makedirs(save_dir, exist_ok=True)
 
+    save_every_hands = config.get("save_every_hands", 1000)
+
     if n_workers > 1 and n_scenarios >= n_workers * 2:
         # --- Multiprocessing path ---
         worker_device = _get_generation_device(config.get("device"))
         if log:
             log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
+            log(f"Incremental save every {save_every_hands} hands")
 
-        # Split work across workers
-        chunk = n_scenarios // n_workers
-        remainder = n_scenarios % n_workers
+        # Split work into small chunks for incremental collection
+        chunk_size = max(save_every_hands // n_workers, 1)
         worker_args = []
-        for i in range(n_workers):
-            n_hands = chunk + (1 if i < remainder else 0)
-            worker_args.append((config, worker_device, n_hands, i))
+        remaining = n_scenarios
+        worker_id = 0
+        while remaining > 0:
+            n_hands = min(chunk_size, remaining)
+            worker_args.append((config, worker_device, n_hands, worker_id))
+            remaining -= n_hands
+            worker_id += 1
 
-        # Use spawn for CUDA compatibility (safe on all platforms)
         ctx = mp.get_context("spawn")
         counter = ctx.Value("i", 0)
         scenarios = []
         total_ok = 0
         total_failed = 0
+        last_save_count = 0
 
         pbar = tqdm(total=n_scenarios, desc="Generating hands")
 
         with ctx.Pool(n_workers, initializer=_init_worker, initargs=(counter,)) as pool:
-            async_result = pool.map_async(_generate_worker, worker_args)
-
-            # Poll shared counter for progress until all workers finish
-            while not async_result.ready():
-                async_result.wait(timeout=1.0)
-                pbar.n = counter.value
-                pbar.refresh()
-
-            pbar.n = n_scenarios
-            pbar.refresh()
-            pbar.close()
-
-            for worker_scenarios, ok, failed in async_result.get():
+            for worker_scenarios, ok, failed in pool.imap_unordered(_generate_worker, worker_args):
                 scenarios.extend(worker_scenarios)
                 total_ok += ok
                 total_failed += failed
+                pbar.n = counter.value
+                pbar.refresh()
 
-        # Save after all workers complete
-        torch.save(scenarios, dataset_path)
-        if log:
-            log(f"  All workers done: {len(scenarios)} samples")
+                if counter.value - last_save_count >= save_every_hands:
+                    torch.save(scenarios, dataset_path)
+                    last_save_count = counter.value
+                    if log:
+                        log(f"  Incremental save: {len(scenarios)} samples ({counter.value} hands)")
+
+        pbar.n = n_scenarios
+        pbar.refresh()
+        pbar.close()
 
         if log:
             log(f"Generated {len(scenarios)} samples from {total_ok} hands ({total_failed} failed)")
 
     else:
         # --- Sequential path (n_workers=1 or very few scenarios) ---
-        batch_size = config.get("batch_size", 64)
-        val_every = config.get("val_every", 10)
-        save_every = val_every * batch_size
         if log:
-            log(f"Generating {n_scenarios} hands on {device} (saving every {save_every} samples)...")
+            log(f"Generating {n_scenarios} hands on {device} (saving every {save_every_hands} hands)...")
 
         scenarios = []
         failed = 0
-        last_save_count = 0
+        hands_done = 0
+        last_save_at = 0
         for _ in tqdm(range(n_scenarios), desc="Generating hands"):
             result = generate_scenario(config, device=device)
             if result is not None:
                 scenarios.extend(result)
             else:
                 failed += 1
+            hands_done += 1
 
-            if len(scenarios) - last_save_count >= save_every:
+            if hands_done - last_save_at >= save_every_hands:
                 torch.save(scenarios, dataset_path)
-                last_save_count = len(scenarios)
+                last_save_at = hands_done
                 if log:
-                    log(f"  Incremental save: {len(scenarios)} samples")
+                    log(f"  Incremental save: {len(scenarios)} samples ({hands_done} hands)")
 
         if log:
             log(f"Generated {len(scenarios)} samples from {n_scenarios - failed} hands ({failed} failed)")

@@ -120,7 +120,8 @@ def main():
 
         game_cfg = config.get("game", {})
         solver_cfg = config.get("solver", {})
-        n_actions = game_cfg.get("table_bins", 50) + 3
+        raise_sizes = game_cfg.get("raise_sizes")
+        n_actions = len(next(iter(raise_sizes.values()))) + 3 if raise_sizes else game_cfg.get("table_bins", 50) + 3
         big_blind = game_cfg.get("big_blind", 10)
         temperature = solver_cfg.get("gto_temperature", 1.0)
 
@@ -154,8 +155,13 @@ def main():
             probs_train_cfg = _merge_train_config(config, "gto_probs_train")
 
             if pipeline_cfg.get("run_gto_ev", True):
-                train_gto_ev(agent, ev_train_cfg, device, agent_log,
+                _, ev_run_dir = train_gto_ev(agent, ev_train_cfg, device, agent_log,
                              scenarios_override=modified, temperature=agent_temperature)
+                # Reload best EV checkpoint so probs training starts from best weights
+                if ev_run_dir:
+                    best_ckpt = os.path.join(ev_run_dir, "best.pt")
+                    if os.path.exists(best_ckpt):
+                        agent.load_checkpoint(best_ckpt)
 
             if pipeline_cfg.get("run_gto_probs", False):
                 train_gto_probs(agent, probs_train_cfg, device, agent_log,
@@ -174,8 +180,12 @@ def main():
         ev_train_cfg = _merge_train_config(config, "gto_ev_train")
 
         if pipeline_cfg.get("run_gto_ev", True):
-            train_gto_ev(agent, ev_train_cfg, device, log,
+            _, ev_run_dir = train_gto_ev(agent, ev_train_cfg, device, log,
                          scenarios_override=base_scenarios, temperature=single_temperature)
+            if ev_run_dir:
+                best_ckpt = os.path.join(ev_run_dir, "best.pt")
+                if os.path.exists(best_ckpt):
+                    agent.load_checkpoint(best_ckpt)
 
         if pipeline_cfg.get("run_gto_probs", False):
             probs_train_cfg = _merge_train_config(config, "gto_probs_train")

@@ -5,14 +5,14 @@ from math import *
 from env.judger import Judger
 
 class Table:
-    def __init__(self, num_players, bins = 10, max_bet = 2, start_credits = 1000, big_blind = 10, small_blind = 5):
+    def __init__(self, num_players, raise_sizes, start_credits = 1000, big_blind = 10, small_blind = 5):
         self.num_players = num_players
         self.big_blind = big_blind
         self.small_blind = small_blind
         self.start_credits = start_credits
         self.credits = [start_credits] * num_players
-        self.bins = bins
-        self.max_bet = max_bet
+        self.raise_sizes = raise_sizes  # list of 4 lists (one per street)
+        self.n_raise_bins = len(raise_sizes[0])
         self.judger = Judger()
 
     def reset(self, position = None):
@@ -62,9 +62,11 @@ class Table:
                 self.players_state[self.active_player] = 0
                 if self.credits[self.active_player] == 0: self.players_state[self.active_player] = 2
 
-            if action > 1 and action < self.bins + 2:
-                part_of_pot = (action - 1) * self.max_bet / self.bins
-                bet = min(self.high_bet - self.bets[self.active_player] + part_of_pot * self.pot, self.credits[self.active_player])
+            if action > 1 and action < self.n_raise_bins + 2:
+                raise_pct = self.raise_sizes[self.turn][action - 2]
+                effective_pot = self.pot - self.bets[self.active_player]
+                call_amount = self.high_bet - self.bets[self.active_player]
+                bet = min(call_amount + raise_pct * effective_pot, self.credits[self.active_player])
                 self.pot += bet
                 self.credits[self.active_player] -= bet
                 self.bets[self.active_player] += bet
@@ -72,7 +74,7 @@ class Table:
                 self.players_state[self.active_player] = 0
                 if self.credits[self.active_player] == 0: self.players_state[self.active_player] = 2
 
-            if action == self.bins + 2:
+            if action == self.n_raise_bins + 2:
                 bet = self.credits[self.active_player]
                 self.pot += bet
                 self.credits[self.active_player] -= bet
@@ -103,6 +105,8 @@ class Table:
                 return True
             else:
                 self.turn += 1
+                self.bets = np.zeros((self.num_players,))
+                self.high_bet = 0
                 self.players_state[waiting_players] = 1
                 start_pos = 1 if self.num_players == 2 else 0
                 for offset in range(self.num_players):

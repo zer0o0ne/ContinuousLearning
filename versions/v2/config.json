@@ -1,15 +1,15 @@
 {
-    "name": "eval_5_test_agents_norm_t",
+    "name": "finalize_v2",
     "agent_dir": "",
     "architecture": {
-        "d_model": 64,
+        "d_model": 128,
         "n_heads": 8,
         "n_kv_heads": 2,
-        "d_ff": 256,
-        "n_encoder_layers": 4,
+        "d_ff": 512,
+        "n_encoder_layers": 6,
         "n_decoder_layers": 4,
-        "n_value_layers": 2,
-        "n_action_layers": 4,
+        "n_value_layers": 4,
+        "n_action_layers": 6,
         "max_seq_len": 2048,
         "max_players": 9,
         "memory": {
@@ -20,12 +20,12 @@
         }
     },
     "multi_agent": {
-        "save_dir": "5_test_agents",
+        "save_dir": "5_final_agents",
         "agents": [
             {
                 "name": "gto_pure",
                 "modifiers": [
-                    {"type": "temperature", "value": 0.3}
+                    {"type": "temperature", "value": 0.5}
                 ]
             },
             {
@@ -56,41 +56,46 @@
             {
                 "name": "mid_raise_specialist",
                 "modifiers": [
-                    {"type": "action_bias", "actions": "15:35", "factor": 0.4},
-                    {"type": "action_bias", "actions": [0, 1, 52], "factor": -0.15},
+                    {"type": "action_bias", "actions": "4:8", "factor": 0.4},
+                    {"type": "action_bias", "actions": [0, 1, 10], "factor": -0.15},
                     {"type": "temperature", "value": 0.3}
                 ]
             }
         ]
     },
     "game": {
-        "table_bins": 50,
-        "table_max_bet": 5,
+        "raise_sizes": {
+            "preflop": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0],
+            "flop":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+            "turn":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+            "river":   [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0]
+        },
         "max_players": 9,
         "max_stack": 3000,
         "big_blind": 10
     },
     "solver": {
         "type": "v3",
-        "mc_iterations": 1000,
-        "n_raise_samples": 3,
+        "mc_iterations": 10000,
+        "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 30,
-        "reraise_threshold": 0.75,
+        "combo_response_iters": 150,
+        "reraise_threshold": 0.72,
         "weighted_sampling": true
     },
     "dataset": {
-        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v1/medium_sample_full_agent_modifiers/dataset/2026_03_28_18_32_05",
+        "dataset_dir": "",
         "save_dir": "",
-        "n_scenarios": 60,
-        "val_split": 0.1,
-        "n_workers": 8
+        "n_scenarios": 25000,
+        "val_split": 0.12,
+        "n_workers": 8,
+        "save_every_hands": 1000
     },
     "gto_ev_train": {
-        "lr": 3e-4,
+        "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 1,
+        "epochs": 10,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,
@@ -98,9 +103,9 @@
         "scheduler_eta_min": 3e-6
     },
     "gto_probs_train": {
-        "lr": 3e-4,
+        "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 1,
+        "epochs": 10,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,
@@ -108,9 +113,9 @@
         "scheduler_eta_min": 3e-6
     },
     "evaluation": {
-        "agents_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v1/5_test_agents",
+        "agents_dir": "5_final_agents",
         "num_players": 5,
-        "n_hands": 10000,
+        "n_hands": 100000,
         "big_blind": 10,
         "start_stack": 1000,
         "min_rebuy_stack": 500,
@@ -118,7 +123,7 @@
         "max_stack_cap": 3000,
         "log_every": 1000,
         "action_temperature": 0.3,
-        "n_tables": 16
+        "n_tables": 8
     },
     "pipeline": {
         "run_gto_ev": true,

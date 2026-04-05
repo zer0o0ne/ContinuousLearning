@@ -17,6 +17,9 @@
             "max_cluster_size": 128,
             "max_cluster_size_after": 64,
             "beam_width": 8
+        },
+        "opponent_embedding": {
+            "enabled": true
         }
     },
     "multi_agent": {

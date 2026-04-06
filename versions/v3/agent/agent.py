@@ -5,6 +5,7 @@ import numpy as np
 from agent.perception.perception import Perception
 from agent.value.value import ValueHead
 from agent.action.action import ActionHead
+from agent.modelling.modelling import ModellingHead
 
 
 class ASI(nn.Module):
@@ -50,6 +51,15 @@ class ASI(nn.Module):
             d_ff=d_ff,
             max_seq_len=head_max_seq_len,
         )
+        self.modelling_head = ModellingHead(
+            d_model=d_model,
+            n_actions=n_actions,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            n_layers=arch.get("n_modelling_layers", 4),
+            d_ff=d_ff,
+            max_seq_len=head_max_seq_len,
+        )
 
         self.device_ = "cpu"
         self.n_actions = n_actions
@@ -86,8 +96,9 @@ class ASI(nn.Module):
 
         value = self.value_head(perception_out, mask=mask)
         action_logits = self.action_head(perception_out, mask=mask)
+        action_embeddings = self.modelling_head(perception_out, mask=mask)
 
-        return {"action_logits": action_logits, "value": value}
+        return {"action_logits": action_logits, "value": value, "action_embeddings": action_embeddings}
 
     def load_checkpoint(self, path):
         """Load model weights from a checkpoint file or directory.

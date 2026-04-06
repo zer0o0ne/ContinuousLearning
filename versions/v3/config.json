@@ -10,6 +10,7 @@
         "n_decoder_layers": 4,
         "n_value_layers": 4,
         "n_action_layers": 6,
+        "n_modelling_layers": 4,
         "max_seq_len": 2048,
         "max_players": 9,
         "memory": {
@@ -115,6 +116,16 @@
         "interrupt_after_fails": 20,
         "scheduler_eta_min": 3e-6
     },
+    "modelling_train": {
+        "lr": 1e-4,
+        "batch_size": 64,
+        "epochs": 10,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 10,
+        "interrupt_after_fails": 20,
+        "scheduler_eta_min": 3e-6
+    },
     "evaluation": {
         "agents_dir": "5_final_agents",
         "num_players": 5,
@@ -131,6 +142,7 @@
     "pipeline": {
         "run_gto_ev": true,
         "run_gto_probs": true,
+        "run_modelling": true,
         "run_evaluation": true
     }
 }

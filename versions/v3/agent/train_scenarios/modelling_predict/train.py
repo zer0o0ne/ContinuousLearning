@@ -49,6 +49,11 @@ class LengthGroupedBatchSampler(Sampler):
         return len(self.batches)
 
 
+def _compress_targets(targets):
+    """Compress extreme negative targets: values < -1 mapped to -1 + (target+1)*0.03."""
+    return torch.where(targets >= -1, targets, -1 + (targets + 1) * 0.03)
+
+
 def _modelling_forward(agent, event_sequences, device):
     """Run the modelling forward pass: perception → modelling_head → value_head.
 
@@ -95,7 +100,7 @@ def _run_validation(agent, val_loader, loss_fn, device, amp_config=None):
     val_count = 0
     with torch.no_grad():
         for event_sequences, action_evs in val_loader:
-            action_evs = action_evs.to(device)
+            action_evs = _compress_targets(action_evs.to(device))
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 predicted_evs = _modelling_forward(agent, event_sequences, device)
                 batch_loss = loss_fn(predicted_evs, action_evs)
@@ -189,7 +194,7 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
     # Optimizer over modelling_head parameters only
     trainable_params = list(agent.modelling_head.parameters())
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.SmoothL1Loss(beta=1.0)
 
     # Run directory
     run_dir = log.run_dir("modelling_predict")
@@ -264,7 +269,7 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
         train_count = 0
 
         for batch_idx, (event_sequences, action_evs) in enumerate(train_loader):
-            action_evs = action_evs.to(device)
+            action_evs = _compress_targets(action_evs.to(device))
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 predicted_evs = _modelling_forward(agent, event_sequences, device)

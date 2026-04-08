@@ -1,6 +1,6 @@
 {
-    "name": "finalize_v2",
-    "agent_dir": "",
+    "name": "test_modeling",
+    "agent_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v3/test_modeling/gto_probs_predict/2026_04_06_20_00_08",
     "architecture": {
         "d_model": 256,
         "n_heads": 8,
@@ -79,27 +79,29 @@
         "big_blind": 10
     },
     "solver": {
-        "type": "v3",
+        "type": "v4",
         "mc_iterations": 10000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
         "combo_response_iters": 150,
         "reraise_threshold": 0.72,
-        "weighted_sampling": true
+        "weighted_sampling": true,
+        "marginal_mc_iters": 10000,
+        "marginal_response_iters": 150
     },
     "dataset": {
-        "dataset_dir": "",
+        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v3/finalize_v2/dataset/2026_04_05_22_00_04",
         "save_dir": "",
         "n_scenarios": 25000,
-        "val_split": 0.12,
+        "val_split": 0.05,
         "n_workers": 8,
         "save_every_hands": 1000
     },
     "gto_ev_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 10,
+        "epochs": 2,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,
@@ -109,7 +111,7 @@
     "gto_probs_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 10,
+        "epochs": 2,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,
@@ -119,7 +121,7 @@
     "modelling_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 10,
+        "epochs": 4,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 10,
@@ -140,9 +142,9 @@
         "n_tables": 8
     },
     "pipeline": {
-        "run_gto_ev": true,
-        "run_gto_probs": true,
+        "run_gto_ev": false,
+        "run_gto_probs": false,
         "run_modelling": true,
-        "run_evaluation": true
+        "run_evaluation": false
     }
 }

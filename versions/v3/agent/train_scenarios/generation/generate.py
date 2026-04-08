@@ -93,8 +93,22 @@ def _get_solver(solver_name):
             "narrow_range": narrow_range,
             "expand_range": expand_range,
         }
+    elif solver_name == "v4":
+        from gpu_solver_v4 import (
+            gpu_equity_v3, compute_ev_v3,
+            get_position_range, narrow_range, expand_range,
+            compute_marginalized_action_probs, bayesian_range_update, filter_dead_combos,
+        )
+        return gpu_equity_v3, compute_ev_v3, {
+            "get_position_range": get_position_range,
+            "narrow_range": narrow_range,
+            "expand_range": expand_range,
+            "compute_marginalized_action_probs": compute_marginalized_action_probs,
+            "bayesian_range_update": bayesian_range_update,
+            "filter_dead_combos": filter_dead_combos,
+        }
     else:
-        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1', 'v2', or 'v3'.")
+        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1', 'v2', 'v3', or 'v4'.")
 
 
 def _get_board_cards(table):
@@ -599,26 +613,49 @@ def generate_scenario(config, device="mps"):
     max_actions = 4 * num_players
     action_history = []
 
-    # V3 solver params
+    # V3/V4 solver params
     eqr_enabled = config.get("eqr_enabled", True)
     combo_response_iters = config.get("combo_response_iters", 30)
     reraise_threshold = config.get("reraise_threshold", 0.75)
     weighted_sampling = config.get("weighted_sampling", True)
+    marginal_mc_iters = config.get("marginal_mc_iters", 3000)
+    marginal_response_iters = config.get("marginal_response_iters", 30)
+
+    # For v4: use v3 solver for normal EV computation
+    ev_solver_name = "v3" if solver_name == "v4" else solver_name
 
     ev_kwargs = {"device": device, "mc_iters": mc_iters}
-    if solver_name == "v2":
+    if ev_solver_name == "v2":
         ev_kwargs.update({
             "mdf_max_fold": mdf_max_fold,
             "reraise_pct": reraise_pct,
             "reraise_cap": reraise_cap,
         })
-    elif solver_name == "v3":
+    elif ev_solver_name in ("v3", "v4"):
         ev_kwargs.update({
             "eqr_enabled": eqr_enabled,
             "combo_response_iters": combo_response_iters,
             "reraise_threshold": reraise_threshold,
             "weighted_sampling": weighted_sampling,
         })
+
+    # V4: initialize Bayesian state for opponent modeling
+    bayesian_state = {}
+    modelling_decisions = []
+    if solver_name == "v4":
+        _, _, v4_modules = _get_solver("v4")
+        v4_get_position_range = v4_modules["get_position_range"]
+        v4_expand_range = v4_modules["expand_range"]
+        v4_compute_marg = v4_modules["compute_marginalized_action_probs"]
+        v4_bayes_update = v4_modules["bayesian_range_update"]
+        v4_filter_dead = v4_modules["filter_dead_combos"]
+
+        for pos in range(num_players):
+            ht = v4_get_position_range(pos, num_players)
+            combos = v4_expand_range(ht, set())
+            n_combos = combos.shape[0]
+            weights = torch.ones(n_combos, dtype=torch.float32) / max(n_combos, 1)
+            bayesian_state[pos] = {"hand_types": ht, "combos": combos, "weights": weights}
 
     for _ in range(max_actions):
         active_pos = table.active_player
@@ -629,7 +666,7 @@ def generate_scenario(config, device="mps"):
         # Compute ALL action EVs for the active player
         all_evs, meta = _compute_all_action_evs(
             table, active_pos, action_history, n_actions,
-            solver_name=solver_name, **ev_kwargs
+            solver_name=ev_solver_name, **ev_kwargs
         )
         if all_evs is None:
             return None
@@ -646,6 +683,61 @@ def generate_scenario(config, device="mps"):
             "action": None,  # no action yet at decision point
         })
         decisions.append((decision_snap_idx, active_pos, all_evs, meta))
+
+        # V4: compute marginalized action probs for opponent modeling
+        v4_per_combo_probs = None
+        v4_valid_mask = None
+        if solver_name == "v4" and active_pos in bayesian_state:
+            try:
+                bs = bayesian_state[active_pos]
+                board_ids = _get_board_cards(table)
+                dead = set(board_ids)
+                valid_combos, valid_weights = v4_filter_dead(
+                    bs["combos"], bs["weights"], dead
+                )
+                if valid_combos.shape[0] > 0:
+                    # Build opponent ranges from acting player's perspective
+                    _, _, solver_mods = _get_solver("v4")
+                    opp_ranges, opp_positions = _build_opponent_ranges(
+                        table, active_pos, action_history, solver_mods
+                    )
+
+                    hero_invested = table.start_credits - table.credits[active_pos]
+                    facing_bet = max(0, table.high_bet - table.bets[active_pos])
+                    act_stack = table.credits[active_pos]
+                    act_pot = table.pot
+                    hero_bets = table.bets[active_pos]
+                    eff_pot = max(act_pot - hero_bets, 1e-6)
+
+                    board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
+
+                    marg_probs, per_combo_probs = v4_compute_marg(
+                        valid_combos, valid_weights, board_t, opp_ranges,
+                        act_pot, facing_bet, act_stack, hero_invested,
+                        n_actions, table.raise_sizes[table.turn], eff_pot,
+                        temperature, big_blind,
+                        n_iters=marginal_mc_iters, device=device,
+                        hero_position=active_pos, street=table.turn,
+                        n_players=num_players,
+                        eqr_enabled=eqr_enabled,
+                        combo_response_iters=marginal_response_iters,
+                        reraise_threshold=reraise_threshold,
+                        weighted_sampling=weighted_sampling,
+                        action_history=action_history,
+                        opponent_positions=opp_positions,
+                    )
+                    modelling_decisions.append({
+                        "snap_idx": decision_snap_idx,
+                        "acting_pos": active_pos,
+                        "marg_probs": marg_probs,
+                        "pot": act_pot,
+                        "facing_bet": facing_bet,
+                    })
+                    v4_per_combo_probs = per_combo_probs
+                    # Build mask mapping valid combos back to full combo tensor
+                    # (for Bayesian update after action is sampled)
+            except Exception:
+                pass  # marginalization failed, continue with normal generation
 
         # Sample action from full EVs
         normalizer = big_blind * temperature
@@ -666,6 +758,32 @@ def generate_scenario(config, device="mps"):
 
         if act_type is not None:
             action_history.append((active_pos, act_type))
+
+        # V4: Bayesian range update after observing action
+        if solver_name == "v4" and v4_per_combo_probs is not None:
+            bs = bayesian_state[active_pos]
+            board_ids_upd = _get_board_cards(table)
+            dead_upd = set(board_ids_upd)
+            _, valid_weights_upd = v4_filter_dead(bs["combos"], bs["weights"], dead_upd)
+            updated_valid_weights = v4_bayes_update(
+                valid_weights_upd, v4_per_combo_probs, choice_idx
+            )
+            # Remap back: zero out dead combos, set valid ones to updated weights
+            new_full_weights = torch.zeros_like(bs["weights"])
+            dead_t = torch.tensor(sorted(dead_upd), dtype=torch.long) if dead_upd else torch.tensor([], dtype=torch.long)
+            c0 = bs["combos"][:, 0]
+            c1 = bs["combos"][:, 1]
+            if len(dead_t) > 0:
+                c0_dead = (c0.unsqueeze(1) == dead_t.unsqueeze(0)).any(dim=1)
+                c1_dead = (c1.unsqueeze(1) == dead_t.unsqueeze(0)).any(dim=1)
+                valid_mask = ~(c0_dead | c1_dead)
+            else:
+                valid_mask = torch.ones(len(bs["combos"]), dtype=torch.bool)
+            new_full_weights[valid_mask] = updated_valid_weights
+            total_w = new_full_weights.sum()
+            if total_w > 0:
+                new_full_weights = new_full_weights / total_w
+            bs["weights"] = new_full_weights
 
         # Execute action on table
         end, several_all_in, state, bet = table.step(action)
@@ -716,6 +834,40 @@ def generate_scenario(config, device="mps"):
             "num_players": num_players,
             "n_events": len(events),
         })
+
+    # V4: build modelling scenarios from observer perspectives
+    if solver_name == "v4" and modelling_decisions:
+        for md in modelling_decisions:
+            snap_idx = md["snap_idx"]
+            acting_pos = md["acting_pos"]
+            marg_probs = md["marg_probs"]
+
+            for observer_pos in range(num_players):
+                if observer_pos == acting_pos:
+                    continue
+                # Skip folded players
+                if table.players_state[observer_pos] < 0:
+                    continue
+
+                events = _rebuild_events(
+                    snapshots, table.deck, observer_pos,
+                    num_players, big_blind, small_blind, n_actions,
+                    up_to=snap_idx,
+                )
+                if len(events) < 2:
+                    continue
+
+                results.append({
+                    "events": events,
+                    "scenario_type": "modelling",
+                    "marginalized_action_probs": marg_probs.cpu().tolist()
+                        if hasattr(marg_probs, 'cpu') else list(marg_probs),
+                    "acting_pos": acting_pos,
+                    "pot": float(md["pot"]),
+                    "facing_bet": float(md["facing_bet"]),
+                    "num_players": num_players,
+                    "n_events": len(events),
+                })
 
     return results if results else None
 

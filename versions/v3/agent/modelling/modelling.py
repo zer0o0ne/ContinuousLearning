@@ -14,7 +14,7 @@ class Qwen3CrossAttention(nn.Module):
     context keys already have positional info from the decoder).
     """
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, dropout=0.0):
         super().__init__()
         self.n_heads = config.num_attention_heads
         self.n_kv_heads = config.num_key_value_heads
@@ -29,14 +29,16 @@ class Qwen3CrossAttention(nn.Module):
 
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, query, key_value, mask=None, q_position_embeddings=None):
+    def forward(self, query, key_value, mask=None, q_position_embeddings=None, kv_position_embeddings=None):
         """
         Args:
             query:     (B, Nq, d_model) — action embeddings
             key_value: (B, Nkv, d_model) — decoder output (context)
             mask:      (B, Nkv) float — 1 for real, 0 for padding
             q_position_embeddings: (cos, sin) tuple for RoPE on queries
+            kv_position_embeddings: (cos, sin) tuple for RoPE on keys
         Returns: (B, Nq, d_model)
         """
         B, Nq, _ = query.shape
@@ -49,7 +51,12 @@ class Qwen3CrossAttention(nn.Module):
         # RoPE on queries — gives each action a distinct positional signature
         if q_position_embeddings is not None:
             cos, sin = q_position_embeddings
-            q, _ = apply_rotary_pos_emb(q, q, cos, sin)  # only q matters
+            q, _ = apply_rotary_pos_emb(q, q, cos, sin)
+
+        # RoPE on keys — positional encoding for context tokens
+        if kv_position_embeddings is not None:
+            cos, sin = kv_position_embeddings
+            _, k = apply_rotary_pos_emb(k, k, cos, sin)
 
         # GQA: repeat K, V heads to match Q heads
         k = repeat_kv(k, self.n_kv_groups)
@@ -64,6 +71,7 @@ class Qwen3CrossAttention(nn.Module):
             attn_weights = attn_weights + attn_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
         out = torch.matmul(attn_weights, v)  # (B, n_heads, Nq, head_dim)
 
         out = out.transpose(1, 2).contiguous().reshape(B, Nq, self.n_heads * self.head_dim)
@@ -78,7 +86,7 @@ class ModellingHead(nn.Module):
     Output: (batch, n_actions, d_model) — one embedding vector per action.
     """
 
-    def __init__(self, d_model, n_actions, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len):
+    def __init__(self, d_model, n_actions, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len, dropout=0.1):
         super().__init__()
         self.n_actions = n_actions
         self.d_model = d_model
@@ -103,11 +111,12 @@ class ModellingHead(nn.Module):
 
         for i in range(n_layers):
             self.cross_norms.append(Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps))
-            self.cross_attns.append(Qwen3CrossAttention(self.config))
+            self.cross_attns.append(Qwen3CrossAttention(self.config, dropout=dropout))
             self.self_attn_layers.append(Qwen3DecoderLayer(self.config, layer_idx=i))
 
         self.rope = Qwen3RotaryEmbedding(config=self.config)
         self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
+        self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, context, mask=None):
         """
@@ -116,23 +125,29 @@ class ModellingHead(nn.Module):
             mask: (batch, seq_len) float — 1 for real, 0 for padding
         Returns: (batch, n_actions, d_model) — action embedding vectors
         """
-        batch_size = context.shape[0]
+        batch_size, seq_len = context.shape[0], context.shape[1]
 
         # Initialize action queries from learnable embeddings
         action_ids = torch.arange(self.n_actions, device=context.device)
         x = self.action_embeddings(action_ids).unsqueeze(0).expand(batch_size, -1, -1)
 
-        # RoPE for Qwen3 self-attention over action tokens
+        # RoPE for action queries (self-attention + cross-attention Q)
         position_ids = torch.arange(self.n_actions, device=context.device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.rope(x, position_ids)
+
+        # RoPE for context keys (cross-attention K)
+        kv_position_ids = torch.arange(seq_len, device=context.device).unsqueeze(0).expand(batch_size, -1)
+        kv_position_embeddings = self.rope(context, kv_position_ids)
 
         for cross_norm, cross_attn, self_attn in zip(
             self.cross_norms, self.cross_attns, self.self_attn_layers
         ):
             # Cross-attention: action embeddings (Q) attend to decoder output (K, V)
             residual = x
-            x = residual + cross_attn(cross_norm(x), context, mask=mask,
-                                      q_position_embeddings=position_embeddings)
+            x = residual + self.resid_dropout(cross_attn(
+                cross_norm(x), context, mask=mask,
+                q_position_embeddings=position_embeddings,
+                kv_position_embeddings=kv_position_embeddings))
 
             # Qwen3 self-attention + FFN among action tokens (has its own pre-norm)
             x = self_attn(x, position_ids=position_ids, position_embeddings=position_embeddings)

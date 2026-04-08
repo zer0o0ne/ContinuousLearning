@@ -59,6 +59,7 @@ class ASI(nn.Module):
             n_layers=arch.get("n_modelling_layers", 4),
             d_ff=d_ff,
             max_seq_len=head_max_seq_len,
+            dropout=arch.get("modelling_dropout", 0.1),
         )
 
         self.device_ = "cpu"

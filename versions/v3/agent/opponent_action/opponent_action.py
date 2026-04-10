@@ -46,8 +46,9 @@ class OpponentActionHead(nn.Module):
 
         x = context
         for layer in self.layers:
-            x = layer(x, position_ids=position_ids, position_embeddings=position_embeddings,
-                      attention_mask=attn_mask)
+            layer_out = layer(x, position_ids=position_ids, position_embeddings=position_embeddings,
+                              attention_mask=attn_mask)
+            x = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         x = self.norm(x)
         if mask is not None:

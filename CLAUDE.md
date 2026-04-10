@@ -16,6 +16,7 @@ source venv/bin/activate
 
 Device auto-detected: CUDA → MPS → CPU. All Python commands must use the venv.
 ALL CODE EDITS MUST MODIFY ONLY DIRECTORY /versoins/<version>!
+ALL DATA MUST STORE OUTSIDE THE /versions DIRECTORY INTO /data DIRECTORY!
 
 ## Project Overview
 

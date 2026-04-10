@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from agent.agent import ASI
-from agent.perception.opponent_embeddings import OpponentEmbeddingTable
 from env.table import Table
 from utils import get_amp_config
 
@@ -100,15 +99,12 @@ def _load_agents(agents_dir, config, device, log, fallback_temperature):
             log(f"WARNING: no temperature in checkpoint for '{name}', using config fallback ({fallback_temperature})")
             temperature = fallback_temperature
 
-        d_model = config.get("architecture", {}).get("d_model", 128)
-        opp_emb_enabled = config.get("architecture", {}).get("opponent_embedding", {}).get("enabled", False)
         agents.append({
             "agent": agent,
             "norm_stats": norm_stats,
             "name": name,
             "temperature": temperature,
             "stack": 0.0,  # initialized later
-            "opponent_emb_table": OpponentEmbeddingTable(d_model) if opp_emb_enabled else None,
         })
         log(f"Loaded agent '{name}' from {ckpt_path} (temperature={temperature})")
 
@@ -377,19 +373,14 @@ def run_evaluation(config, device, log):
 
                     all_events = []
                     temperatures = []
-                    opp_tables = []
                     for pidx, ti, agent_info, events in group_items:
                         _normalize_events_inplace(events, agent_info["norm_stats"])
                         all_events.append(events)
                         temperatures.append(agent_info["temperature"])
-                        opp_tables.append(agent_info.get("opponent_emb_table"))
-
-                    opp_table = opp_tables[0]
 
                     with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                         out = agent_model.forward_batch(
                             all_events, skip_memory=True,
-                            opponent_emb_table=opp_table,
                         )
                     all_logits = out["action_logits"]
 

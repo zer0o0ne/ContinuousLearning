@@ -440,6 +440,33 @@ def _equity_per_combo_batch(hero_cards, board_cards, combos,
 # Main EV calculator
 # ---------------------------------------------------------------------------
 
+def _compute_reraise_threshold(call_cost, pot_after_raise, street, stack, pot):
+    """Compute dynamic reraise threshold based on pot odds, street, and SPR.
+
+    Returns a threshold (0.5-0.95) for opponent equity above which they reraise.
+    """
+    # Base: inverse pot odds the opponent gets
+    if pot_after_raise + call_cost > 0:
+        base = 1.0 - (call_cost / (pot_after_raise + call_cost))
+    else:
+        base = 0.75
+
+    # Street factor: tighter reraise on later streets
+    street_factors = {0: 0.85, 1: 0.90, 2: 0.95, 3: 1.0}
+    street_factor = street_factors.get(street, 1.0)
+
+    # SPR factor: more shoving when shallow
+    spr = stack / max(pot, 1e-6)
+    if spr < 2.0:
+        spr_factor = 0.85
+    elif spr < 4.0:
+        spr_factor = 0.92
+    else:
+        spr_factor = 1.0
+
+    return max(0.5, min(0.95, base * street_factor * spr_factor))
+
+
 def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
                   pot, facing_bet, stack, hero_invested,
                   raise_frac=1.0, n_iters=3000, device="mps",
@@ -449,7 +476,8 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
                   reraise_threshold=0.75,
                   weighted_sampling=True,
                   action_history=None,
-                  opponent_positions=None):
+                  opponent_positions=None,
+                  dynamic_reraise=False):
     """Compute EV for fold/call/raise with per-combo response and EQR.
 
     Args:
@@ -498,6 +526,11 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
     active_positions = list(opponent_positions) + [hero_position] if opponent_positions else None
     eqr = _get_eqr(hero_position, street, n_players, active_positions) if eqr_enabled else 1.0
 
+    # Fix 11: SPR-adjusted EQR — positional advantage vanishes at shallow SPR
+    spr = stack / max(pot, 1e-6)
+    spr_eqr_factor = min(1.0, spr / 6.0)
+    eqr = 1.0 + (eqr - 1.0) * spr_eqr_factor
+
     # --- Fold EV ---
     fold_ev = -hero_invested
 
@@ -507,6 +540,10 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
     total_call_investment = hero_invested + facing_bet
     call_ev = eff_equity * (pot - hero_invested) + (1 - eff_equity) * (-total_call_investment)
 
+    # Fix 13: street discount — earlier streets have more uncertainty ahead
+    _street_discount = {0: 0.92, 1: 0.95, 2: 0.98, 3: 1.0}.get(street, 1.0)
+    call_ev *= _street_discount
+
     # --- Raise EV with per-combo opponent response (Improvement 1) ---
     raise_amount = min(facing_bet + raise_frac * (pot + facing_bet), stack)
     total_raise = hero_invested + raise_amount
@@ -515,10 +552,18 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
     # Pot-odds based fold threshold
     call_cost = raise_amount  # what opponent must put in to call
     pot_after_raise = new_pot
-    if pot_after_raise > 0:
-        fold_threshold = call_cost / pot_after_raise
-    else:
-        fold_threshold = 0.5
+
+    # Fix 8: nonlinear fold threshold — S-curve closer to real solver outputs
+    raw_fold_threshold = call_cost / pot_after_raise if pot_after_raise > 0 else 0.5
+    fold_threshold = raw_fold_threshold ** 0.85
+
+    # Fix 14: IP/OOP fold threshold correction
+    if opponent_positions and street > 0:
+        max_opp_pos = max(opponent_positions)
+        if max_opp_pos < hero_position:
+            fold_threshold *= 1.08  # opponents OOP → fold more
+        elif min(opponent_positions) > hero_position:
+            fold_threshold *= 0.95  # opponents IP → fold less
 
     # Use primary opponent (first) for per-combo response classification
     # For multiway: use first opponent's response, but equity vs all callers
@@ -545,6 +590,16 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
         p_fold = fold_mask.float().sum().item() / n_total if n_total > 0 else 0.0
         p_reraise = reraise_mask.float().sum().item() / n_total if n_total > 0 else 0.0
         p_call = call_mask.float().sum().item() / n_total if n_total > 0 else 1.0
+
+        # Fix 15: blocker-adjusted fold equity
+        mean_opp_eq = opp_eq_cpu.mean().item()
+        blocker_adj = 1.0 + (0.5 - mean_opp_eq) * 0.12
+        p_fold = p_fold * blocker_adj
+        p_total = p_fold + p_call + p_reraise
+        if p_total > 1e-6:
+            p_fold /= p_total
+            p_call /= p_total
+            p_reraise /= p_total
 
         # Equity vs callers only
         if call_mask.any():
@@ -587,10 +642,68 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
 
         showdown_ev = eff_eq_callers * (new_pot - total_raise) + (1 - eff_eq_callers) * (-total_raise)
 
+        # Fix 2+7+10+12: hero continuing on reraise
+        if p_reraise > 0 and reraise_mask.any():
+            reraising_combos = primary_combos[reraise_mask]
+            all_reraise_combos = [
+                reraising_combos if j == primary_idx else c
+                for j, c in enumerate(opp_combos)
+            ]
+
+            # Weights for reraising combos
+            reraise_weights = None
+            if combo_weights is not None and combo_weights[primary_idx] is not None:
+                rw = combo_weights[primary_idx][reraise_mask]
+                rw_sum = rw.sum()
+                if rw_sum > 0:
+                    rw = rw / rw_sum
+                reraise_weights = [
+                    rw if j == primary_idx else
+                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
+                    for j in range(len(opp_combos))
+                ]
+
+            eq_vs_reraisers = gpu_equity_v3(
+                hero_cards, board_cards, all_reraise_combos,
+                n_iters, device, reraise_weights
+            )
+
+            # Fix 12: dynamic reraise sizing — SPR/street-aware
+            if dynamic_reraise:
+                actual_reraise_threshold_val = _compute_reraise_threshold(
+                    call_cost, pot_after_raise, street, stack, pot)
+            _reraise_spr = stack / max(pot, 1e-6)
+            if _reraise_spr < 3.0:
+                reraise_size = stack  # shallow → jam
+            else:
+                _street_mult = {0: 3.0, 1: 2.5, 2: 2.2, 3: 2.0}.get(street, 2.5)
+                reraise_size = min(raise_amount * _street_mult, stack)
+            total_reraise_cost = hero_invested + reraise_size
+            reraise_pot = new_pot + reraise_size
+            hero_call_cost = reraise_size - raise_amount
+            hero_continue_threshold = (
+                hero_call_cost / (reraise_pot + hero_call_cost)
+                if (reraise_pot + hero_call_cost) > 0 else 0.5
+            )
+
+            # Fix 7: soft continue — sigmoid instead of binary threshold
+            p_hero_continues = 1.0 / (1.0 + math.exp(-15.0 * (eq_vs_reraisers - hero_continue_threshold)))
+            eff_eq_reraise = max(0.0, min(1.0, eq_vs_reraisers * eqr)) if eqr_enabled else eq_vs_reraisers
+            ev_continue = eff_eq_reraise * (reraise_pot - total_reraise_cost) + \
+                          (1 - eff_eq_reraise) * (-total_reraise_cost)
+            ev_on_reraise = p_hero_continues * ev_continue + (1 - p_hero_continues) * (-total_raise)
+
+            # Fix 10: geometric approximation for infinite reraise tree
+            reraise_discount = 0.3
+            geometric_factor = min(1.5, 1.0 / max(0.5, 1.0 - p_reraise * reraise_discount))
+            ev_on_reraise *= geometric_factor
+        else:
+            ev_on_reraise = -total_raise
+
         raise_ev = (
             p_fold * (pot - hero_invested)     # opponent folds, we win pot
             + p_call * showdown_ev             # opponent calls, showdown
-            + p_reraise * (-total_raise)       # opponent reraises, we fold
+            + p_reraise * ev_on_reraise        # opponent reraises, hero decides
         )
     else:
         # No opponents — raise always wins pot

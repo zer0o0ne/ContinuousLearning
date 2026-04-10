@@ -284,7 +284,7 @@ class Perception(nn.Module):
         self.d_model = d_model
 
     def forward_batch(self, event_sequences, device="cpu", skip_memory=True,
-                      opponent_emb_table=None):
+                      skip_opponent_emb=True, opponent_emb_table=None):
         """
         Batch-parallel forward over event sequences.
 
@@ -292,9 +292,11 @@ class Perception(nn.Module):
             event_sequences: list of lists of event dicts
             device: torch device
             skip_memory: if True, encoder output goes directly to decoder
+            skip_opponent_emb: if True, skip opponent GRU embedding injection
             opponent_emb_table: optional OpponentEmbeddingTable instance.
-                When provided and opp_emb_enabled, opponent embeddings are
-                injected into hand card positions and updated via GRU after encoding.
+                Only used when skip_opponent_emb=False. When provided and
+                opp_emb_enabled, opponent embeddings are injected into hand card
+                positions and updated via GRU after encoding.
                 The table is mutated in-place (GRU updates write back).
 
         Returns: tuple (output, encoded, mask)
@@ -305,7 +307,9 @@ class Perception(nn.Module):
         # Build opponent embeddings per event if available
         opponent_embs_per_event = None
         opp_event_map = None  # tracks (batch_idx, event_idx) -> opponent_id for GRU update
-        if self.opp_emb_enabled and opponent_emb_table is not None:
+        use_opp_emb = (not skip_opponent_emb and self.opp_emb_enabled
+                       and opponent_emb_table is not None)
+        if use_opp_emb:
             opponent_embs_per_event = []
             opp_event_map = []  # parallel list: opponent_id or None per flat event
             for seq in event_sequences:
@@ -333,7 +337,7 @@ class Perception(nn.Module):
         mask = mask[:, ::C]  # (B, N) — all 7 positions per event share same mask value
 
         # GRU update: compute per-opponent signal from mean-pooled encoder output
-        if self.opp_emb_enabled and opponent_emb_table is not None and opp_event_map is not None:
+        if use_opp_emb and opp_event_map is not None:
             # Flatten encoded to (total_events, d_model) matching opp_event_map order
             encoded_flat = []
             for b_idx, seq in enumerate(event_sequences):

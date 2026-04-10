@@ -89,6 +89,7 @@ def main():
 
     from agent.train_scenarios.gto_ev_predict.train import train_gto_ev
     from agent.train_scenarios.gto_probs_predict.train import train_gto_probs
+    from agent.train_scenarios.gto_predict.train import train_gto
     from agent.train_scenarios.modelling_predict.train import train_modelling
     from evaluation.evaluate import run_evaluation
 
@@ -98,6 +99,7 @@ def main():
 
     needs_training = (pipeline_cfg.get("run_gto_ev", True)
                       or pipeline_cfg.get("run_gto_probs", False)
+                      or pipeline_cfg.get("run_gto_training", False)
                       or pipeline_cfg.get("run_modelling", False))
 
     # --- Load/generate dataset only if training is enabled ---
@@ -174,6 +176,15 @@ def main():
                     if os.path.exists(best_ckpt):
                         agent.load_checkpoint(best_ckpt)
 
+            if pipeline_cfg.get("run_gto_training", False):
+                gto_train_cfg = _merge_train_config(config, "gto_train")
+                _, gto_run_dir = train_gto(agent, gto_train_cfg, device, agent_log,
+                                scenarios_override=modified, temperature=agent_temperature)
+                if gto_run_dir:
+                    best_ckpt = os.path.join(gto_run_dir, "best.pt")
+                    if os.path.exists(best_ckpt):
+                        agent.load_checkpoint(best_ckpt)
+
             if pipeline_cfg.get("run_modelling", False):
                 modelling_cfg = _merge_train_config(config, "modelling_train")
                 train_modelling(agent, modelling_cfg, device, agent_log,
@@ -205,6 +216,15 @@ def main():
                             scenarios_override=base_scenarios, temperature=single_temperature)
             if probs_run_dir:
                 best_ckpt = os.path.join(probs_run_dir, "best.pt")
+                if os.path.exists(best_ckpt):
+                    agent.load_checkpoint(best_ckpt)
+
+        if pipeline_cfg.get("run_gto_training", False):
+            gto_train_cfg = _merge_train_config(config, "gto_train")
+            _, gto_run_dir = train_gto(agent, gto_train_cfg, device, log,
+                            scenarios_override=base_scenarios, temperature=single_temperature)
+            if gto_run_dir:
+                best_ckpt = os.path.join(gto_run_dir, "best.pt")
                 if os.path.exists(best_ckpt):
                     agent.load_checkpoint(best_ckpt)
 

@@ -1,6 +1,6 @@
 {
-    "name": "test_modeling",
-    "agent_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v3/test_modeling/gto_probs_predict/2026_04_06_20_00_08",
+    "name": "finalize_v3",
+    "agent_dir": "",
     "architecture": {
         "d_model": 256,
         "n_heads": 8,
@@ -10,6 +10,7 @@
         "n_decoder_layers": 4,
         "n_value_layers": 4,
         "n_action_layers": 6,
+        "n_opponent_action_layers": 6,
         "n_modelling_layers": 4,
         "max_seq_len": 2048,
         "max_players": 9,
@@ -20,7 +21,7 @@
             "beam_width": 8
         },
         "opponent_embedding": {
-            "enabled": true
+            "enabled": false
         }
     },
     "multi_agent": {
@@ -79,7 +80,7 @@
         "big_blind": 10
     },
     "solver": {
-        "type": "v4",
+        "type": "v3",
         "mc_iterations": 10000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
@@ -101,32 +102,43 @@
     "gto_ev_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 2,
+        "epochs": 5,
         "max_grad_norm": 1.0,
         "log_every": 10,
-        "val_every": 10,
-        "interrupt_after_fails": 20,
+        "val_every": 50,
+        "interrupt_after_fails": 10,
         "scheduler_eta_min": 3e-6
     },
     "gto_probs_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 2,
+        "epochs": 5,
         "max_grad_norm": 1.0,
         "log_every": 10,
-        "val_every": 10,
-        "interrupt_after_fails": 20,
+        "val_every": 50,
+        "interrupt_after_fails": 10,
         "scheduler_eta_min": 3e-6
     },
     "modelling_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 4,
+        "epochs": 5,
         "max_grad_norm": 1.0,
         "log_every": 10,
-        "val_every": 10,
-        "interrupt_after_fails": 20,
+        "val_every": 50,
+        "interrupt_after_fails": 10,
         "scheduler_eta_min": 3e-6
+    },
+    "gto_train": {
+        "lr": 5e-5,
+        "batch_size": 64,
+        "epochs": 10,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 50,
+        "interrupt_after_fails": 10,
+        "scheduler_eta_min": 1e-6,
+        "action_loss_weight": 1.0
     },
     "evaluation": {
         "agents_dir": "5_final_agents",
@@ -139,12 +151,13 @@
         "max_stack_cap": 3000,
         "log_every": 1000,
         "action_temperature": 0.3,
-        "n_tables": 8
+        "n_tables": 16
     },
     "pipeline": {
         "run_gto_ev": false,
         "run_gto_probs": false,
+        "run_gto_training": true,
         "run_modelling": true,
-        "run_evaluation": false
+        "run_evaluation": true
     }
 }

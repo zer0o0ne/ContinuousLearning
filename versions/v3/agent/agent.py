@@ -6,6 +6,7 @@ from agent.perception.perception import Perception
 from agent.value.value import ValueHead
 from agent.action.action import ActionHead
 from agent.modelling.modelling import ModellingHead
+from agent.opponent_action.opponent_action import OpponentActionHead
 
 
 class ASI(nn.Module):
@@ -51,6 +52,15 @@ class ASI(nn.Module):
             d_ff=d_ff,
             max_seq_len=head_max_seq_len,
         )
+        self.opponent_action_head = OpponentActionHead(
+            d_model=d_model,
+            n_actions=n_actions,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            n_layers=arch.get("n_opponent_action_layers", 2),
+            d_ff=d_ff,
+            max_seq_len=head_max_seq_len,
+        )
         self.modelling_head = ModellingHead(
             d_model=d_model,
             n_actions=n_actions,
@@ -67,16 +77,18 @@ class ASI(nn.Module):
         self.optimizer = None
         self.loss_buffer = []
 
-    def forward_batch(self, event_sequences, skip_memory=True, opponent_emb_table=None):
+    def forward_batch(self, event_sequences, skip_memory=True, skip_opponent_emb=True,
+                       opponent_emb_table=None):
         """
         Batch-parallel forward pass over event sequences.
 
         Args:
             event_sequences: list of lists of event dicts
             skip_memory: bypass memory retrieval (True for gto_ev_predict)
+            skip_opponent_emb: bypass opponent GRU embedding injection (True by default)
             opponent_emb_table: optional OpponentEmbeddingTable for opponent modeling.
-                When provided, opponent embeddings are injected into perception and
-                updated via GRU. The table is mutated in-place.
+                Only used when skip_opponent_emb=False. When provided, opponent embeddings
+                are injected into perception and updated via GRU. The table is mutated in-place.
         Returns: {"action_logits": (B, n_actions), "value": (B, 1)}
         """
         # Skip gradient tracking for frozen modules (saves memory/compute)
@@ -86,20 +98,28 @@ class ASI(nn.Module):
             with torch.no_grad():
                 perception_out, encoded, mask = self.perception.forward_batch(
                     event_sequences, device=self.device_, skip_memory=skip_memory,
+                    skip_opponent_emb=skip_opponent_emb,
                     opponent_emb_table=opponent_emb_table,
                 )
             perception_out = perception_out.detach()
         else:
             perception_out, encoded, mask = self.perception.forward_batch(
                 event_sequences, device=self.device_, skip_memory=skip_memory,
+                skip_opponent_emb=skip_opponent_emb,
                 opponent_emb_table=opponent_emb_table,
             )
 
         value = self.value_head(perception_out, mask=mask)
         action_logits = self.action_head(perception_out, mask=mask)
+        opponent_action_logits = self.opponent_action_head(perception_out, mask=mask)
         action_embeddings = self.modelling_head(perception_out, mask=mask)
 
-        return {"action_logits": action_logits, "value": value, "action_embeddings": action_embeddings}
+        return {
+            "action_logits": action_logits,
+            "opponent_action_logits": opponent_action_logits,
+            "value": value,
+            "action_embeddings": action_embeddings,
+        }
 
     def load_checkpoint(self, path):
         """Load model weights from a checkpoint file or directory.

@@ -300,6 +300,7 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
                 "weighted_sampling": weighted_sampling,
                 "action_history": action_history,
                 "opponent_positions": opp_positions,
+                "dynamic_reraise": True,
             }
         else:
             ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
@@ -448,6 +449,7 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                 "weighted_sampling": weighted_sampling,
                 "action_history": action_history,
                 "opponent_positions": opp_positions,
+                "dynamic_reraise": True,
             }
         else:
             ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
@@ -740,7 +742,8 @@ def generate_scenario(config, device="mps"):
                 pass  # marginalization failed, continue with normal generation
 
         # Sample action from full EVs
-        normalizer = big_blind * temperature
+        # Fix 5: normalize by pot size, not just big blind
+        normalizer = max(meta["pot"] + meta["facing_bet"], big_blind) * temperature
         probs = F.softmax(all_evs / normalizer, dim=0)
         choice_idx = torch.multinomial(probs, 1).item()
         action = torch.zeros(n_actions, dtype=torch.float32)
@@ -805,7 +808,6 @@ def generate_scenario(config, device="mps"):
         return None
 
     # Build one sample per decision point
-    normalizer = big_blind * temperature
     results = []
     for snap_idx, player_pos, all_evs, meta in decisions:
         # Rebuild events from this player's perspective, up to the decision
@@ -819,6 +821,8 @@ def generate_scenario(config, device="mps"):
             continue
 
         best_ev = float(all_evs.max().item())
+        # Fix 5: normalize by pot size, not just big blind
+        normalizer = max(meta["pot"] + meta["facing_bet"], big_blind) * temperature
         action_probs = F.softmax(all_evs / normalizer, dim=0)
 
         results.append({

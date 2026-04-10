@@ -150,6 +150,7 @@ class ModellingHead(nn.Module):
                 kv_position_embeddings=kv_position_embeddings))
 
             # Qwen3 self-attention + FFN among action tokens (has its own pre-norm)
-            x = self_attn(x, position_ids=position_ids, position_embeddings=position_embeddings)
+            layer_out = self_attn(x, position_ids=position_ids, position_embeddings=position_embeddings)
+            x = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         return self.norm(x)

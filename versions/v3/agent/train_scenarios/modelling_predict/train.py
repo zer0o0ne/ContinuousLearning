@@ -14,7 +14,7 @@ import copy
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import DataLoader, random_split, Sampler
+from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
@@ -226,18 +226,16 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
     _normalize_action_evs(scenarios, norm_stats)  # BEFORE _normalize_scenarios (uses raw big_blind)
     _normalize_scenarios(scenarios, norm_stats)
 
-    # Train/val split
+    # Train/val split (hand-aware: no hand leaks between sets)
+    from agent.train_scenarios.split import hand_aware_split
     dataset = GTOModellingDataset(scenarios)
-    val_size = max(1, int(len(dataset) * val_split))
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size],
-                                              generator=torch.Generator().manual_seed(42))
+    train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
 
     train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=batch_collate)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=batch_collate)
 
-    log(f"Train: {train_size}, Val: {val_size}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
+    log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:
         log(f"Validation every {val_every} steps")
     if interrupt_after_fails:

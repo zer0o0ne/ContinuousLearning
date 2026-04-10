@@ -1005,6 +1005,8 @@ def _generate_worker(args):
     for _ in range(n_hands):
         result = generate_scenario(config, device=device)
         if result is not None:
+            for s in result:
+                s["hand_id"] = worker_id
             scenarios.extend(result)
         else:
             failed += 1
@@ -1109,10 +1111,14 @@ def generate_dataset(config, save_dir, log=None):
         failed = 0
         hands_done = 0
         last_save_at = 0
+        hand_id = 0
         for _ in tqdm(range(n_scenarios), desc="Generating hands"):
             result = generate_scenario(config, device=device)
             if result is not None:
+                for s in result:
+                    s["hand_id"] = hand_id
                 scenarios.extend(result)
+                hand_id += 1
             else:
                 failed += 1
             hands_done += 1

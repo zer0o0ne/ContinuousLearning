@@ -16,10 +16,15 @@ def _infer_hand_ids(scenarios):
     Scenarios from the same hand are always contiguous in the dataset
     (generate_scenario returns a list per hand, extended sequentially).
 
-    Detects boundaries using three signals:
-    1. num_players changes → definitely new hand
-    2. Community cards contradict known board → new hand
-    3. Same hero_pos appears with different hole cards → new hand
+    Only compares consecutive pairs (no accumulated state) to guarantee
+    that scenarios from the same hand are NEVER split into different groups.
+    This may merge consecutive hands (false negatives), but never falsely
+    splits a hand (no false positives = no data leakage).
+
+    Signals checked between consecutive scenarios:
+    1. num_players changes → new hand
+    2. Community cards contradict → new hand
+    3. Same hero_pos with different hole cards → new hand
 
     Returns:
         list of int hand_ids, one per scenario
@@ -27,61 +32,39 @@ def _infer_hand_ids(scenarios):
     if not scenarios:
         return []
 
-    def _get_fingerprint(scenario):
-        """Extract (hero_pos, hand_tuple) from a scenario."""
-        last_event = scenario["events"][-1]
-        return last_event["hero_pos"], tuple(last_event["hand"])
-
     hand_ids = [0]
     hand_id = 0
-    known_board = [None] * 5
-    # Track hero hands seen in current hand group: {hero_pos: hand_tuple}
-    seen_heroes = {}
-
-    # Initialize from first scenario
-    first_table = scenarios[0]["events"][-1]["table"]
-    for j in range(5):
-        if first_table[j] != -1:
-            known_board[j] = first_table[j]
-
-    hero_pos, hero_hand = _get_fingerprint(scenarios[0])
-    seen_heroes[hero_pos] = hero_hand
-    prev_num_players = scenarios[0]["num_players"]
 
     for i in range(1, len(scenarios)):
-        table = scenarios[i]["events"][-1]["table"]
-        num_players = scenarios[i]["num_players"]
-        hero_pos, hero_hand = _get_fingerprint(scenarios[i])
+        prev = scenarios[i - 1]
+        curr = scenarios[i]
 
-        # Check compatibility
         new_hand = False
 
-        if num_players != prev_num_players:
+        # 1. num_players changed
+        if curr["num_players"] != prev["num_players"]:
             new_hand = True
-        else:
-            # Check community cards
+
+        # 2. Community cards conflict between consecutive scenarios
+        if not new_hand:
+            prev_table = prev["events"][-1]["table"]
+            curr_table = curr["events"][-1]["table"]
             for j in range(5):
-                if table[j] != -1 and known_board[j] is not None and known_board[j] != table[j]:
+                if prev_table[j] != -1 and curr_table[j] != -1 and prev_table[j] != curr_table[j]:
                     new_hand = True
                     break
 
-            # Check hero identity: same position must have same cards
-            if not new_hand and hero_pos in seen_heroes:
-                if seen_heroes[hero_pos] != hero_hand:
+        # 3. Same hero_pos with different hole cards
+        if not new_hand:
+            prev_hero = prev["events"][-1]["hero_pos"]
+            curr_hero = curr["events"][-1]["hero_pos"]
+            if prev_hero == curr_hero:
+                if tuple(prev["events"][-1]["hand"]) != tuple(curr["events"][-1]["hand"]):
                     new_hand = True
 
         if new_hand:
             hand_id += 1
-            known_board = [None] * 5
-            seen_heroes = {}
 
-        # Update known board
-        for j in range(5):
-            if table[j] != -1:
-                known_board[j] = table[j]
-
-        seen_heroes[hero_pos] = hero_hand
-        prev_num_players = num_players
         hand_ids.append(hand_id)
 
     return hand_ids

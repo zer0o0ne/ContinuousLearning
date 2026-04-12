@@ -149,7 +149,12 @@ def main():
             agent = ASI(agent_log, config)
             agent.set_device(device)
             if agent_dir:
-                agent.load_checkpoint(agent_dir)
+                # Try per-agent checkpoint first, fall back to shared agent_dir
+                per_agent_dir = os.path.join(agent_dir, agent_name)
+                if os.path.isdir(per_agent_dir):
+                    agent.load_checkpoint(per_agent_dir)
+                else:
+                    agent.load_checkpoint(agent_dir)
             else:
                 agent_log("Agent initialized randomly")
 

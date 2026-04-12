@@ -174,9 +174,12 @@ class ASI(nn.Module):
         ckpt_path = path
         if os.path.isdir(path):
             ckpt_path = os.path.join(path, "best.pt")
+            if not os.path.exists(ckpt_path):
+                # Search in scenario subdirectories (gto_predict/<timestamp>/best.pt, etc.)
+                ckpt_path = self._find_best_checkpoint(path)
 
-        if not os.path.exists(ckpt_path):
-            self.log(f"WARNING: checkpoint {ckpt_path} not found, agent initialized randomly")
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            self.log(f"WARNING: checkpoint {path} not found, agent initialized randomly")
             return
 
         ckpt = torch.load(ckpt_path, weights_only=False, map_location=self.device_)
@@ -201,6 +204,25 @@ class ASI(nn.Module):
             self.log(f"Loaded agent from {ckpt_path} (all parameters matched)")
         elif not missing:
             self.log(f"Loaded agent from {ckpt_path}")
+
+    @staticmethod
+    def _find_best_checkpoint(agent_dir):
+        """Search scenario subdirectories for the best checkpoint."""
+        import os
+        for scenario in ("gto_predict", "gto_probs_predict", "modelling_predict", "gto_ev_predict"):
+            scenario_dir = os.path.join(agent_dir, scenario)
+            if not os.path.isdir(scenario_dir):
+                continue
+            subdirs = sorted(
+                [d for d in os.listdir(scenario_dir)
+                 if os.path.isdir(os.path.join(scenario_dir, d))],
+                reverse=True,
+            )
+            for subdir in subdirs:
+                ckpt_path = os.path.join(scenario_dir, subdir, "best.pt")
+                if os.path.exists(ckpt_path):
+                    return ckpt_path
+        return None
 
     def set_device(self, device):
         self.device_ = device

@@ -215,10 +215,11 @@ def train_opponent_action(agent, train_cfg, device, log,
         log("No checkpoint norm stats — computing from opponent scenarios")
     log("Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
 
-    # Train/val split (hand-aware)
-    from agent.train_scenarios.split import hand_aware_split
+    # Train/val split (hand-aware, mapped to expanded indices)
+    from agent.train_scenarios.split import hand_aware_split_expanded
     dataset = OpponentActionDataset(scenarios, norm_stats=norm_stats)
-    train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
+    train_dataset, val_dataset = hand_aware_split_expanded(
+        dataset, scenarios, val_split, dataset.indices)
 
     log(f"Expanded samples: {len(dataset)} (train: {len(train_dataset)}, val: {len(val_dataset)})")
 

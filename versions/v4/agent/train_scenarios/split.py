@@ -114,3 +114,56 @@ def hand_aware_split(dataset, scenarios, val_split, seed=42):
             train_indices.extend(indices)
 
     return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
+def hand_aware_split_expanded(dataset, scenarios, val_split, expanded_indices, seed=42):
+    """Split an expanded dataset by hand, mapping scenario-level hands to expanded indices.
+
+    Some datasets (e.g. OpponentActionDataset) expand each scenario into
+    multiple samples (one per hero_position). This function splits by hand
+    at the scenario level, then maps to the correct expanded indices.
+
+    Args:
+        dataset: PyTorch Dataset with expanded indexing
+        scenarios: raw scenario list (for hand_id extraction)
+        val_split: fraction of hands to use for validation
+        expanded_indices: list of (scenario_idx, ...) tuples from dataset.indices
+        seed: random seed for reproducibility
+
+    Returns:
+        (train_dataset, val_dataset) as Subset objects
+    """
+    # Get hand_ids per scenario
+    if scenarios and "hand_id" in scenarios[0]:
+        hand_ids = [s["hand_id"] for s in scenarios]
+    else:
+        hand_ids = _infer_hand_ids(scenarios)
+
+    # Group scenario indices by hand_id
+    hand_to_scenarios = defaultdict(set)
+    for s_idx, hid in enumerate(hand_ids):
+        hand_to_scenarios[hid].add(s_idx)
+
+    # Shuffle and split hand_ids
+    unique_hands = list(hand_to_scenarios.keys())
+    rng = random.Random(seed)
+    rng.shuffle(unique_hands)
+
+    val_n_hands = max(1, int(len(unique_hands) * val_split))
+    val_hands = set(unique_hands[:val_n_hands])
+
+    # Build val scenario set
+    val_scenarios = set()
+    for hid in val_hands:
+        val_scenarios.update(hand_to_scenarios[hid])
+
+    # Map to expanded indices
+    train_indices = []
+    val_indices = []
+    for exp_idx, (s_idx, *_) in enumerate(expanded_indices):
+        if s_idx in val_scenarios:
+            val_indices.append(exp_idx)
+        else:
+            train_indices.append(exp_idx)
+
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)

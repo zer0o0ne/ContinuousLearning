@@ -35,7 +35,7 @@ def _find_best_checkpoint(agent_dir):
     Prefers gto_probs_predict (action head trained) over gto_ev_predict.
     Within each, picks the most recent timestamped subdirectory.
     """
-    for scenario in ("gto_probs_predict", "gto_ev_predict"):
+    for scenario in ("gto_probs_predict", "gto_predict", "gto_ev_predict"):
         scenario_dir = os.path.join(agent_dir, scenario)
         if not os.path.isdir(scenario_dir):
             continue

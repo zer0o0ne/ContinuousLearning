@@ -286,11 +286,15 @@ def main():
                     # Load best checkpoint for this agent
                     agent.load_checkpoint(agent_base)
 
-                    train_opponent_action(
+                    _, opp_run_dir = train_opponent_action(
                         agent, opp_train_cfg, device, agent_log,
                         scenarios_override=opp_scenarios,
                         temperature=agent_temperature,
                     )
+                    if opp_run_dir:
+                        best_ckpt = os.path.join(opp_run_dir, "best.pt")
+                        if os.path.exists(best_ckpt):
+                            agent.load_checkpoint(best_ckpt)
             else:
                 # Single-agent
                 agent = ASI(log, config)
@@ -299,11 +303,87 @@ def main():
                     agent.load_checkpoint(agent_dir)
 
                 single_temp = config.get("solver", {}).get("gto_temperature", 1.0)
-                train_opponent_action(
+                _, opp_run_dir = train_opponent_action(
                     agent, opp_train_cfg, device, log,
                     scenarios_override=opp_scenarios,
                     temperature=single_temp,
                 )
+                if opp_run_dir:
+                    best_ckpt = os.path.join(opp_run_dir, "best.pt")
+                    if os.path.exists(best_ckpt):
+                        agent.load_checkpoint(best_ckpt)
+
+    # --- MCTS training ---
+    if pipeline_cfg.get("run_mcts_train", False):
+        from agent.train_scenarios.mcts_predict.train import train_mcts
+
+        mcts_train_cfg = config.get("mcts_train", {})
+        examples_dir = mcts_train_cfg.get("examples_dir", "")
+        mcts_examples = _load_mcts_examples(examples_dir, log)
+
+        if not mcts_examples:
+            log("MCTS training skipped: no examples available "
+                "(set mcts_train.examples_dir)")
+        elif multi_agent:
+            save_dir_cfg = multi_agent.get("save_dir", "")
+            if save_dir_cfg and os.path.isabs(save_dir_cfg):
+                save_base_dir_mcts = save_dir_cfg
+            else:
+                save_base_dir_mcts = os.path.join(project_root, "data", version,
+                                                   save_dir_cfg or name)
+
+            for agent_cfg in multi_agent["agents"]:
+                agent_name = agent_cfg["name"]
+                agent_base = os.path.join(save_base_dir_mcts, agent_name)
+                agent_log = Logger(agent_base)
+                agent_log(f"\n=== MCTS Training: {agent_name} ===")
+
+                agent = ASI(agent_log, config)
+                agent.set_device(device)
+                agent.load_checkpoint(agent_base)
+
+                _, mcts_run_dir = train_mcts(
+                    agent, mcts_train_cfg, device, agent_log, mcts_examples)
+                if mcts_run_dir:
+                    best_ckpt = os.path.join(mcts_run_dir, "best.pt")
+                    if os.path.exists(best_ckpt):
+                        agent.load_checkpoint(best_ckpt)
+        else:
+            agent = ASI(log, config)
+            agent.set_device(device)
+            if agent_dir:
+                agent.load_checkpoint(agent_dir)
+
+            _, mcts_run_dir = train_mcts(
+                agent, mcts_train_cfg, device, log, mcts_examples)
+
+
+def _load_mcts_examples(examples_dir, log):
+    """Load pre-generated MCTS training examples from a directory."""
+    import torch
+
+    if not examples_dir:
+        return None
+    if not os.path.isdir(examples_dir):
+        # Try as direct file path
+        if os.path.isfile(examples_dir):
+            log(f"Loading MCTS examples from {examples_dir}")
+            return torch.load(examples_dir, weights_only=False)
+        log(f"MCTS examples path not found: {examples_dir}")
+        return None
+
+    # Search for latest examples file in directory
+    candidates = sorted(
+        [f for f in os.listdir(examples_dir) if f.endswith(".pt")],
+        reverse=True,
+    )
+    if not candidates:
+        log(f"No .pt files found in {examples_dir}")
+        return None
+
+    path = os.path.join(examples_dir, candidates[0])
+    log(f"Loading MCTS examples from {path}")
+    return torch.load(path, weights_only=False)
 
 
 if __name__ == "__main__":

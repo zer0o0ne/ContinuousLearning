@@ -35,7 +35,8 @@ def _find_best_checkpoint(agent_dir):
     Prefers gto_probs_predict (action head trained) over gto_ev_predict.
     Within each, picks the most recent timestamped subdirectory.
     """
-    for scenario in ("gto_probs_predict", "gto_predict", "gto_ev_predict"):
+    for scenario in ("mcts_predict", "opponent_action_predict", "modelling_predict",
+                      "gto_probs_predict", "gto_predict", "gto_ev_predict"):
         scenario_dir = os.path.join(agent_dir, scenario)
         if not os.path.isdir(scenario_dir):
             continue
@@ -176,7 +177,7 @@ def _normalize_events_inplace(events, norm_stats):
 
 
 def _init_table_state(agents, agent_queue, num_players, raise_sizes,
-                      big_blind, small_blind, n_actions):
+                      big_blind, small_blind, n_actions, player_ids=None):
     """Initialize a new hand at a table. Returns table state dict."""
     seated_indices = [agent_queue[i] for i in range(num_players)]
     seated = [agents[idx] for idx in seated_indices]
@@ -208,6 +209,7 @@ def _init_table_state(agents, agent_queue, num_players, raise_sizes,
         "table": table,
         "seated": seated,
         "seated_names": seated_names,
+        "player_ids": player_ids,
         "pre_credits": pre_credits,
         "snapshots": snapshots,
         "action_step": 0,
@@ -265,6 +267,31 @@ def run_evaluation(config, device, log):
     for a in agents:
         a["stack"] = float(start_stack)
 
+    # Opponent embedding tables (one per unique agent model)
+    use_opponent_emb = eval_cfg.get("use_opponent_emb", True)
+    from agent.perception.opponent_embeddings import OpponentEmbeddingTable
+    opp_tables = {}
+    if use_opponent_emb:
+        for a in agents:
+            model_id = id(a["agent"])
+            if a["agent"].perception.opp_emb_enabled and model_id not in opp_tables:
+                opp_tables[model_id] = OpponentEmbeddingTable(a["agent"].perception.d_model)
+    if opp_tables:
+        log(f"Opponent GRU embeddings enabled for {len(opp_tables)} agent model(s)")
+    elif use_opponent_emb:
+        log("Opponent embeddings requested but no agent has opp_emb_enabled")
+    else:
+        log("Opponent embeddings disabled by config")
+
+    # Player identity pool + swap config (for opponent embedding tracking)
+    opp_data_cfg = config.get("opponent_data", {})
+    swap_prob = eval_cfg.get("player_swap_prob", opp_data_cfg.get("player_swap_prob", 0.02))
+    n_player_pool = eval_cfg.get("n_player_pool",
+                                  opp_data_cfg.get("n_player_pool", num_players * 3))
+    player_pool = [f"p_{i}" for i in range(n_player_pool)]
+    if opp_tables:
+        log(f"Player pool: {n_player_pool} IDs, swap_prob={swap_prob}")
+
     n_tables = min(n_tables, n_hands)
 
     log(f"Table: {num_players} seats, {len(agents)} agents, {n_hands} hands, {n_tables} parallel tables")
@@ -299,8 +326,10 @@ def run_evaluation(config, device, log):
     for _ in range(n_tables):
         if hands_started >= n_hands:
             break
+        init_pids = [random.choice(player_pool) for _ in range(num_players)]
         ts = _init_table_state(agents, agent_queue, num_players, raise_sizes,
-                               big_blind, small_blind, n_actions)
+                               big_blind, small_blind, n_actions,
+                               player_ids=init_pids)
         table_states.append(ts)
         hands_started += 1
 
@@ -353,7 +382,7 @@ def run_evaluation(config, device, log):
                 ts["snapshots"], table.deck, active_pos,
                 num_players, big_blind, small_blind, n_actions,
                 up_to=len(ts["snapshots"]) - 1,
-                seated_names=ts["seated_names"],
+                seated_names=ts["player_ids"],
             )
             pending.append((ti, agent_info, events))
 
@@ -370,6 +399,7 @@ def run_evaluation(config, device, log):
             with torch.no_grad():
                 for model_id, group_items in groups.items():
                     agent_model = group_items[0][2]["agent"]
+                    opp_table = opp_tables.get(model_id)
 
                     all_events = []
                     temperatures = []
@@ -381,6 +411,8 @@ def run_evaluation(config, device, log):
                     with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                         out = agent_model.forward_batch(
                             all_events, skip_memory=True,
+                            skip_opponent_emb=(opp_table is None),
+                            opponent_emb_table=opp_table,
                         )
                     all_logits = out["action_logits"]
 
@@ -469,8 +501,14 @@ def run_evaluation(config, device, log):
 
             # Start new hand if quota not reached
             if hands_started < n_hands:
+                # Carry forward player IDs with random swaps
+                prev_pids = list(ts["player_ids"])
+                for pos in range(num_players):
+                    if random.random() < swap_prob:
+                        prev_pids[pos] = random.choice(player_pool)
                 new_ts = _init_table_state(agents, agent_queue, num_players, raise_sizes,
-                                           big_blind, small_blind, n_actions)
+                                           big_blind, small_blind, n_actions,
+                                           player_ids=prev_pids)
                 new_table_states.append(new_ts)
                 hands_started += 1
 

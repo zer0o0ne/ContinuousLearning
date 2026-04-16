@@ -8,15 +8,12 @@ class OpponentActionHead(nn.Module):
     """
     Opponent action prediction head.
 
-    Input: concatenation of perception output (d_model), hand-masked feature
-    embeddings (7 * d_model), and opponent embedding (d_model) → projected to
-    d_model → Qwen3 self-attention → mean pool → action logits.
+    Input: perception output (batch, seq_len, d_model) — same space as
+    ActionHead/ValueHead. Qwen3 self-attention → mean pool → action logits.
     """
 
     def __init__(self, d_model, n_actions, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len):
         super().__init__()
-        # Project concatenated [perception_out, masked_features, opponent_emb] → d_model
-        self.input_proj = nn.Linear(d_model * 9, d_model, bias=False)
         self.config = Qwen3Config(
             hidden_size=d_model,
             num_attention_heads=n_heads,
@@ -37,11 +34,10 @@ class OpponentActionHead(nn.Module):
     def forward(self, context, mask=None):
         """
         Args:
-            context: (batch, seq_len, 9 * d_model) -- [perception_out, masked_features, opp_emb]
+            context: (batch, seq_len, d_model) -- perception output
             mask: (batch, seq_len) float — 1 for real, 0 for padding (optional)
         Returns: (batch, n_actions) action logits
         """
-        context = self.input_proj(context)
         batch_size, seq_len, _ = context.shape
         position_ids = torch.arange(seq_len, device=context.device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.rope(context, position_ids)

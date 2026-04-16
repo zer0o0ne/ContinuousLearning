@@ -79,10 +79,10 @@ def _kl_loss(logits, target_probs):
     return F.kl_div(log_probs, target_probs, reduction="batchmean")
 
 
-def _run_validation(agent, val_loader, device, amp_config=None,
-                    opponent_emb_table=None, use_opp_emb=False):
+def _run_validation(agent, val_loader, device, amp_config=None, opponent_emb_table=None):
     """Run validation. Returns (avg_loss, top1_accuracy)."""
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
+    skip_opp = (opponent_emb_table is None)
     agent.eval()
     loss_sum = 0.0
     correct = 0
@@ -92,9 +92,9 @@ def _run_validation(agent, val_loader, device, amp_config=None,
             target_probs = target_probs.to(device)
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 out = agent.forward_batch(event_sequences, skip_memory=True,
-                                          skip_opponent_emb=not use_opp_emb,
-                                          opponent_emb_table=opponent_emb_table,
-                                          heads={"opponent_action"})
+                                          heads={"opponent_action"},
+                                          skip_opponent_emb=skip_opp,
+                                          opponent_emb_table=opponent_emb_table)
                 logits = out["opponent_action_logits"]
                 batch_loss = _kl_loss(logits, target_probs)
             loss_sum += batch_loss.item() * len(event_sequences)
@@ -156,7 +156,7 @@ def train_opponent_action(agent, train_cfg, device, log,
 
     log("=== Opponent Action Prediction Training ===")
 
-    # Freeze everything except opponent_action_head (and optionally opponent_gru)
+    # Freeze everything except opponent_action_head (+ opponent_gru if enabled)
     for param in agent.perception.parameters():
         param.requires_grad = False
     for param in agent.value_head.parameters():
@@ -168,23 +168,20 @@ def train_opponent_action(agent, train_cfg, device, log,
     for param in agent.opponent_action_head.parameters():
         param.requires_grad = True
 
-    # Opponent embedding: unfreeze GRU if enabled
+    # Opponent GRU: unfreeze and include in optimizer if enabled
     use_opp_emb = agent.perception.opp_emb_enabled
-    opp_emb_table = None
     if use_opp_emb:
-        from agent.perception.opponent_embeddings import OpponentEmbeddingTable
-        opp_emb_table = OpponentEmbeddingTable(agent.perception.d_model)
         for param in agent.perception.opponent_gru.parameters():
             param.requires_grad = True
-        log("Frozen: perception (except opponent_gru), value_head, action_head, modelling_head")
-        log("Training: opponent_action_head + opponent_gru")
-    else:
-        log("Frozen: perception, value_head, action_head, modelling_head")
-        log("Training: opponent_action_head only")
 
     trainable_params = list(agent.opponent_action_head.parameters())
     if use_opp_emb:
-        trainable_params.extend(agent.perception.opponent_gru.parameters())
+        trainable_params += list(agent.perception.opponent_gru.parameters())
+
+    log("Frozen: perception (encoder/decoder/embedder), value_head, action_head, modelling_head")
+    log(f"Training: opponent_action_head" +
+        (", opponent_gru" if use_opp_emb else ""))
+
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
 
     run_dir = log.run_dir("opponent_action_predict")
@@ -222,6 +219,13 @@ def train_opponent_action(agent, train_cfg, device, log,
         dataset, scenarios, val_split, dataset.indices)
 
     log(f"Expanded samples: {len(dataset)} (train: {len(train_dataset)}, val: {len(val_dataset)})")
+
+    # Opponent embedding table (persistent across batches, detached after each backward)
+    opp_table = None
+    if use_opp_emb:
+        from agent.perception.opponent_embeddings import OpponentEmbeddingTable
+        opp_table = OpponentEmbeddingTable(agent.perception.d_model)
+        log("Opponent GRU embedding enabled")
 
     train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
@@ -261,9 +265,9 @@ def train_opponent_action(agent, train_cfg, device, log,
             with torch.autocast(device_type=device_type, dtype=amp_dtype,
                                 enabled=amp_enabled):
                 out = agent.forward_batch(event_sequences, skip_memory=True,
-                                          skip_opponent_emb=not use_opp_emb,
-                                          opponent_emb_table=opp_emb_table,
-                                          heads={"opponent_action"})
+                                          heads={"opponent_action"},
+                                          skip_opponent_emb=(opp_table is None),
+                                          opponent_emb_table=opp_table)
                 logits = out["opponent_action_logits"]
                 batch_loss = _kl_loss(logits, target_probs)
 
@@ -274,10 +278,8 @@ def train_opponent_action(agent, train_cfg, device, log,
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-
-            # Truncated BPTT: detach opponent embeddings after each batch
-            if opp_emb_table is not None:
-                opp_emb_table.detach_all()
+            if opp_table is not None:
+                opp_table.detach_all()
 
             step_loss = batch_loss.item()
             history["step_loss"].append((global_step, step_loss))
@@ -296,7 +298,7 @@ def train_opponent_action(agent, train_cfg, device, log,
             if val_every and (global_step % val_every == 0):
                 val_loss, val_acc = _run_validation(
                     agent, val_loader, device, amp_config=amp_cfg,
-                    opponent_emb_table=opp_emb_table, use_opp_emb=use_opp_emb)
+                    opponent_emb_table=opp_table)
                 history["val_loss"].append((global_step, val_loss))
                 history["val_accuracy"].append((global_step, val_acc))
                 _save_history(history, run_dir)
@@ -325,7 +327,7 @@ def train_opponent_action(agent, train_cfg, device, log,
         # End-of-epoch validation
         val_loss, val_acc = _run_validation(
             agent, val_loader, device, amp_config=amp_cfg,
-            opponent_emb_table=opp_emb_table, use_opp_emb=use_opp_emb)
+            opponent_emb_table=opp_table)
         history["val_loss"].append((global_step, val_loss))
         history["val_accuracy"].append((global_step, val_acc))
         history["epoch_train_loss"].append(train_loss_avg)

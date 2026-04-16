@@ -102,7 +102,7 @@ class EventSequenceEmbedder(nn.Module):
     def _build_batch_tensors(self, event_sequences, device="cpu", mask_hand=False):
         """Collect raw event data into batch tensors and compute embedding lookups.
 
-        Shared between forward_batch and forward_masked_components.
+        Shared helper for forward_batch (and subclasses).
 
         Args:
             event_sequences: list of lists of event dicts
@@ -188,64 +188,6 @@ class EventSequenceEmbedder(nn.Module):
             "bet_emb": self.bet_proj(bets),
             "action_emb": self.action_proj(actions),
         }
-
-    def forward_masked_components(self, event_sequences, device="cpu"):
-        """Generate hand-masked per-event feature embeddings for opponent action head.
-
-        Uses the same embedding layers as forward_batch but masks hand cards to
-        no-card tokens. Returns individual feature embeddings concatenated along
-        the feature dimension: [masked_combined, hero_pos, acting_pos, num_players,
-        pot+stack, bets, action] — 7 * d_model total.
-
-        Args:
-            event_sequences: list of lists of event dicts
-            device: torch device
-
-        Returns:
-            features: (B, max_events, 7 * d_model) — detached, no grad
-            mask: (B, max_events) float — 1 for real, 0 for padding
-        """
-        bt = self._build_batch_tensors(event_sequences, device=device, mask_hand=True)
-        if bt is None:
-            B = len(event_sequences)
-            return (torch.zeros(B, 0, self.d_model * 7, dtype=torch.float, device=device),
-                    torch.zeros(B, 0, dtype=torch.float, device=device))
-
-        B, T = bt["B"], bt["T"]
-        max_events = bt["max_events"]
-        D = self.d_model
-
-        # Build combined masked card embedding (same pipeline as forward_batch)
-        context = torch.cat([
-            bt["hero_pos_emb"], bt["acting_pos_emb"], bt["num_players_emb"],
-            bt["scalar_emb"], bt["bet_emb"], bt["action_emb"],
-        ], dim=-1)                                                # (T, 6D)
-        context = context.unsqueeze(1).expand(-1, 7, -1)          # (T, 7, 6D)
-        combined = torch.cat([bt["card_embs"], context], dim=-1)  # (T, 7, 7D)
-        combined = combined.reshape(T * 7, D * 7)
-        out = self.combine(combined).view(T, 7, D)               # (T, 7, D)
-
-        source_ids = torch.tensor([0, 0, 0, 0, 0, 1, 1], dtype=torch.long, device=device)
-        out = out + self.source_embed(source_ids).unsqueeze(0)
-        out = self.post_embed_norm(out)
-        masked_card_emb = out.mean(dim=1)                         # (T, D)
-
-        # Concatenate all feature components: (T, 7D)
-        features_flat = torch.cat([
-            masked_card_emb,
-            bt["hero_pos_emb"], bt["acting_pos_emb"], bt["num_players_emb"],
-            bt["scalar_emb"], bt["bet_emb"], bt["action_emb"],
-        ], dim=-1)
-
-        # Scatter to (B, max_events, 7D)
-        features = torch.zeros(B, max_events, D * 7, dtype=features_flat.dtype, device=device)
-        features[bt["batch_idx"], bt["event_idx"]] = features_flat
-
-        mask = torch.zeros(B, max_events, dtype=torch.float, device=device)
-        for i, sl in enumerate(bt["seq_lengths"]):
-            mask[i, :sl] = 1.0
-
-        return features, mask
 
     def forward_batch(self, event_sequences, device="cpu", opponent_embs_per_event=None):
         """Embed a batch of event sequences into per-card vectors.

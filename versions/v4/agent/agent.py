@@ -78,25 +78,23 @@ class ASI(nn.Module):
         self.loss_buffer = []
         self._checkpoint_norm_stats = None
 
-    def forward_batch(self, event_sequences, skip_memory=True, skip_opponent_emb=True,
-                       opponent_emb_table=None, heads=None):
+    def forward_batch(self, event_sequences, skip_memory=True, heads=None,
+                      skip_opponent_emb=True, opponent_emb_table=None):
         """
         Batch-parallel forward pass over event sequences.
 
         Args:
             event_sequences: list of lists of event dicts
             skip_memory: bypass memory retrieval (True for gto_ev_predict)
-            skip_opponent_emb: bypass opponent GRU embedding injection (True by default)
-            opponent_emb_table: optional OpponentEmbeddingTable for opponent modeling.
-                Only used when skip_opponent_emb=False. When provided, opponent embeddings
-                are injected into perception and updated via GRU. The table is mutated in-place.
             heads: optional set of head names to compute, e.g. {"action"}.
                 Valid names: "action", "value", "opponent_action", "modelling".
                 If None, all heads are computed (backwards compatible).
+            skip_opponent_emb: if True, skip opponent GRU embedding injection
+            opponent_emb_table: OpponentEmbeddingTable instance (required when
+                skip_opponent_emb=False and perception.opp_emb_enabled=True)
         Returns: dict with computed head outputs
         """
         # Skip gradient tracking for frozen modules (saves memory/compute)
-        # GRU is a submodule of perception, so it freezes together with it
         perception_frozen = not any(p.requires_grad for p in self.perception.parameters())
         if perception_frozen:
             with torch.no_grad():
@@ -117,43 +115,7 @@ class ASI(nn.Module):
         if heads is None or "action" in heads:
             result["action_logits"] = self.action_head(perception_out, mask=mask)
         if heads is None or "opponent_action" in heads:
-            # Generate hand-masked feature embeddings (frozen, no grad)
-            with torch.no_grad():
-                masked_features, _ = self.perception.embedder.forward_masked_components(
-                    event_sequences, device=self.device_,
-                )
-            masked_features = masked_features.detach()
-
-            # Build per-event opponent embeddings (NOT detached — allows GRU gradient flow)
-            B_feat = masked_features.shape[0]
-            T_feat = masked_features.shape[1]
-            D = self.perception.d_model
-            use_opp = (not skip_opponent_emb and self.perception.opp_emb_enabled
-                       and opponent_emb_table is not None)
-            if use_opp:
-                opp_embs = torch.zeros(B_feat, T_feat, D,
-                                       dtype=masked_features.dtype, device=masked_features.device)
-                for i, seq in enumerate(event_sequences):
-                    for j, event in enumerate(seq):
-                        opp_id = event.get("opponent_id")
-                        if opp_id is not None:
-                            opp_embs[i, j] = opponent_emb_table.get(opp_id, self.device_)
-            else:
-                opp_embs = torch.zeros(B_feat, T_feat, D,
-                                       dtype=masked_features.dtype, device=masked_features.device)
-            masked_features = torch.cat([masked_features, opp_embs], dim=-1)
-
-            # Align with perception_out length (memory vectors may be prepended)
-            N_perc = perception_out.shape[1]
-            N_feat = masked_features.shape[1]
-            if N_feat < N_perc:
-                pad = torch.zeros(
-                    B_feat, N_perc - N_feat, masked_features.shape[2],
-                    dtype=masked_features.dtype, device=masked_features.device,
-                )
-                masked_features = torch.cat([pad, masked_features], dim=1)
-            opponent_input = torch.cat([perception_out, masked_features], dim=-1)
-            result["opponent_action_logits"] = self.opponent_action_head(opponent_input, mask=mask)
+            result["opponent_action_logits"] = self.opponent_action_head(perception_out, mask=mask)
         if heads is None or "value" in heads:
             result["value"] = self.value_head(perception_out, mask=mask)
         if heads is None or "modelling" in heads:

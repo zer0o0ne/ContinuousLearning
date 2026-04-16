@@ -173,7 +173,7 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
     return loss_sum / max(count, 1)
 
 
-def train_mcts(agent, train_cfg, device, log, examples):
+def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
     """Train all agent heads on MCTS-derived training data.
 
     All heads are unfrozen and trained simultaneously:
@@ -189,6 +189,7 @@ def train_mcts(agent, train_cfg, device, log, examples):
         device: torch device string
         log: logger callable
         examples: list of MCTSTrainingExample
+        temperature: agent temperature (saved in checkpoint)
     """
     lr = train_cfg.get("lr", 3e-5)
     batch_size = train_cfg.get("batch_size", 16)
@@ -205,6 +206,9 @@ def train_mcts(agent, train_cfg, device, log, examples):
                "chain_weight": chain_weight}
 
     log("=== MCTS Training (All Heads) ===")
+
+    # Preserve norm_stats from checkpoint for saving
+    norm_stats = getattr(agent, '_checkpoint_norm_stats', None) or {}
 
     # All parameters trainable
     for param in agent.parameters():
@@ -314,8 +318,8 @@ def train_mcts(agent, train_cfg, device, log, examples):
                 if vl < best_val_loss:
                     best_val_loss = vl
                     fails_since_best = 0
-                    _save_best(agent, optimizer, scheduler, run_dir, global_step,
-                               epoch, vl, log)
+                    _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
+                               global_step, epoch, vl, log, temperature=temperature)
                 else:
                     fails_since_best += 1
                     if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
@@ -337,8 +341,8 @@ def train_mcts(agent, train_cfg, device, log, examples):
         if val_avg < best_val_loss:
             best_val_loss = val_avg
             fails_since_best = 0
-            _save_best(agent, optimizer, scheduler, run_dir, global_step,
-                       epoch, val_avg, log)
+            _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
+                       global_step, epoch, val_avg, log, temperature=temperature)
         else:
             fails_since_best += 1
             if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
@@ -350,13 +354,18 @@ def train_mcts(agent, train_cfg, device, log, examples):
     return history, run_dir
 
 
-def _save_best(agent, optimizer, scheduler, run_dir, step, epoch, val_loss, log):
-    best_path = os.path.join(run_dir, "best.pt")
-    torch.save({
-        "step": step, "epoch": epoch + 1,
+def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
+               global_step, epoch, val_loss, log, temperature=None):
+    best_path = os.path.join(ckpt_dir, "best.pt")
+    ckpt = {
+        "step": global_step, "epoch": epoch + 1,
         "model_state_dict": agent.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
+        "norm_stats": norm_stats,
         "val_loss": val_loss,
-    }, best_path)
+    }
+    if temperature is not None:
+        ckpt["temperature"] = temperature
+    torch.save(ckpt, best_path)
     log(f"  New best model (val loss: {val_loss:.6f})")

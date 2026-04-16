@@ -330,6 +330,8 @@ def main():
         else:
             save_base_dir_mcts = base_dir
 
+        fallback_temp = config.get("solver", {}).get("gto_temperature", 1.0)
+
         if examples_dir:
             # Backwards compatible: pre-generated examples, single pass
             mcts_examples = _load_mcts_examples(examples_dir, log)
@@ -338,22 +340,27 @@ def main():
             elif multi_agent:
                 for agent_cfg in multi_agent["agents"]:
                     agent_name = agent_cfg["name"]
+                    agent_temp = fallback_temp
+                    for mod in agent_cfg.get("modifiers", []):
+                        if mod.get("type") == "temperature":
+                            agent_temp = mod["value"]
                     agent_base = os.path.join(save_base_dir_mcts, agent_name)
                     agent_log = Logger(agent_base)
                     agent_log(f"\n=== MCTS Training: {agent_name} ===")
                     agent = ASI(agent_log, config)
                     agent.set_device(device)
                     agent.load_checkpoint(agent_base)
-                    train_mcts(agent, mcts_train_cfg, device, agent_log, mcts_examples)
+                    train_mcts(agent, mcts_train_cfg, device, agent_log,
+                               mcts_examples, temperature=agent_temp)
             else:
                 agent = ASI(log, config)
                 agent.set_device(device)
                 if agent_dir:
                     agent.load_checkpoint(agent_dir)
-                train_mcts(agent, mcts_train_cfg, device, log, mcts_examples)
+                train_mcts(agent, mcts_train_cfg, device, log,
+                           mcts_examples, temperature=fallback_temp)
         else:
             # Cyclic self-play: collect → train → repeat
-            fallback_temp = config.get("solver", {}).get("gto_temperature", 1.0)
 
             for cycle in range(n_cycles):
                 log(f"\n=== MCTS Cycle {cycle + 1}/{n_cycles} ===")
@@ -390,10 +397,10 @@ def main():
                             "name": agent_name, "temperature": temp,
                         })
                 else:
+                    single_load_dir = agent_dir or save_base_dir_mcts
                     agent_obj = ASI(log, config)
                     agent_obj.set_device(device)
-                    if agent_dir:
-                        agent_obj.load_checkpoint(agent_dir)
+                    agent_obj.load_checkpoint(single_load_dir)
                     agent_obj.eval()
                     norm_stats = getattr(agent_obj, '_checkpoint_norm_stats', None)
                     if norm_stats is None:
@@ -428,8 +435,14 @@ def main():
                         agent.set_device(device)
                         agent.load_checkpoint(agent_base)
 
+                        agent_temp = fallback_temp
+                        for mod in agent_cfg.get("modifiers", []):
+                            if mod.get("type") == "temperature":
+                                agent_temp = mod["value"]
+
                         _, mcts_run_dir = train_mcts(
-                            agent, mcts_train_cfg, device, agent_log, examples)
+                            agent, mcts_train_cfg, device, agent_log,
+                            examples, temperature=agent_temp)
                         if mcts_run_dir:
                             best_ckpt = os.path.join(mcts_run_dir, "best.pt")
                             if os.path.exists(best_ckpt):
@@ -441,9 +454,9 @@ def main():
                             f"{len(examples)} examples) ===")
                         agent = ASI(log, config)
                         agent.set_device(device)
-                        if agent_dir:
-                            agent.load_checkpoint(agent_dir)
-                        train_mcts(agent, mcts_train_cfg, device, log, examples)
+                        agent.load_checkpoint(save_base_dir_mcts)
+                        train_mcts(agent, mcts_train_cfg, device, log,
+                                   examples, temperature=fallback_temp)
 
     # --- Evaluation (after all training stages) ---
     if pipeline_cfg.get("run_evaluation", False):

@@ -16,9 +16,7 @@ from tqdm.auto import tqdm
 from agent.mcts.mcts import MCTS, get_n_distribution
 from agent.mcts.game_state import GameState
 from env.table import Table
-from evaluation.evaluate import (
-    _rebuild_events, _normalize_events_inplace, _get_table_display_from_turn,
-)
+from evaluation.evaluate import _rebuild_events, _normalize_events_inplace
 
 
 @dataclass

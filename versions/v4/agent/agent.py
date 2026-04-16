@@ -171,7 +171,8 @@ class ASI(nn.Module):
     def _find_best_checkpoint(agent_dir):
         """Search scenario subdirectories for the best checkpoint."""
         import os
-        for scenario in ("gto_predict", "gto_probs_predict", "modelling_predict", "gto_ev_predict"):
+        for scenario in ("mcts_predict", "opponent_action_predict", "modelling_predict",
+                          "gto_predict", "gto_probs_predict", "gto_ev_predict"):
             scenario_dir = os.path.join(agent_dir, scenario)
             if not os.path.isdir(scenario_dir):
                 continue

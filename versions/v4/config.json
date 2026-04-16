@@ -148,10 +148,12 @@
         "n_equity_iters": 3000
     },
     "mcts_train": {
+        "n_cycles": 10,
+        "n_hands_per_cycle": 500,
         "examples_dir": "",
         "lr": 3e-5,
         "batch_size": 16,
-        "epochs": 5,
+        "epochs": 2,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 50,
@@ -160,7 +162,7 @@
         "val_split": 0.1,
         "value_weight": 1.0,
         "action_weight": 1.0,
-        "chain_weight": 1.0
+        "chain_weight": 2.5
     },
     "evaluation": {
         "agents_dir": "2_final_agents",

@@ -309,49 +309,141 @@ def main():
                     if os.path.exists(best_ckpt):
                         agent.load_checkpoint(best_ckpt)
 
-    # --- MCTS training ---
+    # --- MCTS cyclic collect → train ---
     if pipeline_cfg.get("run_mcts_train", False):
         from agent.train_scenarios.mcts_predict.train import train_mcts
+        from agent.mcts.collect import run_mcts_collection
 
         mcts_train_cfg = config.get("mcts_train", {})
         examples_dir = mcts_train_cfg.get("examples_dir", "")
-        mcts_examples = _load_mcts_examples(examples_dir, log)
+        n_cycles = mcts_train_cfg.get("n_cycles", 1)
+        n_hands_per_cycle = mcts_train_cfg.get("n_hands_per_cycle", 500)
 
-        if not mcts_examples:
-            log("MCTS training skipped: no examples available "
-                "(set mcts_train.examples_dir)")
-        elif multi_agent:
+        # Resolve agent save directory
+        if multi_agent:
             save_dir_cfg = multi_agent.get("save_dir", "")
             if save_dir_cfg and os.path.isabs(save_dir_cfg):
                 save_base_dir_mcts = save_dir_cfg
             else:
                 save_base_dir_mcts = os.path.join(project_root, "data", version,
                                                    save_dir_cfg or name)
-
-            for agent_cfg in multi_agent["agents"]:
-                agent_name = agent_cfg["name"]
-                agent_base = os.path.join(save_base_dir_mcts, agent_name)
-                agent_log = Logger(agent_base)
-                agent_log(f"\n=== MCTS Training: {agent_name} ===")
-
-                agent = ASI(agent_log, config)
-                agent.set_device(device)
-                agent.load_checkpoint(agent_base)
-
-                _, mcts_run_dir = train_mcts(
-                    agent, mcts_train_cfg, device, agent_log, mcts_examples)
-                if mcts_run_dir:
-                    best_ckpt = os.path.join(mcts_run_dir, "best.pt")
-                    if os.path.exists(best_ckpt):
-                        agent.load_checkpoint(best_ckpt)
         else:
-            agent = ASI(log, config)
-            agent.set_device(device)
-            if agent_dir:
-                agent.load_checkpoint(agent_dir)
+            save_base_dir_mcts = base_dir
 
-            _, mcts_run_dir = train_mcts(
-                agent, mcts_train_cfg, device, log, mcts_examples)
+        if examples_dir:
+            # Backwards compatible: pre-generated examples, single pass
+            mcts_examples = _load_mcts_examples(examples_dir, log)
+            if not mcts_examples:
+                log("MCTS training skipped: no examples at examples_dir")
+            elif multi_agent:
+                for agent_cfg in multi_agent["agents"]:
+                    agent_name = agent_cfg["name"]
+                    agent_base = os.path.join(save_base_dir_mcts, agent_name)
+                    agent_log = Logger(agent_base)
+                    agent_log(f"\n=== MCTS Training: {agent_name} ===")
+                    agent = ASI(agent_log, config)
+                    agent.set_device(device)
+                    agent.load_checkpoint(agent_base)
+                    train_mcts(agent, mcts_train_cfg, device, agent_log, mcts_examples)
+            else:
+                agent = ASI(log, config)
+                agent.set_device(device)
+                if agent_dir:
+                    agent.load_checkpoint(agent_dir)
+                train_mcts(agent, mcts_train_cfg, device, log, mcts_examples)
+        else:
+            # Cyclic self-play: collect → train → repeat
+            fallback_temp = config.get("solver", {}).get("gto_temperature", 1.0)
+
+            for cycle in range(n_cycles):
+                log(f"\n=== MCTS Cycle {cycle + 1}/{n_cycles} ===")
+
+                # Load latest agent checkpoints for collection
+                agents_for_play = []
+                if multi_agent:
+                    for agent_cfg in multi_agent["agents"]:
+                        agent_name = agent_cfg["name"]
+                        agent_base = os.path.join(save_base_dir_mcts, agent_name)
+                        agent_obj = ASI(log, config)
+                        agent_obj.set_device(device)
+                        agent_obj.load_checkpoint(agent_base)
+                        agent_obj.eval()
+
+                        # Get temperature + norm_stats from checkpoint
+                        ckpt_path = agent_obj._find_best_checkpoint(agent_base)
+                        if ckpt_path:
+                            ckpt = torch.load(ckpt_path, weights_only=False,
+                                              map_location=device)
+                            norm_stats = ckpt.get("norm_stats")
+                            temp = ckpt.get("temperature", fallback_temp)
+                        else:
+                            norm_stats = None
+                            temp = fallback_temp
+                        if norm_stats is None:
+                            norm_stats = {"pot_mean": 0, "pot_std": 1,
+                                          "stack_mean": 0, "stack_std": 1,
+                                          "bets_mean": 0, "bets_std": 1,
+                                          "blind_mean": 0, "blind_std": 1}
+
+                        agents_for_play.append({
+                            "agent": agent_obj, "norm_stats": norm_stats,
+                            "name": agent_name, "temperature": temp,
+                        })
+                else:
+                    agent_obj = ASI(log, config)
+                    agent_obj.set_device(device)
+                    if agent_dir:
+                        agent_obj.load_checkpoint(agent_dir)
+                    agent_obj.eval()
+                    norm_stats = getattr(agent_obj, '_checkpoint_norm_stats', None)
+                    if norm_stats is None:
+                        norm_stats = {"pot_mean": 0, "pot_std": 1,
+                                      "stack_mean": 0, "stack_std": 1,
+                                      "bets_mean": 0, "bets_std": 1,
+                                      "blind_mean": 0, "blind_std": 1}
+                    agents_for_play.append({
+                        "agent": agent_obj, "norm_stats": norm_stats,
+                        "name": name, "temperature": fallback_temp,
+                    })
+
+                # Collect
+                per_agent_examples = run_mcts_collection(
+                    agents_for_play, config, device, log, n_hands_per_cycle)
+
+                # Train each agent on its collected examples
+                if multi_agent:
+                    for agent_cfg in multi_agent["agents"]:
+                        agent_name = agent_cfg["name"]
+                        examples = per_agent_examples.get(agent_name, [])
+                        if not examples:
+                            log(f"  {agent_name}: no examples, skipping training")
+                            continue
+
+                        agent_base = os.path.join(save_base_dir_mcts, agent_name)
+                        agent_log = Logger(agent_base)
+                        agent_log(f"\n=== MCTS Train: {agent_name} "
+                                  f"(cycle {cycle + 1}, {len(examples)} examples) ===")
+
+                        agent = ASI(agent_log, config)
+                        agent.set_device(device)
+                        agent.load_checkpoint(agent_base)
+
+                        _, mcts_run_dir = train_mcts(
+                            agent, mcts_train_cfg, device, agent_log, examples)
+                        if mcts_run_dir:
+                            best_ckpt = os.path.join(mcts_run_dir, "best.pt")
+                            if os.path.exists(best_ckpt):
+                                agent.load_checkpoint(best_ckpt)
+                else:
+                    examples = per_agent_examples.get(name, [])
+                    if examples:
+                        log(f"\n=== MCTS Train (cycle {cycle + 1}, "
+                            f"{len(examples)} examples) ===")
+                        agent = ASI(log, config)
+                        agent.set_device(device)
+                        if agent_dir:
+                            agent.load_checkpoint(agent_dir)
+                        train_mcts(agent, mcts_train_cfg, device, log, examples)
 
     # --- Evaluation (after all training stages) ---
     if pipeline_cfg.get("run_evaluation", False):

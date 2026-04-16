@@ -81,6 +81,7 @@ class MCTS:
         for _ in range(self.n_simulations):
             self._simulate(root, root_ctx, root_mask, game_state)
 
+        self.last_root = root
         return self._best_action(root)
 
     def _evaluate_root(self, event_sequences):

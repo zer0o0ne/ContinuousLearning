@@ -134,10 +134,10 @@ def _compute_loss(value_preds, value_targets, action_preds, action_targets,
     for b_preds, b_targets in zip(chain_preds, chain_targets):
         for pred, target in zip(b_preds, b_targets):
             log_probs = F.log_softmax(pred, dim=-1)
-            chain_losses.append(F.kl_div(log_probs, target, reduction="batchmean"))
+            chain_losses.append(F.kl_div(log_probs, target, reduction="sum"))
 
     if chain_losses:
-        chain_loss = torch.stack(chain_losses).mean()
+        chain_loss = torch.stack(chain_losses).sum() / len(chain_losses)
     else:
         chain_loss = torch.tensor(0.0, device=value_preds.device)
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running
 
-Current working <version> - v4
+Current working <version> - v5
 
 ```bash
 # Always use the venv

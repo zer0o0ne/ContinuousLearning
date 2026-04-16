@@ -1,0 +1,188 @@
+{
+    "name": "finalize_v3",
+    "agent_dir": "",
+    "architecture": {
+        "d_model": 256,
+        "n_heads": 8,
+        "n_kv_heads": 2,
+        "d_ff": 512,
+        "n_encoder_layers": 6,
+        "n_decoder_layers": 4,
+        "n_value_layers": 4,
+        "n_action_layers": 6,
+        "n_opponent_action_layers": 6,
+        "n_modelling_layers": 4,
+        "max_seq_len": 2048,
+        "max_players": 9,
+        "memory": {
+            "n_levels": 2,
+            "max_cluster_size": 128,
+            "max_cluster_size_after": 64,
+            "beam_width": 8
+        },
+        "opponent_embedding": {
+            "enabled": true
+        }
+    },
+    "multi_agent": {
+        "save_dir": "5_final_agents",
+        "agents": [
+            {
+                "name": "gto_pure",
+                "modifiers": [
+                    {"type": "temperature", "value": 0.5}
+                ]
+            },
+            {
+                "name": "lag_bluffer",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "aggressive", "factor": 0.35},
+                    {"type": "action_bias", "actions": "fold", "factor": -0.25},
+                    {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.4},
+                    {"type": "temperature", "value": 0.3}
+                ]
+            },
+            {
+                "name": "tight_passive",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "fold", "factor": 0.3},
+                    {"type": "action_bias", "actions": "raises", "factor": -0.2},
+                    {"type": "temperature", "value": 0.1}
+                ]
+            },
+            {
+                "name": "value_heavy",
+                "modifiers": [
+                    {"type": "conditional_bias", "condition": "equity > 0.6", "actions": "aggressive", "factor": 0.5},
+                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.3},
+                    {"type": "temperature", "value": 0.3}
+                ]
+            },
+            {
+                "name": "mid_raise_specialist",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "4:8", "factor": 0.4},
+                    {"type": "action_bias", "actions": [0, 1, 10], "factor": -0.15},
+                    {"type": "temperature", "value": 0.3}
+                ]
+            }
+        ]
+    },
+    "game": {
+        "raise_sizes": {
+            "preflop": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0],
+            "flop":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+            "turn":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+            "river":   [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0]
+        },
+        "max_players": 9,
+        "max_stack": 3000,
+        "big_blind": 10
+    },
+    "solver": {
+        "type": "v3",
+        "mc_iterations": 10000,
+        "n_raise_samples": 5,
+        "gto_temperature": 0.2,
+        "eqr_enabled": true,
+        "combo_response_iters": 150,
+        "reraise_threshold": 0.72,
+        "weighted_sampling": true,
+        "marginal_mc_iters": 10000,
+        "marginal_response_iters": 150
+    },
+    "dataset": {
+        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v3/finalize_v2/dataset/2026_04_05_22_00_04",
+        "save_dir": "",
+        "n_scenarios": 25000,
+        "val_split": 0.05,
+        "n_workers": 8,
+        "save_every_hands": 1000
+    },
+    "gto_ev_train": {
+        "lr": 1e-4,
+        "batch_size": 64,
+        "epochs": 5,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 50,
+        "interrupt_after_fails": 100,
+        "scheduler_eta_min": 3e-6
+    },
+    "gto_probs_train": {
+        "lr": 1e-4,
+        "batch_size": 64,
+        "epochs": 5,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 50,
+        "interrupt_after_fails": 100,
+        "scheduler_eta_min": 3e-6
+    },
+    "modelling_train": {
+        "lr": 1e-4,
+        "batch_size": 64,
+        "epochs": 5,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 50,
+        "interrupt_after_fails": 100,
+        "scheduler_eta_min": 3e-6,
+        "recon_weight": 0.1
+    },
+    "gto_train": {
+        "lr": 5e-5,
+        "batch_size": 64,
+        "epochs": 10,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 50,
+        "interrupt_after_fails": 100,
+        "scheduler_eta_min": 1e-6,
+        "action_loss_weight": 1.8
+    },
+    "opponent_data": {
+        "agents_dir": "5_final_agents",
+        "n_hands": 5000,
+        "action_temperature": 0.3,
+        "range_threshold": 0.5,
+        "max_batch_combos": 256,
+        "save_dir": "",
+        "save_every_hands": 500,
+        "player_swap_prob": 0.05,
+        "n_player_pool": 27
+    },
+    "opponent_action_train": {
+        "lr": 1e-4,
+        "batch_size": 64,
+        "epochs": 5,
+        "max_grad_norm": 1.0,
+        "log_every": 10,
+        "val_every": 50,
+        "interrupt_after_fails": 100,
+        "scheduler_eta_min": 3e-6,
+        "val_split": 0.05
+    },
+    "evaluation": {
+        "agents_dir": "5_final_agents",
+        "num_players": 5,
+        "n_hands": 100000,
+        "big_blind": 10,
+        "start_stack": 1000,
+        "min_rebuy_stack": 500,
+        "max_rebuy_stack": 1500,
+        "max_stack_cap": 3000,
+        "log_every": 1000,
+        "action_temperature": 0.3,
+        "n_tables": 16
+    },
+    "pipeline": {
+        "run_gto_ev": false,
+        "run_gto_probs": false,
+        "run_gto_training": true,
+        "run_modelling": true,
+        "run_evaluation": true,
+        "run_opponent_data": false,
+        "run_opponent_action_train": false
+    }
+}

@@ -101,10 +101,14 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
     Each agent uses MCTS for its decisions. After each hand, training
     examples are extracted using actual game outcomes as value targets.
 
+    Number of players is randomized per hand between min_players and
+    max_players. Seated agents are drawn from the pool and swapped
+    with player_swap_prob between hands (like opponent_action generation).
+
     Args:
         agents_list: list of dicts with keys:
             "agent" (ASI), "norm_stats" (dict), "name" (str), "temperature" (float)
-        config: full config dict (game, mcts, etc.)
+        config: full config dict (game, mcts, mcts_train, etc.)
         device: torch device string
         log: logger callable
         n_hands: number of hands to play
@@ -116,25 +120,39 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
 
     game_cfg = config.get("game", {})
     mcts_cfg = config.get("mcts", {})
+    mcts_train_cfg = config.get("mcts_train", {})
     raise_sizes = _get_raise_sizes(game_cfg)
     n_raise_bins = len(raise_sizes[0])
     n_actions = n_raise_bins + 3
     big_blind = game_cfg.get("big_blind", 10)
     small_blind = big_blind // 2
-    num_players = min(len(agents_list), game_cfg.get("max_players", 9))
-    num_players = max(2, num_players)
-    start_stack = config.get("evaluation", {}).get("start_stack", 1000)
+    abs_max_players = game_cfg.get("max_players", 9)
+    min_players = max(2, mcts_train_cfg.get("min_players", 2))
+    max_players = min(abs_max_players, mcts_train_cfg.get("max_players", 6))
+    max_players = max(min_players, max_players)
+    swap_prob = mcts_train_cfg.get("player_swap_prob", 0.05)
+    min_stack = mcts_train_cfg.get("min_stack", big_blind * 10)
+    max_stack = mcts_train_cfg.get("max_stack", game_cfg.get("max_stack", 3000))
 
     per_agent_examples = {a["name"]: [] for a in agents_list}
-    dummy_action = torch.zeros(n_actions, dtype=torch.float32)
     MAX_ACTIONS = 10000
 
-    log(f"MCTS collection: {n_hands} hands, {num_players} players, "
+    log(f"MCTS collection: {n_hands} hands, players={min_players}-{max_players}, "
+        f"stack={min_stack}-{max_stack}, swap_prob={swap_prob}, "
         f"{mcts_cfg.get('n_simulations', 1000)} simulations/decision")
 
+    # Initial table: random player count + random agents from pool (with replacement)
+    num_players = random.randint(min_players, max_players)
+    hand_seated = random.choices(agents_list, k=num_players)
+
     for hand_i in tqdm(range(n_hands), desc="MCTS collection"):
-        # Seat agents
-        seated = random.choices(agents_list, k=num_players)
+        # With swap_prob, reshuffle the entire table: new count + new agents
+        if random.random() < swap_prob:
+            num_players = random.randint(min_players, max_players)
+            hand_seated = random.choices(agents_list, k=num_players)
+
+        dummy_action = torch.zeros(n_actions, dtype=torch.float32)
+        start_stack = random.randint(min_stack, max_stack)
 
         table = Table(
             num_players=num_players,
@@ -186,7 +204,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
                 "action": None,
             })
 
-            agent_info = seated[active_pos]
+            agent_info = hand_seated[active_pos]
 
             # Build and normalize events for this agent
             events = _rebuild_events(
@@ -247,7 +265,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
         for ex, dec in zip(examples, decisions):
             pos = dec["player_pos"]
             ex.value_target = outcomes[pos]
-            agent_name = seated[pos]["name"]
+            agent_name = hand_seated[pos]["name"]
             per_agent_examples[agent_name].append(ex)
 
     for name, exs in per_agent_examples.items():

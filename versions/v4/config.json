@@ -126,7 +126,9 @@
         "save_dir": "",
         "save_every_hands": 1000,
         "player_swap_prob": 0.02,
-        "n_player_pool": 27
+        "n_player_pool": 27,
+        "min_stack": 100,
+        "max_stack": 3000
     },
     "opponent_action_train": {
         "lr": 1e-4,
@@ -150,6 +152,11 @@
     "mcts_train": {
         "n_cycles": 10,
         "n_hands_per_cycle": 500,
+        "min_players": 2,
+        "max_players": 6,
+        "player_swap_prob": 0.05,
+        "min_stack": 100,
+        "max_stack": 3000,
         "examples_dir": "",
         "lr": 3e-5,
         "batch_size": 16,

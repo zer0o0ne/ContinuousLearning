@@ -313,8 +313,9 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
     n_raise_bins = len(raise_sizes[0])
     n_actions = n_raise_bins + 3
 
+    min_stack = config.get("min_stack", big_blind * 10)
     num_players = random.randint(2, max_players)
-    start_credits = random.randint(big_blind * 2, max_stack)
+    start_credits = random.randint(min_stack, max_stack)
 
     # Build opponent_ids mapping for this hand
     if player_ids is not None:

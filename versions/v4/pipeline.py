@@ -238,10 +238,6 @@ def main():
             train_modelling(agent, modelling_cfg, device, log,
                             scenarios_override=base_scenarios, temperature=single_temperature)
 
-    # --- Evaluation ---
-    if pipeline_cfg.get("run_evaluation", False):
-        run_evaluation(config, device, log)
-
     # --- Opponent data generation + training ---
     if pipeline_cfg.get("run_opponent_data", False):
         from agent.train_scenarios.generation.generate_opponent import generate_opponent_dataset
@@ -356,6 +352,10 @@ def main():
 
             _, mcts_run_dir = train_mcts(
                 agent, mcts_train_cfg, device, log, mcts_examples)
+
+    # --- Evaluation (after all training stages) ---
+    if pipeline_cfg.get("run_evaluation", False):
+        run_evaluation(config, device, log)
 
 
 def _load_mcts_examples(examples_dir, log):

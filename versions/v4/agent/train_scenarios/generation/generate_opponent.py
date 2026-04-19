@@ -38,7 +38,8 @@ from utils import get_amp_config
 
 def _find_best_checkpoint(agent_dir):
     """Find best checkpoint, searching gto_predict in addition to probs/ev."""
-    for scenario in ("gto_probs_predict", "gto_predict", "modelling_predict", "gto_ev_predict"):
+    for scenario in ("mcts_predict", "opponent_action_predict", "modelling_predict",
+                      "gto_predict", "gto_probs_predict", "gto_ev_predict"):
         scenario_dir = os.path.join(agent_dir, scenario)
         if not os.path.isdir(scenario_dir):
             continue

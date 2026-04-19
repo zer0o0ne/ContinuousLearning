@@ -1,18 +1,18 @@
 {
-    "name": "small_end_to_end",
+    "name": "first_big_train",
     "agent_dir": "",
     "architecture": {
-        "d_model": 64,
+        "d_model": 256,
         "n_heads": 8,
         "n_kv_heads": 2,
-        "d_ff": 256,
+        "d_ff": 512,
         "n_encoder_layers": 6,
         "n_decoder_layers": 4,
         "n_value_layers": 4,
         "n_action_layers": 6,
         "n_opponent_action_layers": 6,
         "n_modelling_layers": 4,
-        "max_seq_len": 2048,
+        "max_seq_len": 1024,
         "max_players": 9,
         "memory": {
             "n_levels": 2,
@@ -25,7 +25,7 @@
         }
     },
     "multi_agent": {
-        "save_dir": "2_final_agents",
+        "save_dir": "5_final_agents",
         "agents": [
             {
                 "name": "gto_pure",
@@ -39,6 +39,30 @@
                     {"type": "action_bias", "actions": "aggressive", "factor": 0.35},
                     {"type": "action_bias", "actions": "fold", "factor": -0.25},
                     {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.4},
+                    {"type": "temperature", "value": 0.3}
+                ]
+            },
+            {
+                "name": "tight_passive",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "fold", "factor": 0.3},
+                    {"type": "action_bias", "actions": "raises", "factor": -0.2},
+                    {"type": "temperature", "value": 0.1}
+                ]
+            },
+            {
+                "name": "value_heavy",
+                "modifiers": [
+                    {"type": "conditional_bias", "condition": "equity > 0.6", "actions": "aggressive", "factor": 0.5},
+                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.3},
+                    {"type": "temperature", "value": 0.3}
+                ]
+            },
+            {
+                "name": "mid_raise_specialist",
+                "modifiers": [
+                    {"type": "action_bias", "actions": "4:8", "factor": 0.4},
+                    {"type": "action_bias", "actions": [0, 1, 10], "factor": -0.15},
                     {"type": "temperature", "value": 0.3}
                 ]
             }
@@ -68,7 +92,7 @@
         "marginal_response_iters": 0
     },
     "dataset": {
-        "dataset_dir": "",
+        "dataset_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v3/finalize_v2/dataset/2026_04_05_22_00_04",
         "save_dir": "",
         "n_scenarios": 1000,
         "val_split": 0.05,
@@ -109,7 +133,7 @@
     "gto_train": {
         "lr": 5e-5,
         "batch_size": 64,
-        "epochs": 2,
+        "epochs": 10,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 50,
@@ -118,8 +142,8 @@
         "action_loss_weight": 1.2
     },
     "opponent_data": {
-        "agents_dir": "2_final_agents",
-        "n_hands": 500,
+        "agents_dir": "5_final_agents",
+        "n_hands": 15000,
         "action_temperature": 0.3,
         "range_threshold": 0.75,
         "max_batch_combos": 128,
@@ -133,7 +157,7 @@
     "opponent_action_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 2,
+        "epochs": 5,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 50,
@@ -142,25 +166,25 @@
         "val_split": 0.05
     },
     "mcts": {
-        "n_simulations": 1000,
+        "n_simulations": 3000,
         "c_puct": 1.5,
         "dirichlet_alpha": 0.3,
         "dirichlet_epsilon": 0.25,
         "temperature": 1.0,
-        "n_equity_iters": 3000
+        "n_equity_iters": 5000
     },
     "mcts_train": {
-        "n_cycles": 10,
-        "n_hands_per_cycle": 500,
+        "n_cycles": 100,
+        "n_hands_per_cycle": 1000,
         "min_players": 2,
-        "max_players": 6,
+        "max_players": 9,
         "player_swap_prob": 0.05,
         "min_stack": 100,
         "max_stack": 3000,
         "examples_dir": "",
         "lr": 3e-5,
-        "batch_size": 16,
-        "epochs": 2,
+        "batch_size": 32,
+        "epochs": 1,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 50,
@@ -169,10 +193,10 @@
         "val_split": 0.1,
         "value_weight": 1.0,
         "action_weight": 1.0,
-        "chain_weight": 2.5
+        "chain_weight": 1.0
     },
     "evaluation": {
-        "agents_dir": "2_final_agents",
+        "agents_dir": "5_final_agents",
         "num_players": 5,
         "n_hands": 100000,
         "big_blind": 10,

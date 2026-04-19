@@ -192,8 +192,12 @@ def main():
 
             if pipeline_cfg.get("run_modelling", False):
                 modelling_cfg = _merge_train_config(config, "modelling_train")
-                train_modelling(agent, modelling_cfg, device, agent_log,
+                _, modelling_run_dir = train_modelling(agent, modelling_cfg, device, agent_log,
                                 scenarios_override=modified, temperature=agent_temperature)
+                if modelling_run_dir:
+                    best_ckpt = os.path.join(modelling_run_dir, "best.pt")
+                    if os.path.exists(best_ckpt):
+                        agent.load_checkpoint(best_ckpt)
 
     elif needs_training:
         # --- Single-agent training ---
@@ -235,8 +239,12 @@ def main():
 
         if pipeline_cfg.get("run_modelling", False):
             modelling_cfg = _merge_train_config(config, "modelling_train")
-            train_modelling(agent, modelling_cfg, device, log,
+            _, modelling_run_dir = train_modelling(agent, modelling_cfg, device, log,
                             scenarios_override=base_scenarios, temperature=single_temperature)
+            if modelling_run_dir:
+                best_ckpt = os.path.join(modelling_run_dir, "best.pt")
+                if os.path.exists(best_ckpt):
+                    agent.load_checkpoint(best_ckpt)
 
     # --- Opponent data generation + training ---
     if pipeline_cfg.get("run_opponent_data", False):

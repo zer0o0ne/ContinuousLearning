@@ -42,7 +42,7 @@ class MCTS:
     heads to evaluate positions and explore the game tree in latent space.
     """
 
-    def __init__(self, agent, device, mcts_config=None):
+    def __init__(self, agent, device, mcts_config=None, opponent_emb_table=None):
         self.agent = agent
         self.device = device
         cfg = mcts_config or {}
@@ -52,6 +52,13 @@ class MCTS:
         self.dirichlet_alpha = cfg.get("dirichlet_alpha", 0.3)
         self.dirichlet_epsilon = cfg.get("dirichlet_epsilon", 0.25)
         self.temperature = cfg.get("temperature", 1.0)
+        # Batched search: collect up to `batch_size` leaves, mark in-flight
+        # paths with `virtual_loss` so concurrent simulators avoid them.
+        self.batch_size = cfg.get("batch_size", 1)
+        self.virtual_loss = cfg.get("virtual_loss", 1.0)
+        # Opponent embedding is only injected at the root (inner-tree nodes
+        # work in latent space without re-running perception).
+        self.opponent_emb_table = opponent_emb_table
 
     @torch.no_grad()
     def search(self, event_sequences, game_state):
@@ -77,17 +84,104 @@ class MCTS:
         self._expand_node(root, game_state, act_logits, opp_logits, act_embs)
         self._add_dirichlet_noise(root)
 
-        # Run simulations
-        for _ in range(self.n_simulations):
-            self._simulate(root, root_ctx, root_mask, game_state)
+        # Pending queue: in-flight (path, gs) waiting for batched NN evaluation.
+        # Their nodes already carry virtual loss so subsequent _select_to_leaf
+        # calls steer away from them.
+        pending = []
+        sim = 0
+        while sim < self.n_simulations:
+            while len(pending) < self.batch_size and sim < self.n_simulations:
+                path, gs = self._select_to_leaf(root, game_state)
+                sim += 1
+                if gs is None or path[-1].is_terminal:
+                    for n in path:
+                        n.N += 1
+                    continue
+                self._apply_virtual_loss(path)
+                pending.append((path, gs))
+
+            if pending:
+                self._flush_pending(pending, root_ctx, root_mask)
+                pending.clear()
 
         self.last_root = root
         return self._best_action(root)
 
+    def _apply_virtual_loss(self, path):
+        """Tentatively mark a path as visited with a negative value bias.
+
+        Increments N and decreases W by `virtual_loss` along the path so that
+        subsequent selections see this path as less attractive. Reversed in
+        _flush_pending after the real leaf value arrives.
+        """
+        vl = self.virtual_loss
+        for n in path:
+            n.N += 1
+            n.W -= vl
+            n.Q = n.W / n.N
+
+    def _pad_and_stack(self, contexts, masks):
+        """Pad list of (1, L_i, d) contexts and (1, L_i) masks to common L_max
+        and stack into (B, L_max, d) / (B, L_max).
+
+        At B=1 returns the inputs unchanged so head forwards are bit-for-bit
+        identical to the sequential implementation.
+        """
+        if len(contexts) == 1:
+            return contexts[0], masks[0]
+        L_max = max(c.shape[1] for c in contexts)
+        B = len(contexts)
+        d = contexts[0].shape[2]
+        device = contexts[0].device
+
+        batch_ctx = torch.zeros(B, L_max, d, device=device, dtype=contexts[0].dtype)
+        batch_mask = torch.zeros(B, L_max, device=device, dtype=masks[0].dtype)
+        for i, (c, m) in enumerate(zip(contexts, masks)):
+            L_i = c.shape[1]
+            batch_ctx[i, :L_i] = c[0]
+            batch_mask[i, :L_i] = m[0]
+        return batch_ctx, batch_mask
+
+    def _flush_pending(self, pending, root_ctx, root_mask):
+        """Evaluate all queued leaves in ONE batched NN forward, then expand
+        and resolve virtual loss for each.
+
+        At batch_size=1 this is bit-for-bit equivalent to the previous
+        sequential code: _pad_and_stack returns the single context unchanged
+        and head outputs are identical.
+        """
+        vl = self.virtual_loss
+
+        contexts, masks = [], []
+        for path, gs in pending:
+            ctx, msk = self._build_context(root_ctx, root_mask, path)
+            contexts.append(ctx)
+            masks.append(msk)
+
+        batch_ctx, batch_mask = self._pad_and_stack(contexts, masks)
+
+        # ONE forward per head over the whole batch
+        values     = self.agent.value_head(batch_ctx, mask=batch_mask)            # (B, 1)
+        act_logits = self.agent.action_head(batch_ctx, mask=batch_mask)           # (B, n_actions)
+        opp_logits = self.agent.opponent_action_head(batch_ctx, mask=batch_mask)  # (B, n_actions)
+        act_embs   = self.agent.modelling_head(batch_ctx, mask=batch_mask)        # (B, n_actions, d)
+
+        for i, (path, gs) in enumerate(pending):
+            leaf = path[-1]
+            leaf_value = values[i].item()
+            self._expand_node(leaf, gs,
+                              act_logits[i:i+1], opp_logits[i:i+1], act_embs[i:i+1])
+            for n in path:
+                n.W += vl + leaf_value
+                n.Q = n.W / n.N
+
     def _evaluate_root(self, event_sequences):
         """Run perception + all heads on the real event sequences."""
+        skip_opp = self.opponent_emb_table is None
         p_out, encoded, mask = self.agent.perception.forward_batch(
             event_sequences, device=self.device, skip_memory=True,
+            skip_opponent_emb=skip_opp,
+            opponent_emb_table=self.opponent_emb_table,
         )
         value = self.agent.value_head(p_out, mask=mask)
         act_logits = self.agent.action_head(p_out, mask=mask)
@@ -95,28 +189,46 @@ class MCTS:
         act_embs = self.agent.modelling_head(p_out, mask=mask)
         return p_out, mask, value, act_logits, opp_logits, act_embs
 
-    def _simulate(self, root, root_ctx, root_mask, root_gs):
-        """One MCTS simulation: select → expand → backup."""
-        # SELECT: descend from root to leaf
+    def _select_to_leaf(self, root, root_gs):
+        """Descend from root to a leaf, replay GameState, set lazy flags.
+
+        On first visit to a node, sets node.is_terminal / node.is_hero from
+        the replayed GameState (deferred from _expand_node).
+
+        Returns:
+            path: list[MCTSNode] from root to leaf (length >= 1)
+            gs:   GameState at the leaf, or None if the leaf is an
+                  already-known terminal (no replay needed)
+        """
         node = root
         path = [node]
-
         while node.children and not node.is_terminal:
             action = self._select_child(node)
             node = node.children[action]
             path.append(node)
 
-        # TERMINAL: increment N only
         if node.is_terminal:
+            return path, None
+
+        gs = self._replay_game_state(root_gs, path)
+        if node is not root:
+            node.is_terminal = gs.is_terminal
+            node.is_hero = gs.is_hero_turn()
+        return path, gs
+
+    def _simulate(self, root, root_ctx, root_mask, root_gs):
+        """One MCTS simulation: select → expand → backup."""
+        path, gs = self._select_to_leaf(root, root_gs)
+        node = path[-1]
+
+        # Terminal — known from prior visit (gs is None) or freshly detected
+        if gs is None or node.is_terminal:
             for n in path:
                 n.N += 1
             return
 
         # BUILD CONTEXT: root_ctx + action embeddings along path
         context, mask = self._build_context(root_ctx, root_mask, path)
-
-        # GET GAME STATE at this leaf
-        gs = self._replay_game_state(root_gs, path)
 
         # EXPAND leaf
         if node is root:
@@ -189,7 +301,12 @@ class MCTS:
         return value, act_logits, opp_logits, act_embs
 
     def _expand_node(self, node, game_state, act_logits, opp_logits, act_embs):
-        """Create children for each legal action."""
+        """Create children for each legal action (lazy — no GameState clones).
+
+        is_hero / is_terminal are set on first visit in _simulate via
+        _replay_game_state, so we only allocate the prior + action embedding
+        here. Saves up to n_legal GameState clones per expansion.
+        """
         legal = game_state.get_legal_actions()
         logits = act_logits if node.is_hero else opp_logits
         logits = logits[0]  # (n_actions,)
@@ -198,18 +315,15 @@ class MCTS:
         mask = torch.full_like(logits, float("-inf"))
         for a in legal:
             mask[a] = 0.0
-        priors = F.softmax(logits + mask, dim=0)
+        priors = F.softmax(logits + mask, dim=0).tolist()  # one host transfer
 
         for a in legal:
-            child_gs = game_state.clone()
-            child_gs.step(a)
-
             child = MCTSNode(
                 action_idx=a,
                 parent=node,
-                is_hero=child_gs.is_hero_turn() if not child_gs.is_terminal else True,
-                is_terminal=child_gs.is_terminal,
-                P=priors[a].item(),
+                is_hero=False,        # filled lazily on first visit
+                is_terminal=False,    # filled lazily on first visit
+                P=priors[a],
                 action_embedding=act_embs[0, a].detach(),
             )
             node.children[a] = child

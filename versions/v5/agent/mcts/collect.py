@@ -135,6 +135,21 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
     per_agent_examples = {a["name"]: [] for a in agents_list}
     MAX_ACTIONS = 10000
 
+    # Per-agent OpponentEmbeddingTable. Used at MCTS root perception call so
+    # search sees the same opponent context as supervised training does. Each
+    # agent has its own table because GRU updates are agent-specific (the GRU
+    # lives inside Perception). Tables persist across hands within this call,
+    # mirroring how training accumulates embeddings within an epoch.
+    opp_tables = {}
+    for a in agents_list:
+        asi = a["agent"]
+        if asi.perception.opp_emb_enabled:
+            from agent.perception.opponent_embeddings import OpponentEmbeddingTable
+            opp_tables[a["name"]] = OpponentEmbeddingTable(asi.perception.d_model)
+    if opp_tables:
+        log(f"MCTS collection: opponent_embedding active at root for "
+            f"{len(opp_tables)}/{len(agents_list)} agent(s)")
+
     log(f"MCTS collection: {n_hands} hands, players={min_players}-{max_players}, "
         f"stack={min_stack}-{max_stack}, swap_prob={swap_prob}, "
         f"{mcts_cfg.get('n_simulations', 1000)} simulations/decision")
@@ -148,6 +163,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
         if random.random() < swap_prob:
             num_players = random.randint(min_players, max_players)
             hand_seated = random.choices(agents_list, k=num_players)
+        seated_names = [a["name"] for a in hand_seated]
 
         dummy_action = torch.zeros(n_actions, dtype=torch.float32)
         start_stack = random.randint(min_stack, max_stack)
@@ -209,6 +225,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
                 snapshots, table.deck, active_pos,
                 num_players, big_blind, small_blind, n_actions,
                 up_to=len(snapshots) - 1,
+                seated_names=seated_names,
             )
             norm_events = [dict(e) for e in events]  # shallow copy before mutation
             for e in norm_events:
@@ -216,9 +233,10 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
                     e["bets"] = np.copy(e["bets"])
             _normalize_events_inplace(norm_events, agent_info["norm_stats"])
 
-            # MCTS search
+            # MCTS search (opponent_emb at root only — see MCTS._evaluate_root)
             gs = GameState.from_table(table, active_pos)
-            mcts = MCTS(agent_info["agent"], device, mcts_cfg)
+            mcts = MCTS(agent_info["agent"], device, mcts_cfg,
+                        opponent_emb_table=opp_tables.get(agent_info["name"]))
             agent_info["agent"].eval()
             action_idx = mcts.search([norm_events], gs)
 

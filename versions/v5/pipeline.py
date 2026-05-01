@@ -6,6 +6,39 @@ from utils import Logger
 from agent.agent import ASI
 
 
+def _find_latest_best_ckpt(scenario_dir):
+    """Return path to best.pt in the latest timestamp subdir of scenario_dir, or None."""
+    if not os.path.isdir(scenario_dir):
+        return None
+    candidates = []
+    for name in os.listdir(scenario_dir):
+        best = os.path.join(scenario_dir, name, "best.pt")
+        if os.path.isfile(best):
+            candidates.append((name, best))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
+
+
+def _run_or_skip_phase(scenario_name, agent, agent_base, agent_log, train_fn):
+    """If scenario already has a best.pt, load it and skip. Otherwise run train_fn()
+    and load its best.pt. Returns the path to the loaded best.pt (or None)."""
+    existing = _find_latest_best_ckpt(os.path.join(agent_base, scenario_name))
+    if existing is not None:
+        agent_log(f"  [resume] {scenario_name}: loading existing {existing}, "
+                  f"skipping training")
+        agent.load_checkpoint(existing)
+        return existing
+    _, run_dir = train_fn()
+    if run_dir:
+        best_ckpt = os.path.join(run_dir, "best.pt")
+        if os.path.exists(best_ckpt):
+            agent.load_checkpoint(best_ckpt)
+            return best_ckpt
+    return None
+
+
 def _merge_train_config(config, scenario_key):
     """Merge game + solver + dataset + scenario-specific config into a flat dict."""
     merged = {}
@@ -130,9 +163,16 @@ def main():
         big_blind = game_cfg.get("big_blind", 10)
         temperature = solver_cfg.get("gto_temperature", 1.0)
 
+        skip_training = set(multi_agent.get("skip_training", []))
+
         for agent_cfg in multi_agent["agents"]:
             agent_name = agent_cfg["name"]
             modifiers = agent_cfg.get("modifiers", [])
+
+            if agent_name in skip_training:
+                log(f"\n=== Agent: {agent_name} — skipped "
+                    f"(listed in multi_agent.skip_training) ===")
+                continue
 
             # Extract effective temperature for this agent
             agent_temperature = temperature
@@ -165,35 +205,34 @@ def main():
             probs_train_cfg = _merge_train_config(config, "gto_probs_train")
 
             if pipeline_cfg.get("run_gto_ev", True):
-                _, ev_run_dir = train_gto_ev(agent, ev_train_cfg, device, agent_log,
-                             scenarios_override=modified, temperature=agent_temperature)
-                # Reload best EV checkpoint so probs training starts from best weights
-                if ev_run_dir:
-                    best_ckpt = os.path.join(ev_run_dir, "best.pt")
-                    if os.path.exists(best_ckpt):
-                        agent.load_checkpoint(best_ckpt)
+                _run_or_skip_phase(
+                    "gto_ev_predict", agent, agent_base, agent_log,
+                    lambda: train_gto_ev(agent, ev_train_cfg, device, agent_log,
+                                         scenarios_override=modified,
+                                         temperature=agent_temperature))
 
             if pipeline_cfg.get("run_gto_probs", False):
-                _, probs_run_dir = train_gto_probs(agent, probs_train_cfg, device, agent_log,
-                                scenarios_override=modified, temperature=agent_temperature)
-                if probs_run_dir:
-                    best_ckpt = os.path.join(probs_run_dir, "best.pt")
-                    if os.path.exists(best_ckpt):
-                        agent.load_checkpoint(best_ckpt)
+                _run_or_skip_phase(
+                    "gto_probs_predict", agent, agent_base, agent_log,
+                    lambda: train_gto_probs(agent, probs_train_cfg, device, agent_log,
+                                            scenarios_override=modified,
+                                            temperature=agent_temperature))
 
             if pipeline_cfg.get("run_gto_training", False):
                 gto_train_cfg = _merge_train_config(config, "gto_train")
-                _, gto_run_dir = train_gto(agent, gto_train_cfg, device, agent_log,
-                                scenarios_override=modified, temperature=agent_temperature)
-                if gto_run_dir:
-                    best_ckpt = os.path.join(gto_run_dir, "best.pt")
-                    if os.path.exists(best_ckpt):
-                        agent.load_checkpoint(best_ckpt)
+                _run_or_skip_phase(
+                    "gto_predict", agent, agent_base, agent_log,
+                    lambda: train_gto(agent, gto_train_cfg, device, agent_log,
+                                      scenarios_override=modified,
+                                      temperature=agent_temperature))
 
             if pipeline_cfg.get("run_modelling", False):
                 modelling_cfg = _merge_train_config(config, "modelling_train")
-                train_modelling(agent, modelling_cfg, device, agent_log,
-                                scenarios_override=modified, temperature=agent_temperature)
+                _run_or_skip_phase(
+                    "modelling_predict", agent, agent_base, agent_log,
+                    lambda: train_modelling(agent, modelling_cfg, device, agent_log,
+                                            scenarios_override=modified,
+                                            temperature=agent_temperature))
 
     elif needs_training:
         # --- Single-agent training ---
@@ -461,6 +500,11 @@ def main():
     # --- Evaluation (after all training stages) ---
     if pipeline_cfg.get("run_evaluation", False):
         run_evaluation(config, device, log)
+
+    # --- Slumbot evaluation (external HU benchmark) ---
+    if pipeline_cfg.get("run_slumbot_eval", False):
+        from evaluation.slumbot_eval import run_slumbot_evaluation
+        run_slumbot_evaluation(config, device, log)
 
 
 def _load_mcts_examples(examples_dir, log):

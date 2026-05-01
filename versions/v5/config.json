@@ -25,7 +25,7 @@
         }
     },
     "multi_agent": {
-        "save_dir": "5_final_agents",
+        "save_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents",
         "agents": [
             {
                 "name": "gto_pure",
@@ -147,7 +147,7 @@
         "action_temperature": 0.3,
         "range_threshold": 0.75,
         "max_batch_combos": 128,
-        "save_dir": "",
+        "save_dir": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/first_big_train/opponent_dataset/2026_04_24_12_47_08",
         "save_every_hands": 1000,
         "player_swap_prob": 0.02,
         "n_player_pool": 27,
@@ -157,7 +157,7 @@
     "opponent_action_train": {
         "lr": 1e-4,
         "batch_size": 64,
-        "epochs": 5,
+        "epochs": 2,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 50,
@@ -171,20 +171,22 @@
         "dirichlet_alpha": 0.3,
         "dirichlet_epsilon": 0.25,
         "temperature": 1.0,
-        "n_equity_iters": 5000
+        "n_equity_iters": 5000,
+        "batch_size": 16,
+        "virtual_loss": 1.0
     },
     "mcts_train": {
         "n_cycles": 100,
-        "n_hands_per_cycle": 1000,
+        "n_hands_per_cycle": 250,
         "min_players": 2,
         "max_players": 9,
         "player_swap_prob": 0.05,
         "min_stack": 100,
         "max_stack": 3000,
         "examples_dir": "",
-        "lr": 3e-5,
+        "lr": 1e-5,
         "batch_size": 32,
-        "epochs": 1,
+        "epochs": 2,
         "max_grad_norm": 1.0,
         "log_every": 10,
         "val_every": 50,
@@ -209,14 +211,32 @@
         "n_tables": 16,
         "use_opponent_emb": true
     },
+    "slumbot_eval": {
+        "host": "slumbot.com",
+        "username": "",
+        "password": "",
+        "request_timeout": 30,
+        "log_every": 50,
+        "n_hands": 1000,
+        "agents": [
+            {
+                "name": "gto_pure_vs_slumbot",
+                "path": "5_final_agents/gto_pure",
+                "use_opponent_embedding": false,
+                "use_mcts": false,
+                "action_temperature": 0.3
+            }
+        ]
+    },
     "pipeline": {
         "run_gto_ev": false,
         "run_gto_probs": false,
-        "run_gto_training": true,
-        "run_modelling": true,
-        "run_opponent_data": true,
-        "run_opponent_action_train": true,
+        "run_gto_training": false,
+        "run_modelling": false,
+        "run_opponent_data": false,
+        "run_opponent_action_train": false,
         "run_mcts_train": true,
-        "run_evaluation": true
+        "run_evaluation": true,
+        "run_slumbot_eval": false
     }
 }

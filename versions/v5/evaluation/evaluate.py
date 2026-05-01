@@ -52,6 +52,120 @@ def _find_best_checkpoint(agent_dir):
     return None
 
 
+def _resolve_checkpoint_path(path):
+    """Resolve a user-supplied path to a concrete .pt file.
+
+    Accepted forms:
+      - file ending with .pt → returned as-is
+      - directory with best.pt directly inside → that best.pt
+      - agent directory (contains scenario subdirs like mcts_predict/) →
+            _find_best_checkpoint priority search
+      - scenario directory (contains timestamped subdirs with best.pt) →
+            pick latest timestamp
+    Returns absolute path or None if nothing found.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    if os.path.isfile(path):
+        return path if path.endswith(".pt") else None
+    # Direct best.pt
+    direct = os.path.join(path, "best.pt")
+    if os.path.isfile(direct):
+        return direct
+    # Agent dir (priority search across known scenarios)
+    found = _find_best_checkpoint(path)
+    if found:
+        return found
+    # Scenario dir: any subdir/best.pt? pick latest by name
+    candidates = []
+    for sub in os.listdir(path):
+        sub_path = os.path.join(path, sub)
+        if not os.path.isdir(sub_path):
+            continue
+        ckpt = os.path.join(sub_path, "best.pt")
+        if os.path.isfile(ckpt):
+            candidates.append((sub, ckpt))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    return None
+
+
+def _build_agent_bundle(name, ckpt_path, config, device, log,
+                        fallback_temperature, entry_temperature_override=None):
+    """Build a single agent bundle from a checkpoint path.
+
+    Temperature precedence: checkpoint > entry override > fallback.
+    """
+    agent = ASI(log, config)
+    agent.set_device(device)
+    agent.load_checkpoint(ckpt_path)
+    agent.eval()
+
+    ckpt = torch.load(ckpt_path, weights_only=False, map_location=device)
+    norm_stats = ckpt.get("norm_stats")
+    if norm_stats is None:
+        log(f"WARNING: no norm_stats in checkpoint for '{name}', using identity normalization")
+        norm_stats = {
+            "pot_mean": 0.0, "pot_std": 1.0,
+            "stack_mean": 0.0, "stack_std": 1.0,
+            "bets_mean": 0.0, "bets_std": 1.0,
+            "blind_mean": 0.0, "blind_std": 1.0,
+        }
+
+    ckpt_temp = ckpt.get("temperature")
+    if ckpt_temp is not None:
+        temperature = float(ckpt_temp)
+    elif entry_temperature_override is not None:
+        temperature = float(entry_temperature_override)
+    else:
+        log(f"WARNING: no temperature in checkpoint for '{name}', using config fallback ({fallback_temperature})")
+        temperature = float(fallback_temperature)
+
+    return {
+        "agent": agent,
+        "norm_stats": norm_stats,
+        "name": name,
+        "temperature": temperature,
+        "stack": 0.0,
+    }
+
+
+def _resolve_agent_path(path, project_root, version):
+    if not path:
+        raise ValueError("agent entry missing 'path'")
+    if os.path.isabs(path):
+        return path
+    return os.path.join(project_root, "data", version, path)
+
+
+def _load_agents_from_list(agent_entries, config, device, log, fallback_temperature):
+    """Load agents from an explicit list (eval_pipeline-style).
+
+    Each entry: {"name": str, "path": str, "action_temperature": float (optional)}
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    version = os.path.basename(os.path.abspath(os.path.join(here, "..")))
+    project_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+
+    agents = []
+    for entry in agent_entries:
+        name = entry.get("name") or os.path.basename(entry.get("path", "").rstrip("/"))
+        path = _resolve_agent_path(entry["path"], project_root, version)
+        ckpt_path = _resolve_checkpoint_path(path)
+        if ckpt_path is None:
+            log(f"WARNING: no checkpoint for agent '{name}' at {path}, skipping")
+            continue
+        bundle = _build_agent_bundle(
+            name, ckpt_path, config, device, log,
+            fallback_temperature,
+            entry_temperature_override=entry.get("action_temperature"),
+        )
+        agents.append(bundle)
+        log(f"Loaded agent '{name}' from {ckpt_path} (temperature={bundle['temperature']})")
+    return agents
+
+
 def _load_agents(agents_dir, config, device, log, fallback_temperature):
     """Load all agents from subdirectories.
 
@@ -217,11 +331,15 @@ def _init_table_state(agents, agent_queue, num_players, raise_sizes,
     }
 
 
-def run_evaluation(config, device, log):
+def run_evaluation(config, device, log, results_dir_override=None):
     """Run agent-vs-agent evaluation with multi-table batching.
 
     Runs multiple tables in parallel, batching agent forward passes across
     tables for efficient GPU utilization.
+
+    Two ways to specify agents (mutually exclusive — list takes priority):
+      * eval_cfg["agents"]: explicit list of {"name", "path", "action_temperature"}
+      * eval_cfg["agents_dir"]: directory whose subdirs are agent names
     """
     eval_cfg = config.get("evaluation", {})
     game_cfg = config.get("game", {})
@@ -250,9 +368,13 @@ def run_evaluation(config, device, log):
     amp_enabled, device_type, amp_dtype, _ = get_amp_config(device)
 
     log("=== Evaluation ===")
-    log(f"Loading agents from {agents_dir}")
-
-    agents = _load_agents(agents_dir, config, device, log, fallback_temperature)
+    agent_entries = eval_cfg.get("agents")
+    if isinstance(agent_entries, list) and agent_entries:
+        log(f"Loading {len(agent_entries)} agents from explicit list")
+        agents = _load_agents_from_list(agent_entries, config, device, log, fallback_temperature)
+    else:
+        log(f"Loading agents from {agents_dir}")
+        agents = _load_agents(agents_dir, config, device, log, fallback_temperature)
     if not agents:
         log("No agents loaded. Aborting evaluation.")
         return
@@ -304,10 +426,13 @@ def run_evaluation(config, device, log):
     agent_queue = deque(range(len(agents)))
 
     # History save path
-    version = os.path.basename(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    exp_name = config.get("name", "default")
-    results_dir = os.path.join(project_root, "data", version, exp_name, "evaluation")
+    if results_dir_override:
+        results_dir = results_dir_override
+    else:
+        version = os.path.basename(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        exp_name = config.get("name", "default")
+        results_dir = os.path.join(project_root, "data", version, exp_name, "evaluation")
     os.makedirs(results_dir, exist_ok=True)
     history_path = os.path.join(results_dir, f"{log.init_time}.pt")
 

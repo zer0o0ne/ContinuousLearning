@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-All project was written by Claude Codes
+All project was written by Claude Code, so you are responsible for every bug in the code
 
 ## Running
 

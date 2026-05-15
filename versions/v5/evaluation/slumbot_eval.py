@@ -26,6 +26,7 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 from agent.agent import ASI
 from agent.mcts.game_state import GameState
@@ -476,27 +477,63 @@ def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scal
 # ============================================================================
 
 class SlumbotClient:
-    """Thin wrapper over Slumbot's HTTP API."""
+    """Thin wrapper over Slumbot's HTTP API.
 
-    def __init__(self, host=SLUMBOT_HOST, username="", password="", timeout=30):
+    Retries transient network failures (ConnectTimeout / ReadTimeout /
+    ConnectionError) with exponential backoff. Uses a persistent
+    requests.Session so TCP+TLS handshakes are reused across requests
+    (significant speedup on long evals).
+    """
+
+    def __init__(self, host=SLUMBOT_HOST, username="", password="",
+                 timeout=30, retries=4, backoff=1.0, log=None):
         self.host = host
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.backoff = float(backoff)
+        self.log = log
+        self.session = requests.Session()
         self.token = None
         if username and password:
             self.token = self._login(username, password)
 
     def _post(self, endpoint, data):
+        import time
         url = f"https://{self.host}/slumbot/api/{endpoint}"
-        r = requests.post(url, json=data, timeout=self.timeout)
-        if r.status_code != 200:
-            raise RuntimeError(f"Slumbot {endpoint} HTTP {r.status_code}: {r.text}")
-        body = r.json()
-        if "error_msg" in body:
-            raise RuntimeError(f"Slumbot {endpoint} error: {body['error_msg']}")
-        new_tok = body.get("token")
-        if new_tok:
-            self.token = new_tok
-        return body
+        # Retry on transient network errors (timeout / connection reset).
+        # Other errors (HTTP 4xx/5xx, error_msg in body) propagate immediately.
+        last_exc = None
+        for attempt in range(self.retries + 1):
+            try:
+                r = self.session.post(url, json=data, timeout=self.timeout)
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"Slumbot {endpoint} HTTP {r.status_code}: {r.text}")
+                body = r.json()
+                if "error_msg" in body:
+                    raise RuntimeError(
+                        f"Slumbot {endpoint} error: {body['error_msg']}")
+                new_tok = body.get("token")
+                if new_tok:
+                    self.token = new_tok
+                return body
+            except (requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                if attempt >= self.retries:
+                    break
+                wait = self.backoff * (2 ** attempt)
+                if self.log is not None:
+                    self.log(
+                        f"  Slumbot {endpoint} {type(e).__name__}, "
+                        f"retrying in {wait:.1f}s "
+                        f"(attempt {attempt + 1}/{self.retries})")
+                time.sleep(wait)
+        raise RuntimeError(
+            f"Slumbot {endpoint} failed after {self.retries + 1} attempts: "
+            f"{type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
 
     def _login(self, username, password):
         body = self._post("login", {"username": username, "password": password})
@@ -629,8 +666,14 @@ def _choose_action(bundle, events, state, hero_user_pos, raise_sizes,
 
 def _play_one_hand(client, bundle, config, raise_sizes, n_raise_bins, n_actions,
                    chip_scale, big_blind_internal, small_blind_internal,
-                   amp_enabled, device_type, amp_dtype, clamp_counters, log):
-    """Play one Slumbot hand. Returns (winnings, baseline_winnings)."""
+                   amp_enabled, device_type, amp_dtype, clamp_counters, log,
+                   action_hist=None, action_hist_by_street=None):
+    """Play one Slumbot hand. Returns (winnings, baseline_winnings).
+
+    Optional analytics buffers (mutated in place):
+      action_hist: np.ndarray (n_actions,) — counts per chosen idx (post-clamp)
+      action_hist_by_street: np.ndarray (4, n_actions) — same, split by street
+    """
     r = client.new_hand()
     client_pos = r["client_pos"]
     hero_user_pos = 1 - client_pos
@@ -708,6 +751,12 @@ def _play_one_hand(client, bundle, config, raise_sizes, n_raise_bins, n_actions,
             effective_idx = action_idx
         hero_action_indices.append(effective_idx)
 
+        # Analytics: record action distribution per street
+        if action_hist is not None:
+            action_hist[effective_idx] += 1
+        if action_hist_by_street is not None:
+            action_hist_by_street[int(state["turn"]), effective_idx] += 1
+
         r = client.act(incr)
 
 
@@ -753,6 +802,8 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
     username = cfg.get("username", "") or ""
     password = cfg.get("password", "") or ""
     timeout = int(cfg.get("request_timeout", 30))
+    retries = int(cfg.get("retries", 4))
+    backoff = float(cfg.get("backoff", 1.0))
 
     game_cfg = config.get("game", {})
     big_blind_internal = float(game_cfg.get("big_blind", 10))
@@ -789,24 +840,31 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
 
         name = bundle["name"]
         client = SlumbotClient(host=host, username=username,
-                               password=password, timeout=timeout)
+                               password=password, timeout=timeout,
+                               retries=retries, backoff=backoff, log=log)
         per_hand_chips = []
         per_hand_baseline = []
         clamp_counters = defaultdict(int)
+        action_hist = np.zeros(n_actions, dtype=np.int64)
+        action_hist_by_street = np.zeros((4, n_actions), dtype=np.int64)
         history = {"bb100_raw": [], "bb100_baseline": []}
         hands_failed = 0
 
         log(f"\n--- Playing {name} for {n_hands} hands ---")
+        pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand")
         for hand_idx in range(n_hands):
             try:
                 w, b = _play_one_hand(
                     client, bundle, config, raise_sizes, n_raise_bins, n_actions,
                     chip_scale, big_blind_internal, small_blind_internal,
                     amp_enabled, device_type, amp_dtype, clamp_counters, log,
+                    action_hist=action_hist,
+                    action_hist_by_street=action_hist_by_street,
                 )
             except Exception as e:
                 hands_failed += 1
                 log(f"  hand {hand_idx + 1} failed: {type(e).__name__}: {e}")
+                pbar.update(1)
                 # Try to recover by waiting briefly and starting a new hand
                 continue
 
@@ -814,16 +872,25 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
             per_hand_baseline.append(b)
 
             done = len(per_hand_chips)
+            # Live status on the bar — running BB/100 (baseline-corrected)
+            # plus failure count, refreshed every hand.
+            running_bcorr_chips = [w_i - b_i
+                                    for w_i, b_i in zip(per_hand_chips, per_hand_baseline)]
+            running_bcorr = _bb_per_100(sum(running_bcorr_chips), done)
+            pbar.set_postfix({
+                "BB/100 base": f"{running_bcorr:+.1f}",
+                "failed": hands_failed,
+            }, refresh=False)
+            pbar.update(1)
             if done > 0 and done % log_every == 0:
                 raw = _bb_per_100(sum(per_hand_chips), done)
-                bcorr_chips = [w_i - b_i for w_i, b_i in zip(per_hand_chips, per_hand_baseline)]
-                bcorr = _bb_per_100(sum(bcorr_chips), done)
                 stderr = _stderr_bb_per_100(per_hand_chips)
                 history["bb100_raw"].append((done, raw))
-                history["bb100_baseline"].append((done, bcorr))
+                history["bb100_baseline"].append((done, running_bcorr))
                 log(f"  [{name}] {done}/{n_hands}: "
-                    f"raw={raw:+.2f} BB/100, baseline_corrected={bcorr:+.2f} BB/100, "
+                    f"raw={raw:+.2f} BB/100, baseline_corrected={running_bcorr:+.2f} BB/100, "
                     f"stderr={stderr:.2f}, clamps={dict(clamp_counters)}")
+        pbar.close()
 
         n_played = len(per_hand_chips)
         total_chips = float(sum(per_hand_chips))
@@ -833,6 +900,14 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
         bb100_bcorr = _bb_per_100(sum(bcorr_chips), n_played)
         stderr_bb100 = _stderr_bb_per_100(per_hand_chips)
         mbb_per_hand_raw = bb100_raw * 10.0  # 1000 mbb / 100 hands
+
+        # Action distribution analytics
+        total_actions = int(action_hist.sum())
+        action_dist = (action_hist / max(total_actions, 1)).tolist()
+        action_dist_by_street = (
+            action_hist_by_street
+            / np.maximum(action_hist_by_street.sum(axis=1, keepdims=True), 1)
+        ).tolist()
 
         agent_result = {
             "hands_played": n_played,
@@ -847,15 +922,28 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
             "use_mcts": bundle["mcts"] is not None,
             "use_opponent_embedding": bundle["opp_table"] is not None,
             "temperature": bundle["temperature"],
+            "decisions_made": total_actions,
+            "fold_rate": round(action_dist[0], 4) if total_actions else 0.0,
+            "allin_rate": round(action_dist[n_actions - 1], 4) if total_actions else 0.0,
+            "action_distribution": [round(p, 4) for p in action_dist],
+            "action_distribution_by_street": [
+                [round(p, 4) for p in row] for row in action_dist_by_street
+            ],
+            "action_counts_total": [int(c) for c in action_hist],
+            "action_counts_by_street": [
+                [int(c) for c in row] for row in action_hist_by_street
+            ],
         }
         all_results[name] = agent_result
 
-        # Save per-agent history
+        # Save per-agent history (raw per-hand outcomes for variance analysis)
         hist_path = os.path.join(results_dir, f"{log.init_time}_{name}.history.pt")
         torch.save({
             "per_hand_chips": per_hand_chips,
             "per_hand_baseline": per_hand_baseline,
             "history": history,
+            "action_hist": action_hist.tolist(),
+            "action_hist_by_street": action_hist_by_street.tolist(),
         }, hist_path)
 
         log(f"\n[{name}] FINAL: raw={bb100_raw:+.2f} BB/100, "

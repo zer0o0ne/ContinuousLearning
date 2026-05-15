@@ -19,6 +19,7 @@ class MCTSNode:
     __slots__ = [
         "action_idx", "parent", "children", "is_hero", "is_terminal",
         "N", "W", "Q", "P", "action_embedding",
+        "terminal_Q",
     ]
 
     def __init__(self, action_idx=None, parent=None, is_hero=True,
@@ -33,6 +34,11 @@ class MCTSNode:
         self.Q = 0.0                       # mean value = W / N
         self.P = P                         # prior probability
         self.action_embedding = action_embedding  # (d_model,) tensor
+        # In-search terminal value, cached on first detection so subsequent
+        # visits back up the same real game-theoretic Q (not 0). For fold
+        # terminals it is deterministic; for showdowns we use a fair-share-
+        # of-pot heuristic (1/n_active). None means "not yet evaluated".
+        self.terminal_Q = None
 
 
 class MCTS:
@@ -42,7 +48,8 @@ class MCTS:
     heads to evaluate positions and explore the game tree in latent space.
     """
 
-    def __init__(self, agent, device, mcts_config=None, opponent_emb_table=None):
+    def __init__(self, agent, device, mcts_config=None, opponent_emb_table=None,
+                 terminal_evaluator=None):
         self.agent = agent
         self.device = device
         cfg = mcts_config or {}
@@ -59,6 +66,12 @@ class MCTS:
         # Opponent embedding is only injected at the root (inner-tree nodes
         # work in latent space without re-running perception).
         self.opponent_emb_table = opponent_emb_table
+        # Callable(GameState) -> float, used to compute Q at terminal leaves
+        # during search. Without it, terminals back up Q=0, which biases
+        # visit counts (action_target) toward the priors and the value head
+        # bootstrap, eliminating the policy-improvement signal. When None,
+        # terminal nodes default to Q=0 (legacy behaviour).
+        self.terminal_evaluator = terminal_evaluator
 
     @torch.no_grad()
     def search(self, event_sequences, game_state):
@@ -94,8 +107,7 @@ class MCTS:
                 path, gs = self._select_to_leaf(root, game_state)
                 sim += 1
                 if gs is None or path[-1].is_terminal:
-                    for n in path:
-                        n.N += 1
+                    self._backup_terminal(path)
                     continue
                 self._apply_virtual_loss(path)
                 pending.append((path, gs))
@@ -106,6 +118,24 @@ class MCTS:
 
         self.last_root = root
         return self._best_action(root)
+
+    def _backup_terminal(self, path):
+        """Back up the cached terminal Q at path[-1] through every ancestor.
+
+        Mirrors a normal backup but uses the precomputed game-theoretic Q
+        instead of a value-head estimate. If terminal_Q is None (no
+        evaluator configured), falls back to Q=0 — the legacy behaviour
+        where terminal paths only bumped N.
+        """
+        leaf_q = path[-1].terminal_Q
+        if leaf_q is None:
+            for n in path:
+                n.N += 1
+            return
+        for n in path:
+            n.N += 1
+            n.W += leaf_q
+            n.Q = n.W / n.N
 
     def _apply_virtual_loss(self, path):
         """Tentatively mark a path as visited with a negative value bias.
@@ -214,6 +244,9 @@ class MCTS:
         if node is not root:
             node.is_terminal = gs.is_terminal
             node.is_hero = gs.is_hero_turn()
+            if node.is_terminal and self.terminal_evaluator is not None \
+                    and node.terminal_Q is None:
+                node.terminal_Q = self.terminal_evaluator(gs)
         return path, gs
 
     def _simulate(self, root, root_ctx, root_mask, root_gs):
@@ -223,8 +256,7 @@ class MCTS:
 
         # Terminal — known from prior visit (gs is None) or freshly detected
         if gs is None or node.is_terminal:
-            for n in path:
-                n.N += 1
+            self._backup_terminal(path)
             return
 
         # BUILD CONTEXT: root_ctx + action embeddings along path

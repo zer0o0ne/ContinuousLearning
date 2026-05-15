@@ -399,103 +399,254 @@ def main():
                 train_mcts(agent, mcts_train_cfg, device, log,
                            mcts_examples, temperature=fallback_temp)
         else:
-            # Cyclic self-play: collect → train → repeat
+            # Cyclic self-play: collect → train → repeat.
+            # Agents are loaded ONCE from disk and trained in-place across
+            # cycles so we can save checkpoints less frequently than every
+            # cycle without losing training progress. History is appended to
+            # a single file per agent for continuous loss curves.
+
+            save_every_cycles = max(1, mcts_train_cfg.get("save_every_cycles", 1))
+
+            def _checkpoint_metadata(agent_obj, fallback_norm_stats):
+                """Pull norm_stats / temperature from agent's checkpoint."""
+                norm_stats = getattr(agent_obj, '_checkpoint_norm_stats', None)
+                if norm_stats is None:
+                    norm_stats = fallback_norm_stats
+                return norm_stats
+
+            _identity_norm = {"pot_mean": 0, "pot_std": 1,
+                              "stack_mean": 0, "stack_std": 1,
+                              "bets_mean": 0, "bets_std": 1,
+                              "blind_mean": 0, "blind_std": 1,
+                              "ev_mean": 0, "ev_std": 1}
+
+            def _build_persistent_optim(agent_obj, ckpt, mcts_train_cfg,
+                                         n_cycles, agent_log):
+                """Construct a single Adam + warmup→cosine that survives
+                across all cycles AND across pipeline runs.
+
+                Restores Adam moments and scheduler state from the
+                checkpoint when present, so cosine doesn't restart and β2
+                moments don't reset every cycle.
+                """
+                from torch.optim.lr_scheduler import (
+                    LinearLR, CosineAnnealingLR, SequentialLR)
+                lr = float(mcts_train_cfg.get("lr", 1e-5))
+                opt = torch.optim.Adam(agent_obj.parameters(), lr=lr)
+
+                est_steps = int(mcts_train_cfg.get(
+                    "estimated_steps_per_cycle", 20))
+                # Generous horizon — slight over-estimation just delays
+                # eta_min, under-estimation freezes early.
+                total_steps = max(1, n_cycles * est_steps)
+                warmup_steps = min(100, max(1, total_steps // 5))
+                eta_min = float(mcts_train_cfg.get(
+                    "scheduler_eta_min", 1e-6))
+
+                warmup = LinearLR(opt, start_factor=0.01,
+                                  total_iters=warmup_steps)
+                cosine = CosineAnnealingLR(
+                    opt, T_max=max(1, total_steps - warmup_steps),
+                    eta_min=eta_min)
+                sched = SequentialLR(opt, [warmup, cosine],
+                                     milestones=[warmup_steps])
+
+                restored_opt = False
+                restored_sched = False
+                if ckpt is not None:
+                    opt_state = ckpt.get("optimizer_state_dict")
+                    if opt_state is not None:
+                        try:
+                            opt.load_state_dict(opt_state)
+                            restored_opt = True
+                        except Exception as e:
+                            agent_log(f"  optimizer state ignored: {e}")
+                    sched_state = ckpt.get("scheduler_state_dict")
+                    if sched_state is not None:
+                        try:
+                            sched.load_state_dict(sched_state)
+                            restored_sched = True
+                        except Exception as e:
+                            agent_log(f"  scheduler state ignored: {e}")
+                msg = (
+                    f"  Persistent optim: lr_now={opt.param_groups[0]['lr']:.2e}, "
+                    f"horizon={total_steps} steps "
+                    f"(={n_cycles} cycles × {est_steps}), "
+                    f"warmup={warmup_steps}, eta_min={eta_min:.0e}, "
+                    f"adam_restored={restored_opt}, "
+                    f"sched_restored={restored_sched}")
+                agent_log(msg)
+                return opt, sched
+
+            # Build the persistent agent registry once
+            trained_agents = []  # list of dicts kept across cycles
+            if multi_agent:
+                for agent_cfg in multi_agent["agents"]:
+                    agent_name = agent_cfg["name"]
+                    agent_base = os.path.join(save_base_dir_mcts, agent_name)
+                    agent_log = Logger(agent_base)
+                    agent_log(f"\n=== Loading {agent_name} for cyclic MCTS ===")
+
+                    agent_obj = ASI(agent_log, config)
+                    agent_obj.set_device(device)
+                    agent_obj.load_checkpoint(agent_base)
+                    agent_obj.eval()
+
+                    # Resolve temperature from checkpoint or modifiers
+                    ckpt_path = agent_obj._find_best_checkpoint(agent_base)
+                    temp = fallback_temp
+                    loaded_ckpt = None
+                    if ckpt_path:
+                        loaded_ckpt = torch.load(
+                            ckpt_path, weights_only=False, map_location=device)
+                        temp = loaded_ckpt.get("temperature", fallback_temp)
+                    for mod in agent_cfg.get("modifiers", []):
+                        if mod.get("type") == "temperature":
+                            temp = mod["value"]
+
+                    # New timestamp dir for THIS run's best.pt (cycle-aware
+                    # save). History lives at scenario level (one above the
+                    # timestamp dir) so it accumulates across pipeline runs
+                    # — required for continuous loss curves.
+                    run_dir = agent_log.run_dir("mcts_predict")
+                    scenario_dir = os.path.dirname(run_dir)
+                    history_path = os.path.join(scenario_dir, "history.pt")
+                    cumulative_step = 0
+                    if os.path.exists(history_path):
+                        existing = torch.load(history_path, weights_only=False)
+                        steps = existing.get("step_loss", []) or []
+                        if steps and isinstance(steps[-1], dict):
+                            cumulative_step = int(steps[-1].get("step", 0)) + 1
+
+                    optimizer, scheduler = _build_persistent_optim(
+                        agent_obj, loaded_ckpt, mcts_train_cfg,
+                        n_cycles, agent_log)
+
+                    trained_agents.append({
+                        "agent": agent_obj,
+                        "norm_stats": _checkpoint_metadata(agent_obj, _identity_norm),
+                        "name": agent_name,
+                        "temperature": temp,
+                        "agent_log": agent_log,
+                        "run_dir": run_dir,
+                        "history_path": history_path,
+                        "cumulative_step": cumulative_step,
+                        "optimizer": optimizer,
+                        "scheduler": scheduler,
+                    })
+            else:
+                single_load_dir = agent_dir or save_base_dir_mcts
+                agent_obj = ASI(log, config)
+                agent_obj.set_device(device)
+                agent_obj.load_checkpoint(single_load_dir)
+                agent_obj.eval()
+                run_dir = log.run_dir("mcts_predict")
+                scenario_dir = os.path.dirname(run_dir)
+                history_path = os.path.join(scenario_dir, "history.pt")
+                cumulative_step = 0
+                if os.path.exists(history_path):
+                    existing = torch.load(history_path, weights_only=False)
+                    steps = existing.get("step_loss", []) or []
+                    if steps and isinstance(steps[-1], dict):
+                        cumulative_step = int(steps[-1].get("step", 0)) + 1
+
+                # Re-find checkpoint for optimizer/scheduler state
+                single_ckpt_path = agent_obj._find_best_checkpoint(single_load_dir)
+                single_ckpt = None
+                if single_ckpt_path:
+                    single_ckpt = torch.load(
+                        single_ckpt_path, weights_only=False, map_location=device)
+                optimizer, scheduler = _build_persistent_optim(
+                    agent_obj, single_ckpt, mcts_train_cfg, n_cycles, log)
+
+                trained_agents.append({
+                    "agent": agent_obj,
+                    "norm_stats": _checkpoint_metadata(agent_obj, _identity_norm),
+                    "name": name,
+                    "temperature": fallback_temp,
+                    "agent_log": log,
+                    "run_dir": run_dir,
+                    "history_path": history_path,
+                    "cumulative_step": cumulative_step,
+                    "optimizer": optimizer,
+                    "scheduler": scheduler,
+                })
+
+            # Periodic re-bootstrap of MCTS value norm. The agent's policy
+            # drifts during cyclic training, so realised-outcome distribution
+            # shifts. Clearing the mcts_ev_* keys forces run_mcts_collection
+            # to recompute fresh stats from the current cycle's data. Set to
+            # 0/None to disable (norm stats stay frozen from first bootstrap).
+            value_norm_rebootstrap_every = mcts_train_cfg.get(
+                "value_norm_rebootstrap_every", 0) or 0
+
+            log(f"\nCyclic MCTS: {n_cycles} cycles, "
+                f"save_every_cycles={save_every_cycles}, "
+                f"value_norm_rebootstrap_every={value_norm_rebootstrap_every}")
+
+            _MCTS_NORM_KEYS = ("mcts_ev_mean", "mcts_ev_std",
+                               "mcts_ev_n_samples", "mcts_ev_ratio_min",
+                               "mcts_ev_ratio_max")
 
             for cycle in range(n_cycles):
                 log(f"\n=== MCTS Cycle {cycle + 1}/{n_cycles} ===")
 
-                # Load latest agent checkpoints for collection
-                agents_for_play = []
-                if multi_agent:
-                    for agent_cfg in multi_agent["agents"]:
-                        agent_name = agent_cfg["name"]
-                        agent_base = os.path.join(save_base_dir_mcts, agent_name)
-                        agent_obj = ASI(log, config)
-                        agent_obj.set_device(device)
-                        agent_obj.load_checkpoint(agent_base)
-                        agent_obj.eval()
+                # Re-bootstrap value norm? (only on non-zero cycle id, every N)
+                if (value_norm_rebootstrap_every > 0
+                        and cycle > 0
+                        and cycle % value_norm_rebootstrap_every == 0):
+                    for agent_info in trained_agents:
+                        ns = agent_info.get("norm_stats")
+                        if ns is not None:
+                            had = any(k in ns for k in _MCTS_NORM_KEYS)
+                            for k in _MCTS_NORM_KEYS:
+                                ns.pop(k, None)
+                            if had:
+                                agent_info["agent_log"](
+                                    f"  [{agent_info['name']}] cleared "
+                                    f"mcts_ev_* — will re-bootstrap this cycle")
 
-                        # Get temperature + norm_stats from checkpoint
-                        ckpt_path = agent_obj._find_best_checkpoint(agent_base)
-                        if ckpt_path:
-                            ckpt = torch.load(ckpt_path, weights_only=False,
-                                              map_location=device)
-                            norm_stats = ckpt.get("norm_stats")
-                            temp = ckpt.get("temperature", fallback_temp)
-                        else:
-                            norm_stats = None
-                            temp = fallback_temp
-                        if norm_stats is None:
-                            norm_stats = {"pot_mean": 0, "pot_std": 1,
-                                          "stack_mean": 0, "stack_std": 1,
-                                          "bets_mean": 0, "bets_std": 1,
-                                          "blind_mean": 0, "blind_std": 1}
+                # Use in-memory agents directly for collection (no disk reload)
+                agents_for_play = [
+                    {"agent": a["agent"], "norm_stats": a["norm_stats"],
+                     "name": a["name"], "temperature": a["temperature"]}
+                    for a in trained_agents
+                ]
 
-                        agents_for_play.append({
-                            "agent": agent_obj, "norm_stats": norm_stats,
-                            "name": agent_name, "temperature": temp,
-                        })
-                else:
-                    single_load_dir = agent_dir or save_base_dir_mcts
-                    agent_obj = ASI(log, config)
-                    agent_obj.set_device(device)
-                    agent_obj.load_checkpoint(single_load_dir)
-                    agent_obj.eval()
-                    norm_stats = getattr(agent_obj, '_checkpoint_norm_stats', None)
-                    if norm_stats is None:
-                        norm_stats = {"pot_mean": 0, "pot_std": 1,
-                                      "stack_mean": 0, "stack_std": 1,
-                                      "bets_mean": 0, "bets_std": 1,
-                                      "blind_mean": 0, "blind_std": 1}
-                    agents_for_play.append({
-                        "agent": agent_obj, "norm_stats": norm_stats,
-                        "name": name, "temperature": fallback_temp,
-                    })
-
-                # Collect
                 per_agent_examples = run_mcts_collection(
                     agents_for_play, config, device, log, n_hands_per_cycle)
 
-                # Train each agent on its collected examples
-                if multi_agent:
-                    for agent_cfg in multi_agent["agents"]:
-                        agent_name = agent_cfg["name"]
-                        examples = per_agent_examples.get(agent_name, [])
-                        if not examples:
-                            log(f"  {agent_name}: no examples, skipping training")
-                            continue
+                is_save_cycle = (cycle % save_every_cycles == 0
+                                 or cycle == n_cycles - 1)
 
-                        agent_base = os.path.join(save_base_dir_mcts, agent_name)
-                        agent_log = Logger(agent_base)
-                        agent_log(f"\n=== MCTS Train: {agent_name} "
-                                  f"(cycle {cycle + 1}, {len(examples)} examples) ===")
+                for agent_info in trained_agents:
+                    agent_name = agent_info["name"]
+                    examples = per_agent_examples.get(agent_name, [])
+                    if not examples:
+                        agent_info["agent_log"](
+                            f"  {agent_name}: no examples this cycle, skipping training")
+                        continue
 
-                        agent = ASI(agent_log, config)
-                        agent.set_device(device)
-                        agent.load_checkpoint(agent_base)
+                    agent_info["agent_log"](
+                        f"\n--- MCTS Train: {agent_name} "
+                        f"(cycle {cycle + 1}/{n_cycles}, {len(examples)} examples, "
+                        f"save={is_save_cycle}) ---")
 
-                        agent_temp = fallback_temp
-                        for mod in agent_cfg.get("modifiers", []):
-                            if mod.get("type") == "temperature":
-                                agent_temp = mod["value"]
-
-                        _, mcts_run_dir = train_mcts(
-                            agent, mcts_train_cfg, device, agent_log,
-                            examples, temperature=agent_temp)
-                        if mcts_run_dir:
-                            best_ckpt = os.path.join(mcts_run_dir, "best.pt")
-                            if os.path.exists(best_ckpt):
-                                agent.load_checkpoint(best_ckpt)
-                else:
-                    examples = per_agent_examples.get(name, [])
-                    if examples:
-                        log(f"\n=== MCTS Train (cycle {cycle + 1}, "
-                            f"{len(examples)} examples) ===")
-                        agent = ASI(log, config)
-                        agent.set_device(device)
-                        agent.load_checkpoint(save_base_dir_mcts)
-                        train_mcts(agent, mcts_train_cfg, device, log,
-                                   examples, temperature=fallback_temp)
+                    _, _, new_step = train_mcts(
+                        agent_info["agent"], mcts_train_cfg, device,
+                        agent_info["agent_log"], examples,
+                        temperature=agent_info["temperature"],
+                        run_dir=agent_info["run_dir"],
+                        history_path=agent_info["history_path"],
+                        cycle_id=cycle,
+                        global_step_offset=agent_info["cumulative_step"],
+                        save_checkpoint=is_save_cycle,
+                        run_timestamp=getattr(agent_info["agent_log"],
+                                               "init_time", None),
+                        optimizer=agent_info["optimizer"],
+                        scheduler=agent_info["scheduler"],
+                    )
+                    agent_info["cumulative_step"] = new_step
 
     # --- Evaluation (after all training stages) ---
     if pipeline_cfg.get("run_evaluation", False):

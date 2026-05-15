@@ -27,14 +27,76 @@ class ChainStep:
     is_hero: bool  # True → action_head predicts, False → opponent_action_head
 
 
+def _make_terminal_evaluator(hero_pos, hero_initial_credits, denom,
+                              ev_mean, ev_std):
+    """Build a closure that scores any terminal GameState from hero's POV.
+
+    Returns a callable `evaluate(gs) -> float` whose output is on the same
+    scale as the value head's training target — `(outcome_ratio - ev_mean)
+    / ev_std` where `outcome_ratio = outcome_chips / denom`.
+
+    Fold terminals are deterministic: hero either scoops the pot or loses
+    what they invested along this path. Showdown terminals use a fair-
+    share-of-pot heuristic (`pot / n_active`) because MCTS doesn't carry
+    cards into the tree — this is biased but gives a sensible neutral
+    estimate that scales with pot size.
+
+    When `ev_mean`/`ev_std` are unavailable (first cycle, before
+    `mcts_ev_*` is bootstrapped), the raw outcome ratio is returned.
+    """
+    has_norm = (ev_mean is not None and ev_std is not None and ev_std > 1e-8)
+    denom = max(float(denom), 1.0)
+
+    def evaluate(gs):
+        active = [i for i in range(gs.num_players) if gs.players_state[i] >= 0]
+        hero_invested = hero_initial_credits - float(gs.credits[hero_pos])
+        if len(active) == 1:
+            if active[0] == hero_pos:
+                outcome = float(gs.pot) - hero_invested
+            else:
+                outcome = -hero_invested
+        elif len(active) >= 2:
+            # Showdown: fair-share-of-pot heuristic (cards not available
+            # in MCTS GameState; equity calc happens post-hand in
+            # terminal_eval.py if needed).
+            outcome = float(gs.pot) / len(active) - hero_invested
+        else:
+            outcome = 0.0
+        ratio = outcome / denom
+        if has_norm:
+            return (ratio - ev_mean) / ev_std
+        return ratio
+
+    return evaluate
+
+
 @dataclass
 class MCTSTrainingExample:
     """Training data from one MCTS tree.
 
     events: normalized event sequence at this tree's root
-    value_target: root Q after terminal re-backup
+    value_target: per-decision realised outcome, z-scored using
+        MCTS-specific bootstrapped stats:
+            ratio = outcome_chips_from_decision / max(pot + facing_bet, BB)
+            value_target = (ratio - mcts_ev_mean) / mcts_ev_std
+        Outcome is the chip delta from THIS decision to hand end (excludes
+        sunk costs prior to the decision). The z-score stats live as new
+        top-level keys in `norm_stats` (`mcts_ev_mean`, `mcts_ev_std`,
+        `mcts_ev_n_samples`, `mcts_ev_ratio_min`, `mcts_ev_ratio_max`),
+        added on the first collection that has data and persisted in
+        checkpoints. The original gto_ev_predict stats (ev_mean/ev_std/
+        pot/stack/etc) stay untouched — they keep driving event-input
+        z-scoring. MCTS realised-outcome variance is much wider than
+        solver-EV variance, so MCTS needs its own calibration.
     action_target: root N-distribution (visit count proportions)
-    chain: list of ChainSteps for all subsequent decisions in the hand
+    chain: list of ChainSteps. chain[i].action_taken is the action chosen at
+        the decision *i steps before* chain[i]'s state — i.e. for chain[0] it
+        is the root decision's action (the one that advances state(t)→state(t+1));
+        for chain[i] (i≥1) it is decisions[t+i].action_idx (advances state(t+i)
+        →state(t+i+1)). target_distribution at chain[i] is the N-distribution
+        AT decisions[t+1+i] (i.e. the state we land in after applying
+        action_taken at the prior context). This matches MCTS inner-node
+        semantics (mcts.py: child.action_embedding = modelling(parent_ctx)[a]).
     """
     events: list = field(default_factory=list)
     value_target: float = 0.0
@@ -45,11 +107,13 @@ class MCTSTrainingExample:
 def collect_training_data(hand_record, n_actions):
     """Extract training examples from all MCTS trees in a completed hand.
 
-    For each tree (one per decision point), produces an MCTSTrainingExample with:
-    - value_target: root.Q (after terminal re-backup reflects MC equity)
-    - action_target: normalized visit count distribution at root
-    - chain: for each subsequent decision in the hand, the action taken and
-      the target distribution (N-distribution from that decision's MCTS tree)
+    For each tree (one per decision point), produces an MCTSTrainingExample.
+    `value_target` is left as raw `root.Q` here; the caller (run_mcts_collection)
+    overrides it with the actual normalized hand outcome.
+
+    Chain semantics: chain[i].action_taken advances context from state(t+i)
+    to state(t+i+1). chain[i].target_distribution is the predicted distribution
+    AT state(t+i+1) (after applying that action).
 
     Args:
         hand_record: dict with "decisions" list — each entry has:
@@ -65,27 +129,25 @@ def collect_training_data(hand_record, n_actions):
     for t, decision in enumerate(decisions):
         hero_pos = decision["player_pos"]
         root = decision["mcts_root"]
-
-        # Value target: root Q (should include backed-up terminal equity)
-        value_target = root.Q
-
-        # Action target: N-distribution at root
         action_target = get_n_distribution(root, n_actions)
 
-        # Modelling chain: all subsequent decisions in the hand
+        # Modelling chain: chain[i] predicts distribution at decisions[t+1+i],
+        # using the action taken at decisions[t+i] to advance context.
         chain = []
-        for future_dec in decisions[t + 1:]:
+        for i, future_dec in enumerate(decisions[t + 1:]):
             future_root = future_dec["mcts_root"]
             target_dist = get_n_distribution(future_root, n_actions)
+            # action that advances state(t+i) → state(t+i+1):
+            action_taken = decisions[t + i]["action_idx"]
             chain.append(ChainStep(
-                action_taken=future_dec["action_idx"],
+                action_taken=action_taken,
                 target_distribution=target_dist,
                 is_hero=(future_dec["player_pos"] == hero_pos),
             ))
 
         examples.append(MCTSTrainingExample(
             events=decision["events_at_root"],
-            value_target=value_target,
+            value_target=root.Q,  # placeholder; overwritten in run_mcts_collection
             action_target=action_target,
             chain=chain,
         ))
@@ -233,10 +295,26 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
                     e["bets"] = np.copy(e["bets"])
             _normalize_events_inplace(norm_events, agent_info["norm_stats"])
 
+            # Capture state at decision time (in raw chips, BEFORE action
+            # is applied) — needed to normalize value_target identically to
+            # gto_ev_predict: (outcome / max(pot + facing_bet, BB) - ev_m)/ev_s.
+            pot_at_dec = float(table.pot)
+            facing_at_dec = float(table.high_bet - table.bets[active_pos])
+            credits_at_dec = float(table.credits[active_pos])
+
             # MCTS search (opponent_emb at root only — see MCTS._evaluate_root)
             gs = GameState.from_table(table, active_pos)
+            ns = agent_info.get("norm_stats") or {}
+            term_eval = _make_terminal_evaluator(
+                hero_pos=active_pos,
+                hero_initial_credits=credits_at_dec,
+                denom=max(pot_at_dec + facing_at_dec, float(big_blind)),
+                ev_mean=ns.get("mcts_ev_mean"),
+                ev_std=ns.get("mcts_ev_std"),
+            )
             mcts = MCTS(agent_info["agent"], device, mcts_cfg,
-                        opponent_emb_table=opp_tables.get(agent_info["name"]))
+                        opponent_emb_table=opp_tables.get(agent_info["name"]),
+                        terminal_evaluator=term_eval)
             agent_info["agent"].eval()
             action_idx = mcts.search([norm_events], gs)
 
@@ -245,6 +323,10 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
                 "action_idx": action_idx,
                 "mcts_root": mcts.last_root,
                 "events_at_root": norm_events,
+                "pot_at_decision": pot_at_dec,
+                "facing_bet_at_decision": facing_at_dec,
+                "credits_before_decision": credits_at_dec,
+                "agent_norm_stats": agent_info["norm_stats"],
             })
 
             # Step table
@@ -269,20 +351,68 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
         if not decisions:
             continue
 
-        # Actual outcomes (normalized by big blind)
-        outcomes = {}
-        for pos in range(num_players):
-            outcomes[pos] = (table.credits[pos] - initial_credits[pos]) / big_blind
-
-        # Extract training examples and override value_target with actual outcome
+        # Build training examples; store RAW ratio in value_target as a
+        # temporary scalar. We z-score AFTER all hands are collected because
+        # MCTS realised-outcome distribution is much wider than gto_ev_predict's
+        # solver-EV distribution, so reusing gto_ev's ev_mean/ev_std produces
+        # outliers in z-score space (∼±200). Instead we bootstrap MCTS-
+        # specific stats on the first collection that has data, then reuse
+        # them across cycles (persisted via norm_stats inside the checkpoint).
         hand_record = {"decisions": decisions}
         examples = collect_training_data(hand_record, n_actions)
 
+        final_credits = list(table.credits)
         for ex, dec in zip(examples, decisions):
             pos = dec["player_pos"]
-            ex.value_target = outcomes[pos]
+            outcome_chips = float(final_credits[pos] - dec["credits_before_decision"])
+            denom = max(dec["pot_at_decision"] + dec["facing_bet_at_decision"],
+                        float(big_blind))
+            ex.value_target = outcome_chips / denom  # raw ratio, normalized below
             agent_name = hand_seated[pos]["name"]
             per_agent_examples[agent_name].append(ex)
+
+    # Per-agent: bootstrap MCTS-specific value norm stats on first collection
+    # that has data, then reuse them across cycles. Stored as new top-level
+    # keys with `mcts_ev_*` prefix in norm_stats; the original
+    # gto_ev_predict stats (ev_mean/ev_std/pot/stack/etc) stay untouched.
+    # Mutating norm_stats in place propagates back to
+    # agent._checkpoint_norm_stats and gets persisted by _save_best.
+    for agent_info in agents_list:
+        name = agent_info["name"]
+        examples = per_agent_examples.get(name, [])
+        if not examples:
+            continue
+
+        ns = agent_info.get("norm_stats")
+        if ns is None:
+            ns = {}
+            agent_info["norm_stats"] = ns
+
+        if "mcts_ev_mean" not in ns or "mcts_ev_std" not in ns:
+            ratios = np.array([float(ex.value_target) for ex in examples],
+                              dtype=np.float64)
+            mean_r = float(ratios.mean())
+            std_r = float(ratios.std())
+            if std_r < 1e-8:
+                std_r = 1.0
+            ns["mcts_ev_mean"] = mean_r
+            ns["mcts_ev_std"] = std_r
+            ns["mcts_ev_n_samples"] = int(len(ratios))
+            ns["mcts_ev_ratio_min"] = float(ratios.min())
+            ns["mcts_ev_ratio_max"] = float(ratios.max())
+            log(f"  {name}: bootstrapped mcts_ev_* "
+                f"({len(ratios)} ratios) — mean={mean_r:.4f}, std={std_r:.4f} "
+                f"(min={ns['mcts_ev_ratio_min']:.2f}, "
+                f"max={ns['mcts_ev_ratio_max']:.2f})")
+        else:
+            log(f"  {name}: reusing mcts_ev_* "
+                f"(mean={ns['mcts_ev_mean']:.4f}, std={ns['mcts_ev_std']:.4f}, "
+                f"n_bootstrap={ns.get('mcts_ev_n_samples', '?')})")
+
+        m = float(ns["mcts_ev_mean"])
+        s = float(ns["mcts_ev_std"])
+        for ex in examples:
+            ex.value_target = (float(ex.value_target) - m) / s
 
     for name, exs in per_agent_examples.items():
         log(f"  {name}: {len(exs)} training examples")

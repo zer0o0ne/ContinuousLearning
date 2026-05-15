@@ -42,15 +42,18 @@ class LengthGroupedBatchSampler(Sampler):
 def _mcts_forward(agent, event_sequences, chains, device, opponent_emb_table=None):
     """Forward pass: perception → root predictions → modelling chain.
 
-    Processes one batch. Chains may have different lengths across examples,
-    so we process them per-example (batch_size=1 for chain steps).
+    Chain semantics (matches `collect.py:MCTSTrainingExample`):
+      step.action_taken is the action chosen at the PRIOR state. We extend
+      ctx by appending modelling_head(ctx)[step.action_taken] (which encodes
+      "next state if action_taken was taken at current ctx") then predict
+      the distribution at that extended state and compare with
+      step.target_distribution. This mirrors MCTS inner-node expansion
+      (mcts.py: child.action_embedding = modelling_head(parent_ctx)[a]).
 
     Returns:
-        value_preds: (B, 1)
-        action_preds: (B, n_actions)
-        chain_preds: list of length B, each is a list of (n_actions,) tensors
-        chain_targets: list of length B, each is a list of (n_actions,) tensors
-        chain_is_hero: list of length B, each is a list of bools
+        value_preds: (B, 1) — predicted at root context only
+        action_preds: (B, n_actions) — root predictions
+        chain_preds, chain_targets, chain_is_hero: per-batch list of lists
     """
     # Perception
     skip_opp = (opponent_emb_table is None)
@@ -153,9 +156,10 @@ def _compute_loss(value_preds, value_targets, action_preds, action_targets,
 
 def _run_validation(agent, val_loader, device, weights, amp_config=None,
                     opponent_emb_table=None):
+    """Run validation. Returns dict with total + component losses."""
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     agent.eval()
-    loss_sum = 0.0
+    sums = {"total": 0.0, "value": 0.0, "action": 0.0, "chain": 0.0}
     count = 0
     with torch.no_grad():
         for event_seqs, val_targets, act_targets, chains in val_loader:
@@ -165,16 +169,39 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
                 v_pred, a_pred, c_preds, c_tgts, c_hero = _mcts_forward(
                     agent, event_seqs, chains, device,
                     opponent_emb_table=opponent_emb_table)
-                loss, _ = _compute_loss(v_pred, val_targets, a_pred, act_targets,
-                                        c_preds, c_tgts, c_hero, **weights)
-            loss_sum += loss.item() * len(event_seqs)
-            count += len(event_seqs)
+                loss, ldict = _compute_loss(v_pred, val_targets, a_pred, act_targets,
+                                            c_preds, c_tgts, c_hero, **weights)
+            n = len(event_seqs)
+            sums["total"] += ldict["total"] * n
+            sums["value"] += ldict["value"] * n
+            sums["action"] += ldict["action"] * n
+            sums["chain"] += ldict["chain"] * n
+            count += n
     agent.train()
-    return loss_sum / max(count, 1)
+    if count == 0:
+        return {"total": 0.0, "value": 0.0, "action": 0.0, "chain": 0.0}
+    return {k: v / count for k, v in sums.items()}
 
 
-def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
+def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
+               run_dir=None, history_path=None, cycle_id=0,
+               global_step_offset=0, save_checkpoint=True,
+               run_timestamp=None,
+               optimizer=None, scheduler=None):
     """Train all agent heads on MCTS-derived training data.
+
+    Supports cross-cycle continuity for cyclic self-play training:
+    - run_dir: pre-existing run dir; if None, creates a new one. Pass the same
+        run_dir across cycles so best.pt and history.pt are co-located.
+    - history_path: shared history.pt path across cycles. If file exists, its
+        content is loaded and new entries are appended (continuous loss curves).
+    - cycle_id: outer cycle index, recorded with each step/val entry for
+        analytics.
+    - global_step_offset: starting step counter (cumulative across cycles).
+    - save_checkpoint: when False, training proceeds normally but best.pt is
+        NOT written to disk this cycle. History is always persisted regardless.
+    - run_timestamp: timestamp string of the pipeline run, attached to cycle
+        summary so multi-run analyses can group entries.
 
     All heads are unfrozen and trained simultaneously:
     - perception: gradients from modelling chain
@@ -183,13 +210,10 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
     - opponent_action_head: KL on chain opponent steps
     - modelling_head: gradients from chain predictions
 
-    Args:
-        agent: ASI model instance (on device)
-        train_cfg: dict with lr, batch_size, epochs, etc.
-        device: torch device string
-        log: logger callable
-        examples: list of MCTSTrainingExample
-        temperature: agent temperature (saved in checkpoint)
+    Returns:
+        history: dict (in-memory, also persisted to history_path)
+        run_dir: path used for outputs
+        new_global_step: cumulative step counter to feed back into next cycle
     """
     lr = train_cfg.get("lr", 3e-5)
     batch_size = train_cfg.get("batch_size", 16)
@@ -205,7 +229,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
     weights = {"value_weight": value_weight, "action_weight": action_weight,
                "chain_weight": chain_weight}
 
-    log("=== MCTS Training (All Heads) ===")
+    log(f"=== MCTS Training (cycle {cycle_id}, save={save_checkpoint}) ===")
 
     # Preserve norm_stats from checkpoint for saving
     norm_stats = getattr(agent, '_checkpoint_norm_stats', None) or {}
@@ -214,9 +238,16 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
     for param in agent.parameters():
         param.requires_grad = True
 
-    optimizer = torch.optim.Adam(agent.parameters(), lr=lr)
+    # External optimizer/scheduler take precedence (option 2: single global
+    # instance kept alive across cycles so Adam moments and the long-horizon
+    # cosine schedule both survive). Fall back to fresh per-cycle instances
+    # only when called without externals (legacy usage and one-shot tests).
+    external_optim = optimizer is not None
+    if optimizer is None:
+        optimizer = torch.optim.Adam(agent.parameters(), lr=lr)
 
-    run_dir = log.run_dir("mcts_predict")
+    if run_dir is None:
+        run_dir = log.run_dir("mcts_predict")
 
     # AMP
     from utils import get_amp_config
@@ -252,20 +283,37 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
 
     log(f"Train: {n_train}, Val: {n_val}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     log(f"Weights: value={value_weight}, action={action_weight}, chain={chain_weight}")
+    if external_optim:
+        cur_lr = optimizer.param_groups[0]["lr"]
+        log(f"Using external optimizer/scheduler (current lr={cur_lr:.2e})")
 
-    # Scheduler
-    total_steps = epochs * len(train_loader)
-    warmup_steps = min(100, total_steps // 5)
-    eta_min = train_cfg.get("scheduler_eta_min", 1e-6)
-    warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-    cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps),
-                               eta_min=eta_min)
-    scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+    # Scheduler: legacy per-cycle warmup+cosine only when no external one
+    # was supplied. With external schedulers the LR plan spans all cycles.
+    if scheduler is None:
+        total_steps = epochs * len(train_loader)
+        warmup_steps = min(100, total_steps // 5)
+        eta_min = train_cfg.get("scheduler_eta_min", 1e-6)
+        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+        cosine = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps),
+                                   eta_min=eta_min)
+        scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+
+    # Cross-cycle history: load existing if present, else fresh
+    if history_path is None:
+        history_path = os.path.join(run_dir, "history.pt")
+    if os.path.exists(history_path):
+        history = torch.load(history_path, weights_only=False)
+        for k in ("step_loss", "val_loss", "epoch_train_loss",
+                  "epoch_val_loss", "cycles"):
+            history.setdefault(k, [])
+    else:
+        history = {"step_loss": [], "val_loss": [], "epoch_train_loss": [],
+                   "epoch_val_loss": [], "cycles": []}
 
     best_val_loss = float("inf")
     fails_since_best = 0
-    history = {"step_loss": [], "val_loss": [], "epoch_train_loss": [], "epoch_val_loss": []}
-    global_step = 0
+    global_step = int(global_step_offset)
+    cycle_step_start = global_step
     stopped_early = False
 
     for epoch in range(epochs):
@@ -299,27 +347,48 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
                 opp_table.detach_all()
 
             step_loss = loss.item()
-            history["step_loss"].append((global_step, step_loss))
+            current_lr = optimizer.param_groups[0]["lr"]
+            history["step_loss"].append({
+                "step": global_step,
+                "cycle_id": cycle_id,
+                "total": step_loss,
+                "value": loss_dict["value"],
+                "action": loss_dict["action"],
+                "chain": loss_dict["chain"],
+                "lr": current_lr,
+                "batch_size": len(event_seqs),
+            })
             global_step += 1
             train_loss_sum += step_loss * len(event_seqs)
             train_count += len(event_seqs)
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count
-                log(f"  Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}, "
+                log(f"  Cycle {cycle_id} Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}, "
                     f"Loss: {avg:.6f} (v={loss_dict['value']:.4f} "
-                    f"a={loss_dict['action']:.4f} c={loss_dict['chain']:.4f})")
+                    f"a={loss_dict['action']:.4f} c={loss_dict['chain']:.4f}) "
+                    f"lr={current_lr:.2e}")
 
             if val_every and (global_step % val_every == 0):
-                vl = _run_validation(agent, val_loader, device, weights, amp_cfg,
-                                     opponent_emb_table=opp_table)
-                history["val_loss"].append((global_step, vl))
-                log(f"  [Step {global_step}] Val Loss: {vl:.6f}")
+                val_dict = _run_validation(agent, val_loader, device, weights,
+                                            amp_cfg, opponent_emb_table=opp_table)
+                vl = val_dict["total"]
+                history["val_loss"].append({
+                    "step": global_step,
+                    "cycle_id": cycle_id,
+                    **val_dict,
+                })
+                log(f"  [Cycle {cycle_id} Step {global_step}] Val: "
+                    f"total={vl:.6f} v={val_dict['value']:.4f} "
+                    f"a={val_dict['action']:.4f} c={val_dict['chain']:.4f}")
                 if vl < best_val_loss:
                     best_val_loss = vl
                     fails_since_best = 0
-                    _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
-                               global_step, epoch, vl, log, temperature=temperature)
+                    if save_checkpoint:
+                        _save_best(agent, optimizer, scheduler, norm_stats,
+                                   run_dir, global_step, epoch, vl, log,
+                                   temperature=temperature, cycle_id=cycle_id,
+                                   examples_in_cycle=len(examples))
                 else:
                     fails_since_best += 1
                     if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
@@ -331,41 +400,102 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None):
             break
 
         train_avg = train_loss_sum / max(train_count, 1)
-        val_avg = _run_validation(agent, val_loader, device, weights, amp_cfg,
-                                   opponent_emb_table=opp_table)
-        history["epoch_train_loss"].append(train_avg)
-        history["epoch_val_loss"].append(val_avg)
-        history["val_loss"].append((global_step, val_avg))
-        log(f"Epoch {epoch+1}/{epochs} — Train: {train_avg:.6f}, Val: {val_avg:.6f}")
+        val_dict = _run_validation(agent, val_loader, device, weights, amp_cfg,
+                                    opponent_emb_table=opp_table)
+        val_avg = val_dict["total"]
+        history["epoch_train_loss"].append({
+            "step": global_step, "cycle_id": cycle_id,
+            "total": train_avg, "epoch": epoch + 1,
+        })
+        history["epoch_val_loss"].append({
+            "step": global_step, "cycle_id": cycle_id,
+            "epoch": epoch + 1, **val_dict,
+        })
+        history["val_loss"].append({
+            "step": global_step, "cycle_id": cycle_id, **val_dict,
+        })
+        log(f"Cycle {cycle_id} Epoch {epoch+1}/{epochs} — "
+            f"Train: {train_avg:.6f}, Val: {val_avg:.6f}")
 
         if val_avg < best_val_loss:
             best_val_loss = val_avg
             fails_since_best = 0
-            _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
-                       global_step, epoch, val_avg, log, temperature=temperature)
+            if save_checkpoint:
+                _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
+                           global_step, epoch, val_avg, log,
+                           temperature=temperature, cycle_id=cycle_id,
+                           examples_in_cycle=len(examples))
         else:
             fails_since_best += 1
             if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
                 log(f"  Early stopping: {fails_since_best} failed validations")
                 break
 
-    torch.save(history, os.path.join(run_dir, "history.pt"))
-    log(f"=== MCTS Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
-    return history, run_dir
+    # Always persist the cycle's FINAL state — best.pt is "latest after
+    # cycle finished" (overwritten each cycle) and cycles/cycle_NNNN.pt is
+    # the permanent per-cycle snapshot. This is unconditional: even when
+    # val didn't improve we still want continuity, otherwise the next
+    # cycle re-loads a stale checkpoint and burns its warmup re-learning
+    # what it just learned.
+    final_val = float(val_avg) if 'val_avg' in locals() else float(best_val_loss)
+    final_epoch = epoch if 'epoch' in locals() else 0
+    _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
+               global_step, final_epoch, final_val, log,
+               temperature=temperature, cycle_id=cycle_id,
+               examples_in_cycle=len(examples), reason="cycle_end")
+
+    # Cycle summary for analytics
+    history["cycles"].append({
+        "cycle_id": cycle_id,
+        "run_timestamp": run_timestamp or getattr(log, "init_time", None),
+        "examples_count": len(examples),
+        "train_size": n_train,
+        "val_size": n_val,
+        "step_start": cycle_step_start,
+        "step_end": global_step,
+        "best_val_loss_in_cycle": (best_val_loss if best_val_loss != float("inf") else None),
+        "saved_checkpoint": True,
+        "lr_start": train_cfg.get("lr", 3e-5),
+        "epochs_run": epochs,
+    })
+
+    torch.save(history, history_path)
+    log(f"=== MCTS Cycle {cycle_id} Complete. "
+        f"Best val: {best_val_loss:.6f}, saved=cycle_end ===")
+    return history, run_dir, global_step
 
 
 def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
-               global_step, epoch, val_loss, log, temperature=None):
-    best_path = os.path.join(ckpt_dir, "best.pt")
+               global_step, epoch, val_loss, log, temperature=None,
+               cycle_id=None, examples_in_cycle=None, reason="val_improved"):
+    """Save checkpoint to BOTH a rolling `best.pt` and a per-cycle snapshot
+    `cycles/cycle_<N>.pt`. The rolling file is what `_find_best_checkpoint`
+    picks up (latest state); the per-cycle snapshot is permanent for
+    historical comparison and analysis.
+    """
     ckpt = {
         "step": global_step, "epoch": epoch + 1,
+        "cycle_id": cycle_id,
+        "examples_in_cycle": examples_in_cycle,
         "model_state_dict": agent.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "norm_stats": norm_stats,
         "val_loss": val_loss,
+        "save_reason": reason,
     }
     if temperature is not None:
         ckpt["temperature"] = temperature
+
+    # Rolling latest — what _find_best_checkpoint loads
+    best_path = os.path.join(ckpt_dir, "best.pt")
     torch.save(ckpt, best_path)
-    log(f"  New best model (val loss: {val_loss:.6f})")
+
+    # Per-cycle permanent snapshot
+    if cycle_id is not None:
+        snapshots_dir = os.path.join(ckpt_dir, "cycles")
+        os.makedirs(snapshots_dir, exist_ok=True)
+        snapshot_path = os.path.join(snapshots_dir, f"cycle_{cycle_id:04d}.pt")
+        torch.save(ckpt, snapshot_path)
+
+    log(f"  Saved checkpoint ({reason}, val={val_loss:.6f}, cycle={cycle_id})")

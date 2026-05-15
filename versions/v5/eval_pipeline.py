@@ -118,6 +118,13 @@ def main():
     else:
         log("\nSlumbot evaluation: disabled, skipping")
 
+    # Consolidated summary covering both sections
+    try:
+        from analytics.eval_summary import write_summary
+        write_summary(base_results_dir, log)
+    except Exception as e:
+        log(f"WARNING: eval summary generation failed: {type(e).__name__}: {e}")
+
     log("\nEval pipeline complete.")
 
 

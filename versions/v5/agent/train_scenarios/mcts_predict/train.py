@@ -198,8 +198,9 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     - cycle_id: outer cycle index, recorded with each step/val entry for
         analytics.
     - global_step_offset: starting step counter (cumulative across cycles).
-    - save_checkpoint: when False, training proceeds normally but best.pt is
-        NOT written to disk this cycle. History is always persisted regardless.
+    - save_checkpoint: when True, the permanent per-cycle snapshot
+        `cycles/cycle_<N>.pt` is written this cycle. The rolling `best.pt`
+        is overwritten every cycle regardless. History is always persisted.
     - run_timestamp: timestamp string of the pipeline run, attached to cycle
         summary so multi-run analyses can group entries.
 
@@ -384,11 +385,11 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 if vl < best_val_loss:
                     best_val_loss = vl
                     fails_since_best = 0
-                    if save_checkpoint:
-                        _save_best(agent, optimizer, scheduler, norm_stats,
-                                   run_dir, global_step, epoch, vl, log,
-                                   temperature=temperature, cycle_id=cycle_id,
-                                   examples_in_cycle=len(examples))
+                    _save_best(agent, optimizer, scheduler, norm_stats,
+                               run_dir, global_step, epoch, vl, log,
+                               temperature=temperature, cycle_id=cycle_id,
+                               examples_in_cycle=len(examples),
+                               write_snapshot=save_checkpoint)
                 else:
                     fails_since_best += 1
                     if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
@@ -420,29 +421,27 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         if val_avg < best_val_loss:
             best_val_loss = val_avg
             fails_since_best = 0
-            if save_checkpoint:
-                _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
-                           global_step, epoch, val_avg, log,
-                           temperature=temperature, cycle_id=cycle_id,
-                           examples_in_cycle=len(examples))
+            _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
+                       global_step, epoch, val_avg, log,
+                       temperature=temperature, cycle_id=cycle_id,
+                       examples_in_cycle=len(examples),
+                       write_snapshot=save_checkpoint)
         else:
             fails_since_best += 1
             if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
                 log(f"  Early stopping: {fails_since_best} failed validations")
                 break
 
-    # Always persist the cycle's FINAL state — best.pt is "latest after
-    # cycle finished" (overwritten each cycle) and cycles/cycle_NNNN.pt is
-    # the permanent per-cycle snapshot. This is unconditional: even when
-    # val didn't improve we still want continuity, otherwise the next
-    # cycle re-loads a stale checkpoint and burns its warmup re-learning
-    # what it just learned.
+    # best.pt is always rolled forward (latest-after-cycle), but the
+    # permanent per-cycle snapshot under cycles/ is gated by
+    # save_every_cycles via save_checkpoint.
     final_val = float(val_avg) if 'val_avg' in locals() else float(best_val_loss)
     final_epoch = epoch if 'epoch' in locals() else 0
     _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
                global_step, final_epoch, final_val, log,
                temperature=temperature, cycle_id=cycle_id,
-               examples_in_cycle=len(examples), reason="cycle_end")
+               examples_in_cycle=len(examples), reason="cycle_end",
+               write_snapshot=save_checkpoint)
 
     # Cycle summary for analytics
     history["cycles"].append({
@@ -467,11 +466,12 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
 
 def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
                global_step, epoch, val_loss, log, temperature=None,
-               cycle_id=None, examples_in_cycle=None, reason="val_improved"):
-    """Save checkpoint to BOTH a rolling `best.pt` and a per-cycle snapshot
-    `cycles/cycle_<N>.pt`. The rolling file is what `_find_best_checkpoint`
-    picks up (latest state); the per-cycle snapshot is permanent for
-    historical comparison and analysis.
+               cycle_id=None, examples_in_cycle=None, reason="val_improved",
+               write_snapshot=True):
+    """Save checkpoint to a rolling `best.pt` (always) and optionally a
+    per-cycle snapshot `cycles/cycle_<N>.pt`. The rolling file is what
+    `_find_best_checkpoint` loads (latest state); the per-cycle snapshot is
+    permanent and gated by `save_every_cycles` via `write_snapshot`.
     """
     ckpt = {
         "step": global_step, "epoch": epoch + 1,
@@ -487,15 +487,17 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
     if temperature is not None:
         ckpt["temperature"] = temperature
 
-    # Rolling latest — what _find_best_checkpoint loads
     best_path = os.path.join(ckpt_dir, "best.pt")
     torch.save(ckpt, best_path)
 
-    # Per-cycle permanent snapshot
-    if cycle_id is not None:
+    snapshot_written = False
+    if cycle_id is not None and write_snapshot:
         snapshots_dir = os.path.join(ckpt_dir, "cycles")
         os.makedirs(snapshots_dir, exist_ok=True)
         snapshot_path = os.path.join(snapshots_dir, f"cycle_{cycle_id:04d}.pt")
         torch.save(ckpt, snapshot_path)
+        snapshot_written = True
 
-    log(f"  Saved checkpoint ({reason}, val={val_loss:.6f}, cycle={cycle_id})")
+    snap_str = " + snapshot" if snapshot_written else ""
+    log(f"  Saved best.pt{snap_str} ({reason}, val={val_loss:.6f}, "
+        f"cycle={cycle_id})")

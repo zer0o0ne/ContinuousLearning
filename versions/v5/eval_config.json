@@ -106,12 +106,18 @@
         "password": "",
         "request_timeout": 30,
         "log_every": 1000,
-        "n_hands": 100000,
+        "n_hands": 3000,
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "gto_pure_mcts_60",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_05_04_15_43_05/cycles/cycle_0020.pt",
+                "name": "gto_pure_mcts_1",
+                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_05_16_12_13_54/cycles/cycle_0001.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
+            },
+            {
+                "name": "gto_pure_mcts_10",
+                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_05_16_12_13_54/cycles/cycle_0010.pt",
                 "use_opponent_embedding": true,
                 "use_mcts": true
             }

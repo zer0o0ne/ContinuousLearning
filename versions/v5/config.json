@@ -198,7 +198,19 @@
         "val_split": 0.1,
         "value_weight": 1.0,
         "action_weight": 1.0,
-        "chain_weight": 1.0
+        "chain_weight": 1.0,
+        "max_chain_depth": 4,
+        "chain_depth_gamma": 0.75,
+        "recon_weight": 0.5,
+        "value_chain_weight": 0.0,
+        "value_target_alpha": 0.5,
+        "value_target_clip": 5.0,
+        "stop_grad_old_embs": true,
+        "teacher_forcing": {
+            "p_start": 1.0,
+            "p_end": 0.0,
+            "decay_cycles": 30
+        }
     },
     "evaluation": {
         "agents_dir": "5_final_agents",

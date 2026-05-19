@@ -395,20 +395,35 @@ def _collect_terminals(node):
 
 
 def re_backup_terminals(root):
-    """After terminal Q values are set externally, propagate to all ancestors.
+    """Re-propagate terminal Q values to ancestors after an external override.
 
-    During MCTS search, terminal paths only incremented N without adding to W.
-    This function adds each terminal's Q * N contribution to all ancestors' W,
-    then recalculates Q = W / N for every affected node.
+    Two situations need to be handled correctly without double-counting:
+      (a) Terminals were Q=0 during search (no `terminal_evaluator`):
+          `terminal.W == 0` going in. Delta = new_W - 0 = new_W. Behaviour
+          equivalent to the previous "add Q*N" implementation.
+      (b) Terminals had a search-time Q from `terminal_evaluator` (e.g. the
+          fold/fair-share heuristic in `_make_terminal_evaluator`): each visit
+          during search already added that heuristic Q to every ancestor's W.
+          We now overwrite `terminal.Q` with the equity-based value; the
+          ancestors must receive only the *difference* `(new_Q − old_Q) * N`,
+          else the heuristic contribution would be double-counted in W.
+
+    Operates by reading the existing `terminal.W` as the cumulative old-Q
+    contribution and writing the difference to ancestors. Final `terminal.W`
+    is consistent with `terminal.Q * terminal.N` regardless of starting state.
     """
     for terminal in _collect_terminals(root):
         if terminal.N == 0:
             continue
-        terminal.W = terminal.Q * terminal.N
-        contribution = terminal.W
+        old_W = terminal.W
+        new_W = terminal.Q * terminal.N
+        delta = new_W - old_W
+        terminal.W = new_W
+        if delta == 0.0:
+            continue
         node = terminal.parent
         while node is not None:
-            node.W += contribution
+            node.W += delta
             node.Q = node.W / node.N if node.N > 0 else 0.0
             node = node.parent
 

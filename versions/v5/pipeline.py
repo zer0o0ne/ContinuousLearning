@@ -584,9 +584,19 @@ def main():
                 f"save_every_cycles={save_every_cycles}, "
                 f"value_norm_rebootstrap_every={value_norm_rebootstrap_every}")
 
+            # New normalization key (post-Step-1 redesign): single per-agent
+            # std of realized chip deltas, used as `value_scale` in
+            # `_make_terminal_evaluator` and the final hybrid target. Legacy
+            # `mcts_ev_*` keys are kept in the clear list for backward-compat
+            # with checkpoints saved before the redesign.
+            # See versions/v5/PLAN_MCTS_VALUE_REDESIGN.md for math.
             _MCTS_NORM_KEYS = ("mcts_ev_mean", "mcts_ev_std",
                                "mcts_ev_n_samples", "mcts_ev_ratio_min",
-                               "mcts_ev_ratio_max")
+                               "mcts_ev_ratio_max",
+                               "mcts_value_scale",
+                               "mcts_value_scale_n_samples",
+                               "mcts_value_chip_min",
+                               "mcts_value_chip_max")
 
             for cycle in range(n_cycles):
                 log(f"\n=== MCTS Cycle {cycle + 1}/{n_cycles} ===")

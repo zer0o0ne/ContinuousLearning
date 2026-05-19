@@ -39,7 +39,8 @@ class LengthGroupedBatchSampler(Sampler):
         return len(self.batches)
 
 
-def _mcts_forward(agent, event_sequences, chains, device, opponent_emb_table=None):
+def _mcts_forward(agent, event_sequences, chains, device,
+                  opponent_emb_table=None, p_tf=0.0, stop_grad_old_embs=True):
     """Forward pass: perception → root predictions → modelling chain.
 
     Chain semantics (matches `collect.py:MCTSTrainingExample`):
@@ -50,136 +51,347 @@ def _mcts_forward(agent, event_sequences, chains, device, opponent_emb_table=Non
       step.target_distribution. This mirrors MCTS inner-node expansion
       (mcts.py: child.action_embedding = modelling_head(parent_ctx)[a]).
 
-    Returns:
-        value_preds: (B, 1) — predicted at root context only
-        action_preds: (B, n_actions) — root predictions
-        chain_preds, chain_targets, chain_is_hero: per-batch list of lists
+    New training signals (controllable via train_cfg / cycle-scheduled p_tf):
+      - Teacher forcing (point 2): with probability p_tf, the prediction heads
+        receive the REAL perception of decisions[t+1+i] as ctx instead of the
+        recursively-rolled ctx. The rolled ctx is still maintained so modelling
+        and downstream chain steps stay defined; only the prediction-head input
+        is swapped this step.
+      - Stop-gradient on old modelling embeddings (point 6): when extending
+        ctx_rolled for the next iteration, the appended emb is detached so the
+        gradient at step i only updates modelling_head/perception via the
+        CURRENT step's emb (and via the original root perception_out).
+      - Reconstruction (point 1) and per-step value (point 11) targets are
+        produced here and consumed by `_compute_loss`.
+
+    Returns: dict with keys
+      value_preds: (B, 1) — root prediction only
+      action_preds: (B, n_actions) — root prediction only
+      chain_action_preds / chain_action_targets / chain_is_hero:
+          per-batch list of lists (n_actions,) / (n_actions,) / bool
+      chain_value_preds / chain_value_targets:
+          per-batch list of lists, scalar tensors
+      chain_recon_preds / chain_recon_targets / chain_recon_depths:
+          per-batch list of lists, (D,) tensors / (D,) tensors / int — the
+          depth `i` of each recon entry in the original chain. Targets
+          detached. Only populated for steps whose ChainStep.events_at_step
+          is non-empty; the depth list lets `_compute_loss` apply the same
+          `chain_depth_gamma` weighting as the action/value chain losses
+          even though recon is sparse over chain positions.
     """
-    # Perception
     skip_opp = (opponent_emb_table is None)
+
+    # 1. Root perception (updates opp_table once)
     perception_out, _, mask = agent.perception.forward_batch(
         event_sequences, device=device, skip_memory=True,
         skip_opponent_emb=skip_opp, opponent_emb_table=opponent_emb_table)
 
-    # Root predictions
+    # 2. Root predictions
     value_preds = agent.value_head(perception_out, mask=mask)
     action_preds = agent.action_head(perception_out, mask=mask)
 
     B = perception_out.shape[0]
-    all_chain_preds = []
-    all_chain_targets = []
-    all_chain_is_hero = []
+
+    # 3. Collect chain events for ONE batched perception forward
+    flat_step_events = []
+    step_index = {}  # (b, i) -> index into flat_step_events / chain_pooled
+    for b, chain in enumerate(chains):
+        for i, step in enumerate(chain):
+            evts = getattr(step, "events_at_step", None) or []
+            if evts:
+                step_index[(b, i)] = len(flat_step_events)
+                flat_step_events.append(evts)
+
+    chain_perception_out = None
+    chain_perception_mask = None
+    chain_pooled_detached = None
+    need_grad_chain_perc = bool(flat_step_events) and p_tf > 0.0
+    if flat_step_events:
+        # Snapshot opp_table embeddings BEFORE chain perception so the GRU
+        # state seen by next batch matches what root-only would have left
+        # behind (no double-update from chain perception).
+        opp_snapshot = None
+        if opponent_emb_table is not None:
+            opp_snapshot = dict(opponent_emb_table.embeddings)
+
+        if need_grad_chain_perc:
+            chain_perception_out, _, chain_perception_mask = (
+                agent.perception.forward_batch(
+                    flat_step_events, device=device, skip_memory=True,
+                    skip_opponent_emb=skip_opp,
+                    opponent_emb_table=opponent_emb_table)
+            )
+        else:
+            with torch.no_grad():
+                chain_perception_out, _, chain_perception_mask = (
+                    agent.perception.forward_batch(
+                        flat_step_events, device=device, skip_memory=True,
+                        skip_opponent_emb=skip_opp,
+                        opponent_emb_table=opponent_emb_table)
+                )
+
+        if opp_snapshot is not None:
+            opponent_emb_table.embeddings = opp_snapshot
+
+        # Pool real-perception output to a single (D,) per step for recon target
+        m_float = chain_perception_mask.float().unsqueeze(-1)  # (M, S, 1)
+        sums = (chain_perception_out * m_float).sum(dim=1)     # (M, D)
+        counts = m_float.sum(dim=1).clamp(min=1.0)             # (M, 1)
+        chain_pooled_detached = (sums / counts).detach()       # (M, D)
+
+    # 4. Per-example chain loop
+    chain_action_preds = []
+    chain_action_targets = []
+    chain_is_hero = []
+    chain_value_preds = []
+    chain_value_targets = []
+    chain_recon_preds = []
+    chain_recon_targets = []
+    chain_recon_depths = []
 
     for b in range(B):
         chain = chains[b]
         if not chain:
-            all_chain_preds.append([])
-            all_chain_targets.append([])
-            all_chain_is_hero.append([])
+            for L in (chain_action_preds, chain_action_targets, chain_is_hero,
+                      chain_value_preds, chain_value_targets,
+                      chain_recon_preds, chain_recon_targets,
+                      chain_recon_depths):
+                L.append([])
             continue
 
-        # Per-example context: (1, seq_len, d_model)
-        ctx = perception_out[b:b+1]
+        ctx_rolled = perception_out[b:b+1]
         ctx_mask = mask[b:b+1]
-        preds = []
-        targets = []
-        is_hero_list = []
 
-        for step in chain:
-            # Modelling: get action embeddings for current context
-            action_embs = agent.modelling_head(ctx, mask=ctx_mask)
+        b_action_preds = []
+        b_action_tgts = []
+        b_is_hero = []
+        b_value_preds = []
+        b_value_tgts = []
+        b_recon_preds = []
+        b_recon_tgts = []
+        b_recon_depths = []
 
-            # Select embedding for the action actually taken
-            emb = action_embs[:, step.action_taken, :]  # (1, d_model)
+        for i, step in enumerate(chain):
+            action_embs = agent.modelling_head(ctx_rolled, mask=ctx_mask)
+            emb = action_embs[:, step.action_taken, :]  # (1, D)
+            new_emb_token = emb.unsqueeze(1)            # (1, 1, D)
+            ones_mask = torch.ones(1, 1, dtype=ctx_mask.dtype, device=device)
+            ctx_with_new_emb = torch.cat([ctx_rolled, new_emb_token], dim=1)
+            ctx_with_new_emb_mask = torch.cat([ctx_mask, ones_mask], dim=1)
 
-            # Extend context
-            ctx = torch.cat([ctx, emb.unsqueeze(1)], dim=1)
-            ctx_mask = torch.cat([
-                ctx_mask,
-                torch.ones(1, 1, dtype=ctx_mask.dtype, device=device)
-            ], dim=1)
-
-            # Predict distribution
-            if step.is_hero:
-                pred = agent.action_head(ctx, mask=ctx_mask)
+            tf_idx = step_index.get((b, i))
+            use_tf = (tf_idx is not None and p_tf > 0.0
+                      and chain_perception_out is not None
+                      and random.random() < p_tf)
+            if use_tf:
+                ctx_for_pred = chain_perception_out[tf_idx:tf_idx+1]
+                ctx_for_pred_mask = chain_perception_mask[tf_idx:tf_idx+1]
             else:
-                pred = agent.opponent_action_head(ctx, mask=ctx_mask)
+                ctx_for_pred = ctx_with_new_emb
+                ctx_for_pred_mask = ctx_with_new_emb_mask
 
-            preds.append(pred.squeeze(0))  # (n_actions,)
-            targets.append(torch.tensor(
+            if step.is_hero:
+                pred = agent.action_head(ctx_for_pred, mask=ctx_for_pred_mask)
+            else:
+                pred = agent.opponent_action_head(ctx_for_pred,
+                                                   mask=ctx_for_pred_mask)
+            value_pred = agent.value_head(ctx_for_pred, mask=ctx_for_pred_mask)
+
+            b_action_preds.append(pred.squeeze(0))
+            b_action_tgts.append(torch.tensor(
                 step.target_distribution, dtype=torch.float32, device=device))
-            is_hero_list.append(step.is_hero)
+            b_is_hero.append(bool(step.is_hero))
+            b_value_preds.append(value_pred.reshape(()))
+            b_value_tgts.append(torch.tensor(
+                float(getattr(step, "value_target", 0.0)),
+                dtype=torch.float32, device=device))
 
-        all_chain_preds.append(preds)
-        all_chain_targets.append(targets)
-        all_chain_is_hero.append(is_hero_list)
+            if tf_idx is not None and chain_pooled_detached is not None:
+                m_float = ctx_with_new_emb_mask.float().unsqueeze(-1)
+                sums_e = (ctx_with_new_emb * m_float).sum(dim=1)  # (1, D)
+                counts_e = m_float.sum(dim=1).clamp(min=1.0)      # (1, 1)
+                recon_pred = (sums_e / counts_e).squeeze(0)       # (D,)
+                b_recon_preds.append(recon_pred)
+                b_recon_tgts.append(chain_pooled_detached[tf_idx])
+                b_recon_depths.append(i)
 
-    return value_preds, action_preds, all_chain_preds, all_chain_targets, all_chain_is_hero
+            if stop_grad_old_embs:
+                ctx_rolled = torch.cat([ctx_rolled, new_emb_token.detach()],
+                                        dim=1)
+            else:
+                ctx_rolled = torch.cat([ctx_rolled, new_emb_token], dim=1)
+            ctx_mask = ctx_with_new_emb_mask
+
+        chain_action_preds.append(b_action_preds)
+        chain_action_targets.append(b_action_tgts)
+        chain_is_hero.append(b_is_hero)
+        chain_value_preds.append(b_value_preds)
+        chain_value_targets.append(b_value_tgts)
+        chain_recon_preds.append(b_recon_preds)
+        chain_recon_targets.append(b_recon_tgts)
+        chain_recon_depths.append(b_recon_depths)
+
+    return {
+        "value_preds": value_preds,
+        "action_preds": action_preds,
+        "chain_action_preds": chain_action_preds,
+        "chain_action_targets": chain_action_targets,
+        "chain_is_hero": chain_is_hero,
+        "chain_value_preds": chain_value_preds,
+        "chain_value_targets": chain_value_targets,
+        "chain_recon_preds": chain_recon_preds,
+        "chain_recon_targets": chain_recon_targets,
+        "chain_recon_depths": chain_recon_depths,
+    }
 
 
-def _compute_loss(value_preds, value_targets, action_preds, action_targets,
-                  chain_preds, chain_targets, chain_is_hero,
-                  value_weight=1.0, action_weight=1.0, chain_weight=1.0):
+def _compute_loss(forward_out, value_targets, action_targets,
+                  value_weight=1.0, action_weight=1.0, chain_weight=1.0,
+                  recon_weight=0.5, value_chain_weight=0.5,
+                  chain_depth_gamma=0.7):
     """Compute combined loss across all heads.
 
-    Returns:
-        total_loss, loss_dict (for logging)
-    """
-    # Value loss: SmoothL1
-    value_loss = F.smooth_l1_loss(value_preds.squeeze(-1), value_targets)
+    Aggregation policy (post-modifications):
+      - chain KL, chain value AND reconstruction are first weighted by
+        `gamma^i` within an example, normalized by the sum of weights for
+        that example, then averaged across examples (point 5 + point 3).
+        For recon, `i` is the original chain depth (not the position in
+        the filtered recon list) — recon entries exist only for steps with
+        non-empty `events_at_step`, so the gamma exponent must come from
+        `chain_recon_depths`, not from sequential indexing. This stops a
+        single long-chain example from dominating the gradient AND aligns
+        recon weighting with the action/value chain losses (deeper
+        modelling rollouts compound prediction error, so their recon
+        target is also intrinsically noisier).
+      - Empty chains contribute nothing.
 
-    # Action loss: KL divergence (root action distribution)
+    Args:
+        forward_out: dict returned by `_mcts_forward`.
+        value_targets / action_targets: root targets (B,) / (B, n_actions).
+
+    Returns: (total_loss, loss_dict) where loss_dict has float entries for
+        value / action / chain / chain_value / recon / total.
+    """
+    value_preds = forward_out["value_preds"]
+    action_preds = forward_out["action_preds"]
+    device = value_preds.device
+
+    # --- Root losses (unchanged semantics) ---
+    value_loss = F.smooth_l1_loss(value_preds.squeeze(-1), value_targets)
     action_log_probs = F.log_softmax(action_preds, dim=-1)
     action_loss = F.kl_div(action_log_probs, action_targets, reduction="batchmean")
 
-    # Chain loss: KL divergence at each step
-    chain_losses = []
-    for b_preds, b_targets in zip(chain_preds, chain_targets):
+    # --- Helper: per-example weighted mean with gamma^i ---
+    def _per_example_weighted(per_example_steps, gamma):
+        """Each item: list of scalar tensors (one per chain step).
+        Returns batch-mean of (sum gamma^i * loss_i / sum gamma^i)."""
+        per_ex = []
+        for steps in per_example_steps:
+            if not steps:
+                continue
+            weights = [gamma ** i for i in range(len(steps))]
+            total_w = sum(weights) or 1.0
+            weighted_sum = torch.stack(
+                [w * s for w, s in zip(weights, steps)]
+            ).sum()
+            per_ex.append(weighted_sum / total_w)
+        if not per_ex:
+            return torch.tensor(0.0, device=device)
+        return torch.stack(per_ex).mean()
+
+    # --- Chain action KL (depth-weighted per example) ---
+    chain_kl_per_example = []
+    for b_preds, b_targets in zip(forward_out["chain_action_preds"],
+                                   forward_out["chain_action_targets"]):
+        steps = []
         for pred, target in zip(b_preds, b_targets):
             log_probs = F.log_softmax(pred, dim=-1)
-            chain_losses.append(F.kl_div(log_probs, target, reduction="sum"))
+            steps.append(F.kl_div(log_probs, target, reduction="sum"))
+        chain_kl_per_example.append(steps)
+    chain_loss = _per_example_weighted(chain_kl_per_example, chain_depth_gamma)
 
-    if chain_losses:
-        chain_loss = torch.stack(chain_losses).sum() / len(chain_losses)
+    # --- Chain value (depth-weighted per example, SmoothL1) ---
+    chain_value_per_example = []
+    for b_preds, b_targets in zip(forward_out["chain_value_preds"],
+                                   forward_out["chain_value_targets"]):
+        steps = []
+        for pred, target in zip(b_preds, b_targets):
+            steps.append(F.smooth_l1_loss(pred, target))
+        chain_value_per_example.append(steps)
+    chain_value_loss = _per_example_weighted(chain_value_per_example,
+                                              chain_depth_gamma)
+
+    # --- Reconstruction MSE (depth-weighted per example using ORIGINAL
+    # chain index, not the position within the recon-only sublist) ---
+    recon_per_example = []
+    for b_preds, b_targets, b_depths in zip(
+            forward_out["chain_recon_preds"],
+            forward_out["chain_recon_targets"],
+            forward_out["chain_recon_depths"]):
+        if not b_preds:
+            continue
+        step_losses = [F.mse_loss(p, t) for p, t in zip(b_preds, b_targets)]
+        weights = [chain_depth_gamma ** d for d in b_depths]
+        total_w = sum(weights) or 1.0
+        weighted_sum = torch.stack(
+            [w * s for w, s in zip(weights, step_losses)]
+        ).sum()
+        recon_per_example.append(weighted_sum / total_w)
+    if recon_per_example:
+        recon_loss = torch.stack(recon_per_example).mean()
     else:
-        chain_loss = torch.tensor(0.0, device=value_preds.device)
+        recon_loss = torch.tensor(0.0, device=device)
 
-    total = value_weight * value_loss + action_weight * action_loss + chain_weight * chain_loss
+    total = (value_weight * value_loss
+             + action_weight * action_loss
+             + chain_weight * chain_loss
+             + value_chain_weight * chain_value_loss
+             + recon_weight * recon_loss)
 
     return total, {
         "value": value_loss.item(),
         "action": action_loss.item(),
         "chain": chain_loss.item(),
+        "chain_value": chain_value_loss.item(),
+        "recon": recon_loss.item(),
         "total": total.item(),
     }
 
 
+_LOSS_KEYS = ("total", "value", "action", "chain", "chain_value", "recon")
+
+
 def _run_validation(agent, val_loader, device, weights, amp_config=None,
-                    opponent_emb_table=None):
-    """Run validation. Returns dict with total + component losses."""
+                    opponent_emb_table=None, stop_grad_old_embs=True):
+    """Run validation. Returns dict with total + component losses.
+
+    Validation always uses p_tf=0 (fully rolled chain) so the metric stays
+    comparable across cycles regardless of the current teacher-forcing
+    schedule.
+    """
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     agent.eval()
-    sums = {"total": 0.0, "value": 0.0, "action": 0.0, "chain": 0.0}
+    sums = {k: 0.0 for k in _LOSS_KEYS}
     count = 0
     with torch.no_grad():
         for event_seqs, val_targets, act_targets, chains in val_loader:
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                v_pred, a_pred, c_preds, c_tgts, c_hero = _mcts_forward(
+                forward_out = _mcts_forward(
                     agent, event_seqs, chains, device,
-                    opponent_emb_table=opponent_emb_table)
-                loss, ldict = _compute_loss(v_pred, val_targets, a_pred, act_targets,
-                                            c_preds, c_tgts, c_hero, **weights)
+                    opponent_emb_table=opponent_emb_table,
+                    p_tf=0.0,
+                    stop_grad_old_embs=stop_grad_old_embs)
+                _, ldict = _compute_loss(
+                    forward_out, val_targets, act_targets, **weights)
             n = len(event_seqs)
-            sums["total"] += ldict["total"] * n
-            sums["value"] += ldict["value"] * n
-            sums["action"] += ldict["action"] * n
-            sums["chain"] += ldict["chain"] * n
+            for k in _LOSS_KEYS:
+                sums[k] += ldict[k] * n
             count += n
     agent.train()
     if count == 0:
-        return {"total": 0.0, "value": 0.0, "action": 0.0, "chain": 0.0}
+        return {k: 0.0 for k in _LOSS_KEYS}
     return {k: v / count for k, v in sums.items()}
 
 
@@ -227,8 +439,26 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     value_weight = train_cfg.get("value_weight", 1.0)
     action_weight = train_cfg.get("action_weight", 1.0)
     chain_weight = train_cfg.get("chain_weight", 1.0)
+    recon_weight = train_cfg.get("recon_weight", 0.0)
+    value_chain_weight = train_cfg.get("value_chain_weight", 0.0)
+    chain_depth_gamma = float(train_cfg.get("chain_depth_gamma", 1.0))
+    stop_grad_old_embs = bool(train_cfg.get("stop_grad_old_embs", True))
     weights = {"value_weight": value_weight, "action_weight": action_weight,
-               "chain_weight": chain_weight}
+               "chain_weight": chain_weight, "recon_weight": recon_weight,
+               "value_chain_weight": value_chain_weight,
+               "chain_depth_gamma": chain_depth_gamma}
+
+    # Teacher-forcing probability decays linearly from p_start → p_end over
+    # `decay_cycles` cycles. Disabled (p_tf=0) when section is missing.
+    tf_cfg = train_cfg.get("teacher_forcing", {}) or {}
+    tf_p_start = float(tf_cfg.get("p_start", 0.0))
+    tf_p_end = float(tf_cfg.get("p_end", 0.0))
+    tf_decay_cycles = max(1, int(tf_cfg.get("decay_cycles", 1)))
+    if tf_p_start <= 0.0 and tf_p_end <= 0.0:
+        p_tf = 0.0
+    else:
+        frac = min(1.0, max(0.0, cycle_id / tf_decay_cycles))
+        p_tf = tf_p_start + (tf_p_end - tf_p_start) * frac
 
     log(f"=== MCTS Training (cycle {cycle_id}, save={save_checkpoint}) ===")
 
@@ -283,7 +513,12 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                             collate_fn=batch_collate)
 
     log(f"Train: {n_train}, Val: {n_val}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
-    log(f"Weights: value={value_weight}, action={action_weight}, chain={chain_weight}")
+    log(f"Weights: value={value_weight}, action={action_weight}, "
+        f"chain={chain_weight}, recon={recon_weight}, "
+        f"chain_value={value_chain_weight}, depth_gamma={chain_depth_gamma}")
+    log(f"Chain extras: p_tf={p_tf:.3f} "
+        f"(start={tf_p_start}, end={tf_p_end}, decay={tf_decay_cycles}), "
+        f"stop_grad_old_embs={stop_grad_old_embs}")
     if external_optim:
         cur_lr = optimizer.param_groups[0]["lr"]
         log(f"Using external optimizer/scheduler (current lr={cur_lr:.2e})")
@@ -330,12 +565,13 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
             act_targets = act_targets.to(device)
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                v_pred, a_pred, c_preds, c_tgts, c_hero = _mcts_forward(
+                forward_out = _mcts_forward(
                     agent, event_seqs, chains, device,
-                    opponent_emb_table=opp_table)
+                    opponent_emb_table=opp_table,
+                    p_tf=p_tf,
+                    stop_grad_old_embs=stop_grad_old_embs)
                 loss, loss_dict = _compute_loss(
-                    v_pred, val_targets, a_pred, act_targets,
-                    c_preds, c_tgts, c_hero, **weights)
+                    forward_out, val_targets, act_targets, **weights)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -356,6 +592,9 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 "value": loss_dict["value"],
                 "action": loss_dict["action"],
                 "chain": loss_dict["chain"],
+                "chain_value": loss_dict["chain_value"],
+                "recon": loss_dict["recon"],
+                "p_tf": p_tf,
                 "lr": current_lr,
                 "batch_size": len(event_seqs),
             })
@@ -367,12 +606,16 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 avg = train_loss_sum / train_count
                 log(f"  Cycle {cycle_id} Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}, "
                     f"Loss: {avg:.6f} (v={loss_dict['value']:.4f} "
-                    f"a={loss_dict['action']:.4f} c={loss_dict['chain']:.4f}) "
+                    f"a={loss_dict['action']:.4f} c={loss_dict['chain']:.4f} "
+                    f"cv={loss_dict['chain_value']:.4f} "
+                    f"r={loss_dict['recon']:.4f}) "
                     f"lr={current_lr:.2e}")
 
             if val_every and (global_step % val_every == 0):
-                val_dict = _run_validation(agent, val_loader, device, weights,
-                                            amp_cfg, opponent_emb_table=opp_table)
+                val_dict = _run_validation(
+                    agent, val_loader, device, weights, amp_cfg,
+                    opponent_emb_table=opp_table,
+                    stop_grad_old_embs=stop_grad_old_embs)
                 vl = val_dict["total"]
                 history["val_loss"].append({
                     "step": global_step,
@@ -381,7 +624,9 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 })
                 log(f"  [Cycle {cycle_id} Step {global_step}] Val: "
                     f"total={vl:.6f} v={val_dict['value']:.4f} "
-                    f"a={val_dict['action']:.4f} c={val_dict['chain']:.4f}")
+                    f"a={val_dict['action']:.4f} c={val_dict['chain']:.4f} "
+                    f"cv={val_dict['chain_value']:.4f} "
+                    f"r={val_dict['recon']:.4f}")
                 if vl < best_val_loss:
                     best_val_loss = vl
                     fails_since_best = 0
@@ -401,8 +646,10 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
             break
 
         train_avg = train_loss_sum / max(train_count, 1)
-        val_dict = _run_validation(agent, val_loader, device, weights, amp_cfg,
-                                    opponent_emb_table=opp_table)
+        val_dict = _run_validation(
+            agent, val_loader, device, weights, amp_cfg,
+            opponent_emb_table=opp_table,
+            stop_grad_old_embs=stop_grad_old_embs)
         val_avg = val_dict["total"]
         history["epoch_train_loss"].append({
             "step": global_step, "cycle_id": cycle_id,
@@ -416,7 +663,10 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
             "step": global_step, "cycle_id": cycle_id, **val_dict,
         })
         log(f"Cycle {cycle_id} Epoch {epoch+1}/{epochs} — "
-            f"Train: {train_avg:.6f}, Val: {val_avg:.6f}")
+            f"Train: {train_avg:.6f}, Val: {val_avg:.6f} "
+            f"(v={val_dict['value']:.4f} a={val_dict['action']:.4f} "
+            f"c={val_dict['chain']:.4f} cv={val_dict['chain_value']:.4f} "
+            f"r={val_dict['recon']:.4f})")
 
         if val_avg < best_val_loss:
             best_val_loss = val_avg

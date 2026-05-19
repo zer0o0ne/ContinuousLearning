@@ -217,9 +217,77 @@ config.json → pipeline.py
 | GTO Combined | SmoothL1 + `action_loss_weight` * KL | modelling, opponent_action | perception, value, action |
 | Modelling | SmoothL1(predicted_evs) + `recon_weight` * MSE(state_reconstruction) | perception, value, action | modelling |
 | Opponent Action | KL divergence | perception, value, action, modelling | opponent_action (+ opponent_gru if enabled) |
-| MCTS | `value_weight` * SmoothL1 + `action_weight` * KL(root) + `chain_weight` * KL(chain) | — | all heads |
+| MCTS | `value_weight`·SmoothL1(root) + `action_weight`·KL(root) + `chain_weight`·KL(chain) + `recon_weight`·MSE + `value_chain_weight`·SmoothL1(chain). Value-target = `clip(α·(root.Q rescaled) + (1−α)·(equity_realized/new_scale), ±clip)`; equity-anchored root.Q (terminal_eval) + equity-based realized outcome at actual hand-end | — | all heads |
 
 All phases: LR warmup (100 steps) + cosine decay, gradient clipping (max_norm=1.0), early stopping, intra-epoch validation, AMP when available.
+
+### MCTS value-target normalization — IMPORTANT
+
+Step 1 and Step 2 both implemented (2026-05). Full plan + math + reasoning
+lives in [`versions/v5/PLAN_MCTS_VALUE_REDESIGN.md`](versions/v5/PLAN_MCTS_VALUE_REDESIGN.md).
+Read it before changing anything in `_make_terminal_evaluator`,
+`run_mcts_collection`, `_finalize_value_targets`, `terminal_eval.py`, or
+`re_backup_terminals`. Highlights:
+
+- **The 97% fold rate of trained agents was a normalization bug, not an
+  architecture bug.** Per-agent z-score `(ratio − μ)/σ` with `μ < 0` made
+  fold's deterministic `outcome = 0` land at `−μ/σ ≈ +0.13…+0.25` in
+  z-space while internal value_head outputs averaged to 0 → fold won PUCT
+  systematically. Step 1 removed the mean shift.
+- **`value_target = root.Q` in `collect_training_data` is a placeholder**
+  overwritten by `run_mcts_collection`. Value head trains on the hybrid
+  `α · root_q_ratio + (1−α) · realized` after Step 1; the realized half is
+  the **equity-based** chip delta after Step 2 (was: single-sample MC).
+- **Terminal Q has two stages**:
+  - During search: `_make_terminal_evaluator` uses fast heuristic
+    `pot/n_active − invested` (chips / `search_scale`). Good enough for
+    selection.
+  - Post-hand: `evaluate_all_terminals` in `terminal_eval.py` overrides
+    every terminal across every MCTS tree. Fold = deterministic; showdown
+    = `equity * pot − hero_invested` via `gpu_equity_v2` with opponent
+    range narrowing through each player's `action_head`. Output is
+    divided by `value_scales_by_position[hero_pos]` so it matches
+    ancestor-W scale.
+  - `re_backup_terminals` propagates the override as **delta**
+    `(new_Q − old_Q) * N` — replaces heuristic contribution, doesn't add
+    on top of it.
+- **Equity-based realized outcome** (Step 2B):
+  `realized = equity_hero * final_pot − chips_invested_from(t)` for
+  showdown hands; deterministic for fold-terminated hands.
+  `equity_by_hero` is computed once per hero and reused across all chain
+  steps of all that hero's examples in the hand (only
+  `chips_invested_from(t+1+i)` varies per step).
+- **`final_credits` is NOT used for showdown realized outcome.** The
+  engine has a known pot-distribution mis-accounting on multi-street
+  showdowns (`Table.next_turn` resets `self.bets` at each street, then
+  passes river-only `self.bets` to `Judger.get_reward`). Step 2 tracks
+  `cumulative_bets` via `Table.step`'s 4th return value and derives
+  `credits_pre_distribution = initial_credits − cumulative_bets`.
+- **Single scale across root + chain**. `_make_terminal_evaluator` and
+  `_finalize_value_targets` use one bootstrapped per-agent
+  `mcts_value_scale = std(realized_chip_deltas)` in chips (state-
+  dependent denoms cause extreme tails). Stored in `norm_stats`.
+- **Hybrid `α·Q + (1−α)·realized`** controlled by
+  `mcts_train.value_target_alpha`. Pure MC (`α=0`) = AlphaZero-style and
+  safe. Pure TD (`α=1`) = self-bootstrap, risks policy fixed-point
+  drift. Default `0.5`.
+- **Q normalization** in `_finalize_value_targets` passes through
+  `search_scale → chips → new_scale`. NOT double-division: the
+  multiplication undoes terminal_evaluator's division so we can re-apply
+  the cycle's freshly bootstrapped `new_scale`. When stable
+  (`search_scale == new_scale`), the ratio is 1 → identity. Plan §4.1.
+- **Legacy `norm_stats` keys** `mcts_ev_mean`, `mcts_ev_std`,
+  `mcts_ev_n_samples`, `mcts_ev_ratio_min`, `mcts_ev_ratio_max` stay in
+  checkpoints for backward-compat but are unused. New keys:
+  `mcts_value_scale` (chips), `mcts_value_scale_n_samples`,
+  `mcts_value_chip_min`, `mcts_value_chip_max`.
+  `pipeline.py:_MCTS_NORM_KEYS` controls clearing on
+  `value_norm_rebootstrap_every`.
+- **Belief-based equity ≠ per-hand zero-sum.** Each hero's equity is vs
+  the OPPONENT'S range (not opponent's actual cards), so
+  `Σ_p equity_p ≠ 1` on a single hand. Zero-sum holds in expectation
+  across hands. This is correct: training signal must come from what
+  hero can estimate at decision time, not omniscient ground truth.
 
 **Modelling forward**: perception(frozen) → modelling_head produces per-action embeddings → each action embedding appended to perception output → value_head(frozen params, grad flows through) predicts EV per action. Reconstruction loss: action embedding for taken action ≈ next perception state.
 

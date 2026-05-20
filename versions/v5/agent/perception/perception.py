@@ -189,93 +189,103 @@ class EventSequenceEmbedder(nn.Module):
             "action_emb": self.action_proj(actions),
         }
 
-    def forward_batch(self, event_sequences, device="cpu", opponent_embs_per_event=None):
-        """Embed a batch of event sequences into per-card vectors.
+    def _compute_pre_inject(self, event_sequences, device="cpu"):
+        """Compute per-event features up to (but excluding) opp_emb injection.
 
-        Vectorized: collects all events into batch tensors, transfers to device
-        once, runs all embedding layers in batch.
-
-        Args:
-            event_sequences: list of lists of event dicts (B samples, variable lengths)
-            device: torch device
-            opponent_embs_per_event: optional list of length T (total events across batch),
-                each element is a (d_model,) tensor or None. When provided, the embedding
-                is added to hand card positions (5, 6) before LayerNorm.
+        Output is post-`combine`, post-`source_embed`, pre-LayerNorm.
+        Lets the caller compute an opp_emb update signal from these features
+        and re-enter the pipeline via `_apply_post_inject` with fresh embeddings.
 
         Returns:
-            embeddings: (B, max_events * 7, d_model)
-            mask: (B, max_events * 7) float — 1 for real, 0 for padding
+            out_pre: (T, 7, d_model) — None if batch is empty
+            meta: dict with B, T, max_events, seq_lengths, batch_idx, event_idx
         """
-        C = self.CARDS_PER_EVENT
         bt = self._build_batch_tensors(event_sequences, device=device, mask_hand=False)
-
         B = len(event_sequences)
         seq_lengths = [len(seq) for seq in event_sequences]
         max_events = max(seq_lengths) if seq_lengths else 0
 
+        meta = {
+            "B": B, "max_events": max_events, "seq_lengths": seq_lengths,
+            "T": 0, "batch_idx": None, "event_idx": None,
+        }
         if bt is None:
+            return None, meta
+
+        T = bt["T"]
+        meta.update(T=T, batch_idx=bt["batch_idx"], event_idx=bt["event_idx"])
+
+        context = torch.cat([
+            bt["hero_pos_emb"], bt["acting_pos_emb"], bt["num_players_emb"],
+            bt["scalar_emb"], bt["bet_emb"], bt["action_emb"],
+        ], dim=-1)                                               # (T, 6*d_model)
+        context = context.unsqueeze(1).expand(-1, 7, -1)         # (T, 7, 6*d_model)
+
+        combined = torch.cat([bt["card_embs"], context], dim=-1) # (T, 7, 7*d_model)
+        combined = combined.reshape(T * 7, self.d_model * 7)
+        out = self.combine(combined).view(T, 7, self.d_model)
+
+        source_ids = torch.tensor([0, 0, 0, 0, 0, 1, 1], dtype=torch.long, device=device)
+        source_embs = self.source_embed(source_ids)              # (7, d_model)
+        out = out + source_embs.unsqueeze(0)                     # (T, 7, d_model)
+        return out, meta
+
+    def _apply_post_inject(self, out_pre, meta, opponent_embs_per_event, device="cpu"):
+        """Inject opp_emb into hand slots, LayerNorm, scatter to (B, M*7, d_model).
+
+        out_pre may be None when batch had no events; returns zero tensors.
+        opponent_embs_per_event: None or list of length T (parallel to flat
+        event order), each entry a (d_model,) tensor or None.
+        """
+        C = self.CARDS_PER_EVENT
+        B = meta["B"]
+        max_events = meta["max_events"]
+        seq_lengths = meta["seq_lengths"]
+
+        if out_pre is None:
             embeddings = torch.zeros(B, max_events * C, self.d_model,
                                      dtype=torch.float, device=device)
             mask = torch.zeros(B, max_events * C, dtype=torch.float, device=device)
             return embeddings, mask
 
-        T = bt["T"]
+        T = meta["T"]
+        out = out_pre
 
-        card_embs = bt["card_embs"]
-        hero_pos_emb = bt["hero_pos_emb"]
-        acting_pos_emb = bt["acting_pos_emb"]
-        num_players_emb = bt["num_players_emb"]
-        scalar_emb = bt["scalar_emb"]
-        bet_emb = bt["bet_emb"]
-        action_emb = bt["action_emb"]
-
-        # Context: cat 6 embeddings, broadcast to 7 cards
-        context = torch.cat([
-            hero_pos_emb, acting_pos_emb, num_players_emb,
-            scalar_emb, bet_emb, action_emb
-        ], dim=-1)                                               # (T, 6*d_model)
-        context = context.unsqueeze(1).expand(-1, 7, -1)         # (T, 7, 6*d_model)
-
-        # Combine: cat(card_emb, context) → Linear → + source → LayerNorm
-        combined = torch.cat([card_embs, context], dim=-1)       # (T, 7, 7*d_model)
-        combined = combined.reshape(T * 7, self.d_model * 7)     # (T*7, 7*d_model)
-        out = self.combine(combined)                              # (T*7, d_model)
-        out = out.view(T, 7, self.d_model)                       # (T, 7, d_model)
-
-        # Source embedding: constant [0,0,0,0,0,1,1], same for all events
-        source_ids = torch.tensor([0, 0, 0, 0, 0, 1, 1], dtype=torch.long, device=device)
-        source_embs = self.source_embed(source_ids)              # (7, d_model)
-        out = out + source_embs.unsqueeze(0)                     # (T, 7, d_model) broadcast
-
-        # Inject opponent embeddings into hand card positions (5, 6)
         if opponent_embs_per_event is not None:
             indices = [i for i, e in enumerate(opponent_embs_per_event) if e is not None]
             if indices:
                 stacked = torch.stack([opponent_embs_per_event[i] for i in indices])  # (K, d_model)
                 idx_t = torch.tensor(indices, dtype=torch.long, device=device)
+                out = out.clone()
                 out[idx_t, 5, :] = out[idx_t, 5, :] + stacked
                 out[idx_t, 6, :] = out[idx_t, 6, :] + stacked
 
         out = self.post_embed_norm(out)                          # (T, 7, d_model)
 
-        # --- Scatter into (B, max_events*7, d_model) output ---
         embeddings = torch.zeros(B, max_events * C, self.d_model,
                                  dtype=out.dtype, device=device)
         mask = torch.zeros(B, max_events * C, dtype=torch.float, device=device)
 
-        bi = bt["batch_idx"]   # (T,)
-        ei = bt["event_idx"]   # (T,)
-        # Expand indices for 7 cards per event
-        bi_exp = bi.unsqueeze(1).expand(-1, 7).reshape(-1)            # (T*7,)
-        offsets = torch.arange(7, device=device).unsqueeze(0).expand(T, -1)  # (T, 7)
-        col_idx = (ei.unsqueeze(1) * 7 + offsets).reshape(-1)         # (T*7,)
+        bi = meta["batch_idx"]
+        ei = meta["event_idx"]
+        bi_exp = bi.unsqueeze(1).expand(-1, 7).reshape(-1)
+        offsets = torch.arange(7, device=device).unsqueeze(0).expand(T, -1)
+        col_idx = (ei.unsqueeze(1) * 7 + offsets).reshape(-1)
 
         embeddings[bi_exp, col_idx] = out.reshape(T * 7, self.d_model)
-
         for i, sl in enumerate(seq_lengths):
             mask[i, :sl * C] = 1.0
-
         return embeddings, mask
+
+    def forward_batch(self, event_sequences, device="cpu", opponent_embs_per_event=None):
+        """Embed a batch of event sequences into per-card vectors.
+
+        Thin wrapper over `_compute_pre_inject` + `_apply_post_inject`.
+        Returns (embeddings: (B, M*7, d_model), mask: (B, M*7)).
+        """
+        out_pre, meta = self._compute_pre_inject(event_sequences, device=device)
+        return self._apply_post_inject(out_pre, meta, opponent_embs_per_event,
+                                       device=device)
 
 
 class Perception(nn.Module):
@@ -332,70 +342,77 @@ class Perception(nn.Module):
             skip_opponent_emb: if True, skip opponent GRU embedding injection
             opponent_emb_table: optional OpponentEmbeddingTable instance.
                 Only used when skip_opponent_emb=False. When provided and
-                opp_emb_enabled, opponent embeddings are injected into hand card
-                positions and updated via GRU after encoding.
-                The table is mutated in-place (GRU updates write back).
+                opp_emb_enabled, each opponent's embedding is updated via GRU
+                BEFORE the encoder forward (signal = embedder pre-injection
+                features of that opponent's LAST event in the batch), and the
+                fresh embedding is then injected into hand-slot tokens so the
+                encoder sees the updated value. This keeps GRU parameters on
+                the gradient path from loss back through the encoder.
+                The table is mutated in-place.
 
         Returns: tuple (output, encoded, mask)
             output: (B, seq_len, d_model)
             encoded: (B, seq_len, d_model)
             mask: (B, seq_len)
         """
-        # Build opponent embeddings per event if available
-        opponent_embs_per_event = None
-        opp_event_map = None  # tracks (batch_idx, event_idx) -> opponent_id for GRU update
+        C = EventSequenceEmbedder.CARDS_PER_EVENT
         use_opp_emb = (not skip_opponent_emb and self.opp_emb_enabled
                        and opponent_emb_table is not None)
+
         if use_opp_emb:
-            opponent_embs_per_event = []
-            opp_event_map = []  # parallel list: opponent_id or None per flat event
+            # Flat parallel list of opponent_ids (one entry per event, None if
+            # event has no opponent_id). Must match flat order used by
+            # _build_batch_tensors (sample-major, event-major).
+            opp_event_map = []
             for seq in event_sequences:
                 for event in seq:
-                    opp_id = event.get("opponent_id")
-                    if opp_id is not None:
-                        opponent_embs_per_event.append(
-                            opponent_emb_table.get(opp_id, device)
-                        )
-                        opp_event_map.append(opp_id)
-                    else:
-                        opponent_embs_per_event.append(None)
-                        opp_event_map.append(None)
+                    opp_event_map.append(event.get("opponent_id"))
 
-        embedded, mask = self.embedder.forward_batch(
-            event_sequences, device=device,
-            opponent_embs_per_event=opponent_embs_per_event,
-        )
+            # Stage 1: embedder pre-injection features for every event.
+            # out_pre: (T, 7, d_model). Used both as GRU signal source AND as
+            # input to the post-injection stage (no double work).
+            out_pre, meta = self.embedder._compute_pre_inject(
+                event_sequences, device=device,
+            )
+
+            new_opp_embs = {}
+            if out_pre is not None:
+                # Per opp_id, take the LAST event where this opponent acted.
+                # Signal = mean over its 7 card vectors of out_pre at that
+                # event. GRU sees only one signal per opp per forward.
+                last_flat_idx = {}
+                for flat_idx, opp_id in enumerate(opp_event_map):
+                    if opp_id is not None:
+                        last_flat_idx[opp_id] = flat_idx
+
+                for opp_id, flat_idx in last_flat_idx.items():
+                    signal = out_pre[flat_idx].mean(dim=0)            # (d_model,)
+                    old_emb = opponent_emb_table.get(opp_id, device)  # detached / zeros
+                    new_emb = self.opponent_gru(signal, old_emb)      # in graph → GRU params
+                    new_opp_embs[opp_id] = new_emb
+                    opponent_emb_table.embeddings[opp_id] = new_emb
+
+            # Build per-event opp_emb list using the FRESH embedding so the
+            # encoder forward depends on new_emb → gradient reaches GRU.
+            opponent_embs_per_event = [
+                new_opp_embs[oid] if oid is not None else None
+                for oid in opp_event_map
+            ]
+
+            embedded, mask = self.embedder._apply_post_inject(
+                out_pre, meta, opponent_embs_per_event, device=device,
+            )
+        else:
+            embedded, mask = self.embedder.forward_batch(
+                event_sequences, device=device,
+            )
+
         encoded = self.encoder(embedded, mask=mask)  # (B, N*7, d_model)
 
         # Mean pool window=7: compress each event's 7 card vectors into 1
-        C = EventSequenceEmbedder.CARDS_PER_EVENT
         B, S, D = encoded.shape
         encoded = encoded.view(B, S // C, C, D).mean(dim=2)  # (B, N, d_model)
         mask = mask[:, ::C]  # (B, N) — all 7 positions per event share same mask value
-
-        # GRU update: compute per-opponent signal from mean-pooled encoder output
-        if use_opp_emb and opp_event_map is not None:
-            # Flatten encoded to (total_events, d_model) matching opp_event_map order
-            encoded_flat = []
-            for b_idx, seq in enumerate(event_sequences):
-                n_events = len(seq)
-                for e_idx in range(n_events):
-                    encoded_flat.append(encoded[b_idx, e_idx])
-
-            # Group signals by opponent_id
-            opp_signals = {}  # opponent_id -> list of (d_model,) tensors
-            for flat_idx, opp_id in enumerate(opp_event_map):
-                if opp_id is not None:
-                    if opp_id not in opp_signals:
-                        opp_signals[opp_id] = []
-                    opp_signals[opp_id].append(encoded_flat[flat_idx])
-
-            # Run GRU update for each opponent
-            for opp_id, signals in opp_signals.items():
-                signal = torch.stack(signals).mean(dim=0)  # (d_model,)
-                old_emb = opponent_emb_table.get(opp_id, device)
-                new_emb = self.opponent_gru(signal, old_emb)  # stays in graph
-                opponent_emb_table.embeddings[opp_id] = new_emb
 
         if skip_memory:
             decoder_input = encoded

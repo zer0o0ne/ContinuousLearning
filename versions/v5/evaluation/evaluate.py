@@ -34,27 +34,9 @@ from utils import get_amp_config
 # which imports from evaluation.evaluate.
 
 
-def _find_best_checkpoint(agent_dir):
-    """Find the best checkpoint in an agent directory.
-
-    Prefers gto_probs_predict (action head trained) over gto_ev_predict.
-    Within each, picks the most recent timestamped subdirectory.
-    """
-    for scenario in ("mcts_predict", "opponent_action_predict", "modelling_predict",
-                      "gto_probs_predict", "gto_predict", "gto_ev_predict"):
-        scenario_dir = os.path.join(agent_dir, scenario)
-        if not os.path.isdir(scenario_dir):
-            continue
-        subdirs = sorted(
-            [d for d in os.listdir(scenario_dir)
-             if os.path.isdir(os.path.join(scenario_dir, d))],
-            reverse=True,
-        )
-        for subdir in subdirs:
-            ckpt_path = os.path.join(scenario_dir, subdir, "best.pt")
-            if os.path.exists(ckpt_path):
-                return ckpt_path
-    return None
+# Re-exported for slumbot_eval (and any other consumer) so there is one
+# canonical scenario-priority list (defined on ASI in agent/agent.py).
+_find_best_checkpoint = ASI._find_best_checkpoint
 
 
 def _resolve_checkpoint_path(path):

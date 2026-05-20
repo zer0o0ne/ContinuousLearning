@@ -34,26 +34,8 @@ from utils import get_amp_config
 
 
 # ---------------------------------------------------------------------------
-# Agent loading (extended checkpoint search)
+# Agent loading
 # ---------------------------------------------------------------------------
-
-def _find_best_checkpoint(agent_dir):
-    """Find best checkpoint, searching gto_predict in addition to probs/ev."""
-    for scenario in ("gto_probs_predict", "gto_predict", "modelling_predict", "gto_ev_predict"):
-        scenario_dir = os.path.join(agent_dir, scenario)
-        if not os.path.isdir(scenario_dir):
-            continue
-        subdirs = sorted(
-            [d for d in os.listdir(scenario_dir)
-             if os.path.isdir(os.path.join(scenario_dir, d))],
-            reverse=True,
-        )
-        for subdir in subdirs:
-            ckpt_path = os.path.join(scenario_dir, subdir, "best.pt")
-            if os.path.exists(ckpt_path):
-                return ckpt_path
-    return None
-
 
 def _load_agents(agents_dir, config, device, log, fallback_temperature):
     """Load all agents from subdirectories."""
@@ -72,7 +54,7 @@ def _load_agents(agents_dir, config, device, log, fallback_temperature):
     agents = []
     for name in agent_names:
         agent_path = os.path.join(agents_dir, name)
-        ckpt_path = _find_best_checkpoint(agent_path)
+        ckpt_path = ASI._find_best_checkpoint(agent_path)
         if ckpt_path is None:
             log(f"WARNING: no checkpoint found for agent '{name}', skipping")
             continue

@@ -586,6 +586,10 @@ def run_evaluation(config, device, log, results_dir_override=None):
                     model_id = id(agent_info["agent"])
                     groups[model_id].append((pidx, ti, agent_info, events, street))
 
+                # Single lazy import outside the per-decision loop.
+                if groups:
+                    from agent.mcts.game_state import GameState  # noqa: F401 (used below)
+
                 for model_id, group_items in groups.items():
                     agent_model = group_items[0][2]["agent"]
                     # All entries in a group share the same agent → same opp_table
@@ -609,6 +613,16 @@ def run_evaluation(config, device, log, results_dir_override=None):
                     for local_idx, (pidx, ti, agent_info, events, street) in enumerate(group_items):
                         logits = all_logits[local_idx]
                         temp = temperatures[local_idx]
+                        # Mask out unplayable actions (dominated fold, raises
+                        # that collapse to call/all-in) so the policy can't
+                        # sample them at inference.
+                        table = table_states[ti]["table"]
+                        gs = GameState.from_table(table, table.active_player)
+                        legal_mask = torch.tensor(
+                            gs.get_legal_action_mask(n_actions),
+                            dtype=torch.bool, device=logits.device,
+                        )
+                        logits = logits.masked_fill(~legal_mask, float("-inf"))
                         probs = F.softmax(logits / temp, dim=0)
                         action_idx = torch.multinomial(probs, 1).item()
                         action = torch.zeros(n_actions, dtype=torch.float32)

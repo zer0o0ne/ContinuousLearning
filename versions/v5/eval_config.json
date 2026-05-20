@@ -105,13 +105,13 @@
         "username": "",
         "password": "",
         "request_timeout": 30,
-        "log_every": 1000,
-        "n_hands": 3000,
+        "log_every": 200,
+        "n_hands": 30000,
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "gto_pure_mcts_23",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_05_16_12_13_54/cycles/cycle_0023.pt",
+                "name": "gto_pure_mcts_10",
+                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_05_19_09_39_14/best.pt",
                 "use_opponent_embedding": true,
                 "use_mcts": true
             }

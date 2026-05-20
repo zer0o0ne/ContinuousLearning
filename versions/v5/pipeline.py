@@ -407,18 +407,26 @@ def main():
 
             save_every_cycles = max(1, mcts_train_cfg.get("save_every_cycles", 1))
 
-            def _checkpoint_metadata(agent_obj, fallback_norm_stats):
-                """Pull norm_stats / temperature from agent's checkpoint."""
+            def _make_identity_norm():
+                return {"pot_mean": 0, "pot_std": 1,
+                        "stack_mean": 0, "stack_std": 1,
+                        "bets_mean": 0, "bets_std": 1,
+                        "blind_mean": 0, "blind_std": 1,
+                        "ev_mean": 0, "ev_std": 1}
+
+            def _checkpoint_metadata(agent_obj):
+                """Return agent's norm_stats dict. If the checkpoint had none,
+                create a per-agent identity-norm dict and attach it to the
+                agent so mutations (e.g. `_finalize_value_targets` bootstrapping
+                `mcts_value_scale`) propagate through to `train_mcts._save_best`
+                — which reads `agent._checkpoint_norm_stats` when writing the
+                next `best.pt`. Without this, freshly bootstrapped MCTS norms
+                would never reach disk and restarts would fall back to BB."""
                 norm_stats = getattr(agent_obj, '_checkpoint_norm_stats', None)
                 if norm_stats is None:
-                    norm_stats = fallback_norm_stats
+                    norm_stats = _make_identity_norm()
+                    agent_obj._checkpoint_norm_stats = norm_stats
                 return norm_stats
-
-            _identity_norm = {"pot_mean": 0, "pot_std": 1,
-                              "stack_mean": 0, "stack_std": 1,
-                              "bets_mean": 0, "bets_std": 1,
-                              "blind_mean": 0, "blind_std": 1,
-                              "ev_mean": 0, "ev_std": 1}
 
             def _build_persistent_optim(agent_obj, ckpt, mcts_train_cfg,
                                          n_cycles, agent_log):
@@ -524,7 +532,7 @@ def main():
 
                     trained_agents.append({
                         "agent": agent_obj,
-                        "norm_stats": _checkpoint_metadata(agent_obj, _identity_norm),
+                        "norm_stats": _checkpoint_metadata(agent_obj),
                         "name": agent_name,
                         "temperature": temp,
                         "agent_log": agent_log,
@@ -561,7 +569,7 @@ def main():
 
                 trained_agents.append({
                     "agent": agent_obj,
-                    "norm_stats": _checkpoint_metadata(agent_obj, _identity_norm),
+                    "norm_stats": _checkpoint_metadata(agent_obj),
                     "name": name,
                     "temperature": fallback_temp,
                     "agent_log": log,
@@ -584,37 +592,52 @@ def main():
                 f"save_every_cycles={save_every_cycles}, "
                 f"value_norm_rebootstrap_every={value_norm_rebootstrap_every}")
 
-            # New normalization key (post-Step-1 redesign): single per-agent
-            # std of realized chip deltas, used as `value_scale` in
-            # `_make_terminal_evaluator` and the final hybrid target. Legacy
-            # `mcts_ev_*` keys are kept in the clear list for backward-compat
-            # with checkpoints saved before the redesign.
+            # Legacy `mcts_ev_*` keys (pre-Step-1 redesign) are unused but
+            # cleared opportunistically for hygiene. The live key
+            # `mcts_value_scale` (+ its companions) is NEVER popped here —
+            # see comment below.
             # See versions/v5/PLAN_MCTS_VALUE_REDESIGN.md for math.
-            _MCTS_NORM_KEYS = ("mcts_ev_mean", "mcts_ev_std",
-                               "mcts_ev_n_samples", "mcts_ev_ratio_min",
-                               "mcts_ev_ratio_max",
-                               "mcts_value_scale",
-                               "mcts_value_scale_n_samples",
-                               "mcts_value_chip_min",
-                               "mcts_value_chip_max")
+            _LEGACY_MCTS_NORM_KEYS = ("mcts_ev_mean", "mcts_ev_std",
+                                       "mcts_ev_n_samples",
+                                       "mcts_ev_ratio_min",
+                                       "mcts_ev_ratio_max")
 
             for cycle in range(n_cycles):
                 log(f"\n=== MCTS Cycle {cycle + 1}/{n_cycles} ===")
 
                 # Re-bootstrap value norm? (only on non-zero cycle id, every N)
+                #
+                # IMPORTANT: do NOT pop `mcts_value_scale` here. Doing so
+                # makes `_make_terminal_evaluator` fall back to BB during
+                # this cycle's MCTS search, while the value head is still
+                # trained on the OLD scale → terminal Qs and value-head
+                # outputs end up on different axes, PUCT compares apples to
+                # oranges, and the agent typically collapses (e.g. into
+                # always-fold). Instead we keep the old scale alive for
+                # search and inference, and set a "pending rebootstrap"
+                # flag that `_finalize_value_targets` consumes AFTER
+                # collection: it overwrites `mcts_value_scale` from this
+                # cycle's freshly observed chip deltas. The rescale math
+                # in `_finalize_value_targets` (search_scale / new_scale)
+                # correctly bridges old-scale search results onto the new
+                # target axis.
                 if (value_norm_rebootstrap_every > 0
                         and cycle > 0
                         and cycle % value_norm_rebootstrap_every == 0):
                     for agent_info in trained_agents:
                         ns = agent_info.get("norm_stats")
                         if ns is not None:
-                            had = any(k in ns for k in _MCTS_NORM_KEYS)
-                            for k in _MCTS_NORM_KEYS:
+                            for k in _LEGACY_MCTS_NORM_KEYS:
                                 ns.pop(k, None)
-                            if had:
-                                agent_info["agent_log"](
-                                    f"  [{agent_info['name']}] cleared "
-                                    f"mcts_ev_* — will re-bootstrap this cycle")
+                            ns["_mcts_value_scale_pending_rebootstrap"] = True
+                            old_scale = ns.get("mcts_value_scale")
+                            old_scale_s = (f"{old_scale:.2f}"
+                                            if isinstance(old_scale, (int, float))
+                                            else "absent")
+                            agent_info["agent_log"](
+                                f"  [{agent_info['name']}] marked for "
+                                f"mcts_value_scale rebootstrap this cycle "
+                                f"(keeping old scale={old_scale_s} for search)")
 
                 # Use in-memory agents directly for collection (no disk reload)
                 agents_for_play = [

@@ -462,8 +462,15 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
 
     log(f"=== MCTS Training (cycle {cycle_id}, save={save_checkpoint}) ===")
 
-    # Preserve norm_stats from checkpoint for saving
-    norm_stats = getattr(agent, '_checkpoint_norm_stats', None) or {}
+    # Preserve norm_stats from checkpoint for saving. Use `is None` rather
+    # than `or {}` so an empty-but-present dict still shares its identity
+    # with the pipeline's `agent_info["norm_stats"]` — that's the dict
+    # `_finalize_value_targets` mutates to bootstrap `mcts_value_scale`,
+    # and we need those mutations to flow into the saved best.pt.
+    norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
+    if norm_stats is None:
+        norm_stats = {}
+        agent._checkpoint_norm_stats = norm_stats
 
     # All parameters trainable
     for param in agent.parameters():

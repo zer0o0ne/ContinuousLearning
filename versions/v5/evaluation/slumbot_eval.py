@@ -642,8 +642,9 @@ def _choose_action(bundle, events, state, hero_user_pos, raise_sizes,
     # Normalize a copy in place (events are local to this hand)
     _normalize_events_inplace(events, norm_stats)
 
+    gs = _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scale)
+
     if bundle["mcts"] is not None:
-        gs = _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scale)
         return int(bundle["mcts"].search([events], gs))
 
     opp_table = bundle["opp_table"]
@@ -656,6 +657,10 @@ def _choose_action(bundle, events, state, hero_user_pos, raise_sizes,
                 opponent_emb_table=opp_table,
             )
     logits = out["action_logits"][0]
+    legal_mask = torch.tensor(
+        gs.get_legal_action_mask(n_actions), dtype=torch.bool, device=logits.device,
+    )
+    logits = logits.masked_fill(~legal_mask, float("-inf"))
     probs = F.softmax(logits / max(bundle["temperature"], 1e-3), dim=0)
     return int(torch.multinomial(probs, 1).item())
 
@@ -872,11 +877,17 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
             per_hand_baseline.append(b)
 
             done = len(per_hand_chips)
-            # Live status on the bar — running BB/100 (baseline-corrected)
-            # plus failure count, refreshed every hand.
-            running_bcorr_chips = [w_i - b_i
-                                    for w_i, b_i in zip(per_hand_chips, per_hand_baseline)]
-            running_bcorr = _bb_per_100(sum(running_bcorr_chips), done)
+            # `baseline_winnings` from Slumbot is its AIVAT-style low-variance
+            # estimator of the SAME quantity as `winnings` (expected hero
+            # chip P&L), with chance and known-strategy variance removed.
+            # The right "baseline-corrected" winrate is therefore the mean
+            # of baseline_winnings — NOT the difference (which is the AIVAT
+            # correction term and should be ≈ 0 in expectation).
+            running_bcorr = _bb_per_100(sum(per_hand_baseline), done)
+            running_residual = _bb_per_100(
+                sum(w_i - b_i for w_i, b_i in zip(per_hand_chips, per_hand_baseline)),
+                done,
+            )
             pbar.set_postfix({
                 "BB/100 base": f"{running_bcorr:+.1f}",
                 "failed": hands_failed,
@@ -884,21 +895,25 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
             pbar.update(1)
             if done > 0 and done % log_every == 0:
                 raw = _bb_per_100(sum(per_hand_chips), done)
-                stderr = _stderr_bb_per_100(per_hand_chips)
+                stderr_raw = _stderr_bb_per_100(per_hand_chips)
+                stderr_bcorr = _stderr_bb_per_100(per_hand_baseline)
                 history["bb100_raw"].append((done, raw))
                 history["bb100_baseline"].append((done, running_bcorr))
                 log(f"  [{name}] {done}/{n_hands}: "
-                    f"raw={raw:+.2f} BB/100, baseline_corrected={running_bcorr:+.2f} BB/100, "
-                    f"stderr={stderr:.2f}, clamps={dict(clamp_counters)}")
+                    f"raw={raw:+.2f} BB/100 (stderr={stderr_raw:.2f}), "
+                    f"baseline_corrected={running_bcorr:+.2f} BB/100 (stderr={stderr_bcorr:.2f}), "
+                    f"aivat_residual={running_residual:+.2f} BB/100, "
+                    f"clamps={dict(clamp_counters)}")
         pbar.close()
 
         n_played = len(per_hand_chips)
         total_chips = float(sum(per_hand_chips))
         total_baseline = float(sum(per_hand_baseline))
-        bcorr_chips = [w_i - b_i for w_i, b_i in zip(per_hand_chips, per_hand_baseline)]
         bb100_raw = _bb_per_100(total_chips, n_played)
-        bb100_bcorr = _bb_per_100(sum(bcorr_chips), n_played)
+        bb100_bcorr = _bb_per_100(total_baseline, n_played)
+        bb100_residual = _bb_per_100(total_chips - total_baseline, n_played)
         stderr_bb100 = _stderr_bb_per_100(per_hand_chips)
+        stderr_bb100_bcorr = _stderr_bb_per_100(per_hand_baseline)
         mbb_per_hand_raw = bb100_raw * 10.0  # 1000 mbb / 100 hands
 
         # Action distribution analytics
@@ -916,8 +931,10 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
             "session_baseline_total_chips": total_baseline,
             "bb_per_100_raw": round(bb100_raw, 4),
             "bb_per_100_baseline_corrected": round(bb100_bcorr, 4),
+            "bb_per_100_aivat_residual": round(bb100_residual, 4),
             "mbb_per_hand_raw": round(mbb_per_hand_raw, 4),
             "stderr_bb_per_100": round(stderr_bb100, 4),
+            "stderr_bb_per_100_baseline_corrected": round(stderr_bb100_bcorr, 4),
             "clamps": dict(clamp_counters),
             "use_mcts": bundle["mcts"] is not None,
             "use_opponent_embedding": bundle["opp_table"] is not None,
@@ -946,9 +963,10 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
             "action_hist_by_street": action_hist_by_street.tolist(),
         }, hist_path)
 
-        log(f"\n[{name}] FINAL: raw={bb100_raw:+.2f} BB/100, "
-            f"baseline_corrected={bb100_bcorr:+.2f} BB/100, "
-            f"stderr={stderr_bb100:.2f} ({n_played} hands, {hands_failed} failed)")
+        log(f"\n[{name}] FINAL: raw={bb100_raw:+.2f} BB/100 (stderr={stderr_bb100:.2f}), "
+            f"baseline_corrected={bb100_bcorr:+.2f} BB/100 (stderr={stderr_bb100_bcorr:.2f}), "
+            f"aivat_residual={bb100_residual:+.2f} BB/100 "
+            f"({n_played} hands, {hands_failed} failed)")
         log(f"[{name}] Clamps: {dict(clamp_counters)}")
 
     # Save aggregate JSON

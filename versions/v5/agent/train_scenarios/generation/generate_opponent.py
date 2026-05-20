@@ -29,6 +29,7 @@ from env.table import Table
 from evaluation.evaluate import _normalize_events_inplace
 from agent.train_scenarios.generation.generate import _get_raise_sizes, load_dataset
 from agent.agent import ASI
+from agent.mcts.game_state import GameState
 from utils import get_amp_config
 
 
@@ -396,6 +397,18 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             agent_info["norm_stats"], agent_info["temperature"],
             device, n_actions, max_batch, amp_config,
         )
+
+        # Mask out unplayable actions (dominated fold / raises that collapse
+        # to call or all-in) so the training target and the sampled action
+        # both respect the playable set. Re-normalize per row.
+        gs = GameState.from_table(table, active_pos)
+        legal_mask = torch.tensor(
+            gs.get_legal_action_mask(n_actions), dtype=torch.bool,
+        )
+        per_combo_probs = per_combo_probs.masked_fill(~legal_mask, 0.0)
+        row_sums = per_combo_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        per_combo_probs = per_combo_probs / row_sums
+        avg_probs = per_combo_probs.mean(dim=0)
 
         # Fix hand at first action of this player
         if fixed_hands[active_pos] is None:

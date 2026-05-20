@@ -659,8 +659,14 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
             ns = {}
             agent_info["norm_stats"] = ns
 
-        # 1. Bootstrap new_scale from raw chip-delta std if absent.
-        if "mcts_value_scale" not in ns:
+        # 1. Bootstrap new_scale from raw chip-delta std if absent OR if the
+        # pipeline asked for a forced rebootstrap this cycle (flag set by
+        # `value_norm_rebootstrap_every`). The flag path keeps the OLD scale
+        # in `ns` until this moment so MCTS search & inference earlier in the
+        # cycle used a coherent value scale; we only now swap to the fresh one.
+        pending = bool(ns.pop("_mcts_value_scale_pending_rebootstrap", False))
+        need_bootstrap = ("mcts_value_scale" not in ns) or pending
+        if need_bootstrap:
             chips = np.array(
                 [float(ex.value_target) for ex in examples],
                 dtype=np.float64,
@@ -668,12 +674,16 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
             std_c = float(chips.std())
             if std_c < 1e-8:
                 std_c = bb
+            old_scale = ns.get("mcts_value_scale")
             ns["mcts_value_scale"] = std_c
             ns["mcts_value_scale_n_samples"] = int(len(chips))
             ns["mcts_value_chip_min"] = float(chips.min())
             ns["mcts_value_chip_max"] = float(chips.max())
-            log(f"  {name}: bootstrapped mcts_value_scale = {std_c:.2f} "
-                f"chips (n={len(chips)}, range "
+            origin = "rebootstrapped" if pending else "bootstrapped"
+            old_s = (f" (was {old_scale:.2f})"
+                      if isinstance(old_scale, (int, float)) else "")
+            log(f"  {name}: {origin} mcts_value_scale = {std_c:.2f} "
+                f"chips{old_s} (n={len(chips)}, range "
                 f"[{chips.min():.1f}, {chips.max():.1f}])")
         else:
             log(f"  {name}: reusing mcts_value_scale = "

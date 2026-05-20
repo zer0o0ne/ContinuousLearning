@@ -194,7 +194,7 @@
         "val_every": 50,
         "interrupt_after_fails": 100,
         "scheduler_eta_min": 1e-6,
-        "estimated_steps_per_cycle": 20,
+        "estimated_steps_per_cycle": 7,
         "val_split": 0.1,
         "value_weight": 1.0,
         "action_weight": 1.0,

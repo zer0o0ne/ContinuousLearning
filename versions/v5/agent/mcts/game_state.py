@@ -163,19 +163,56 @@ class GameState:
                 self.active_player = (self.active_player + 1) % self.num_players
 
     def get_legal_actions(self):
-        """Return list of legal action indices."""
+        """Return list of *playable* action indices.
+
+        Beyond rule-legality, also filters strictly-dominated branches that
+        only inflate the search space without adding distinct game-theoretic
+        choices:
+          - fold when there's nothing to call (check dominates),
+          - raise sizes whose resulting bet does not exceed the call amount
+            (collapses to a call in step()),
+          - raise sizes that already commit the full stack (duplicate of
+            the explicit all-in action).
+        """
         pos = self.active_player
         call_amount = self.high_bet - self.bets[pos]
-        can_raise = self.credits[pos] > call_amount
+        credits_pos = self.credits[pos]
+        effective_pot = self.pot - self.bets[pos]
+        facing_bet = call_amount > 0
 
-        actions = [0, 1]  # fold and call/check always legal
+        actions = []
+        # Fold only when facing a bet (otherwise check strictly dominates).
+        if facing_bet:
+            actions.append(0)
+        # Call/check is always playable.
+        actions.append(1)
 
+        can_raise = credits_pos > call_amount
         if can_raise:
+            # Keep distinct raise sizes; drop those that collapse to a call
+            # or already match/exceed all-in.
             for i in range(self.n_raise_bins):
+                raise_pct = self.raise_sizes[self.turn][i]
+                bet = call_amount + raise_pct * effective_pot
+                if bet <= call_amount:
+                    # Degenerates to call in step() — skip.
+                    continue
+                if bet >= credits_pos:
+                    # Collapses into the explicit all-in action.
+                    continue
                 actions.append(i + 2)
             actions.append(self.n_raise_bins + 2)  # all-in
-        elif self.credits[pos] > 0:
+        elif credits_pos > 0:
             # Can only go all-in (not enough to raise, but has chips)
             actions.append(self.n_raise_bins + 2)
 
         return actions
+
+    def get_legal_action_mask(self, n_actions):
+        """Boolean mask of length n_actions: True where action is playable.
+
+        Convenience for inference sites that need to zero out logits without
+        constructing the legal list. Matches get_legal_actions() semantics.
+        """
+        legal = set(self.get_legal_actions())
+        return [a in legal for a in range(n_actions)]

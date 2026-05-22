@@ -6,6 +6,7 @@ Provides:
 - run_mcts_collection(): play hands with MCTS, produce training data per agent
 """
 
+import math
 import random
 from dataclasses import dataclass, field
 
@@ -13,7 +14,9 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from agent.mcts.mcts import MCTS, get_n_distribution
+from agent.mcts.mcts import (
+    MCTS, get_n_distribution, _collect_terminals, action_path_from_root,
+)
 from agent.mcts.game_state import GameState
 from env.table import Table
 from evaluation.evaluate import _rebuild_events, _normalize_events_inplace
@@ -41,12 +44,11 @@ class ChainStep:
       value_target: raw outcome ratio for the ORIGINAL hero (the player who
         decided at the root state) measured at state(t+1+i), **scaled by
         the SAME denom as the root example** so root + chain targets stay on
-        a single shared scale. MCTS backup mixes value_head outputs across
-        nodes at different depths in the tree, all normalized by
-        `denom_at_root` via `_make_terminal_evaluator`; using a local denom
-        per chain step would create a per-depth scale mismatch. Same
-        mcts_ev_* stats then apply to root + chain uniformly. Pre-z-score
-        stored here; the caller z-scores at the end.
+        a single shared scale. MCTS value_head outputs across nodes at
+        different depths are all on the same per-agent `mcts_value_scale`;
+        using a local denom per chain step would create a per-depth scale
+        mismatch. Same mcts_ev_* stats then apply to root + chain uniformly.
+        Pre-z-score stored here; the caller z-scores at the end.
       root_q_ratio: MCTS `root.Q` of the **future** tree at decisions[t+1+i],
         de-z-scored (back to ratio space) and rescaled into THIS example's
         root_denom — so it lives on the SAME scale as `value_target`. After
@@ -61,47 +63,6 @@ class ChainStep:
     events_at_step: list = field(default_factory=list)
     value_target: float = 0.0
     root_q_ratio: float = float("nan")
-
-
-def _make_terminal_evaluator(hero_pos, hero_initial_credits, value_scale):
-    """Build a closure that scores any terminal GameState from hero's POV.
-
-    Returns a callable `evaluate(gs) -> float` whose output is the chip
-    delta from hero's perspective scaled by a single per-cycle `value_scale`
-    (in chips). No `-mean` shift and no state-dependent `(pot + facing)`
-    denom — that combination created the fold-bias (fold's `0` mapping to
-    `(0 − μ)/σ = +0.15` when μ<0). Single-scale division preserves
-    zero-sum across players and keeps fold at exactly 0.
-
-    `value_scale` semantics:
-      - In `run_mcts_collection`: pass `norm_stats["mcts_value_scale"]` if
-        present (the bootstrapped per-agent std of realized chip deltas),
-        else `big_blind` as a fallback (used only on the first cycle
-        before any bootstrap exists).
-
-    Fold terminals are deterministic: hero either scoops the pot or loses
-    what they invested along this path. Showdown terminals use a fair-
-    share-of-pot heuristic (`pot / n_active`) because MCTS doesn't carry
-    cards into the tree — `evaluate_all_terminals` (Step 2) will replace
-    showdown values with proper equity calculations.
-    """
-    value_scale = max(float(value_scale), 1.0)
-
-    def evaluate(gs):
-        active = [i for i in range(gs.num_players) if gs.players_state[i] >= 0]
-        hero_invested = hero_initial_credits - float(gs.credits[hero_pos])
-        if len(active) == 1:
-            if active[0] == hero_pos:
-                outcome = float(gs.pot) - hero_invested
-            else:
-                outcome = -hero_invested
-        elif len(active) >= 2:
-            outcome = float(gs.pot) / len(active) - hero_invested
-        else:
-            outcome = 0.0
-        return outcome / value_scale
-
-    return evaluate
 
 
 @dataclass
@@ -141,10 +102,55 @@ class MCTSTrainingExample:
     # value-head target (see run_mcts_collection). NaN ⇒ TD-blend unavailable
     # (legacy data) → caller falls back to pure MC.
     root_q_ratio: float = float("nan")
+    # Tree-terminal value targets for direct value_head supervision. Each entry
+    # is `(action_path_from_root, equity_Q)` where `action_path_from_root` is
+    # the list of `action_idx` to walk from root to that terminal, and
+    # `equity_Q` is the equity-based terminal value (in `mcts_value_scale`
+    # units, matching the rest of the value-target axis). Selected at
+    # collection time as K_worst lowest-Q + K_best highest-Q terminals from
+    # the tree — sampling at both tails avoids biasing the value head toward
+    # only "good" outcomes. Empty when k_worst+k_best=0 (disabled).
+    terminal_targets: list = field(default_factory=list)
+
+
+def _select_terminal_targets(root, k_worst, k_best):
+    """Pick `k_worst` lowest-Q + `k_best` highest-Q terminals from the tree.
+
+    Returns a list of `(action_path_from_root, equity_Q)` tuples ready to
+    drop into `MCTSTrainingExample.terminal_targets`. Terminals are sorted
+    by `terminal.Q` (which `evaluate_all_terminals` has set to the
+    equity-based value in `mcts_value_scale` units). Both tails are taken
+    to avoid biasing value-head training toward only successful outcomes;
+    overlap (small trees) is handled by union of indices.
+
+    Returns `[]` when `k_worst + k_best == 0`.
+    """
+    k_worst = max(0, int(k_worst))
+    k_best = max(0, int(k_best))
+    if k_worst + k_best == 0:
+        return []
+    terminals = _collect_terminals(root)
+    if not terminals:
+        return []
+    # Stable sort: ascending Q. Tail K_best are the highest.
+    sorted_terms = sorted(terminals, key=lambda t: float(t.Q))
+    n = len(sorted_terms)
+    picked = set()
+    for i in range(min(k_worst, n)):
+        picked.add(i)
+    for i in range(max(0, n - k_best), n):
+        picked.add(i)
+    out = []
+    for i in sorted(picked):
+        t = sorted_terms[i]
+        out.append((action_path_from_root(t), float(t.Q)))
+    return out
 
 
 def collect_training_data(hand_record, n_actions, max_chain_depth=None,
-                          final_credits=None, big_blind=None):
+                          final_credits=None, big_blind=None,
+                          action_label_smoothing=0.0,
+                          terminal_k_worst=0, terminal_k_best=0):
     """Extract training examples from all MCTS trees in a completed hand.
 
     For each tree (one per decision point), produces an MCTSTrainingExample.
@@ -158,9 +164,11 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
     AT state(t+i+1) (after applying that action).
 
     `root_q_ratio` stores MCTS `root.Q` (the backed-up value from the tree at
-    that decision). Because `_make_terminal_evaluator` now returns
-    `outcome / BB` directly, **all `root.Q` values are already in BB units**
-    — no de-z-scoring or rescaling required for root or chain.
+    that decision). After `evaluate_all_terminals` + `re_backup_terminals`
+    have run, `root.Q` is a mix of value-head outputs at non-terminal leaves
+    and equity-based terminal contributions, both in `search_scale` units
+    (= the cycle's `mcts_value_scale`). `_finalize_value_targets` then
+    rescales by `search_scale / new_scale` onto the current target axis.
 
     Args:
         hand_record: dict with "decisions" list — each entry has:
@@ -172,6 +180,12 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
         final_credits: optional list[float] of credits at hand end. Required
             to compute per-step chain value targets.
         big_blind: optional int. Constant scale factor for value_target.
+        action_label_smoothing: ε for the KL target on both root and chain
+            visit distributions. Mixes `N/total` with uniform over legal
+            actions to keep mass on rarely-visited but legal moves; see
+            ``mcts.get_n_distribution``. Same ε is applied to root
+            (action_head) and chain (action_head / opponent_action_head)
+            targets so they live on the same calibrated scale.
 
     Returns:
         list of MCTSTrainingExample, one per tree
@@ -183,10 +197,13 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
     for t, decision in enumerate(decisions):
         hero_pos = decision["player_pos"]
         root = decision["mcts_root"]
-        action_target = get_n_distribution(root, n_actions)
+        action_target = get_n_distribution(
+            root, n_actions, label_smoothing=action_label_smoothing)
 
-        # `_make_terminal_evaluator` returns chip_delta in BB units, so
-        # `root.Q` is already in BB units. No transform needed.
+        # `root.Q` is in `search_scale` units after re_backup_terminals
+        # (terminals divided by `value_scales_by_position[hero_pos]` in
+        # `evaluate_all_terminals`, value-head outputs trained on the same
+        # axis). `_finalize_value_targets` lifts it to the new target scale.
         example_root_q_ratio = float(root.Q)
 
         # Modelling chain: chain[i] predicts distribution at decisions[t+1+i],
@@ -196,7 +213,8 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
             if max_chain_depth is not None and i >= max_chain_depth:
                 break
             future_root = future_dec["mcts_root"]
-            target_dist = get_n_distribution(future_root, n_actions)
+            target_dist = get_n_distribution(
+                future_root, n_actions, label_smoothing=action_label_smoothing)
             # action that advances state(t+i) → state(t+i+1):
             action_taken = decisions[t + i]["action_idx"]
             events_at_step = future_dec.get("events_at_root", []) or []
@@ -212,8 +230,9 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                     value_target_step = float(final_credits[hero_pos]
                                                 - hero_credits)
 
-            # future_root.Q is already in BB units (terminal_evaluator returns
-            # chip_delta/BB uniformly across all trees in this hand).
+            # future_root.Q is in `search_scale` units (same per-cycle scale
+            # used for terminal Q in every tree of this hand), so a single
+            # `search_scale → new_scale` lift applies uniformly to root + chain.
             step_root_q_ratio = float(future_root.Q)
 
             chain.append(ChainStep(
@@ -225,18 +244,23 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                 root_q_ratio=step_root_q_ratio,
             ))
 
+        terminal_targets = _select_terminal_targets(
+            root, terminal_k_worst, terminal_k_best)
+
         examples.append(MCTSTrainingExample(
             events=decision["events_at_root"],
             value_target=root.Q,  # placeholder; overwritten in run_mcts_collection
             action_target=action_target,
             chain=chain,
             root_q_ratio=example_root_q_ratio,
+            terminal_targets=terminal_targets,
         ))
 
     return examples
 
 
-def run_mcts_collection(agents_list, config, device, log, n_hands):
+def run_mcts_collection(agents_list, config, device, log, n_hands,
+                          cycle_idx=0, n_cycles=1):
     """Play hands with MCTS decisions and collect training examples.
 
     Each agent uses MCTS for its decisions. After each hand, training
@@ -246,6 +270,16 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
     max_players. Seated agents are drawn from the pool and swapped
     with player_swap_prob between hands (like opponent_action generation).
 
+    `cycle_idx` / `n_cycles` drive the strange-traversal schedule:
+        ``C(t) = C_start * 0.5 * (1 + cos(π * t / n_cycles))``
+    starts at `mcts.strange_traversal_C_start` (config) and decays to 0 by
+    the last cycle. Per-agent probability is
+        ``p_strange = C(t) * exp(-last_action_loss)``
+    where `last_action_loss` is the mean KL of `action_head` over the
+    previous training cycle, stored in `agent_info["norm_stats"]
+    ["last_action_loss"]` by `train_mcts`. First-ever cycle (no prior loss):
+    `p_strange = 0`.
+
     Args:
         agents_list: list of dicts with keys:
             "agent" (ASI), "norm_stats" (dict), "name" (str), "temperature" (float)
@@ -253,6 +287,8 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
         device: torch device string
         log: logger callable
         n_hands: number of hands to play
+        cycle_idx: current MCTS cycle index (0-based)
+        n_cycles: total number of MCTS cycles in this run
 
     Returns:
         dict mapping agent_name -> list[MCTSTrainingExample]
@@ -279,6 +315,10 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
     max_stack = mcts_train_cfg.get("max_stack", game_cfg.get("max_stack", 3000))
     raw_max_chain_depth = mcts_train_cfg.get("max_chain_depth", None)
     max_chain_depth = None if not raw_max_chain_depth else int(raw_max_chain_depth)
+    action_label_smoothing = float(
+        mcts_train_cfg.get("action_label_smoothing", 0.0))
+    terminal_k_worst = int(mcts_train_cfg.get("terminal_value_k_worst", 0))
+    terminal_k_best = int(mcts_train_cfg.get("terminal_value_k_best", 0))
 
     per_agent_examples = {a["name"]: [] for a in agents_list}
     MAX_ACTIONS = 10000
@@ -298,12 +338,13 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
         log(f"MCTS collection: opponent_embedding active at root for "
             f"{len(opp_tables)}/{len(agents_list)} agent(s)")
 
-    # Per-agent search-time value scale: what `terminal_evaluator` divided
-    # outcomes by during this cycle's MCTS searches. Snapshot once at the
-    # start so the final normalization can convert root.Q (in search_scale
-    # units) back into chips even if mcts_value_scale is re-bootstrapped
-    # later in the same call. Fallback to BB on the first-ever cycle (no
-    # bootstrap yet).
+    # Per-agent search-time value scale: the per-cycle `mcts_value_scale`
+    # snapshot used by `evaluate_all_terminals` (via `value_scales_by_position`)
+    # to divide equity-based terminal Q into the same axis as the value head's
+    # outputs at non-terminal leaves. Captured once at the start so the final
+    # normalization can convert root.Q back into chips even if
+    # mcts_value_scale is re-bootstrapped later in the same call. Fallback to
+    # BB on the first-ever cycle (no bootstrap yet).
     search_scales = {}
     for a in agents_list:
         ns = a.get("norm_stats") or {}
@@ -316,6 +357,36 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
     for name_, sc_ in search_scales.items():
         log(f"  {name_}: search_scale = {sc_:.2f} chips "
             f"({'bootstrapped' if sc_ != float(big_blind) else 'BB fallback'})")
+
+    # ── Strange-traversal schedule ───────────────────────────────────────
+    # C(t) = C_start * 0.5 * (1 + cos(π * t / n_cycles)) — cosine decay from
+    # C_start (at cycle 0) to 0 (at the final cycle). Per-agent
+    # `p_strange = C(t) * exp(-last_action_loss)` where `last_action_loss`
+    # comes from `norm_stats`. Missing key (first cycle, fresh agent) →
+    # p_strange = 0.
+    strange_C_start = float(mcts_cfg.get("strange_traversal_C_start", 0.3))
+    nc = max(1, int(n_cycles))
+    if nc > 1:
+        frac = max(0.0, min(1.0, float(cycle_idx) / float(nc)))
+        C_t = strange_C_start * 0.5 * (1.0 + math.cos(math.pi * frac))
+    else:
+        C_t = strange_C_start
+    strange_p_by_agent = {}
+    for a in agents_list:
+        last_loss = (a.get("norm_stats") or {}).get("last_action_loss")
+        if last_loss is None:
+            strange_p_by_agent[a["name"]] = 0.0
+        else:
+            strange_p_by_agent[a["name"]] = float(C_t) * float(
+                math.exp(-float(last_loss)))
+    log(f"  strange traversal: C_start={strange_C_start:.3f}, "
+        f"cycle={cycle_idx}/{nc}, C_t={C_t:.4f}")
+    for a in agents_list:
+        name_ = a["name"]
+        last_loss = (a.get("norm_stats") or {}).get("last_action_loss")
+        loss_str = f"{last_loss:.4f}" if isinstance(last_loss, (int, float)) else "n/a"
+        log(f"  {name_}: p_strange = {strange_p_by_agent[name_]:.4f} "
+            f"(last_action_loss={loss_str})")
 
     # Initial table: random player count + random agents from pool (with replacement)
     num_players = random.randint(min_players, max_players)
@@ -425,24 +496,15 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
             facing_at_dec = float(table.high_bet - table.bets[active_pos])
             credits_at_dec = float(table.credits[active_pos])
 
-            # MCTS search (opponent_emb at root only — see MCTS._evaluate_root)
+            # MCTS search (opponent_emb at root only — see MCTS._evaluate_root).
+            # Terminals during search no longer contribute value to ancestors
+            # (`_backup_terminal` only bumps N) — their proper game-theoretic Q
+            # is computed post-hand by `evaluate_all_terminals` and propagated
+            # via `re_backup_terminals`. No search-time terminal evaluator.
             gs = GameState.from_table(table, active_pos)
-            # Use the agent's bootstrapped value scale if available, else
-            # fall back to BB (first-ever cycle has no scale yet). The same
-            # scale is captured per-agent below for the final normalization
-            # of value_target so the search-time scale and the target-time
-            # scale are converted into a consistent target space.
-            ns_search = agent_info.get("norm_stats") or {}
-            search_scale = float(ns_search.get("mcts_value_scale",
-                                                float(big_blind)))
-            term_eval = _make_terminal_evaluator(
-                hero_pos=active_pos,
-                hero_initial_credits=credits_at_dec,
-                value_scale=search_scale,
-            )
             mcts = MCTS(agent_info["agent"], device, mcts_cfg,
                         opponent_emb_table=opp_tables.get(agent_info["name"]),
-                        terminal_evaluator=term_eval)
+                        strange_p=strange_p_by_agent[agent_info["name"]])
             agent_info["agent"].eval()
             action_idx = mcts.search([norm_events], gs)
 
@@ -513,9 +575,10 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
         # Build agents_by_position / value_scales_by_position for the
         # equity machinery. Position → ASI (used for action-head range
         # narrowing) and position → per-hero `mcts_value_scale` (used so
-        # `evaluate_all_terminals` emits terminal Q in the SAME scale the
-        # search-time terminal_evaluator did — otherwise re_backup_terminals
-        # would mix raw-chip terminal Q with normalized-scale W in ancestors).
+        # `evaluate_all_terminals` emits terminal Q in the SAME scale as the
+        # value head's outputs at non-terminal leaves — otherwise
+        # `re_backup_terminals` would mix raw-chip terminal Q with
+        # normalized-scale W in ancestors).
         agents_by_position = {p: hand_seated[p]["agent"]
                               for p in range(num_players)}
         value_scales_by_position = {
@@ -582,6 +645,9 @@ def run_mcts_collection(agents_list, config, device, log, n_hands):
             max_chain_depth=max_chain_depth,
             final_credits=None,  # equity-realized supersedes raw final_credits
             big_blind=big_blind,
+            action_label_smoothing=action_label_smoothing,
+            terminal_k_worst=terminal_k_worst,
+            terminal_k_best=terminal_k_best,
         )
 
         # Overwrite raw realized targets with equity-based ones.
@@ -632,9 +698,10 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
               + (1 − α) · (realized_chips / new_scale),
               ±clip)
     where:
-      - `search_scale` is the scale `_make_terminal_evaluator` used during
-        this cycle's MCTS search for this agent (from `norm_stats` snapshot
-        before any clearing, fallback `big_blind`).
+      - `search_scale` is the per-agent `mcts_value_scale` snapshot taken
+        before this cycle's collection — the same scale `evaluate_all_terminals`
+        divided terminal Q by, so `root.Q` lives on `search_scale` axis
+        (fallback `big_blind` on the first-ever cycle, before any bootstrap).
       - `new_scale` is either the existing `mcts_value_scale` from
         `norm_stats`, or freshly bootstrapped as `std(chip_deltas)` if the
         key is absent (first cycle or post-rebootstrap).

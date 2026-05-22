@@ -40,7 +40,8 @@ class LengthGroupedBatchSampler(Sampler):
 
 
 def _mcts_forward(agent, event_sequences, chains, device,
-                  opponent_emb_table=None, p_tf=0.0, stop_grad_old_embs=True):
+                  opponent_emb_table=None, p_tf=0.0, stop_grad_old_embs=True,
+                  examples_per_batch_terminals=None):
     """Forward pass: perception → root predictions → modelling chain.
 
     Chain semantics (matches `collect.py:MCTSTrainingExample`):
@@ -231,6 +232,44 @@ def _mcts_forward(agent, event_sequences, chains, device,
         chain_recon_targets.append(b_recon_tgts)
         chain_recon_depths.append(b_recon_depths)
 
+    # 5. Terminal value supervision: for each example, roll out the modelling
+    #    chain along each terminal's action_path_from_root and predict
+    #    value_head at the terminal context. MSE'd against equity_Q in
+    #    `_compute_loss`. Per-terminal sequential rollout (within an example).
+    #    K_worst+K_best caps the count per example so this stays bounded.
+    terminal_value_preds = []
+    terminal_value_targets = []
+    if examples_per_batch_terminals is None:
+        examples_per_batch_terminals = [[] for _ in range(B)]
+    for b in range(B):
+        # `examples_per_batch_terminals[b]` is one list per example, each
+        # entry a (action_path, equity_Q) tuple.
+        t_list = examples_per_batch_terminals[b] or []
+        if not t_list:
+            terminal_value_preds.append([])
+            terminal_value_targets.append([])
+            continue
+
+        b_t_preds = []
+        b_t_tgts = []
+        ctx_init = perception_out[b:b+1]
+        mask_init = mask[b:b+1]
+        for action_path, equity_Q in t_list:
+            ctx = ctx_init
+            ctx_mask = mask_init
+            for a in action_path:
+                a_embs = agent.modelling_head(ctx, mask=ctx_mask)  # (1, n_actions, d)
+                emb_tok = a_embs[:, int(a), :].unsqueeze(1)        # (1, 1, d)
+                ones = torch.ones(1, 1, dtype=ctx_mask.dtype, device=device)
+                ctx = torch.cat([ctx, emb_tok], dim=1)
+                ctx_mask = torch.cat([ctx_mask, ones], dim=1)
+            v_pred = agent.value_head(ctx, mask=ctx_mask).reshape(())
+            b_t_preds.append(v_pred)
+            b_t_tgts.append(torch.tensor(
+                float(equity_Q), dtype=torch.float32, device=device))
+        terminal_value_preds.append(b_t_preds)
+        terminal_value_targets.append(b_t_tgts)
+
     return {
         "value_preds": value_preds,
         "action_preds": action_preds,
@@ -242,13 +281,16 @@ def _mcts_forward(agent, event_sequences, chains, device,
         "chain_recon_preds": chain_recon_preds,
         "chain_recon_targets": chain_recon_targets,
         "chain_recon_depths": chain_recon_depths,
+        "terminal_value_preds": terminal_value_preds,
+        "terminal_value_targets": terminal_value_targets,
     }
 
 
 def _compute_loss(forward_out, value_targets, action_targets,
                   value_weight=1.0, action_weight=1.0, chain_weight=1.0,
                   recon_weight=0.5, value_chain_weight=0.5,
-                  chain_depth_gamma=0.7):
+                  chain_depth_gamma=0.7, entropy_weight=0.0,
+                  terminal_value_weight=0.0):
     """Compute combined loss across all heads.
 
     Aggregation policy (post-modifications):
@@ -280,6 +322,16 @@ def _compute_loss(forward_out, value_targets, action_targets,
     value_loss = F.smooth_l1_loss(value_preds.squeeze(-1), value_targets)
     action_log_probs = F.log_softmax(action_preds, dim=-1)
     action_loss = F.kl_div(action_log_probs, action_targets, reduction="batchmean")
+    # Entropy regularization on root action_head — encourages mixed strategies
+    # so policy doesn't collapse onto 1–2 deterministic actions during
+    # self-play. `entropy_weight * Σ p log p` adds a NEGATIVE entropy term to
+    # the loss; minimization therefore maximizes H. The bare KL action_loss
+    # value (above) is what gets reported / averaged into `last_action_loss`
+    # — entropy term is logged separately so the strange-traversal schedule
+    # stays calibrated to actual policy convergence, not the regularizer.
+    action_probs = action_log_probs.exp()
+    action_entropy = -(action_probs * action_log_probs).sum(dim=-1).mean()
+    entropy_penalty = -float(entropy_weight) * action_entropy
 
     # --- Helper: per-example weighted mean with gamma^i ---
     def _per_example_weighted(per_example_steps, gamma):
@@ -342,11 +394,32 @@ def _compute_loss(forward_out, value_targets, action_targets,
     else:
         recon_loss = torch.tensor(0.0, device=device)
 
+    # --- Terminal value MSE: direct supervision at tree-terminal states.
+    # `equity_Q` (from `evaluate_all_terminals`) is the target; current
+    # value_head on the rolled terminal context is the prediction. K_worst +
+    # K_best terminals per example (sampled from both tails of Q to avoid
+    # bias toward only "good" outcomes — see `_select_terminal_targets`).
+    # Per-example mean of per-terminal MSE; batch-mean across examples.
+    terminal_per_example = []
+    for b_preds, b_tgts in zip(forward_out.get("terminal_value_preds", []),
+                                forward_out.get("terminal_value_targets", [])):
+        if not b_preds:
+            continue
+        step_losses = torch.stack(
+            [F.mse_loss(p, t) for p, t in zip(b_preds, b_tgts)])
+        terminal_per_example.append(step_losses.mean())
+    if terminal_per_example:
+        terminal_value_loss = torch.stack(terminal_per_example).mean()
+    else:
+        terminal_value_loss = torch.tensor(0.0, device=device)
+
     total = (value_weight * value_loss
              + action_weight * action_loss
              + chain_weight * chain_loss
              + value_chain_weight * chain_value_loss
-             + recon_weight * recon_loss)
+             + recon_weight * recon_loss
+             + terminal_value_weight * terminal_value_loss
+             + entropy_penalty)
 
     return total, {
         "value": value_loss.item(),
@@ -354,11 +427,14 @@ def _compute_loss(forward_out, value_targets, action_targets,
         "chain": chain_loss.item(),
         "chain_value": chain_value_loss.item(),
         "recon": recon_loss.item(),
+        "terminal_value": terminal_value_loss.item(),
+        "action_entropy": action_entropy.item(),
         "total": total.item(),
     }
 
 
-_LOSS_KEYS = ("total", "value", "action", "chain", "chain_value", "recon")
+_LOSS_KEYS = ("total", "value", "action", "chain", "chain_value", "recon",
+              "terminal_value", "action_entropy")
 
 
 def _run_validation(agent, val_loader, device, weights, amp_config=None,
@@ -374,7 +450,7 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
     sums = {k: 0.0 for k in _LOSS_KEYS}
     count = 0
     with torch.no_grad():
-        for event_seqs, val_targets, act_targets, chains in val_loader:
+        for event_seqs, val_targets, act_targets, chains, term_tgts in val_loader:
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
@@ -382,7 +458,8 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
                     agent, event_seqs, chains, device,
                     opponent_emb_table=opponent_emb_table,
                     p_tf=0.0,
-                    stop_grad_old_embs=stop_grad_old_embs)
+                    stop_grad_old_embs=stop_grad_old_embs,
+                    examples_per_batch_terminals=term_tgts)
                 _, ldict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
             n = len(event_seqs)
@@ -443,10 +520,14 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     value_chain_weight = train_cfg.get("value_chain_weight", 0.0)
     chain_depth_gamma = float(train_cfg.get("chain_depth_gamma", 1.0))
     stop_grad_old_embs = bool(train_cfg.get("stop_grad_old_embs", True))
+    entropy_weight = float(train_cfg.get("entropy_weight", 0.0))
+    terminal_value_weight = float(train_cfg.get("terminal_value_weight", 0.0))
     weights = {"value_weight": value_weight, "action_weight": action_weight,
                "chain_weight": chain_weight, "recon_weight": recon_weight,
                "value_chain_weight": value_chain_weight,
-               "chain_depth_gamma": chain_depth_gamma}
+               "chain_depth_gamma": chain_depth_gamma,
+               "entropy_weight": entropy_weight,
+               "terminal_value_weight": terminal_value_weight}
 
     # Teacher-forcing probability decays linearly from p_start → p_end over
     # `decay_cycles` cycles. Disabled (p_tf=0) when section is missing.
@@ -555,6 +636,12 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
 
     best_val_loss = float("inf")
     fails_since_best = 0
+    # Accumulate `action_loss` (KL only — entropy term excluded) across all
+    # training steps of this cycle. Mean stored into
+    # `norm_stats["last_action_loss"]` at cycle end and consumed by
+    # `run_mcts_collection` next cycle to set `p_strange = C(t) * exp(-loss)`.
+    cycle_action_sum = 0.0
+    cycle_action_count = 0
     global_step = int(global_step_offset)
     cycle_step_start = global_step
     stopped_early = False
@@ -567,7 +654,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_seqs, val_targets, act_targets, chains) in enumerate(train_loader):
+        for batch_idx, (event_seqs, val_targets, act_targets, chains, term_tgts) in enumerate(train_loader):
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
 
@@ -576,7 +663,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                     agent, event_seqs, chains, device,
                     opponent_emb_table=opp_table,
                     p_tf=p_tf,
-                    stop_grad_old_embs=stop_grad_old_embs)
+                    stop_grad_old_embs=stop_grad_old_embs,
+                    examples_per_batch_terminals=term_tgts)
                 loss, loss_dict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
 
@@ -601,6 +689,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 "chain": loss_dict["chain"],
                 "chain_value": loss_dict["chain_value"],
                 "recon": loss_dict["recon"],
+                "terminal_value": loss_dict["terminal_value"],
+                "action_entropy": loss_dict["action_entropy"],
                 "p_tf": p_tf,
                 "lr": current_lr,
                 "batch_size": len(event_seqs),
@@ -608,6 +698,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
             global_step += 1
             train_loss_sum += step_loss * len(event_seqs)
             train_count += len(event_seqs)
+            cycle_action_sum += loss_dict["action"] * len(event_seqs)
+            cycle_action_count += len(event_seqs)
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count
@@ -615,7 +707,9 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                     f"Loss: {avg:.6f} (v={loss_dict['value']:.4f} "
                     f"a={loss_dict['action']:.4f} c={loss_dict['chain']:.4f} "
                     f"cv={loss_dict['chain_value']:.4f} "
-                    f"r={loss_dict['recon']:.4f}) "
+                    f"r={loss_dict['recon']:.4f} "
+                    f"tv={loss_dict['terminal_value']:.4f} "
+                    f"H={loss_dict['action_entropy']:.4f}) "
                     f"lr={current_lr:.2e}")
 
             if val_every and (global_step % val_every == 0):
@@ -694,6 +788,17 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     # save_every_cycles via save_checkpoint.
     final_val = float(val_avg) if 'val_avg' in locals() else float(best_val_loss)
     final_epoch = epoch if 'epoch' in locals() else 0
+
+    # Record this cycle's mean action_loss (KL only) into norm_stats so the
+    # NEXT cycle's `run_mcts_collection` can compute strange-traversal
+    # probability. Mutating the same `norm_stats` dict the pipeline holds
+    # makes it available immediately AND it lands in best.pt via _save_best.
+    if cycle_action_count > 0 and norm_stats is not None:
+        norm_stats["last_action_loss"] = float(
+            cycle_action_sum / cycle_action_count)
+        log(f"  last_action_loss = {norm_stats['last_action_loss']:.6f} "
+            f"(mean over {cycle_action_count} samples)")
+
     _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
                global_step, final_epoch, final_val, log,
                temperature=temperature, cycle_id=cycle_id,

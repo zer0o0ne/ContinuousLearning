@@ -608,19 +608,20 @@ def main():
                 # Re-bootstrap value norm? (only on non-zero cycle id, every N)
                 #
                 # IMPORTANT: do NOT pop `mcts_value_scale` here. Doing so
-                # makes `_make_terminal_evaluator` fall back to BB during
-                # this cycle's MCTS search, while the value head is still
-                # trained on the OLD scale → terminal Qs and value-head
-                # outputs end up on different axes, PUCT compares apples to
+                # makes `evaluate_all_terminals` fall back to BB when dividing
+                # equity-based terminal Q (via `value_scales_by_position`),
+                # while the value head is still trained on the OLD scale →
+                # terminal contributions and value-head outputs end up on
+                # different axes inside ancestors' W, PUCT compares apples to
                 # oranges, and the agent typically collapses (e.g. into
                 # always-fold). Instead we keep the old scale alive for
-                # search and inference, and set a "pending rebootstrap"
+                # collection and inference, and set a "pending rebootstrap"
                 # flag that `_finalize_value_targets` consumes AFTER
                 # collection: it overwrites `mcts_value_scale` from this
                 # cycle's freshly observed chip deltas. The rescale math
                 # in `_finalize_value_targets` (search_scale / new_scale)
-                # correctly bridges old-scale search results onto the new
-                # target axis.
+                # correctly bridges old-scale results onto the new target
+                # axis.
                 if (value_norm_rebootstrap_every > 0
                         and cycle > 0
                         and cycle % value_norm_rebootstrap_every == 0):
@@ -647,7 +648,8 @@ def main():
                 ]
 
                 per_agent_examples = run_mcts_collection(
-                    agents_for_play, config, device, log, n_hands_per_cycle)
+                    agents_for_play, config, device, log, n_hands_per_cycle,
+                    cycle_idx=cycle, n_cycles=n_cycles)
 
                 is_save_cycle = (cycle % save_every_cycles == 0
                                  or cycle == n_cycles - 1)

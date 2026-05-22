@@ -41,17 +41,21 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
             big_blind: float
         agents_by_position: dict {pos: ASI} — each player's agent model
         device: torch device string
-        config: optional dict with n_equity_iters (default 3000), max_batch (default 128)
+        config: optional dict with `n_equity_iters` (default 3000),
+            `max_batch` (default 128) and `terminal_eval_prob_floor`
+            (default 0.05 — uniform mix on per-combo action probs before
+            the Bayesian range narrowing).
         value_scales_by_position: optional dict {pos: float}. When provided,
             terminal Q values are divided by `value_scales_by_position[hero_pos]`
-            so they live on the same scale as `_make_terminal_evaluator`'s
-            search-time output. ``re_backup_terminals`` then correctly swaps
-            the in-tree heuristic Q for this equity-based value. When omitted,
-            terminal Q is left in raw chips (legacy / debugging behaviour).
+            so they live on the same `mcts_value_scale` axis as the value
+            head's outputs at non-terminal leaves; ``re_backup_terminals``
+            then propagates them up consistently. When omitted, terminal Q
+            is left in raw chips (legacy / debugging behaviour).
     """
     cfg = config or {}
     n_equity_iters = cfg.get("n_equity_iters", 3000)
     max_batch = cfg.get("max_batch", 128)
+    prob_floor = float(cfg.get("terminal_eval_prob_floor", 0.05))
 
     decisions = hand_record["decisions"]
     deck = hand_record["deck"]
@@ -74,8 +78,8 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
         initial_stacks = list(root_gs.credits)
 
         # Scale into which terminal Q must be projected so it matches the
-        # rest of the in-tree Q values (the search-time terminal_evaluator
-        # divided by this same scale). 1.0 keeps raw chips (legacy).
+        # value-head outputs already living in ancestors' W (the cycle's
+        # `mcts_value_scale`). 1.0 keeps raw chips (legacy / debug).
         if value_scales_by_position is not None:
             scale = float(value_scales_by_position.get(hero_pos, 1.0))
         else:
@@ -125,6 +129,7 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                     root_gs=root_gs,
                     n_equity_iters=n_equity_iters,
                     device=device,
+                    prob_floor=prob_floor,
                 )
 
             terminal.Q = q_chips / scale
@@ -191,6 +196,7 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
     cfg = config or {}
     n_equity_iters = cfg.get("n_equity_iters", 3000)
     max_batch = cfg.get("max_batch", 128)
+    prob_floor = float(cfg.get("terminal_eval_prob_floor", 0.05))
 
     decisions = hand_record["decisions"]
     deck = hand_record["deck"]
@@ -258,6 +264,7 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
                 combo_probs_cache=combo_probs_cache,
                 n_equity_iters=n_equity_iters,
                 device=device,
+                prob_floor=prob_floor,
             )
 
         equity = equity_by_hero[hero_pos]
@@ -285,7 +292,7 @@ def _board_at_turn(deck, turn):
 def _equity_terminal_chips(hero_pos, hero_hand, board_cards, pot, hero_invested,
                            active_players, num_players, dec_idx, decisions,
                            combo_probs_cache, path, root_gs, n_equity_iters,
-                           device):
+                           device, prob_floor=0.05):
     """Compute hero's chip-units terminal Q via equity vs narrowed ranges.
 
     Used inside :func:`evaluate_all_terminals` for showdown terminals. Shared
@@ -302,7 +309,8 @@ def _equity_terminal_chips(hero_pos, hero_hand, board_cards, pot, hero_invested,
             continue
         range_types = get_position_range(opp_pos, num_players)
         range_types = _narrow_by_real_actions(
-            range_types, opp_pos, dec_idx, decisions, combo_probs_cache)
+            range_types, opp_pos, dec_idx, decisions, combo_probs_cache,
+            prob_floor=prob_floor)
         range_types = _narrow_by_simulated_actions(
             range_types, opp_pos, hero_pos, path, root_gs)
         combos = expand_range(range_types, dead_cards)
@@ -322,7 +330,7 @@ def _equity_terminal_chips(hero_pos, hero_hand, board_cards, pot, hero_invested,
 
 def _hero_equity_at_showdown(hero_pos, hero_hand, board_cards, final_active,
                              num_players, decisions, combo_probs_cache,
-                             n_equity_iters, device):
+                             n_equity_iters, device, prob_floor=0.05):
     """Hero equity at the real hand's showdown. Narrowing uses **all** of the
     hand's decisions (not just those before some `dec_idx`), since by the time
     we compute the realized outcome the whole sequence is known.
@@ -339,7 +347,8 @@ def _hero_equity_at_showdown(hero_pos, hero_hand, board_cards, final_active,
         # Use the entire decision sequence to narrow this opponent's range.
         range_types = _narrow_by_real_actions(
             range_types, opp_pos, current_dec_idx=len(decisions),
-            decisions=decisions, combo_probs_cache=combo_probs_cache)
+            decisions=decisions, combo_probs_cache=combo_probs_cache,
+            prob_floor=prob_floor)
         combos = expand_range(range_types, dead_cards)
         if len(combos) == 0:
             combos = expand_range(
@@ -425,13 +434,61 @@ def _precompute_combo_probs(decisions, hero_hands, agents_by_position, num_playe
     return cache
 
 
-def _narrow_by_real_actions(range_types, opp_pos, current_dec_idx, decisions,
-                            combo_probs_cache):
-    """Narrow an opponent's range using their per-combo action probs from real decisions.
+_RANK_CHARS = "23456789TJQKA"
 
-    For each prior decision by this opponent, uses Bayesian update:
-    weight(combo) *= P(actual_action | combo) from their action_head.
-    Returns the top-weighted hand types.
+
+def _combo_to_hand_type(c1, c2):
+    """Map a (card_id, card_id) combo (0..51) to a canonical hand type string.
+
+    Card encoding: ``card_id = rank * 4 + suit`` (matches
+    ``expand_hand_type`` in `gpu_solver_v2.py`). Output format matches
+    `HAND_RANKINGS`: pairs ``"AA"``, suited ``"AKs"``, offsuit ``"AKo"``.
+    """
+    r1, s1 = c1 // 4, c1 % 4
+    r2, s2 = c2 // 4, c2 % 4
+    if r1 == r2:
+        return _RANK_CHARS[r1] + _RANK_CHARS[r2]
+    if r1 < r2:
+        r1, r2 = r2, r1
+    suffix = "s" if s1 == s2 else "o"
+    return _RANK_CHARS[r1] + _RANK_CHARS[r2] + suffix
+
+
+def _narrow_by_real_actions(range_types, opp_pos, current_dec_idx, decisions,
+                            combo_probs_cache, prob_floor=0.05):
+    """Narrow an opponent's range using their per-combo action probs from
+    real decisions, with two robustness improvements over the legacy logic:
+
+    1. **Likelihood floor.** Per-combo ``P(action | combo)`` from
+       `action_head` is mixed with uniform over actions before multiplication:
+       ``L = (1 − prob_floor) · p + prob_floor / n_actions``. This caps the
+       influence of an over-confident or under-trained `action_head` so a
+       single sharp predictor on one decision can't crush combo weights to
+       ≈0; multi-decision Bayesian products stay well-conditioned. Set
+       ``prob_floor=0`` to recover the raw-likelihood behaviour.
+
+    2. **Correct combo → hand-type remap.** The legacy code computed Bayesian
+       weights per combo, then ignored *which* combos won mass — it returned
+       ``range_types[:n_keep]`` where ``n_keep`` was a function only of the
+       ``count`` of high-mass combos. The result was always "keep the top
+       X% of the position range" regardless of what the opponent actually
+       did, which biased every showdown equity computation toward strong
+       opp ranges (premium pairs / top broadways). This rewrite:
+
+         - aggregates the (smoothed, Bayesian) combo weights by canonical
+           hand type via `_combo_to_hand_type`;
+         - re-ranks `range_types` by aggregated mass (descending);
+         - keeps the prefix whose cumulative mass covers ≥95% of the total.
+
+       Information from the action_head likelihoods now actually flows into
+       which hand types survive, so the narrowed range reflects what
+       opponent's pattern of actions implies (e.g. a multi-check line on a
+       dry board narrows toward weak / showdown-value hands, not
+       premium pairs).
+
+    Returns the narrowed list of hand-type strings. Falls back to the
+    original ``range_types`` when there is nothing to narrow on or when all
+    weights collapse to ≈0.
     """
     # Collect all prior decisions by this opponent
     prior_decisions = []
@@ -459,7 +516,13 @@ def _narrow_by_real_actions(range_types, opp_pos, current_dec_idx, decisions,
         action_idx = cached["action_idx"]
         combos = cached["combos"]    # (n_cached, 2)
         probs = cached["probs"]      # (n_cached, n_actions)
-        likelihoods = probs[:, action_idx]  # (n_cached,)
+        n_actions_local = probs.shape[1]
+        # Likelihood floor (see docstring §1)
+        if prob_floor > 0.0:
+            likelihoods = ((1.0 - prob_floor) * probs[:, action_idx]
+                           + prob_floor / float(n_actions_local))
+        else:
+            likelihoods = probs[:, action_idx]
 
         # Build cached lookup: (c1, c2) → likelihood
         cached_lookup = {}
@@ -479,19 +542,33 @@ def _narrow_by_real_actions(range_types, opp_pos, current_dec_idx, decisions,
 
     weights /= total
 
-    # Keep combos with weight above threshold (top ~70%)
-    sorted_w, sorted_idx = weights.sort(descending=True)
-    cumsum = sorted_w.cumsum(dim=0)
-    cutoff = (cumsum >= 0.95).nonzero(as_tuple=True)[0]
-    if len(cutoff) > 0:
-        keep = min(len(weights), cutoff[0].item() + 1)
-    else:
-        keep = len(weights)
+    # ── Correct remap: aggregate per-combo mass into per-hand-type mass ──
+    # (see docstring §2)
+    type_mass = {}
+    for i in range(n_combos):
+        c1 = int(ref_combos[i, 0])
+        c2 = int(ref_combos[i, 1])
+        ht = _combo_to_hand_type(c1, c2)
+        type_mass[ht] = type_mass.get(ht, 0.0) + float(weights[i])
 
-    # Map back to hand types (heuristic: keep the top fraction of range)
-    frac = keep / max(n_combos, 1)
-    n_keep = max(1, int(len(range_types) * frac))
-    return range_types[:n_keep]
+    # Sort range_types by their aggregated mass (descending). Hand types
+    # absent from the reference combo set get mass 0 (typically blocked by
+    # dead cards) — they end up at the tail and get pruned by the cumulative
+    # threshold.
+    ranked = sorted(range_types, key=lambda t: type_mass.get(t, 0.0),
+                    reverse=True)
+    total_mass = sum(type_mass.get(t, 0.0) for t in ranked)
+    if total_mass < 1e-8:
+        return range_types
+
+    cum = 0.0
+    keep = 0
+    for t in ranked:
+        cum += type_mass.get(t, 0.0)
+        keep += 1
+        if cum / total_mass >= 0.95:
+            break
+    return ranked[:max(1, keep)]
 
 
 def _narrow_by_simulated_actions(range_types, opp_pos, hero_pos, path, root_gs):

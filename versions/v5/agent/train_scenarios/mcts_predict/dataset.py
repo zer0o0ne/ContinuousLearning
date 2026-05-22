@@ -32,6 +32,10 @@ class MCTSDataset(Dataset):
             ex.value_target,
             torch.tensor(ex.action_target, dtype=torch.float32),
             ex.chain,
+            # New: tree-terminal targets — list of (action_path, equity_Q).
+            # Older pickled examples without this field default to empty via
+            # `getattr` so the loader stays backwards-compatible.
+            list(getattr(ex, "terminal_targets", []) or []),
         )
 
 
@@ -41,9 +45,11 @@ def batch_collate(batch):
     Events stay as list-of-lists (variable length).
     Value targets stacked. Action targets stacked.
     Chains stay as list (variable length per example).
+    Terminal targets stay as list-of-lists (variable count per example).
     """
     event_sequences = [item[0] for item in batch]
     value_targets = torch.tensor([item[1] for item in batch], dtype=torch.float32)
     action_targets = torch.stack([item[2] for item in batch])
     chains = [item[3] for item in batch]
-    return event_sequences, value_targets, action_targets, chains
+    terminal_targets = [item[4] for item in batch]
+    return event_sequences, value_targets, action_targets, chains, terminal_targets

@@ -1,9 +1,9 @@
 """
 Timing benchmark for the v5 pipeline.
 
-Runs the REAL pipeline (`pipeline.py`) end-to-end — GTO data generation →
-GTO training → opponent data generation → opponent training → MCTS self-play
-collection + training — and measures the three long phases:
+Runs the REAL pipeline (`pipeline.py`) end-to-end -- GTO data generation ->
+GTO training -> opponent data generation -> opponent training -> MCTS self-play
+collection + training -- and measures the three long phases:
 
     phase 1 (gto)       : GTO data generation + GTO head training
     phase 2 (opponent)  : opponent data generation + opponent_action training
@@ -11,13 +11,13 @@ collection + training — and measures the three long phases:
 
 It sweeps three axes and reports how each phase scales:
 
-    * parallelism P ∈ {1, 2, 4}   (drives dataset.n_workers, opponent_data.n_workers,
-                                    mcts_train.n_workers simultaneously — all three stages)
-    * agent size     : base (as now), half (×0.5 width), big (×1.5 width)
+    * parallelism P in {1, 2, 4}  (drives dataset.n_workers, opponent_data.n_workers,
+                                    mcts_train.n_workers simultaneously -- all three stages)
+    * agent size     : base (as now), half (x0.5 width), big (x1.5 width)
     * device         : GPU first (9 runs), then CPU (9 runs)
 
-The CPU runs use the SAME 9 configurations, each phase capped at 2× the wall-clock
-of its GPU counterpart — a phase that exceeds the cap is killed and the rest of
+The CPU runs use the SAME 9 configurations, each phase capped at 2x the wall-clock
+of its GPU counterpart -- a phase that exceeds the cap is killed and the rest of
 that measurement is skipped.
 
 Everything is production-like; only the SCALE (iteration counts) is reduced so the
@@ -27,13 +27,13 @@ Design notes
 ------------
 * Each measurement runs the pipeline as THREE separate subprocesses (one per
   phase, chained through on-disk checkpoints). Separate subprocesses give clean
-  per-phase wall-clock AND let the CPU run kill a single phase on the 2× cap.
+  per-phase wall-clock AND let the CPU run kill a single phase on the 2x cap.
 * The pipeline reads `config.json` next to itself, so the benchmark BACKS UP the
   production config, writes a scaled config per phase, and RESTORES the backup at
   the end (in a finally block). The backup file is left on disk so it can be
   restored by hand if the benchmark crashes mid-run.
 * GPU vs CPU is selected per subprocess via the CUDA_VISIBLE_DEVICES env var
-  (empty string → torch.cuda.is_available() is False → pipeline picks "cpu").
+  (empty string -> torch.cuda.is_available() is False -> pipeline picks "cpu").
   pipeline.py is NOT modified.
 * The console shows ONLY progress (which of the 18 stages is running). Detailed
   per-phase timings go to a log file whose path is printed at startup. Each
@@ -59,30 +59,30 @@ import subprocess
 from datetime import datetime
 
 
-# ─────────────────────────── Tunable scale ───────────────────────────
+# --------------------------- Tunable scale ---------------------------
 # Agent width variants: (name, d_model, n_heads, n_kv_heads, d_ff).
 # head_dim is kept at 32 and n_kv_heads divides n_heads for all sizes.
 SIZES = [
     ("base", 256, 8, 2, 512),   # as now
-    ("half", 128, 4, 1, 256),   # ×0.5 width
-    ("big",  384, 12, 3, 768),  # ×1.5 width
+    ("half", 128, 4, 1, 256),   # x0.5 width
+    ("big",  384, 12, 3, 768),  # x1.5 width
 ]
 PARALLELISM = [1, 2, 4]         # applied to all three stages' n_workers
 
-# Phase 1 — GTO data gen + training
+# Phase 1 -- GTO data gen + training
 SCALE_N_SCENARIOS = 96          # >= max(PARALLELISM)*2 so the gen pool engages
 SCALE_MC_ITERATIONS = 100       # solver Monte-Carlo iters (prod: 1000)
 SCALE_COMBO_RESPONSE_ITERS = 8  # solver combo-response iters (prod: 30)
 SCALE_GTO_EPOCHS = 1
 SCALE_GTO_BATCH = 64            # kept large so the GPU is meaningfully loaded
 
-# Phase 2 — opponent data gen + training
+# Phase 2 -- opponent data gen + training
 SCALE_OPP_N_HANDS = 16
-SCALE_OPP_MAX_PLAYERS = 3       # smaller tables → faster, still multi-player
+SCALE_OPP_MAX_PLAYERS = 3       # smaller tables -> faster, still multi-player
 SCALE_OPP_BATCH = 64
 SCALE_OPP_EPOCHS = 1
 
-# Phase 3 — MCTS collect + train
+# Phase 3 -- MCTS collect + train
 SCALE_MCTS_N_SIMULATIONS = 120  # prod: 3000 (within-tree batch_size stays 16)
 SCALE_MCTS_EQUITY_ITERS = 200
 SCALE_MCTS_N_HANDS = 12
@@ -99,14 +99,14 @@ N_AGENTS = 2                    # multi-agent, scaled down from prod's 5
 
 # Safety / timeout
 GPU_SAFETY_CAP_S = 3600         # hard ceiling per GPU phase (hang guard)
-CPU_CAP_MULTIPLIER = 2.0        # CPU phase cap = this × matching GPU phase time
+CPU_CAP_MULTIPLIER = 2.0        # CPU phase cap = this x matching GPU phase time
 CPU_FALLBACK_CAP_S = 900        # used when the GPU baseline phase didn't finish
 
 
 # Working directories under data/<version>/ that are WIPED before each
 # measurement (regenerated by the pipeline). Results/raw logs live elsewhere.
-_BENCH_NAME = "bench"           # pipeline experiment name → data/<v>/bench
-_BENCH_AGENTS = "bench_agents"  # multi_agent save_dir → data/<v>/bench_agents
+_BENCH_NAME = "bench"           # pipeline experiment name -> data/<v>/bench
+_BENCH_AGENTS = "bench_agents"  # multi_agent save_dir -> data/<v>/bench_agents
 
 
 def _build_scaled_config(prod_cfg, size, n_workers):
@@ -156,7 +156,7 @@ def _build_scaled_config(prod_cfg, size, n_workers):
     # Opponent data: small, parallel via P, agents come from our local save dir.
     opp = cfg["opponent_data"]
     opp["agents_dir"] = _BENCH_AGENTS
-    opp["save_dir"] = ""            # fresh per run → always timed
+    opp["save_dir"] = ""            # fresh per run -> always timed
     opp["n_hands"] = SCALE_OPP_N_HANDS
     opp["max_players"] = SCALE_OPP_MAX_PLAYERS
     opp["n_player_pool"] = max(SCALE_OPP_MAX_PLAYERS * 2, 4)
@@ -184,7 +184,7 @@ def _build_scaled_config(prod_cfg, size, n_workers):
     mt["n_workers"] = n_workers
     mt["server_max_batch"] = SERVER_MAX_BATCH
     mt["server_linger_ms"] = SERVER_LINGER_MS
-    mt["examples_dir"] = ""        # force cyclic collect→train (not pre-baked)
+    mt["examples_dir"] = ""        # force cyclic collect->train (not pre-baked)
 
     return cfg
 
@@ -233,7 +233,7 @@ def run_benchmark():
     # Back up the production config; it is restored in `finally`.
     backup_path = os.path.join(v5_dir, f"config.prod_backup_{ts}.json")
     shutil.copyfile(config_path, backup_path)
-    with open(backup_path, "r") as f:
+    with open(backup_path, "r", encoding="utf-8") as f:
         prod_cfg = json.load(f)
 
     _log_fh = open(detail_log_path, "a", encoding="utf-8")
@@ -247,8 +247,8 @@ def run_benchmark():
         # The ONLY thing printed to the console.
         print(msg, flush=True)
 
-    progress(f"time_bench: detailed log → {detail_log_path}")
-    progress(f"time_bench: config backup → {backup_path}")
+    progress(f"time_bench: detailed log -> {detail_log_path}")
+    progress(f"time_bench: config backup -> {backup_path}")
     log_detail("=== time_bench start ===")
     log_detail(f"config backup: {backup_path}")
     log_detail(f"sizes={[s[0] for s in SIZES]} parallelism={PARALLELISM} "
@@ -267,7 +267,7 @@ def run_benchmark():
         cuda_ok = False
     log_detail(f"torch.cuda.is_available()={cuda_ok}")
     if not cuda_ok:
-        progress("WARNING: CUDA not detected — 'GPU' runs will execute on CPU "
+        progress("WARNING: CUDA not detected -- 'GPU' runs will execute on CPU "
                  "(see log).")
         log_detail("WARNING: CUDA not available; GPU half runs on CPU, CPU caps "
                    "still derived from the GPU-half timings.")
@@ -296,14 +296,17 @@ def run_benchmark():
     def run_phase(cfg, phase, use_gpu, timeout_s, raw_path):
         """Write the per-phase config, launch the pipeline subprocess, time it.
 
-        Returns (status, elapsed_seconds): status ∈ {ok, error, timeout}.
+        Returns (status, elapsed_seconds): status in {ok, error, timeout}.
         """
         _set_phase_flags(cfg, phase)
-        with open(config_path, "w") as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4)
 
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        # Force UTF-8 for the child's stdout/stderr -- pipeline logs may contain
+        # non-ASCII, which crashes on a Windows cp1251 console.
+        env["PYTHONIOENCODING"] = "utf-8"
         if not use_gpu:
             env["CUDA_VISIBLE_DEVICES"] = ""  # force CPU device in the pipeline
 
@@ -339,13 +342,13 @@ def run_benchmark():
     total_stages = 2 * len(SIZES) * len(PARALLELISM)
 
     try:
-        # ── Pass 1: GPU (no per-phase cap beyond the safety ceiling) ──
+        # -- Pass 1: GPU (no per-phase cap beyond the safety ceiling) --
         for size in SIZES:
             for P in PARALLELISM:
                 stage += 1
                 size_name = size[0]
                 progress(f"[{stage}/{total_stages}] GPU  size={size_name} P={P} "
-                         f"— starting")
+                         f"-- starting")
                 log_detail(f"--- STAGE {stage}/{total_stages} | GPU | "
                            f"size={size_name} | P={P} ---")
                 wipe_working_dirs()
@@ -363,7 +366,7 @@ def run_benchmark():
                                    f"SKIPPED (earlier phase failed)")
                         continue
                     progress(f"[{stage}/{total_stages}] GPU  size={size_name} "
-                             f"P={P} — phase {phase} ({PHASE_NAMES[phase]})")
+                             f"P={P} -- phase {phase} ({PHASE_NAMES[phase]})")
                     status, t = run_phase(cfg, phase, use_gpu=True,
                                           timeout_s=GPU_SAFETY_CAP_S,
                                           raw_path=raw_path)
@@ -374,13 +377,13 @@ def run_benchmark():
                 tot = sum(v["t"] for v in per_phase.values())
                 log_detail(f"  GPU total (size={size_name} P={P}): {tot:.1f}s")
 
-        # ── Pass 2: CPU (each phase capped at 2× its GPU counterpart) ──
+        # -- Pass 2: CPU (each phase capped at 2x its GPU counterpart) --
         for size in SIZES:
             for P in PARALLELISM:
                 stage += 1
                 size_name = size[0]
                 progress(f"[{stage}/{total_stages}] CPU  size={size_name} P={P} "
-                         f"— starting")
+                         f"-- starting")
                 log_detail(f"--- STAGE {stage}/{total_stages} | CPU | "
                            f"size={size_name} | P={P} ---")
                 wipe_working_dirs()
@@ -402,10 +405,10 @@ def run_benchmark():
                         cap = CPU_CAP_MULTIPLIER * g["t"]
                     else:
                         cap = CPU_FALLBACK_CAP_S
-                        log_detail(f"  phase{phase}: no usable GPU baseline → "
+                        log_detail(f"  phase{phase}: no usable GPU baseline -> "
                                    f"fallback cap {cap:.0f}s")
                     progress(f"[{stage}/{total_stages}] CPU  size={size_name} "
-                             f"P={P} — phase {phase} ({PHASE_NAMES[phase]}) "
+                             f"P={P} -- phase {phase} ({PHASE_NAMES[phase]}) "
                              f"cap={cap:.0f}s")
                     status, t = run_phase(cfg, phase, use_gpu=False,
                                           timeout_s=cap, raw_path=raw_path)
@@ -418,7 +421,7 @@ def run_benchmark():
                 tot = sum(v["t"] for v in per_phase.values())
                 log_detail(f"  CPU total (size={size_name} P={P}): {tot:.1f}s")
 
-        # ── Summary table (both devices) ──
+        # -- Summary table (both devices) --
         def _fmt(pp):
             cells, tot = [], 0.0
             for phase in (1, 2, 3):

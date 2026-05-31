@@ -34,7 +34,7 @@ class Logger:
     def __call__(self, obj):
         text = str(obj)
         print(text)
-        with open(self.filename, "a") as f:
+        with open(self.filename, "a", encoding="utf-8") as f:
             f.write(text + "\n")
 
     def run_dir(self, scenario_name):

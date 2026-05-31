@@ -110,6 +110,10 @@ Beam-search clustering memory. Currently disabled (`skip_memory=True` everywhere
 - `game_state.py`: `GameState` — lightweight table tracker (no cards/judger). Mirrors `Table.step()` + `next_turn()` betting logic.
 - `collect.py`: `run_mcts_collection()` — plays hands with MCTS decisions, extracts `MCTSTrainingExample` per decision point (events, value_target from actual outcome, action_target from visit distribution, chain of future decisions).
 - `terminal_eval.py`: terminal equity evaluation for MCTS nodes.
+- `evaluator.py`: neural-net boundary for MCTS. `LocalEvaluator` wraps a live ASI (in-process; bit-for-bit identical to the old direct head calls). `RemoteEvaluator` / `EvalProxy` marshal forwards to the inference server. MCTS calls only `evaluate_root` / `evaluate_leaves`; context assembly (`_build_context`/`_pad_and_stack`) stays in the tree as cheap CPU ops.
+- `inference_server.py`: single GPU process holding all agents; batches `ROOT`/`LEAF`/`FORWARD_BATCH` requests ACROSS actors into large forwards.
+
+**Parallel collection** (`mcts_train.n_workers > 1`): CPU actor processes run the tree search + game logic and offload neural-net forwards to the GPU inference server. Within-tree `mcts.batch_size` (16) is **unchanged** — cross-actor batching at the server provides GPU efficiency on top, so search faithfulness is preserved. `n_workers <= 1` runs the original sequential path (LocalEvaluator), bit-for-bit. Actors split `n_hands`, each with its own RNG seed and independent hand stream; the parent merges all examples and runs `_finalize_value_targets` ONCE over them (so the `mcts_value_scale` bootstrap sees every example). `opponent_embedding` uses a per-`(worker, agent)` GRU table on the server (variant B — each actor accumulates over its own stream; deterministic, no cross-actor races). Equity (`terminal_eval`) runs on CPU in actors with action-head range-narrowing routed to the server (`FORWARD_BATCH`); actors never init CUDA. Config knobs (`mcts_train`): `n_workers` (default 1), `server_max_batch` (256), `server_linger_ms` (2). **Caveat**: parallel runs are NOT bitwise-reproducible vs sequential (fp16 context transport + cross-actor batch composition), only distributionally equivalent. IPC sends full contexts in fp16; if IPC-bound, a server-side root cache is the planned v2 optimization.
 
 ### Evaluation (`evaluation/evaluate.py`)
 
@@ -168,6 +172,8 @@ Simulates poker hands with GTO-sampled actions. Each sample: `events` (variable-
 ### Opponent Data (`generation/generate_opponent.py`)
 
 Simulates hands with trained agents, tracking per-player hand ranges. At each decision: runs inference for every hand in acting player's range → averages action distributions → training target. Range narrowing: removes hands where P(chosen)/P(best) < threshold. Shared event format (all hands unmasked); data loader converts to per-observer masking.
+
+**Parallel generation** (`opponent_data.n_workers > 1`): reuses the same GPU inference server as MCTS (`agent/mcts/inference_server.py`). CPU actor processes play hands + range bookkeeping; the only model forward — the action-head combo inference in `_compute_range_probs` — is routed to the server via `EvalProxy` (`FORWARD_BATCH`). No opponent embedding here (`skip_opponent_emb=True`), so no server-side state. Hands split across actors with contiguous `hand_id` offsets; parent merges scenarios and saves once (no per-`save_every_hands` incremental save in parallel mode). Config: `opponent_data.n_workers` (default 1 = sequential, unchanged), `server_max_batch` (256), `server_linger_ms` (2).
 
 ## Normalization
 

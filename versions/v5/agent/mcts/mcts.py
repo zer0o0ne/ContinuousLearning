@@ -48,13 +48,22 @@ class MCTS:
     """
 
     def __init__(self, agent, device, mcts_config=None, opponent_emb_table=None,
-                 strange_p=0.0):
+                 strange_p=0.0, evaluator=None):
         self.agent = agent
         self.device = device
+        # Evaluator boundary: all neural-net access goes through `self.evaluator`
+        # (see agent/mcts/evaluator.py). When none is supplied, wrap the live
+        # agent in a LocalEvaluator — this preserves the exact in-process
+        # behaviour (sequential collection path). The parallel path injects a
+        # RemoteEvaluator that offloads forwards to the inference server.
+        if evaluator is None:
+            from agent.mcts.evaluator import LocalEvaluator
+            evaluator = LocalEvaluator(agent, device, opponent_emb_table)
+        self.evaluator = evaluator
         cfg = mcts_config or {}
         self.n_simulations = cfg.get("n_simulations", 1000)
         self.c_puct = cfg.get("c_puct", 1.5)
-        self.n_actions = agent.n_actions
+        self.n_actions = self.evaluator.n_actions
         self.dirichlet_alpha = cfg.get("dirichlet_alpha", 0.3)
         self.dirichlet_epsilon = cfg.get("dirichlet_epsilon", 0.25)
         # Probability per simulation of doing a "strange" traversal: at every
@@ -244,12 +253,9 @@ class MCTS:
         # them when the batch is entirely terminals, but if even one
         # non-terminal is present we just run all heads (cheap to batch
         # together, avoids extra branching).
-        values     = self.agent.value_head(batch_ctx, mask=batch_mask)            # (B, 1)
         needs_expansion = any(not is_term for _, _, is_term in pending)
-        if needs_expansion:
-            act_logits = self.agent.action_head(batch_ctx, mask=batch_mask)           # (B, n_actions)
-            opp_logits = self.agent.opponent_action_head(batch_ctx, mask=batch_mask)  # (B, n_actions)
-            act_embs   = self.agent.modelling_head(batch_ctx, mask=batch_mask)        # (B, n_actions, d)
+        values, act_logits, opp_logits, act_embs = self.evaluator.evaluate_leaves(
+            batch_ctx, batch_mask, needs_expansion)
 
         for i, (path, gs, is_term) in enumerate(pending):
             leaf = path[-1]
@@ -306,18 +312,8 @@ class MCTS:
                 self._refresh_opp_q(n)
 
     def _evaluate_root(self, event_sequences):
-        """Run perception + all heads on the real event sequences."""
-        skip_opp = self.opponent_emb_table is None
-        p_out, encoded, mask = self.agent.perception.forward_batch(
-            event_sequences, device=self.device, skip_memory=True,
-            skip_opponent_emb=skip_opp,
-            opponent_emb_table=self.opponent_emb_table,
-        )
-        value = self.agent.value_head(p_out, mask=mask)
-        act_logits = self.agent.action_head(p_out, mask=mask)
-        opp_logits = self.agent.opponent_action_head(p_out, mask=mask)
-        act_embs = self.agent.modelling_head(p_out, mask=mask)
-        return p_out, mask, value, act_logits, opp_logits, act_embs
+        """Run perception + all heads on the real event sequences (via evaluator)."""
+        return self.evaluator.evaluate_root(event_sequences)
 
     def _select_to_leaf(self, root, root_gs, strange=False):
         """Descend from root to a leaf, replay GameState, set lazy flags.
@@ -363,7 +359,9 @@ class MCTS:
             if node._term_value is None:
                 # First terminal visit — evaluate value_head once and cache.
                 context, mask = self._build_context(root_ctx, root_mask, path)
-                leaf_value = self.agent.value_head(context, mask=mask).item()
+                values, _, _, _ = self.evaluator.evaluate_leaves(
+                    context, mask, needs_expansion=False)
+                leaf_value = values.item()
                 node._term_value = float(leaf_value)
             self._backup_cached_terminal(path, node._term_value)
             return
@@ -373,7 +371,9 @@ class MCTS:
 
         # EXPAND leaf
         if node is root:
-            leaf_value = self.agent.value_head(context, mask=mask).item()
+            values, _, _, _ = self.evaluator.evaluate_leaves(
+                context, mask, needs_expansion=False)
+            leaf_value = values.item()
         else:
             leaf_value, act_logits, opp_logits, act_embs = \
                 self._evaluate_node(context, mask)
@@ -447,12 +447,10 @@ class MCTS:
         return gs
 
     def _evaluate_node(self, context, mask):
-        """Run all heads on the given context."""
-        value = self.agent.value_head(context, mask=mask).item()
-        act_logits = self.agent.action_head(context, mask=mask)
-        opp_logits = self.agent.opponent_action_head(context, mask=mask)
-        act_embs = self.agent.modelling_head(context, mask=mask)
-        return value, act_logits, opp_logits, act_embs
+        """Run all heads on the given context (via evaluator)."""
+        values, act_logits, opp_logits, act_embs = self.evaluator.evaluate_leaves(
+            context, mask, needs_expansion=True)
+        return values.item(), act_logits, opp_logits, act_embs
 
     def _expand_node(self, node, game_state, act_logits, opp_logits, act_embs):
         """Create children for each legal action (lazy — no GameState clones).

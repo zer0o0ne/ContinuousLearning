@@ -388,11 +388,97 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
         log(f"  {name_}: p_strange = {strange_p_by_agent[name_]:.4f} "
             f"(last_action_loss={loss_str})")
 
+    # ── Dispatch: sequential (n_workers<=1) vs parallel CPU actors + GPU server ──
+    n_workers = int(mcts_train_cfg.get("n_workers", 1) or 1)
+    if n_workers > 1:
+        per_agent_examples = _run_parallel_collection(
+            agents_list, config, device, log, n_hands, n_workers,
+            search_scales, strange_p_by_agent, cycle_idx)
+    else:
+        def make_mcts(agent_info, gs):
+            asi = agent_info["agent"]
+            asi.eval()
+            return MCTS(asi, device, mcts_cfg,
+                        opponent_emb_table=opp_tables.get(agent_info["name"]),
+                        strange_p=strange_p_by_agent[agent_info["name"]])
+
+        per_agent_examples = _play_hands(
+            agents_list, config, device, n_hands, make_mcts=make_mcts,
+            terminal_proxy=None, equity_device=device,
+            search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
+            log=log, progress=True)
+
+    # Per-agent bootstrap + hybrid + clip. See
+    # `versions/v5/PLAN_MCTS_VALUE_REDESIGN.md` §4 + §5 for math.
+    alpha = float(mcts_train_cfg.get("value_target_alpha", 0.5))
+    clip_val = float(mcts_train_cfg.get("value_target_clip", 5.0))
+    _finalize_value_targets(
+        per_agent_examples=per_agent_examples,
+        agents_list=agents_list,
+        search_scales=search_scales,
+        alpha=alpha,
+        clip_val=clip_val,
+        big_blind=float(big_blind),
+        log=log,
+    )
+
+    for name, exs in per_agent_examples.items():
+        log(f"  {name}: {len(exs)} training examples")
+
+    return per_agent_examples
+
+
+def _play_hands(agents_list, config, device, n_hands, make_mcts,
+                terminal_proxy, equity_device, search_scales,
+                strange_p_by_agent, log, progress=True):
+    """Play `n_hands` hands and return per-agent MCTSTrainingExamples.
+
+    Value targets are RAW chip deltas at this stage — `_finalize_value_targets`
+    runs ONCE in the parent over all merged examples (so the per-agent
+    `mcts_value_scale` bootstrap sees every example). `make_mcts(agent_info, gs)`
+    builds the MCTS for the acting agent with the appropriate evaluator
+    (LocalEvaluator in sequential mode, RemoteEvaluator in an actor).
+    `terminal_proxy` is None in sequential mode (terminal equity uses the live
+    ASI on `device`); in an actor it is an EvalProxy routing range-narrowing
+    forwards to the server, with the equity Monte Carlo on `equity_device`.
+    """
+    from agent.train_scenarios.generation.generate import _get_raise_sizes
+    from agent.mcts.terminal_eval import (
+        evaluate_all_terminals, compute_equity_outcome,
+    )
+
+    game_cfg = config.get("game", {})
+    mcts_cfg = config.get("mcts", {})
+    mcts_train_cfg = config.get("mcts_train", {})
+    raise_sizes = _get_raise_sizes(game_cfg)
+    n_raise_bins = len(raise_sizes[0])
+    n_actions = n_raise_bins + 3
+    big_blind = game_cfg.get("big_blind", 10)
+    small_blind = big_blind // 2
+    abs_max_players = game_cfg.get("max_players", 9)
+    min_players = max(2, mcts_train_cfg.get("min_players", 2))
+    max_players = min(abs_max_players, mcts_train_cfg.get("max_players", 6))
+    max_players = max(min_players, max_players)
+    swap_prob = mcts_train_cfg.get("player_swap_prob", 0.05)
+    min_stack = mcts_train_cfg.get("min_stack", big_blind * 10)
+    max_stack = mcts_train_cfg.get("max_stack", game_cfg.get("max_stack", 3000))
+    raw_max_chain_depth = mcts_train_cfg.get("max_chain_depth", None)
+    max_chain_depth = None if not raw_max_chain_depth else int(raw_max_chain_depth)
+    action_label_smoothing = float(
+        mcts_train_cfg.get("action_label_smoothing", 0.0))
+    terminal_k_worst = int(mcts_train_cfg.get("terminal_value_k_worst", 0))
+    terminal_k_best = int(mcts_train_cfg.get("terminal_value_k_best", 0))
+
+    per_agent_examples = {a["name"]: [] for a in agents_list}
+    MAX_ACTIONS = 10000
+
     # Initial table: random player count + random agents from pool (with replacement)
     num_players = random.randint(min_players, max_players)
     hand_seated = random.choices(agents_list, k=num_players)
 
-    for hand_i in tqdm(range(n_hands), desc="MCTS collection"):
+    hand_iter = (tqdm(range(n_hands), desc="MCTS collection")
+                 if progress else range(n_hands))
+    for hand_i in hand_iter:
         # With swap_prob, reshuffle the entire table: new count + new agents
         if random.random() < swap_prob:
             num_players = random.randint(min_players, max_players)
@@ -502,10 +588,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
             # is computed post-hand by `evaluate_all_terminals` and propagated
             # via `re_backup_terminals`. No search-time terminal evaluator.
             gs = GameState.from_table(table, active_pos)
-            mcts = MCTS(agent_info["agent"], device, mcts_cfg,
-                        opponent_emb_table=opp_tables.get(agent_info["name"]),
-                        strange_p=strange_p_by_agent[agent_info["name"]])
-            agent_info["agent"].eval()
+            mcts = make_mcts(agent_info, gs)
             action_idx = mcts.search([norm_events], gs)
 
             decisions.append({
@@ -579,8 +662,14 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
         # value head's outputs at non-terminal leaves — otherwise
         # `re_backup_terminals` would mix raw-chip terminal Q with
         # normalized-scale W in ancestors).
-        agents_by_position = {p: hand_seated[p]["agent"]
-                              for p in range(num_players)}
+        if terminal_proxy is None:
+            agents_by_position = {p: hand_seated[p]["agent"]
+                                  for p in range(num_players)}
+            agent_name_by_pos = None
+        else:
+            agents_by_position = {}
+            agent_name_by_pos = {p: hand_seated[p]["name"]
+                                 for p in range(num_players)}
         value_scales_by_position = {
             p: float(search_scales.get(hand_seated[p]["name"], float(big_blind)))
             for p in range(num_players)
@@ -606,6 +695,8 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
             hand_record, agents_by_position, device,
             config=mcts_cfg,
             value_scales_by_position=value_scales_by_position,
+            proxy=terminal_proxy, agent_name_by_pos=agent_name_by_pos,
+            equity_device=equity_device,
         )
 
         # 2) Equity-based realized outcome at the actual played-out final
@@ -617,6 +708,8 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
         equity_pkt = compute_equity_outcome(
             hand_record, agents_by_position, device,
             ref_credits_by_decision=ref_credits, config=mcts_cfg,
+            proxy=terminal_proxy, agent_name_by_pos=agent_name_by_pos,
+            equity_device=equity_device,
         )
         realized_by_dec = equity_pkt["realized_by_decision"]
         equity_by_hero = equity_pkt["equity_by_hero"]
@@ -666,23 +759,6 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
                     step.value_target = 0.0
             agent_name = hand_seated[hero_pos]["name"]
             per_agent_examples[agent_name].append(ex)
-
-    # Per-agent bootstrap + hybrid + clip. See
-    # `versions/v5/PLAN_MCTS_VALUE_REDESIGN.md` §4 + §5 for math.
-    alpha = float(mcts_train_cfg.get("value_target_alpha", 0.5))
-    clip_val = float(mcts_train_cfg.get("value_target_clip", 5.0))
-    _finalize_value_targets(
-        per_agent_examples=per_agent_examples,
-        agents_list=agents_list,
-        search_scales=search_scales,
-        alpha=alpha,
-        clip_val=clip_val,
-        big_blind=float(big_blind),
-        log=log,
-    )
-
-    for name, exs in per_agent_examples.items():
-        log(f"  {name}: {len(exs)} training examples")
 
     return per_agent_examples
 
@@ -795,3 +871,163 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
         log(f"  {name}: blended (α={alpha:.2f}, clip=±{clip_val:.1f}) — "
             f"root: {n_clipped_root}/{n_root} clipped; "
             f"chain: {n_clipped_chain}/{n_chain} clipped")
+
+
+# ─────────────────────────── Parallel collection ───────────────────────────
+# CPU actor processes run the tree search + game logic; one GPU inference
+# server (agent/mcts/inference_server.py) batches their forward requests. The
+# within-tree mcts.batch_size (16) is unchanged — cross-actor batching at the
+# server provides GPU efficiency on top. opponent_embedding uses a per-actor
+# table on the server (variant B). See versions/v5 CLAUDE.md / the plan.
+
+
+def _actor_main(worker_id, agents_meta, config, n_hands, seed,
+                search_scales, strange_p_by_agent, req_q, resp_q,
+                result_q, progress):
+    """Actor process: play `n_hands` with a RemoteEvaluator (forwards offloaded
+    to the inference server), return raw examples via `result_q`.
+
+    Never touches CUDA (model lives on the server; equity MC runs on CPU)."""
+    import traceback as _tb
+    try:
+        import torch as _torch
+        # One BLAS thread per actor so N actors don't oversubscribe the cores.
+        _torch.set_num_threads(1)
+        random.seed(seed)
+        np.random.seed(seed % (2 ** 32 - 1))
+        _torch.manual_seed(seed)
+
+        from agent.mcts.evaluator import RemoteEvaluator, EvalProxy
+        from agent.train_scenarios.generation.generate import _get_raise_sizes
+
+        game_cfg = config.get("game", {})
+        mcts_cfg = config.get("mcts", {})
+        raise_sizes = _get_raise_sizes(game_cfg)
+        n_actions = len(raise_sizes[0]) + 3
+
+        terminal_proxy = EvalProxy(worker_id, req_q, resp_q)
+
+        def make_mcts(agent_info, gs):
+            name = agent_info["name"]
+            ev = RemoteEvaluator(worker_id, name, req_q, resp_q, n_actions)
+            return MCTS(None, "cpu", mcts_cfg,
+                        strange_p=strange_p_by_agent[name], evaluator=ev)
+
+        per_agent = _play_hands(
+            agents_meta, config, "cpu", n_hands, make_mcts=make_mcts,
+            terminal_proxy=terminal_proxy, equity_device="cpu",
+            search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
+            log=lambda *a, **k: None, progress=progress)
+        result_q.put(("OK", worker_id, per_agent))
+    except Exception:
+        result_q.put(("ACTOR_ERROR", worker_id, _tb.format_exc()))
+
+
+def _run_parallel_collection(agents_list, config, device, log, n_hands,
+                             n_workers, search_scales, strange_p_by_agent,
+                             cycle_idx):
+    """Spawn the inference server + `n_workers` CPU actors, gather and merge
+    their per-agent examples. Returns the merged (still RAW) per_agent_examples
+    dict; the caller runs `_finalize_value_targets` once over it."""
+    import torch.multiprocessing as tmp
+    from agent.mcts.inference_server import server_main
+
+    mcts_train_cfg = config.get("mcts_train", {})
+    server_cfg = {
+        "device": device,
+        "server_max_batch": int(mcts_train_cfg.get("server_max_batch", 256)),
+        "server_linger_ms": float(mcts_train_cfg.get("server_linger_ms", 2)),
+    }
+
+    # Server spec: each agent's config + CPU state_dict + norm_stats.
+    spec = []
+    for a in agents_list:
+        sd = {k: v.detach().cpu() for k, v in a["agent"].state_dict().items()}
+        spec.append({"name": a["name"], "config": config,
+                     "state_dict": sd, "norm_stats": a.get("norm_stats")})
+
+    # Model-free metadata for actors (the server holds the live model).
+    agents_meta = [{"name": a["name"], "norm_stats": a.get("norm_stats"),
+                    "temperature": a.get("temperature")} for a in agents_list]
+
+    ctx = tmp.get_context("spawn")
+    req_q = ctx.Queue(maxsize=max(64, 8 * n_workers))
+    resp_qs = [ctx.Queue() for _ in range(n_workers)]
+    result_q = ctx.Queue()
+    ready_event = ctx.Event()
+    stop_event = ctx.Event()
+
+    server = ctx.Process(
+        target=server_main,
+        args=(spec, req_q, resp_qs, ready_event, stop_event, server_cfg),
+        daemon=True)
+    server.start()
+    if not ready_event.wait(timeout=600):
+        stop_event.set()
+        server.terminate()
+        raise RuntimeError("inference server failed to become ready in 600s")
+
+    # Split hands across actors; per-actor seed varies by cycle and worker.
+    base = n_hands // n_workers
+    rem = n_hands % n_workers
+    hands_per = [base + (1 if i < rem else 0) for i in range(n_workers)]
+    base_seed = 1000 * (int(cycle_idx) + 1)
+
+    actors = []
+    for wid in range(n_workers):
+        p = ctx.Process(
+            target=_actor_main,
+            args=(wid, agents_meta, config, hands_per[wid],
+                  base_seed + wid, search_scales, strange_p_by_agent,
+                  req_q, resp_qs[wid], result_q, wid == 0),
+            daemon=True)
+        p.start()
+        actors.append(p)
+
+    log(f"MCTS parallel collection: {n_workers} actors, server on {device}, "
+        f"max_batch={server_cfg['server_max_batch']}, hands/actor={hands_per}")
+
+    # Gather results; fail loudly on any actor error or unexpected death.
+    per_agent_examples = {a["name"]: [] for a in agents_list}
+    received = 0
+    error = None
+    while received < n_workers:
+        try:
+            msg = result_q.get(timeout=1.0)
+        except Exception:
+            if any((not p.is_alive()) and (p.exitcode not in (0, None))
+                   for p in actors):
+                error = "an actor process died unexpectedly"
+                break
+            if not server.is_alive() and server.exitcode not in (0, None):
+                error = "the inference server died unexpectedly"
+                break
+            continue
+        if msg[0] == "OK":
+            _, _wid, partial = msg
+            for name, exs in partial.items():
+                per_agent_examples.setdefault(name, []).extend(exs)
+            received += 1
+        else:
+            _, _wid, tb = msg
+            error = f"actor {_wid} failed:\n{tb}"
+            break
+
+    # Shutdown: stop server, join everything (terminate stragglers).
+    stop_event.set()
+    try:
+        req_q.put(None)  # SENTINEL
+    except Exception:
+        pass
+    for p in actors:
+        p.join(timeout=30)
+        if p.is_alive():
+            p.terminate()
+    server.join(timeout=30)
+    if server.is_alive():
+        server.terminate()
+
+    if error is not None:
+        raise RuntimeError(error)
+
+    return per_agent_examples

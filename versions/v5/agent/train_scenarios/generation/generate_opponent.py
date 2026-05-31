@@ -218,7 +218,7 @@ def _shared_to_standard(shared_events, hero_pos, hero_hand):
 
 def _compute_range_probs(agent, shared_events, combos, active_pos,
                          norm_stats, temperature, device, n_actions,
-                         max_batch, amp_config):
+                         max_batch, amp_config, proxy=None, agent_name=None):
     """Compute action distributions for all combos in range via batched inference.
 
     Args:
@@ -256,12 +256,18 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
                 e["hand"] = [c1, c2]
             batch_events.append(events)
 
-        with torch.no_grad():
-            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})
-            logits = out["action_logits"]  # (batch, n_actions)
+        if proxy is not None:
+            # Parallel/actor mode: action-head forward offloaded to the GPU
+            # inference server; softmax/temperature stay here on CPU.
+            logits = proxy.forward_batch(agent_name, batch_events, heads=("action",))
             probs = F.softmax(logits / temperature, dim=-1)
-            all_probs.append(probs.cpu())
+        else:
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                    out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})
+                logits = out["action_logits"]  # (batch, n_actions)
+                probs = F.softmax(logits / temperature, dim=-1)
+        all_probs.append(probs.cpu())
 
     per_combo_probs = torch.cat(all_probs, dim=0)  # (n_combos, n_actions)
     avg_probs = per_combo_probs.mean(dim=0)          # (n_actions,)
@@ -273,7 +279,8 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
 # Hand generation
 # ---------------------------------------------------------------------------
 
-def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=None):
+def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=None,
+                           proxy=None):
     """Generate training scenarios from one poker hand with range tracking.
 
     Args:
@@ -343,7 +350,10 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             break
 
         agent_info = seated[active_pos]
-        agent = agent_info["agent"]
+        # In parallel/actor mode there is no live model (it lives on the
+        # inference server); the forward is routed via `proxy` by agent name.
+        agent = None if proxy is not None else agent_info["agent"]
+        agent_name = agent_info["name"]
 
         # Filter range by dead board cards
         dead = _get_board_dead(table)
@@ -378,6 +388,7 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             agent, shared_events, live_range, active_pos,
             agent_info["norm_stats"], agent_info["temperature"],
             device, n_actions, max_batch, amp_config,
+            proxy=proxy, agent_name=agent_name,
         )
 
         # Mask out unplayable actions (dominated fold / raises that collapse
@@ -533,30 +544,41 @@ def generate_opponent_dataset(config, save_dir, device, log):
     os.makedirs(save_dir, exist_ok=True)
     dataset_path = os.path.join(save_dir, "dataset.pt")
 
-    scenarios = []
-    failed = 0
+    # Dispatch: parallel (opponent_data.n_workers > 1) reuses the MCTS GPU
+    # inference server — CPU actors play hands + range bookkeeping and offload
+    # the action-head combo inference (FORWARD_BATCH) to one GPU server. The
+    # default (n_workers <= 1) keeps the original sequential path unchanged.
+    n_workers = int(opp_cfg.get("n_workers", 1) or 1)
+    if n_workers > 1:
+        scenarios = _run_parallel_opponent(
+            agents_list, config, gen_cfg, device, log, n_hands, n_workers,
+            max_players, n_player_pool, swap_prob, player_pool)
+        log(f"Generated {len(scenarios)} scenarios (parallel, {n_workers} actors)")
+    else:
+        scenarios = []
+        failed = 0
 
-    for hand_i in tqdm(range(n_hands), desc="Generating opponent data"):
-        # Simulate player rotation — occasionally swap seat identities
-        for pos in range(max_players):
-            if random.random() < swap_prob:
-                table_roster[pos] = random.choice(player_pool)
+        for hand_i in tqdm(range(n_hands), desc="Generating opponent data"):
+            # Simulate player rotation — occasionally swap seat identities
+            for pos in range(max_players):
+                if random.random() < swap_prob:
+                    table_roster[pos] = random.choice(player_pool)
 
-        result = generate_opponent_hand(gen_cfg, agents_list, device, amp_config,
-                                        player_ids=table_roster)
-        if result is not None:
-            for s in result:
-                s["hand_id"] = hand_i
-            scenarios.extend(result)
-        else:
-            failed += 1
+            result = generate_opponent_hand(gen_cfg, agents_list, device, amp_config,
+                                            player_ids=table_roster)
+            if result is not None:
+                for s in result:
+                    s["hand_id"] = hand_i
+                scenarios.extend(result)
+            else:
+                failed += 1
 
-        if (hand_i + 1) % save_every == 0:
-            torch.save(scenarios, dataset_path)
-            log(f"  Incremental save: {len(scenarios)} scenarios ({hand_i + 1} hands)")
+            if (hand_i + 1) % save_every == 0:
+                torch.save(scenarios, dataset_path)
+                log(f"  Incremental save: {len(scenarios)} scenarios ({hand_i + 1} hands)")
 
-    log(f"Generated {len(scenarios)} scenarios from {n_hands - failed} hands "
-        f"({failed} failed)")
+        log(f"Generated {len(scenarios)} scenarios from {n_hands - failed} hands "
+            f"({failed} failed)")
 
     if scenarios:
         range_sizes = [s["range_size"] for s in scenarios]
@@ -565,6 +587,153 @@ def generate_opponent_dataset(config, save_dir, device, log):
 
     torch.save(scenarios, dataset_path)
     log(f"Dataset saved to {dataset_path}")
+
+    return scenarios
+
+
+# ---------------------------------------------------------------------------
+# Parallel generation (CPU actors + reused GPU inference server)
+# ---------------------------------------------------------------------------
+
+def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
+                    seed, max_players, player_pool, swap_prob,
+                    req_q, resp_q, result_q, progress):
+    """Actor process: play `n_hands` opponent hands with an EvalProxy (action
+    inference offloaded to the server), return scenarios via `result_q`.
+
+    Never touches CUDA — the model lives on the server; all CPU here."""
+    import traceback as _tb
+    try:
+        import torch as _torch
+        _torch.set_num_threads(1)
+        random.seed(seed)
+        np.random.seed(seed % (2 ** 32 - 1))
+        _torch.manual_seed(seed)
+        from agent.mcts.evaluator import EvalProxy
+
+        proxy = EvalProxy(worker_id, req_q, resp_q)
+        amp_config = (False, "cpu", _torch.float32)  # unused on the proxy path
+        table_roster = list(player_pool[:max_players])
+        scenarios = []
+        it = (tqdm(range(n_hands), desc=f"opp actor {worker_id}")
+              if progress else range(n_hands))
+        for hand_i in it:
+            for pos in range(max_players):
+                if random.random() < swap_prob:
+                    table_roster[pos] = random.choice(player_pool)
+            result = generate_opponent_hand(
+                gen_cfg, agents_meta, "cpu", amp_config,
+                player_ids=table_roster, proxy=proxy)
+            if result is not None:
+                hid = hand_id_offset + hand_i
+                for s in result:
+                    s["hand_id"] = hid
+                scenarios.extend(result)
+        result_q.put(("OK", worker_id, scenarios))
+    except Exception:
+        result_q.put(("ACTOR_ERROR", worker_id, _tb.format_exc()))
+
+
+def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
+                           n_workers, max_players, n_player_pool, swap_prob,
+                           player_pool):
+    """Spawn the inference server + `n_workers` CPU actors, gather and merge
+    their scenarios. Hand ids are contiguous across actors (offset per actor).
+    """
+    import torch.multiprocessing as tmp
+    from agent.mcts.inference_server import server_main
+
+    opp_cfg = config.get("opponent_data", {})
+    server_cfg = {
+        "device": device,
+        "server_max_batch": int(opp_cfg.get("server_max_batch", 256)),
+        "server_linger_ms": float(opp_cfg.get("server_linger_ms", 2)),
+    }
+
+    spec = []
+    for a in agents_list:
+        sd = {k: v.detach().cpu() for k, v in a["agent"].state_dict().items()}
+        spec.append({"name": a["name"], "config": config,
+                     "state_dict": sd, "norm_stats": a.get("norm_stats")})
+    agents_meta = [{"name": a["name"], "norm_stats": a.get("norm_stats"),
+                    "temperature": a.get("temperature")} for a in agents_list]
+
+    ctx = tmp.get_context("spawn")
+    req_q = ctx.Queue(maxsize=max(64, 8 * n_workers))
+    resp_qs = [ctx.Queue() for _ in range(n_workers)]
+    result_q = ctx.Queue()
+    ready_event = ctx.Event()
+    stop_event = ctx.Event()
+
+    server = ctx.Process(
+        target=server_main,
+        args=(spec, req_q, resp_qs, ready_event, stop_event, server_cfg),
+        daemon=True)
+    server.start()
+    if not ready_event.wait(timeout=600):
+        stop_event.set()
+        server.terminate()
+        raise RuntimeError("inference server failed to become ready in 600s")
+
+    base = n_hands // n_workers
+    rem = n_hands % n_workers
+    hands_per = [base + (1 if i < rem else 0) for i in range(n_workers)]
+    offsets, acc = [], 0
+    for h in hands_per:
+        offsets.append(acc)
+        acc += h
+
+    actors = []
+    for wid in range(n_workers):
+        p = ctx.Process(
+            target=_opp_actor_main,
+            args=(wid, agents_meta, gen_cfg, hands_per[wid], offsets[wid],
+                  1000 + wid, max_players, player_pool, swap_prob,
+                  req_q, resp_qs[wid], result_q, wid == 0),
+            daemon=True)
+        p.start()
+        actors.append(p)
+
+    log(f"Opponent parallel generation: {n_workers} actors, server on {device}, "
+        f"max_batch={server_cfg['server_max_batch']}, hands/actor={hands_per}")
+
+    scenarios = []
+    received = 0
+    error = None
+    while received < n_workers:
+        try:
+            msg = result_q.get(timeout=1.0)
+        except Exception:
+            if any((not p.is_alive()) and (p.exitcode not in (0, None))
+                   for p in actors):
+                error = "an opponent actor died unexpectedly"
+                break
+            if not server.is_alive() and server.exitcode not in (0, None):
+                error = "the inference server died unexpectedly"
+                break
+            continue
+        if msg[0] == "OK":
+            scenarios.extend(msg[2])
+            received += 1
+        else:
+            error = f"opponent actor {msg[1]} failed:\n{msg[2]}"
+            break
+
+    stop_event.set()
+    try:
+        req_q.put(None)
+    except Exception:
+        pass
+    for p in actors:
+        p.join(timeout=30)
+        if p.is_alive():
+            p.terminate()
+    server.join(timeout=30)
+    if server.is_alive():
+        server.terminate()
+
+    if error is not None:
+        raise RuntimeError(error)
 
     return scenarios
 

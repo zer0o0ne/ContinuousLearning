@@ -23,7 +23,8 @@ from agent.gto_utils.gpu_solver_v2 import (
 
 
 def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
-                           value_scales_by_position=None):
+                           value_scales_by_position=None,
+                           proxy=None, agent_name_by_pos=None, equity_device=None):
     """Evaluate terminal nodes across all MCTS trees from one completed hand.
 
     For fold terminals: deterministic Q (pot distribution).
@@ -56,6 +57,9 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
     n_equity_iters = cfg.get("n_equity_iters", 3000)
     max_batch = cfg.get("max_batch", 128)
     prob_floor = float(cfg.get("terminal_eval_prob_floor", 0.05))
+    # Device for the pure-card equity MC. In parallel actors this is forced to
+    # "cpu" (actors must not init CUDA); sequential keeps the passed device.
+    eq_dev = equity_device if equity_device is not None else device
 
     decisions = hand_record["decisions"]
     deck = hand_record["deck"]
@@ -65,7 +69,8 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
     # Pre-compute per-combo action probs for each decision (for range narrowing)
     # combo_probs[decision_idx] = {pos: (combos, per_combo_probs)} or None
     combo_probs_cache = _precompute_combo_probs(
-        decisions, hero_hands, agents_by_position, num_players, device, max_batch)
+        decisions, hero_hands, agents_by_position, num_players, device, max_batch,
+        proxy=proxy, agent_name_by_pos=agent_name_by_pos)
 
     # Process each tree
     for dec_idx, decision in enumerate(decisions):
@@ -128,7 +133,7 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                     path=path,
                     root_gs=root_gs,
                     n_equity_iters=n_equity_iters,
-                    device=device,
+                    device=eq_dev,
                     prob_floor=prob_floor,
                 )
 
@@ -138,7 +143,8 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
 
 
 def compute_equity_outcome(hand_record, agents_by_position, device,
-                           ref_credits_by_decision, config=None):
+                           ref_credits_by_decision, config=None,
+                           proxy=None, agent_name_by_pos=None, equity_device=None):
     """Equity-based realized outcome at the played-out final state of the hand.
 
     Replaces the noisy single-sample chip delta `final_credits[hero] −
@@ -197,6 +203,7 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
     n_equity_iters = cfg.get("n_equity_iters", 3000)
     max_batch = cfg.get("max_batch", 128)
     prob_floor = float(cfg.get("terminal_eval_prob_floor", 0.05))
+    eq_dev = equity_device if equity_device is not None else device
 
     decisions = hand_record["decisions"]
     deck = hand_record["deck"]
@@ -241,7 +248,8 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
     board_cards = torch.tensor(deck[:5].tolist(), dtype=torch.long)
 
     combo_probs_cache = _precompute_combo_probs(
-        decisions, hero_hands, agents_by_position, num_players, device, max_batch)
+        decisions, hero_hands, agents_by_position, num_players, device, max_batch,
+        proxy=proxy, agent_name_by_pos=agent_name_by_pos)
 
     for dec_idx, decision in enumerate(decisions):
         hero_pos = decision["player_pos"]
@@ -263,7 +271,7 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
                 decisions=decisions,
                 combo_probs_cache=combo_probs_cache,
                 n_equity_iters=n_equity_iters,
-                device=device,
+                device=eq_dev,
                 prob_floor=prob_floor,
             )
 
@@ -375,7 +383,7 @@ def _path_to_root(node):
 
 
 def _precompute_combo_probs(decisions, hero_hands, agents_by_position, num_players,
-                            device, max_batch):
+                            device, max_batch, proxy=None, agent_name_by_pos=None):
     """Pre-compute P(action | combo) for each decision point.
 
     For each decision, runs the acting player's action_head on every combo
@@ -389,9 +397,18 @@ def _precompute_combo_probs(decisions, hero_hands, agents_by_position, num_playe
 
     for dec_idx, decision in enumerate(decisions):
         acting_pos = decision["player_pos"]
-        agent = agents_by_position.get(acting_pos)
-        if agent is None:
-            continue
+        # In parallel/actor mode the model lives on the inference server, so
+        # `agents_by_position` is empty and we route the action-head forward
+        # through `proxy` keyed by the acting position's agent name. In
+        # sequential mode `proxy is None` and we use the live ASI directly.
+        if proxy is not None:
+            agent = None
+            if agent_name_by_pos is None or acting_pos not in agent_name_by_pos:
+                continue
+        else:
+            agent = agents_by_position.get(acting_pos)
+            if agent is None:
+                continue
 
         events_template = decision["events_at_root"]
 
@@ -418,10 +435,15 @@ def _precompute_combo_probs(decisions, hero_hands, agents_by_position, num_playe
                     e["hand"] = [c1, c2]
                 batch_events.append(events_copy)
 
-            with torch.no_grad():
-                out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})
-                logits = out["action_logits"]
+            if proxy is not None:
+                logits = proxy.forward_batch(
+                    agent_name_by_pos[acting_pos], batch_events, heads=("action",))
                 probs = F.softmax(logits, dim=-1)
+            else:
+                with torch.no_grad():
+                    out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})
+                    logits = out["action_logits"]
+                    probs = F.softmax(logits, dim=-1)
             all_probs.append(probs.cpu())
 
         per_combo_probs = torch.cat(all_probs, dim=0)  # (n_combos, n_actions)

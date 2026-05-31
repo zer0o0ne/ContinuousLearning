@@ -144,6 +144,9 @@
     "opponent_data": {
         "agents_dir": "5_final_agents",
         "n_hands": 15000,
+        "n_workers": 1,
+        "server_max_batch": 256,
+        "server_linger_ms": 2,
         "action_temperature": 0.3,
         "range_threshold": 0.75,
         "max_batch_combos": 128,
@@ -184,6 +187,9 @@
     "mcts_train": {
         "n_cycles": 100,
         "n_hands_per_cycle": 250,
+        "n_workers": 1,
+        "server_max_batch": 256,
+        "server_linger_ms": 2,
         "save_every_cycles": 10,
         "value_norm_rebootstrap_every": 10,
         "min_players": 2,

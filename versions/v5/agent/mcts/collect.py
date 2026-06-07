@@ -933,7 +933,22 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
             terminal_proxy=terminal_proxy, equity_device="cpu",
             search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
             log=lambda *a, **k: None, progress=progress)
+        n_items = sum(len(v) for v in per_agent.values())
+        _sys.stderr.write(
+            f"[mcts actor {worker_id}] loop done, putting OK with "
+            f"{n_items} examples\n")
+        _sys.stderr.flush()
         result_q.put(("OK", worker_id, per_agent))
+        # CRITICAL: force the QueueFeederThread to flush the OK message to
+        # the pipe BEFORE the process exits. Without this, the daemon feeder
+        # may be torn down mid-pickle on process exit (observed under Python
+        # 3.14 with large payloads), the OK never reaches parent, parent's
+        # silent_dead detector fires, and the whole cycle is killed.
+        result_q.close()
+        result_q.join_thread()
+        _sys.stderr.write(
+            f"[mcts actor {worker_id}] OK flushed to pipe, exiting\n")
+        _sys.stderr.flush()
     except BaseException:
         # BaseException catches SystemExit / KeyboardInterrupt too — otherwise
         # the actor can exit silently with code 0 and parent waits forever.
@@ -942,6 +957,8 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
         _sys.stderr.flush()
         try:
             result_q.put(("ACTOR_ERROR", worker_id, tb))
+            result_q.close()
+            result_q.join_thread()
         except BaseException:
             pass
 

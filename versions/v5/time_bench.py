@@ -69,7 +69,7 @@ SIZES = [
 PARALLELISM = [2, 4, 16, 32, 64, 128]         # applied to all three stages' n_workers
 
 # Phase 1 -- GTO data gen + training
-SCALE_N_SCENARIOS = 96          # >= max(PARALLELISM)*2 so the gen pool engages
+SCALE_N_SCENARIOS = 3          # >= max(PARALLELISM)*2 so the gen pool engages
 SCALE_MC_ITERATIONS = 100       # solver Monte-Carlo iters (prod: 1000)
 SCALE_COMBO_RESPONSE_ITERS = 8  # solver combo-response iters (prod: 30)
 SCALE_GTO_EPOCHS = 1

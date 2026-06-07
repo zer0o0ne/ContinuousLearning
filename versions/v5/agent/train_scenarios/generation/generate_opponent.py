@@ -632,7 +632,21 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
                 for s in result:
                     s["hand_id"] = hid
                 scenarios.extend(result)
+        _sys.stderr.write(
+            f"[opp actor {worker_id}] loop done, putting OK with "
+            f"{len(scenarios)} scenarios\n")
+        _sys.stderr.flush()
         result_q.put(("OK", worker_id, scenarios))
+        # CRITICAL: force the QueueFeederThread to flush the OK message to
+        # the pipe BEFORE the process exits. Without this, the daemon feeder
+        # may be torn down mid-pickle on process exit (observed under Python
+        # 3.14 with large scenarios payloads), the OK never reaches parent,
+        # parent's silent_dead detector fires, and the whole bench is killed.
+        result_q.close()
+        result_q.join_thread()
+        _sys.stderr.write(
+            f"[opp actor {worker_id}] OK flushed to pipe, exiting\n")
+        _sys.stderr.flush()
     except BaseException:
         # BaseException catches SystemExit / KeyboardInterrupt too — otherwise
         # the actor can exit silently with code 0 and parent waits forever.
@@ -641,6 +655,8 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
         _sys.stderr.flush()
         try:
             result_q.put(("ACTOR_ERROR", worker_id, tb))
+            result_q.close()
+            result_q.join_thread()
         except BaseException:
             pass
 

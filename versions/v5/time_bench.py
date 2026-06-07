@@ -77,7 +77,7 @@ SCALE_GTO_EPOCHS = 1
 SCALE_GTO_BATCH = 64            # kept large so the GPU is meaningfully loaded
 
 # Phase 2 -- opponent data gen + training
-SCALE_OPP_N_HANDS = 16
+SCALE_OPP_N_HANDS = 160
 SCALE_OPP_MAX_PLAYERS = 3       # smaller tables -> faster, still multi-player
 SCALE_OPP_BATCH = 64
 SCALE_OPP_EPOCHS = 1
@@ -85,7 +85,7 @@ SCALE_OPP_EPOCHS = 1
 # Phase 3 -- MCTS collect + train
 SCALE_MCTS_N_SIMULATIONS = 120  # prod: 3000 (within-tree batch_size stays 16)
 SCALE_MCTS_EQUITY_ITERS = 200
-SCALE_MCTS_N_HANDS = 12
+SCALE_MCTS_N_HANDS = 120
 SCALE_MCTS_CYCLES = 1
 SCALE_MCTS_BATCH = 32
 SCALE_MCTS_EPOCHS = 1

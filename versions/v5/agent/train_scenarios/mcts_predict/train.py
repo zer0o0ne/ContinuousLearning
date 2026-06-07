@@ -406,7 +406,7 @@ def _compute_loss(forward_out, value_targets, action_targets,
         if not b_preds:
             continue
         step_losses = torch.stack(
-            [F.mse_loss(p, t) for p, t in zip(b_preds, b_tgts)])
+            [F.smooth_l1_loss(p, t) for p, t in zip(b_preds, b_tgts)])
         terminal_per_example.append(step_losses.mean())
     if terminal_per_example:
         terminal_value_loss = torch.stack(terminal_per_example).mean()

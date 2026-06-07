@@ -113,7 +113,7 @@ class MCTSTrainingExample:
     terminal_targets: list = field(default_factory=list)
 
 
-def _select_terminal_targets(root, k_worst, k_best):
+def _select_terminal_targets(root, k_worst, k_best, clip_val=None):
     """Pick `k_worst` lowest-Q + `k_best` highest-Q terminals from the tree.
 
     Returns a list of `(action_path_from_root, equity_Q)` tuples ready to
@@ -122,6 +122,11 @@ def _select_terminal_targets(root, k_worst, k_best):
     equity-based value in `mcts_value_scale` units). Both tails are taken
     to avoid biasing value-head training toward only successful outcomes;
     overlap (small trees) is handled by union of indices.
+
+    `clip_val`: if not None, each `equity_Q` is clamped to `[-clip_val,
+    clip_val]` — matches the `value_target_clip` applied to root/chain
+    value targets in `_finalize_value_targets`, so the value head's tail
+    supervision lives on the same bounded axis as its other targets.
 
     Returns `[]` when `k_worst + k_best == 0`.
     """
@@ -143,14 +148,18 @@ def _select_terminal_targets(root, k_worst, k_best):
     out = []
     for i in sorted(picked):
         t = sorted_terms[i]
-        out.append((action_path_from_root(t), float(t.Q)))
+        q = float(t.Q)
+        if clip_val is not None:
+            q = max(-float(clip_val), min(float(clip_val), q))
+        out.append((action_path_from_root(t), q))
     return out
 
 
 def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                           final_credits=None, big_blind=None,
                           action_label_smoothing=0.0,
-                          terminal_k_worst=0, terminal_k_best=0):
+                          terminal_k_worst=0, terminal_k_best=0,
+                          terminal_clip_val=None):
     """Extract training examples from all MCTS trees in a completed hand.
 
     For each tree (one per decision point), produces an MCTSTrainingExample.
@@ -245,7 +254,8 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
             ))
 
         terminal_targets = _select_terminal_targets(
-            root, terminal_k_worst, terminal_k_best)
+            root, terminal_k_worst, terminal_k_best,
+            clip_val=terminal_clip_val)
 
         examples.append(MCTSTrainingExample(
             events=decision["events_at_root"],
@@ -468,6 +478,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         mcts_train_cfg.get("action_label_smoothing", 0.0))
     terminal_k_worst = int(mcts_train_cfg.get("terminal_value_k_worst", 0))
     terminal_k_best = int(mcts_train_cfg.get("terminal_value_k_best", 0))
+    terminal_clip_val = float(mcts_train_cfg.get("value_target_clip", 5.0))
 
     per_agent_examples = {a["name"]: [] for a in agents_list}
     MAX_ACTIONS = 10000
@@ -741,6 +752,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             action_label_smoothing=action_label_smoothing,
             terminal_k_worst=terminal_k_worst,
             terminal_k_best=terminal_k_best,
+            terminal_clip_val=terminal_clip_val,
         )
 
         # Overwrite raw realized targets with equity-based ones.

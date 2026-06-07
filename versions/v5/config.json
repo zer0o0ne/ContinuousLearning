@@ -220,9 +220,9 @@
         "stop_grad_old_embs": true,
         "action_label_smoothing": 0.04,
         "entropy_weight": 0.05,
-        "terminal_value_weight": 0.5,
-        "terminal_value_k_worst": 128,
-        "terminal_value_k_best": 128,
+        "terminal_value_weight": 0.2,
+        "terminal_value_k_worst": 6,
+        "terminal_value_k_best": 6,
         "teacher_forcing": {
             "p_start": 1.0,
             "p_end": 0.0,

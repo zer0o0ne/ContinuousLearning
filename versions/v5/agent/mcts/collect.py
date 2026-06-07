@@ -900,7 +900,10 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
     to the inference server), return raw examples via `result_q`.
 
     Never touches CUDA (model lives on the server; equity MC runs on CPU)."""
+    import sys as _sys
     import traceback as _tb
+    _sys.stderr.write(f"[mcts actor {worker_id}] starting, n_hands={n_hands}\n")
+    _sys.stderr.flush()
     try:
         import torch as _torch
         # One BLAS thread per actor so N actors don't oversubscribe the cores.
@@ -931,8 +934,16 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
             search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
             log=lambda *a, **k: None, progress=progress)
         result_q.put(("OK", worker_id, per_agent))
-    except Exception:
-        result_q.put(("ACTOR_ERROR", worker_id, _tb.format_exc()))
+    except BaseException:
+        # BaseException catches SystemExit / KeyboardInterrupt too — otherwise
+        # the actor can exit silently with code 0 and parent waits forever.
+        tb = _tb.format_exc()
+        _sys.stderr.write(f"[mcts actor {worker_id}] FAILED:\n{tb}\n")
+        _sys.stderr.flush()
+        try:
+            result_q.put(("ACTOR_ERROR", worker_id, tb))
+        except BaseException:
+            pass
 
 
 def _run_parallel_collection(agents_list, config, device, log, n_hands,
@@ -991,7 +1002,7 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
             target=_actor_main,
             args=(wid, agents_meta, config, hands_per[wid],
                   base_seed + wid, search_scales, strange_p_by_agent,
-                  req_q, resp_qs[wid], result_q, wid == 0),
+                  req_q, resp_qs[wid], result_q, True),
             daemon=True)
         p.start()
         actors.append(p)
@@ -1001,29 +1012,53 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
 
     # Gather results; fail loudly on any actor error or unexpected death.
     per_agent_examples = {a["name"]: [] for a in agents_list}
-    received = 0
+    received_from = [False] * n_workers
     error = None
-    while received < n_workers:
+
+    def _consume(msg):
+        nonlocal error
+        if msg[0] == "OK":
+            _, wid_done, partial = msg
+            for name, exs in partial.items():
+                per_agent_examples.setdefault(name, []).extend(exs)
+            received_from[wid_done] = True
+        else:
+            _, wid_done, tb = msg
+            error = f"actor {wid_done} failed:\n{tb}"
+
+    while not all(received_from) and error is None:
         try:
             msg = result_q.get(timeout=1.0)
         except Exception:
-            if any((not p.is_alive()) and (p.exitcode not in (0, None))
-                   for p in actors):
-                error = "an actor process died unexpectedly"
+            # Drain pending messages: an actor may have already put its OK on
+            # the pipe and exited cleanly between our get() timeout and the
+            # is_alive() check below.
+            while True:
+                try:
+                    drained = result_q.get_nowait()
+                except Exception:
+                    break
+                _consume(drained)
+                if error is not None:
+                    break
+            if error is not None or all(received_from):
+                break
+            silent_dead = [
+                (wid, actors[wid].exitcode)
+                for wid, ok in enumerate(received_from)
+                if not ok and not actors[wid].is_alive()
+            ]
+            if silent_dead:
+                details = ", ".join(
+                    f"actor {w} (exitcode={ec})" for w, ec in silent_dead)
+                error = (f"mcts actor(s) exited without reporting: "
+                         f"{details} — check stderr above for traceback")
                 break
             if not server.is_alive() and server.exitcode not in (0, None):
                 error = "the inference server died unexpectedly"
                 break
             continue
-        if msg[0] == "OK":
-            _, _wid, partial = msg
-            for name, exs in partial.items():
-                per_agent_examples.setdefault(name, []).extend(exs)
-            received += 1
-        else:
-            _, _wid, tb = msg
-            error = f"actor {_wid} failed:\n{tb}"
-            break
+        _consume(msg)
 
     # Shutdown: stop server, join everything (terminate stragglers).
     stop_event.set()

@@ -64,10 +64,9 @@ from datetime import datetime
 # head_dim is kept at 32 and n_kv_heads divides n_heads for all sizes.
 SIZES = [
     ("base", 256, 8, 2, 512),   # as now
-    ("half", 128, 4, 1, 256),   # x0.5 width
     ("big",  384, 12, 3, 768),  # x1.5 width
 ]
-PARALLELISM = [1, 2, 4]         # applied to all three stages' n_workers
+PARALLELISM = [2, 4, 16, 32, 64, 128]         # applied to all three stages' n_workers
 
 # Phase 1 -- GTO data gen + training
 SCALE_N_SCENARIOS = 96          # >= max(PARALLELISM)*2 so the gen pool engages

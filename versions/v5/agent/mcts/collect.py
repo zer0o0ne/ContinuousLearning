@@ -895,11 +895,19 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
 
 def _actor_main(worker_id, agents_meta, config, n_hands, seed,
                 search_scales, strange_p_by_agent, req_q, resp_q,
-                result_q, progress):
+                result_q, progress, output_dir):
     """Actor process: play `n_hands` with a RemoteEvaluator (forwards offloaded
-    to the inference server), return raw examples via `result_q`.
+    to the inference server), write per_agent examples to a per-actor pickle
+    file on disk, signal completion via `result_q` (path only, no payload).
+
+    Why disk transport: mp.Queue with large pickled payloads silently lost the
+    OK message in Python 3.14 (observed in the opponent-gen actors — feeder
+    confirmed flushed, parent never received). Disk-based payload + tiny-
+    signal-via-queue removes the queue from the failure path entirely.
 
     Never touches CUDA (model lives on the server; equity MC runs on CPU)."""
+    import os as _os
+    import pickle as _pickle
     import sys as _sys
     import traceback as _tb
     _sys.stderr.write(f"[mcts actor {worker_id}] starting, n_hands={n_hands}\n")
@@ -934,20 +942,29 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
             search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
             log=lambda *a, **k: None, progress=progress)
         n_items = sum(len(v) for v in per_agent.values())
+
+        # Persist payload to disk atomically (write to .tmp then rename).
+        out_path = _os.path.join(output_dir, f"actor_{worker_id}.pkl")
+        tmp_path = out_path + ".tmp"
         _sys.stderr.write(
-            f"[mcts actor {worker_id}] loop done, putting OK with "
-            f"{n_items} examples\n")
+            f"[mcts actor {worker_id}] loop done, writing {n_items} examples "
+            f"to {out_path}\n")
         _sys.stderr.flush()
-        result_q.put(("OK", worker_id, per_agent))
-        # CRITICAL: force the QueueFeederThread to flush the OK message to
-        # the pipe BEFORE the process exits. Without this, the daemon feeder
-        # may be torn down mid-pickle on process exit (observed under Python
-        # 3.14 with large payloads), the OK never reaches parent, parent's
-        # silent_dead detector fires, and the whole cycle is killed.
+        with open(tmp_path, "wb") as _f:
+            _pickle.dump(per_agent, _f, protocol=_pickle.HIGHEST_PROTOCOL)
+            _f.flush()
+            _os.fsync(_f.fileno())
+        _os.rename(tmp_path, out_path)
+        size_mb = _os.path.getsize(out_path) / (1024 * 1024)
+        _sys.stderr.write(
+            f"[mcts actor {worker_id}] wrote {size_mb:.1f} MB, signalling OK\n")
+        _sys.stderr.flush()
+        # Tiny signal via queue (path string, no big payload).
+        result_q.put(("OK", worker_id, out_path))
         result_q.close()
         result_q.join_thread()
         _sys.stderr.write(
-            f"[mcts actor {worker_id}] OK flushed to pipe, exiting\n")
+            f"[mcts actor {worker_id}] OK signal flushed, exiting\n")
         _sys.stderr.flush()
     except BaseException:
         # BaseException catches SystemExit / KeyboardInterrupt too — otherwise
@@ -1002,6 +1019,12 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
     ready_event = ctx.Event()
     stop_event = ctx.Event()
 
+    # Per-actor payload directory (disk transport — avoids the Python-3.14
+    # mp.Queue large-payload loss). Cleaned at end of run.
+    import tempfile as _tempfile
+    import shutil as _shutil
+    payload_dir = _tempfile.mkdtemp(prefix=f"mcts_actor_payloads_cycle{cycle_idx}_")
+
     server = ctx.Process(
         target=server_main,
         args=(spec, req_q, resp_qs, ready_event, stop_event, server_cfg),
@@ -1024,23 +1047,39 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
             target=_actor_main,
             args=(wid, agents_meta, config, hands_per[wid],
                   base_seed + wid, search_scales, strange_p_by_agent,
-                  req_q, resp_qs[wid], result_q, True),
+                  req_q, resp_qs[wid], result_q, True, payload_dir),
             daemon=True)
         p.start()
         actors.append(p)
 
     log(f"MCTS parallel collection: {n_workers} actors, server on {device}, "
-        f"max_batch={server_cfg['server_max_batch']}, hands/actor={hands_per}")
+        f"max_batch={server_cfg['server_max_batch']}, hands/actor={hands_per}, "
+        f"payload_dir={payload_dir}")
 
     # Gather results; fail loudly on any actor error or unexpected death.
+    import pickle as _pickle
+    import os as _os
     per_agent_examples = {a["name"]: [] for a in agents_list}
     received_from = [False] * n_workers
     error = None
 
     def _consume(msg):
         nonlocal error
-        if msg[0] == "OK":
-            _, wid_done, partial = msg
+        tag = msg[0]
+        if tag == "OK":
+            _, wid_done, path = msg
+            # Disk-transported payload: read & delete the file immediately.
+            try:
+                with open(path, "rb") as _f:
+                    partial = _pickle.load(_f)
+            except BaseException as _e:
+                error = (f"mcts actor {wid_done} OK file unreadable "
+                         f"({path}): {type(_e).__name__}: {_e}")
+                return
+            try:
+                _os.unlink(path)
+            except OSError:
+                pass
             for name, exs in partial.items():
                 per_agent_examples.setdefault(name, []).extend(exs)
             received_from[wid_done] = True
@@ -1048,53 +1087,60 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
             _, wid_done, tb = msg
             error = f"actor {wid_done} failed:\n{tb}"
 
-    while not all(received_from) and error is None:
-        try:
-            msg = result_q.get(timeout=1.0)
-        except Exception:
-            # Drain pending messages: an actor may have already put its OK on
-            # the pipe and exited cleanly between our get() timeout and the
-            # is_alive() check below.
-            while True:
-                try:
-                    drained = result_q.get_nowait()
-                except Exception:
-                    break
-                _consume(drained)
-                if error is not None:
-                    break
-            if error is not None or all(received_from):
-                break
-            silent_dead = [
-                (wid, actors[wid].exitcode)
-                for wid, ok in enumerate(received_from)
-                if not ok and not actors[wid].is_alive()
-            ]
-            if silent_dead:
-                details = ", ".join(
-                    f"actor {w} (exitcode={ec})" for w, ec in silent_dead)
-                error = (f"mcts actor(s) exited without reporting: "
-                         f"{details} — check stderr above for traceback")
-                break
-            if not server.is_alive() and server.exitcode not in (0, None):
-                error = "the inference server died unexpectedly"
-                break
-            continue
-        _consume(msg)
-
-    # Shutdown: stop server, join everything (terminate stragglers).
-    stop_event.set()
     try:
-        req_q.put(None)  # SENTINEL
-    except Exception:
-        pass
-    for p in actors:
-        p.join(timeout=30)
-        if p.is_alive():
-            p.terminate()
-    server.join(timeout=30)
-    if server.is_alive():
-        server.terminate()
+        while not all(received_from) and error is None:
+            try:
+                msg = result_q.get(timeout=1.0)
+            except Exception:
+                # Drain pending messages: an actor may have already put its
+                # OK on the pipe and exited cleanly between our get() timeout
+                # and the is_alive() check below.
+                while True:
+                    try:
+                        drained = result_q.get_nowait()
+                    except Exception:
+                        break
+                    _consume(drained)
+                    if error is not None:
+                        break
+                if error is not None or all(received_from):
+                    break
+                silent_dead = [
+                    (wid, actors[wid].exitcode)
+                    for wid, ok in enumerate(received_from)
+                    if not ok and not actors[wid].is_alive()
+                ]
+                if silent_dead:
+                    details = ", ".join(
+                        f"actor {w} (exitcode={ec})" for w, ec in silent_dead)
+                    error = (f"mcts actor(s) exited without reporting: "
+                             f"{details} — check stderr above for traceback")
+                    break
+                if not server.is_alive() and server.exitcode not in (0, None):
+                    error = "the inference server died unexpectedly"
+                    break
+                continue
+            _consume(msg)
+
+        # Shutdown: stop server, join everything (terminate stragglers).
+        stop_event.set()
+        try:
+            req_q.put(None)  # SENTINEL
+        except Exception:
+            pass
+        for p in actors:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
+        server.join(timeout=30)
+        if server.is_alive():
+            server.terminate()
+    finally:
+        # Always clean up the payload directory, even on error / Ctrl+C.
+        try:
+            _shutil.rmtree(payload_dir, ignore_errors=True)
+        except BaseException:
+            pass
 
     if error is not None:
         raise RuntimeError(error)

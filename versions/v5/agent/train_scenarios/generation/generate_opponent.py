@@ -672,6 +672,11 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
     ctx = tmp.get_context("spawn")
     req_q = ctx.Queue(maxsize=max(64, 8 * n_workers))
     resp_qs = [ctx.Queue() for _ in range(n_workers)]
+    # When an actor exits, the server's feeder for that resp_q will see EPIPE
+    # on the next push. ignore_epipe makes it return silently instead of
+    # spamming a traceback from a daemon thread.
+    for q in resp_qs:
+        q._ignore_epipe = True
     result_q = ctx.Queue()
     ready_event = ctx.Event()
     stop_event = ctx.Event()

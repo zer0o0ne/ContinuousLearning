@@ -187,10 +187,14 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
     stop_event: set by the parent to request shutdown.
     server_cfg: {device, server_max_batch, server_linger_ms}.
     """
+    import sys
     torch.set_grad_enabled(False)
     device = server_cfg.get("device", "cuda")
     max_batch = int(server_cfg.get("server_max_batch", 256))
     linger = float(server_cfg.get("server_linger_ms", 2)) / 1000.0
+
+    sys.stderr.write(f"[server] starting on device={device} max_batch={max_batch}\n")
+    sys.stderr.flush()
 
     opp_tables = {}
 
@@ -203,9 +207,12 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
             opp_tables[key] = t
         return t
 
+    fatal_reason = None
     try:
         agents = _build_agents(spec, device)
         ready_event.set()
+        sys.stderr.write(f"[server] ready, {len(agents)} agent(s) loaded\n")
+        sys.stderr.flush()
 
         while not stop_event.is_set():
             try:
@@ -215,49 +222,93 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
             if first is None:  # SENTINEL
                 break
 
-            # Form a batch: drain whatever is queued, up to max_batch, within a
-            # short linger window. With N blocked actors the queue naturally
-            # holds up to N requests, so linger mainly smooths arrival jitter.
-            bucket = [first]
-            deadline = time.monotonic() + linger
-            while len(bucket) < max_batch:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    r = req_q.get(timeout=remaining)
-                except Exception:
-                    break
-                if r is None:  # SENTINEL mid-drain
-                    stop_event.set()
-                    break
-                bucket.append(r)
+            # Per-iteration outer guard: ANY BaseException raised below
+            # (bucket forming, group iteration, _run_group, agents lookup,
+            # torch internals) is caught, broadcast to actors, and the server
+            # continues to the next request. An actor's death must not kill
+            # the server — neither directly nor via a downstream CUDA fault.
+            try:
+                # Form a batch: drain whatever is queued, up to max_batch,
+                # within a short linger window. With N blocked actors the
+                # queue naturally holds up to N requests, so linger mainly
+                # smooths arrival jitter.
+                bucket = [first]
+                deadline = time.monotonic() + linger
+                while len(bucket) < max_batch:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        r = req_q.get(timeout=remaining)
+                    except Exception:
+                        break
+                    if r is None:  # SENTINEL mid-drain
+                        stop_event.set()
+                        break
+                    bucket.append(r)
 
-            # Group by (req_type, agent, worker_for_ROOT). ROOT is keyed by
-            # worker too because each worker has its own opp-emb table.
-            groups = defaultdict(list)
-            for req in bucket:
-                _rid, wid, name, rtype, _payload = req
-                key = (rtype, name, wid if rtype == REQ_ROOT else None)
-                groups[key].append(req)
+                # Group by (req_type, agent, worker_for_ROOT). ROOT is keyed
+                # by worker too because each worker has its own opp-emb table.
+                groups = defaultdict(list)
+                for req in bucket:
+                    _rid, wid, name, rtype, _payload = req
+                    key = (rtype, name, wid if rtype == REQ_ROOT else None)
+                    groups[key].append(req)
 
-            for (rtype, name, _wid), reqs in groups.items():
-                try:
-                    _run_group(agents[name], rtype, reqs, device, get_table, resp_qs)
-                except Exception:
-                    tb = traceback.format_exc()
-                    for req in reqs:
-                        resp_qs[req[1]].put((req[0], "ERROR", tb))
-    except Exception:
+                for (rtype, name, _wid), reqs in groups.items():
+                    try:
+                        _run_group(agents[name], rtype, reqs, device,
+                                   get_table, resp_qs)
+                    except BaseException:
+                        # BaseException so SystemExit/KeyboardInterrupt from
+                        # torch don't kill the server silently — surface them
+                        # to the actors involved in this group.
+                        tb = traceback.format_exc()
+                        sys.stderr.write(
+                            f"[server] _run_group failed "
+                            f"(rtype={rtype} agent={name} n_reqs={len(reqs)}):"
+                            f"\n{tb}\n")
+                        sys.stderr.flush()
+                        for req in reqs:
+                            try:
+                                resp_qs[req[1]].put((req[0], "ERROR", tb))
+                            except Exception:
+                                pass
+            except BaseException:
+                # Last-resort guard: error outside any inner try (e.g. bad
+                # req unpack, KeyError on agents[name] before _run_group,
+                # something deeper). Log it, notify ALL actors so any blocked
+                # _rpc gets unstuck, and keep the server alive.
+                tb = traceback.format_exc()
+                sys.stderr.write(
+                    f"[server] per-iter error (server stays alive):\n{tb}\n")
+                sys.stderr.flush()
+                for q in resp_qs:
+                    try:
+                        q.put((None, "ERROR", tb))
+                    except Exception:
+                        pass
+                continue
+    except BaseException:
         # Model build / fatal loop error: surface to anyone waiting.
         tb = traceback.format_exc()
+        fatal_reason = tb
+        sys.stderr.write(f"[server] FATAL in main loop:\n{tb}\n")
+        sys.stderr.flush()
         for q in resp_qs:
             try:
                 q.put((None, "ERROR", tb))
             except Exception:
                 pass
-        raise
+        # Don't re-raise — let finally run cleanly and the process exit 0 so
+        # the parent's death-detector reads a clean state. The traceback is
+        # already on stderr and on every resp_q.
     finally:
+        if fatal_reason is None:
+            sys.stderr.write("[server] shutting down (clean)\n")
+        else:
+            sys.stderr.write("[server] shutting down after fatal error\n")
+        sys.stderr.flush()
         # Unblock any actor still waiting on a response so it can't hang.
         for q in resp_qs:
             try:

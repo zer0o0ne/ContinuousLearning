@@ -26,7 +26,27 @@ Two implementations:
 call (`agent.forward_batch(..., heads={"action"})` for range narrowing).
 """
 
+import os
+import time
+
 import torch
+
+from agent.mcts import _timing
+
+
+# Optimization switch shared with `inference_server.py`. When 1 (default), the
+# parallel path uses:
+#   - REQ_LEAF_CACHED: actor ships only the action-embedding deltas; the server
+#     reconstructs full context from a cached root_ctx per (worker, agent).
+#     Eliminates re-shipping the (large) root_ctx in every LEAF flush (~625×
+#     per decision per actor in a typical 10k-sim run).
+#   - REQ_FORWARD_TEMPLATED: opponent_data range inference ships the event
+#     template ONCE plus N hand pairs, server replicates server-side — saves
+#     ~256× the dict-spine pickling cost per range call.
+# Set to 0 to fall back to the original REQ_LEAF / REQ_FORWARD paths for A/B
+# benchmarking. The flag is consulted only by RemoteEvaluator / EvalProxy /
+# the server's request handler — LocalEvaluator is unaffected.
+PARALLEL_OPT_ENABLED = os.environ.get("MCTS_PARALLEL_OPT", "1") == "1"
 
 
 class RemoteServerError(RuntimeError):
@@ -72,7 +92,9 @@ class LocalEvaluator:
 # Request type tags (shared with inference_server.py).
 REQ_ROOT = "ROOT"
 REQ_LEAF = "LEAF"
+REQ_LEAF_CACHED = "LEAF_CACHED"     # uses server-side root_ctx cache
 REQ_FORWARD = "FORWARD_BATCH"
+REQ_FORWARD_TEMPLATED = "FORWARD_TEMPLATED"  # template + hand pairs
 
 
 class _RemoteBase:
@@ -92,26 +114,70 @@ class _RemoteBase:
     def _rpc(self, agent_name, req_type, payload):
         self._req_id += 1
         rid = (self.worker_id, self._req_id)
-        self.req_q.put((rid, self.worker_id, agent_name, req_type, payload))
-        out_rid, status, result = self.resp_q.get()
+        if _timing.ENABLED:
+            t0 = time.monotonic()
+            self.req_q.put((rid, self.worker_id, agent_name, req_type, payload))
+            t1 = time.monotonic()
+            out_rid, status, result = self.resp_q.get()
+            t2 = time.monotonic()
+            _timing.event(
+                "actor_rpc",
+                worker_id=self.worker_id,
+                agent=agent_name,
+                rtype=req_type,
+                put_ms=(t1 - t0) * 1000.0,
+                wait_ms=(t2 - t1) * 1000.0,
+            )
+        else:
+            self.req_q.put((rid, self.worker_id, agent_name, req_type, payload))
+            out_rid, status, result = self.resp_q.get()
         if status == "ERROR":
             raise RemoteServerError(result)
         return result
 
 
 class RemoteEvaluator(_RemoteBase):
-    """Evaluator that offloads root/leaf forwards to the inference server."""
+    """Evaluator that offloads root/leaf forwards to the inference server.
+
+    With `PARALLEL_OPT_ENABLED` (default), LEAF requests ship only the action-
+    embedding deltas — the part of the context that's NOT the cached root_ctx.
+    The server holds a per-(worker, agent) root_ctx cache populated on every
+    ROOT response, so each LEAF flush avoids re-shipping the (1, L_root, d)
+    perception output (the dominant IPC payload at high simulation counts).
+
+    `self._root_len` is set after every `evaluate_root` to the length of the
+    cached prefix; LEAF slicing uses it to extract just the delta.
+    """
 
     def __init__(self, worker_id, agent_name, req_q, resp_q, n_actions):
         super().__init__(worker_id, req_q, resp_q)
         self.agent_name = agent_name
         self.n_actions = n_actions
+        self._root_len = 0
 
     def evaluate_root(self, event_sequences):
         # event_sequences are plain dicts (np bets serialize fine via pickle).
-        return self._rpc(self.agent_name, REQ_ROOT, event_sequences)
+        result = self._rpc(self.agent_name, REQ_ROOT, event_sequences)
+        # Cache the root prefix length locally so subsequent LEAF flushes can
+        # strip it off before sending. Server-side cache is keyed by the same
+        # (worker_id, agent_name) and is populated by `_run_root`.
+        # result = (p_out, mask, value, act_logits, opp_logits, act_embs)
+        p_out = result[0]
+        self._root_len = int(p_out.shape[1])
+        return result
 
     def evaluate_leaves(self, batch_ctx, batch_mask, needs_expansion):
+        if PARALLEL_OPT_ENABLED and self._root_len > 0:
+            # Strip the cached root prefix and ship only the deltas. The server
+            # rebuilds full context by concatenating its cached root_ctx.
+            r = self._root_len
+            # If a path has no delta (depth 0 → leaf is root, only possible for
+            # degenerate trees), batch_ctx.shape[1] == r and delta is empty.
+            delta_ctx = batch_ctx[:, r:, :].detach().to(torch.float16).cpu()
+            delta_mask = batch_mask[:, r:].detach().cpu()
+            payload = (delta_ctx, delta_mask, bool(needs_expansion))
+            return self._rpc(self.agent_name, REQ_LEAF_CACHED, payload)
+        # Legacy path: full batch_ctx over the wire.
         payload = (
             batch_ctx.detach().to(torch.float16).cpu(),
             batch_mask.detach().cpu(),
@@ -121,12 +187,27 @@ class RemoteEvaluator(_RemoteBase):
 
 
 class EvalProxy(_RemoteBase):
-    """Remote handle for terminal_eval range narrowing.
+    """Remote handle for terminal_eval range narrowing AND opponent_data range
+    inference.
 
-    `forward_batch(agent_name, batch_events, heads)` returns the action-head
-    logits tensor (CPU) directly — terminal_eval only ever needs
-    `heads={"action"}`.
+    Two transports:
+
+    - `forward_batch(agent_name, batch_events, heads)` ships the full
+      `batch_events` over the wire (one list per combo). Kept for terminal_eval
+      and as the legacy path. With `PARALLEL_OPT_ENABLED`, opponent_data
+      switches to `forward_batch_templated` (below) to amortize the dict-spine
+      pickling cost across combos.
+
+    - `forward_batch_templated(agent_name, template_events, hand_pairs, heads)`
+      ships the template ONCE plus a list of `(c1, c2)` hand pairs. The server
+      replicates the template per pair and overwrites the `hand` field. Returns
+      the action-head logits with shape `(len(hand_pairs), n_actions)`.
     """
 
     def forward_batch(self, agent_name, batch_events, heads=("action",)):
         return self._rpc(agent_name, REQ_FORWARD, (batch_events, tuple(heads)))
+
+    def forward_batch_templated(self, agent_name, template_events, hand_pairs,
+                                heads=("action",)):
+        payload = (template_events, list(hand_pairs), tuple(heads))
+        return self._rpc(agent_name, REQ_FORWARD_TEMPLATED, payload)

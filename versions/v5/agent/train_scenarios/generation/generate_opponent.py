@@ -243,25 +243,48 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
     template = _shared_to_standard(shared_events, active_pos, [0, 1])
     _normalize_events_inplace(template, norm_stats)
 
+    # In parallel/actor mode we can use the server's templated forward path
+    # (Phase 3): ship the template ONCE per `_compute_range_probs` call and
+    # have the server replicate per combo. This avoids pickling N copies of
+    # the (~100-event) template per chunk for IPC. Controlled by the global
+    # PARALLEL_OPT_ENABLED flag in evaluator.py.
+    use_templated = False
+    if proxy is not None:
+        try:
+            from agent.mcts.evaluator import PARALLEL_OPT_ENABLED
+            use_templated = bool(PARALLEL_OPT_ENABLED) and hasattr(
+                proxy, "forward_batch_templated")
+        except ImportError:
+            use_templated = False
+
     all_probs = []
 
     for start in range(0, len(combos), max_batch):
         batch_combos = combos[start:start + max_batch]
 
-        # Build event sequences — shallow copy template, replace hand
-        batch_events = []
-        for c1, c2 in batch_combos:
-            events = [dict(e) for e in template]
-            for e in events:
-                e["hand"] = [c1, c2]
-            batch_events.append(events)
-
-        if proxy is not None:
-            # Parallel/actor mode: action-head forward offloaded to the GPU
-            # inference server; softmax/temperature stay here on CPU.
+        if use_templated:
+            # Send template once + N hand pairs. Server replicates and runs.
+            logits = proxy.forward_batch_templated(
+                agent_name, template, batch_combos, heads=("action",))
+            probs = F.softmax(logits / temperature, dim=-1)
+        elif proxy is not None:
+            # Legacy parallel path: actor builds N event copies and ships them.
+            batch_events = []
+            for c1, c2 in batch_combos:
+                events = [dict(e) for e in template]
+                for e in events:
+                    e["hand"] = [c1, c2]
+                batch_events.append(events)
             logits = proxy.forward_batch(agent_name, batch_events, heads=("action",))
             probs = F.softmax(logits / temperature, dim=-1)
         else:
+            # Sequential path: in-process forward, unchanged.
+            batch_events = []
+            for c1, c2 in batch_combos:
+                events = [dict(e) for e in template]
+                for e in events:
+                    e["hand"] = [c1, c2]
+                batch_events.append(events)
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                     out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})

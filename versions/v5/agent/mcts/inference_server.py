@@ -35,7 +35,10 @@ from collections import defaultdict
 import torch
 
 from agent.agent import ASI
-from agent.mcts.evaluator import REQ_ROOT, REQ_LEAF, REQ_FORWARD
+from agent.mcts.evaluator import (
+    REQ_ROOT, REQ_LEAF, REQ_LEAF_CACHED, REQ_FORWARD, REQ_FORWARD_TEMPLATED,
+)
+from agent.mcts import _timing
 
 
 def _server_log(*args, **kwargs):
@@ -81,12 +84,19 @@ def _server_pad_and_stack(ctxs, masks, device):
     return big.to(device), big_mask.to(device)
 
 
-def _run_root(agent, worker_id, agent_name, event_sequences, device, get_table):
+def _run_root(agent, worker_id, agent_name, event_sequences, device, get_table,
+              root_cache):
     """Perception + all 4 heads on one event sequence (batch size 1).
 
     Mirrors `LocalEvaluator.evaluate_root`: `skip_opponent_emb` is False exactly
     when the agent has opponent embedding enabled (then a per-(worker, agent)
-    table is used and mutated by the GRU)."""
+    table is used and mutated by the GRU).
+
+    Side effect: stores the GPU-side `(p_out, mask)` in `root_cache` keyed by
+    `(worker_id, agent_name)`. Subsequent `REQ_LEAF_CACHED` requests from that
+    pair rebuild full LEAF context server-side using this cache, so the actor
+    never re-ships root_ctx. Each ROOT overwrites the cached value; one
+    decision corresponds to exactly one ROOT, so freshness is automatic."""
     if agent.perception.opp_emb_enabled:
         table = get_table(worker_id, agent_name)
         skip = False
@@ -100,6 +110,10 @@ def _run_root(agent, worker_id, agent_name, event_sequences, device, get_table):
     act_logits = agent.action_head(p_out, mask=mask)
     opp_logits = agent.opponent_action_head(p_out, mask=mask)
     act_embs = agent.modelling_head(p_out, mask=mask)
+    # Cache the GPU-resident root_ctx + root_mask for downstream LEAF_CACHED.
+    # `.detach()` ensures we don't hold autograd state — torch.set_grad_enabled
+    # is already False at server start, but explicit is safer.
+    root_cache[(worker_id, agent_name)] = (p_out.detach(), mask.detach())
     return (p_out.cpu(), mask.cpu(), value.cpu(),
             act_logits.cpu(), opp_logits.cpu(), act_embs.cpu())
 
@@ -142,6 +156,77 @@ def _run_leaf_batch(agent, reqs, device):
     return out
 
 
+def _run_leaf_cached_batch(agent, reqs, device, root_cache):
+    """Like `_run_leaf_batch` but the actor shipped only the action-embedding
+    delta — the root_ctx prefix lives on the server in `root_cache`.
+
+    For each request, look up the cached `(root_ctx, root_mask)` by
+    `(worker_id, agent_name)`, concatenate with the delta, then aggregate
+    via `_server_pad_and_stack` exactly as the legacy path. The cache is
+    populated by `_run_root` and guaranteed present because MCTS always
+    calls `evaluate_root` before any `evaluate_leaves` on the same actor."""
+    ctxs, masks, sizes, needs = [], [], [], []
+    for (_rid, wid, name, _rtype, payload) in reqs:
+        delta_ctx, delta_mask, ne = payload
+        cached = root_cache.get((wid, name))
+        if cached is None:
+            raise RuntimeError(
+                f"LEAF_CACHED received for (worker={wid}, agent={name}) "
+                f"but no ROOT has populated the cache. "
+                f"Did the actor call evaluate_root before evaluate_leaves?")
+        root_ctx, root_mask = cached  # both on `device`, fp32
+        B_i = delta_ctx.shape[0]
+        # delta_ctx may have no delta rows (depth=0) → shape (B_i, 0, d). cat
+        # handles that as a no-op. delta_ctx arrives in fp16; cast to fp32 to
+        # match the cached root_ctx dtype before concat.
+        delta_ctx_gpu = delta_ctx.to(device=device, dtype=torch.float32,
+                                     non_blocking=True)
+        delta_mask_gpu = delta_mask.to(device=device, non_blocking=True)
+        root_ctx_exp = root_ctx.expand(B_i, -1, -1)
+        root_mask_exp = root_mask.expand(B_i, -1)
+        ctx_full = torch.cat([root_ctx_exp, delta_ctx_gpu], dim=1)
+        mask_full = torch.cat([root_mask_exp, delta_mask_gpu], dim=1)
+        ctxs.append(ctx_full)
+        masks.append(mask_full)
+        sizes.append(B_i)
+        needs.append(bool(ne))
+
+    # Pad to max L across requests and concat along batch dim. We're already
+    # on `device` (unlike _server_pad_and_stack which expects CPU input), so
+    # inline the pad-and-stack here to avoid pointless GPU→CPU→GPU round-trip.
+    L_max = max(c.shape[1] for c in ctxs)
+    d = ctxs[0].shape[2]
+    total = sum(sizes)
+    big_ctx = torch.zeros(total, L_max, d, device=device, dtype=torch.float32)
+    big_mask = torch.zeros(total, L_max, device=device, dtype=masks[0].dtype)
+    off = 0
+    for c, m, n in zip(ctxs, masks, sizes):
+        L_i = c.shape[1]
+        big_ctx[off:off + n, :L_i] = c
+        big_mask[off:off + n, :L_i] = m
+        off += n
+
+    values = agent.value_head(big_ctx, mask=big_mask)
+    any_exp = any(needs)
+    act = opp = embs = None
+    if any_exp:
+        act = agent.action_head(big_ctx, mask=big_mask)
+        opp = agent.opponent_action_head(big_ctx, mask=big_mask)
+        embs = agent.modelling_head(big_ctx, mask=big_mask)
+
+    out = []
+    off = 0
+    for i, n in enumerate(sizes):
+        v = values[off:off + n].cpu()
+        if needs[i]:
+            out.append((v, act[off:off + n].cpu(),
+                        opp[off:off + n].cpu(), embs[off:off + n].cpu()))
+        else:
+            out.append((v, None, None, None))
+        off += n
+    return out
+
+
 def _run_forward_batch(agent, reqs, device):
     """action-head logits on the concatenated event batches of all FORWARD
     requests. Returns a list aligned with `reqs` (each its own action_logits)."""
@@ -161,20 +246,84 @@ def _run_forward_batch(agent, reqs, device):
     return res
 
 
-def _run_group(agent, rtype, reqs, device, get_table, resp_qs):
+def _run_forward_templated_batch(agent, reqs, device):
+    """Templated counterpart to `_run_forward_batch` for opponent_data range
+    inference. Each request carries (template_events, hand_pairs, heads) where
+    `template_events` is sent ONCE; the server replicates it per hand pair and
+    swaps in the hand. This avoids the actor pickling N (=combo count) full
+    copies of the event sequence per range call — that path used to dominate
+    `_compute_range_probs` IPC time for typical 100-event histories × 256
+    combos × pickled-dict overhead.
+
+    Cross-request: we still batch all requests' (combo × events) into one
+    `agent.forward_batch` to amortize per-call setup."""
+    all_events, lens = [], []
+    heads = ("action",)
+    for (_rid, _wid, _name, _rtype, payload) in reqs:
+        template, hand_pairs, hds = payload
+        heads = hds
+        # Per-request expansion: one combo = one shallow-copied event list
+        # with the `hand` slot overwritten. `dict(e)` matches the actor's old
+        # behaviour (`[dict(e) for e in template]` in _compute_range_probs).
+        # `hand` lives in every event because perception's per-event hand_emb
+        # consumes it.
+        for c1, c2 in hand_pairs:
+            events = [dict(e) for e in template]
+            for e in events:
+                e["hand"] = [c1, c2]
+            all_events.append(events)
+        lens.append(len(hand_pairs))
+    out = agent.forward_batch(all_events, skip_memory=True, heads=set(heads))
+    logits = out["action_logits"]
+    res, off = [], 0
+    for n in lens:
+        res.append(logits[off:off + n].cpu())
+        off += n
+    return res
+
+
+def _run_group(agent, rtype, reqs, device, get_table, resp_qs, root_cache):
     """Run one (agent, req_type) group and scatter responses to the actors."""
-    if rtype == REQ_ROOT:
-        for (rid, wid, name, _rtype, payload) in reqs:
-            res = _run_root(agent, wid, name, payload, device, get_table)
-            resp_qs[wid].put((rid, "OK", res))
-    elif rtype == REQ_LEAF:
-        results = _run_leaf_batch(agent, reqs, device)
-        for req, res in zip(reqs, results):
-            resp_qs[req[1]].put((req[0], "OK", res))
+    n_leaves = 0
+    if rtype == REQ_LEAF:
+        for r in reqs:
+            n_leaves += r[4][0].shape[0]  # ctx.shape[0] per request
+    elif rtype == REQ_LEAF_CACHED:
+        for r in reqs:
+            n_leaves += r[4][0].shape[0]  # delta_ctx.shape[0]
     elif rtype == REQ_FORWARD:
-        results = _run_forward_batch(agent, reqs, device)
-        for req, res in zip(reqs, results):
-            resp_qs[req[1]].put((req[0], "OK", res))
+        for r in reqs:
+            n_leaves += len(r[4][0])  # len(events)
+    elif rtype == REQ_FORWARD_TEMPLATED:
+        for r in reqs:
+            n_leaves += len(r[4][1])  # len(hand_pairs)
+
+    with _timing.span("server_run_group", rtype=rtype, n_reqs=len(reqs),
+                      n_items=n_leaves):
+        if rtype == REQ_ROOT:
+            for (rid, wid, name, _rtype, payload) in reqs:
+                res = _run_root(agent, wid, name, payload, device, get_table,
+                                root_cache)
+                resp_qs[wid].put((rid, "OK", res))
+        elif rtype == REQ_LEAF:
+            results = _run_leaf_batch(agent, reqs, device)
+            for req, res in zip(reqs, results):
+                resp_qs[req[1]].put((req[0], "OK", res))
+        elif rtype == REQ_LEAF_CACHED:
+            results = _run_leaf_cached_batch(agent, reqs, device, root_cache)
+            for req, res in zip(reqs, results):
+                resp_qs[req[1]].put((req[0], "OK", res))
+        elif rtype == REQ_FORWARD:
+            results = _run_forward_batch(agent, reqs, device)
+            for req, res in zip(reqs, results):
+                resp_qs[req[1]].put((req[0], "OK", res))
+        elif rtype == REQ_FORWARD_TEMPLATED:
+            results = _run_forward_templated_batch(agent, reqs, device)
+            for req, res in zip(reqs, results):
+                resp_qs[req[1]].put((req[0], "OK", res))
+        if _timing.ENABLED and isinstance(device, str) and device.startswith("cuda"):
+            # Sync so the span captures actual GPU time, not just launch time.
+            torch.cuda.synchronize()
 
 
 def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
@@ -197,6 +346,13 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
     sys.stderr.flush()
 
     opp_tables = {}
+    # Server-side root_ctx cache: per-(worker, agent) GPU tensors populated by
+    # `_run_root` and consumed by `_run_leaf_cached_batch`. Mirrors the actor's
+    # LocalEvaluator behaviour where root_ctx is computed once per decision
+    # and reused for every LEAF flush. Memory cost: O(n_workers × n_agents),
+    # ~25–50 KB per entry — negligible. Each new ROOT overwrites freely (one
+    # decision = one root), so no LRU bound is needed.
+    root_cache = {}
 
     def get_table(worker_id, agent_name):
         key = (worker_id, agent_name)
@@ -234,6 +390,7 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
                 # smooths arrival jitter.
                 bucket = [first]
                 deadline = time.monotonic() + linger
+                bucket_t0 = time.monotonic() if _timing.ENABLED else 0.0
                 while len(bucket) < max_batch:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -246,9 +403,20 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
                         stop_event.set()
                         break
                     bucket.append(r)
+                if _timing.ENABLED:
+                    _timing.event(
+                        "server_bucket_formed",
+                        n_reqs=len(bucket),
+                        linger_used_ms=(time.monotonic() - bucket_t0) * 1000.0,
+                        hit_max=(len(bucket) >= max_batch),
+                    )
 
                 # Group by (req_type, agent, worker_for_ROOT). ROOT is keyed
                 # by worker too because each worker has its own opp-emb table.
+                # LEAF_CACHED is NOT keyed by worker — `_run_leaf_cached_batch`
+                # looks up each request's own (worker, agent) cache entry while
+                # building context, so cross-worker batching for the same agent
+                # is still safe and desirable.
                 groups = defaultdict(list)
                 for req in bucket:
                     _rid, wid, name, rtype, _payload = req
@@ -258,7 +426,7 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
                 for (rtype, name, _wid), reqs in groups.items():
                     try:
                         _run_group(agents[name], rtype, reqs, device,
-                                   get_table, resp_qs)
+                                   get_table, resp_qs, root_cache)
                     except BaseException:
                         # BaseException so SystemExit/KeyboardInterrupt from
                         # torch don't kill the server silently — surface them

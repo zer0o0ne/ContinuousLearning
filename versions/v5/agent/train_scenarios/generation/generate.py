@@ -189,6 +189,12 @@ def _build_event(table, hero_pos, acting_pos, action, num_players, big_blind, sm
     table_cards = _get_table_display(table)
     bets = np.copy(table.bets)
 
+    # Keep action as a plain Python list so the event dict can cross process
+    # boundaries via normal pickle (shared-memory tensor sharing exhausts
+    # `vm.max_map_count` after ~10k hands — see `_rebuild_events`).
+    if isinstance(action, torch.Tensor):
+        action = action.detach().cpu().tolist()
+
     return {
         "hand": hand,
         "num_players": num_players,
@@ -602,7 +608,13 @@ def _rebuild_events(snapshots, deck, hero_pos, num_players, big_blind, small_bli
         table_cards = _get_table_display_from_turn(deck, snap["turn"])
         action = snap["action"]
         if action is None:
-            action = torch.zeros(n_actions, dtype=torch.float32)
+            action = [0.0] * n_actions
+        elif isinstance(action, torch.Tensor):
+            # Plain-Python action vector — torch.Tensor here would force IPC to
+            # use shared-memory tensor sharing (one mmap + one FD per event),
+            # exhausting `vm.max_map_count` / `ulimit -n` after ~10k hands when
+            # results stream back to the main process. Lists pickle inline.
+            action = action.detach().cpu().tolist()
         events.append({
             "hand": hand,
             "num_players": num_players,

@@ -168,7 +168,13 @@ def _build_shared_events(snapshots, deck, fixed_hands, num_players,
 
         action = snap["action"]
         if action is None:
-            action = torch.zeros(n_actions, dtype=torch.float32)
+            action = [0.0] * n_actions
+        elif isinstance(action, torch.Tensor):
+            # Plain-Python action vector — see `generate.py:_rebuild_events`
+            # for why: torch.Tensor in event dicts forces shared-memory IPC
+            # which exhausts `vm.max_map_count` after ~10k hands when
+            # results stream back to the main process.
+            action = action.detach().cpu().tolist()
 
         hands = {}
         for pos, hand in fixed_hands.items():

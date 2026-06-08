@@ -31,7 +31,18 @@ import os
 import sys
 import time
 
-import torch
+# Set the CUDA allocator to expandable_segments BEFORE importing torch.
+# With random-init agents the opp-data range never narrows (uniform action
+# distributions trip neither `range_threshold` nor anything else), so each
+# decision repeatedly allocates very large attention matrices. The default
+# allocator fragments after ~hundred hands and starts OOMing on requests it
+# could have served before. Production training with trained checkpoints
+# doesn't hit this because range narrows quickly to ~tens of combos.
+# `expandable_segments:True` lets the allocator grow/shrink contiguously,
+# essentially eliminating the fragmentation OOMs we see in the bench.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+import torch  # noqa: E402  -- must come after the env var above
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -176,6 +187,21 @@ def _bench_opponent(config, n_workers, n_hands, device, log, agents_dir):
 
     agents_override = None
     if not agents_dir:
+        # Random-init agents make range narrowing ineffective (uniform action
+        # distributions never trip the `range_threshold` filter), so every
+        # decision processes the full ~1300-combo range. With the production
+        # `max_batch_combos=512` that means a (512, ~245, 384) forward whose
+        # attention matrix alone is ~10 GiB — 4090 OOMs on the second or
+        # third such chunk. Override to a small batch for the bench: still
+        # the same TOTAL combo count and forward FLOPs (so parallel-speedup
+        # is measured correctly), just split into more, smaller chunks.
+        # Production training with trained checkpoints quickly narrows the
+        # range and never sees this; that's why 512 works there.
+        cfg["opponent_data"]["max_batch_combos"] = 64
+        log(f"  random-init mode: max_batch_combos override to "
+            f"{cfg['opponent_data']['max_batch_combos']} to avoid OOM "
+            f"(range narrowing is ineffective with random weights)")
+
         # Build random-init agents matching the multi_agent config layout.
         # In parallel mode keep them on CPU — the inference server holds the
         # GPU copies (same memory trick as the MCTS bench path).
@@ -302,25 +328,30 @@ def main():
             os.environ["MCTS_TIMING_PATH"] = os.path.join(run_dir, "t.jsonl")
 
         if not args.skip_mcts:
-            wall, n_ex = _bench_mcts(
-                config, nw, args.mcts_hands, args.mcts_sims, device, log,
-                args.agents_dir or None)
-            ex_per_s = n_ex / wall if wall > 0 else 0
-            results["mcts"].append((nw, wall, n_ex, ex_per_s))
-            log(f"  MCTS n_workers={nw}: {wall:.2f}s, {n_ex} examples, "
-                f"{ex_per_s:.1f} ex/s")
+            try:
+                wall, n_ex = _bench_mcts(
+                    config, nw, args.mcts_hands, args.mcts_sims, device, log,
+                    args.agents_dir or None)
+                ex_per_s = n_ex / wall if wall > 0 else 0
+                results["mcts"].append((nw, wall, n_ex, ex_per_s))
+                log(f"  MCTS n_workers={nw}: {wall:.2f}s, {n_ex} examples, "
+                    f"{ex_per_s:.1f} ex/s")
+            except BaseException as e:
+                log(f"  MCTS n_workers={nw}: FAILED — {type(e).__name__}: {e}")
+                _cleanup_cuda()
 
         if not args.skip_opp:
-            # `_bench_opponent` builds random-init agents internally when
-            # `--agents-dir` is not provided. Throughput is meaningful even
-            # with random weights (same forward passes, same IPC volume).
-            wall, n_sc = _bench_opponent(
-                config, nw, args.opp_hands, device, log,
-                args.agents_dir or None)
-            sc_per_s = n_sc / wall if wall > 0 else 0
-            results["opp"].append((nw, wall, n_sc, sc_per_s))
-            log(f"  Opp  n_workers={nw}: {wall:.2f}s, {n_sc} scenarios, "
-                f"{sc_per_s:.1f} sc/s")
+            try:
+                wall, n_sc = _bench_opponent(
+                    config, nw, args.opp_hands, device, log,
+                    args.agents_dir or None)
+                sc_per_s = n_sc / wall if wall > 0 else 0
+                results["opp"].append((nw, wall, n_sc, sc_per_s))
+                log(f"  Opp  n_workers={nw}: {wall:.2f}s, {n_sc} scenarios, "
+                    f"{sc_per_s:.1f} sc/s")
+            except BaseException as e:
+                log(f"  Opp  n_workers={nw}: FAILED — {type(e).__name__}: {e}")
+                _cleanup_cuda()
 
     print("\n" + "=" * 60)
     print("MCTS benchmark")

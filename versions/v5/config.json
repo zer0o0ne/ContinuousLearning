@@ -270,6 +270,9 @@
         "run_opponent_action_train": true,
         "run_mcts_train": true,
         "run_evaluation": false,
-        "run_slumbot_eval": false
+        "run_slumbot_eval": false,
+        "resume": false,
+        "force_restart_phases": [],
+        "force_restart_agents": []
     }
 }

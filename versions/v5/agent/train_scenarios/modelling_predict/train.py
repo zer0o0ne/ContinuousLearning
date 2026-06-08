@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
     _compute_norm_stats, _normalize_scenarios
 from agent.train_scenarios.modelling_predict.dataset import GTOModellingDataset, batch_collate
+from agent.resume import atomic_torch_save
 
 
 class LengthGroupedBatchSampler(Sampler):
@@ -193,7 +194,27 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
 
 def _save_history(history, run_dir):
     """Save training history incrementally for real-time monitoring."""
-    torch.save(history, os.path.join(run_dir, "history.pt"))
+    atomic_torch_save(history, os.path.join(run_dir, "history.pt"))
+
+
+def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
+                 next_epoch, global_step, best_val_loss, fails_since_best,
+                 val_loss, temperature=None):
+    """Atomic per-epoch checkpoint for pipeline.resume."""
+    ckpt = {
+        "model_state_dict":     agent.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "next_epoch":           next_epoch,
+        "global_step":          global_step,
+        "best_val_loss":        best_val_loss,
+        "fails_since_best":     fails_since_best,
+        "norm_stats":           norm_stats,
+        "val_loss":             val_loss,
+    }
+    if temperature is not None:
+        ckpt["temperature"] = temperature
+    atomic_torch_save(ckpt, os.path.join(run_dir, "latest.pt"))
 
 
 def _check_val(val_loss, best_val_loss, fails_since_best, interrupt_after_fails, log):
@@ -222,7 +243,8 @@ def _normalize_action_evs(scenarios, norm_stats):
             s["action_evs"] = [(ev / denom - ev_m) / ev_s for ev in evs]
 
 
-def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temperature=None):
+def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
+                    temperature=None, run_dir=None, resume_state=None):
     """Main training entry point for modelling head.
 
     Args:
@@ -232,6 +254,9 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
         log: logger callable
         scenarios_override: if provided, use these raw scenarios instead of loading/generating
         temperature: effective temperature for this agent (saved in checkpoint)
+        run_dir: pre-existing run directory (reused on resume).
+        resume_state: optimizer/scheduler/counters from a prior interrupted
+            run — see gto_ev_predict.train for the schema.
     """
     lr = train_cfg.get("lr", 1e-4)
     batch_size = train_cfg.get("batch_size", 64)
@@ -262,8 +287,12 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
     loss_fn = nn.SmoothL1Loss(beta=1.0)
 
-    # Run directory
-    run_dir = log.run_dir("modelling_predict")
+    # Run directory: reuse one passed by the pipeline (resume) or create
+    # a fresh timestamped directory.
+    if run_dir is None:
+        run_dir = log.run_dir("modelling_predict")
+    else:
+        os.makedirs(run_dir, exist_ok=True)
 
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
 
@@ -286,15 +315,20 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
             return None, run_dir
 
     # Use norm stats from checkpoint (same distribution perception was trained on)
-    # to avoid distribution mismatch with frozen perception.
+    # to avoid distribution mismatch with frozen perception. On resume, the
+    # pipeline has already restored `_checkpoint_norm_stats` from `latest.pt`.
     scenarios = copy.deepcopy(scenarios)
-    checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
-    if checkpoint_norm_stats is not None:
-        norm_stats = checkpoint_norm_stats
-        log("Using norm stats from agent checkpoint (matches perception training)")
+    if resume_state is not None and resume_state.get("norm_stats"):
+        norm_stats = resume_state["norm_stats"]
+        log("Using norm stats from resume_state")
     else:
-        norm_stats = _compute_norm_stats(scenarios)
-        log("No checkpoint norm stats — computing from scenarios")
+        checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
+        if checkpoint_norm_stats is not None:
+            norm_stats = checkpoint_norm_stats
+            log("Using norm stats from agent checkpoint (matches perception training)")
+        else:
+            norm_stats = _compute_norm_stats(scenarios)
+            log("No checkpoint norm stats — computing from scenarios")
     log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
     _normalize_action_evs(scenarios, norm_stats)  # BEFORE _normalize_scenarios (uses raw big_blind)
     _normalize_scenarios(scenarios, norm_stats)
@@ -326,11 +360,37 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
 
     best_val_loss = float("inf")
     fails_since_best = 0
-    history = {"step_loss": [], "val_loss": [], "epoch_train_loss": [], "epoch_val_loss": []}
     global_step = 0
+    start_epoch = 0
+
+    history_path = os.path.join(run_dir, "history.pt")
+    if os.path.exists(history_path):
+        history = torch.load(history_path, weights_only=False)
+        for k in ("step_loss", "val_loss", "epoch_train_loss", "epoch_val_loss"):
+            history.setdefault(k, [])
+        log(f"Resumed history from {history_path} "
+            f"(step_loss n={len(history['step_loss'])})")
+    else:
+        history = {"step_loss": [], "val_loss": [],
+                   "epoch_train_loss": [], "epoch_val_loss": []}
+
+    if resume_state is not None:
+        try:
+            optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        except Exception as e:
+            log(f"  Optimizer/scheduler restore failed: {e}. "
+                f"Continuing with fresh ones.")
+        start_epoch = int(resume_state.get("start_epoch", 0))
+        global_step = int(resume_state.get("global_step", 0))
+        best_val_loss = float(resume_state.get("best_val_loss", float("inf")))
+        fails_since_best = int(resume_state.get("fails_since_best", 0))
+        log(f"  [resume] start_epoch={start_epoch}, global_step={global_step}, "
+            f"best_val_loss={best_val_loss:.6f}, "
+            f"fails_since_best={fails_since_best}")
     stopped_early = False
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         if stopped_early:
             break
 
@@ -414,6 +474,12 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None, temp
         if val_loss_avg < prev_best:
             _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
                        global_step, epoch, val_loss_avg, log, temperature=temperature)
+
+        _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
+                     next_epoch=epoch + 1, global_step=global_step,
+                     best_val_loss=best_val_loss,
+                     fails_since_best=fails_since_best,
+                     val_loss=val_loss_avg, temperature=temperature)
 
         if should_stop:
             break

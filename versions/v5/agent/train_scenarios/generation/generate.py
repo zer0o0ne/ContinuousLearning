@@ -22,6 +22,7 @@ import copy
 import random
 import argparse
 import multiprocessing as mp
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -29,6 +30,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from env.table import Table
+from agent.resume import atomic_torch_save, atomic_json_dump
 
 # Add gto_utils to path for direct import
 _gto_utils_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "gto_utils")
@@ -996,20 +998,54 @@ def _normalize_scenarios(scenarios, norm_stats):
                 event["bets"] = [(b - bets_m) / bets_s for b in event["bets"]]
 
 
-def load_dataset(dataset_dir, log=None):
+def _meta_path(dataset_dir):
+    return os.path.join(dataset_dir, "meta.json")
+
+
+def _read_meta(dataset_dir):
+    """Read meta.json sidecar, or return None if absent/unreadable."""
+    p = _meta_path(dataset_dir)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_meta(dataset_dir, meta):
+    """Atomically persist the meta.json sidecar."""
+    atomic_json_dump(meta, _meta_path(dataset_dir))
+
+
+def load_dataset(dataset_dir, log=None, strict_done=False):
     """Load a raw dataset from a directory.
 
     Args:
         dataset_dir: directory containing dataset.pt
         log: optional logger
+        strict_done: if True, only return scenarios when meta.json marks the
+            dataset as fully generated (`done: true`). Resumable callers use
+            this to avoid loading a partial dataset as complete. Legacy
+            callers (no meta.json) keep the old behaviour: load whatever's
+            on disk.
 
     Returns:
-        scenarios list, or None if dataset.pt not found
+        scenarios list, or None if missing / partial-when-strict
     """
     dataset_path = os.path.join(dataset_dir, "dataset.pt")
 
     if not os.path.exists(dataset_path):
         return None
+
+    meta = _read_meta(dataset_dir)
+    if strict_done:
+        if meta is None or not meta.get("done"):
+            if log:
+                log(f"Dataset at {dataset_dir} present but not marked done; "
+                    f"will resume/regenerate")
+            return None
 
     scenarios = torch.load(dataset_path, weights_only=False)
     if log:
@@ -1074,7 +1110,7 @@ def _generate_worker(args):
     return scenarios, n_hands - failed, failed
 
 
-def generate_dataset(config, save_dir, log=None):
+def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None):
     """Generate full dataset of scenarios with both EV and action prob labels.
 
     Saves raw (unnormalized) data. Normalization is done at training time
@@ -1091,15 +1127,19 @@ def generate_dataset(config, save_dir, log=None):
         config: merged config dict (game + solver + scenario-specific)
         save_dir: directory to save dataset.pt
         log: optional logger
+        resume: if True, look at meta.json and continue from where a prior
+            interrupted run left off (sequential mode only — parallel mode
+            still treats partial datasets as all-or-nothing). Verifies
+            `meta.config_hash == config_hash`; on mismatch the existing
+            dataset is renamed to `dataset.pt.stale.<ts>` and generation
+            starts from scratch.
+        config_hash: hash of game.* + solver.* (see `agent.resume.compute_config_hash`).
+            Stored in meta.json so subsequent resumes know whether the
+            dataset is still compatible. Required when `resume=True`.
 
     Returns:
         scenarios list
     """
-    # Try loading existing dataset first
-    existing = load_dataset(save_dir, log=log)
-    if existing is not None:
-        return existing
-
     n_scenarios = config.get("n_scenarios", 50000)
     n_workers = config.get("n_workers", 0)
     if n_workers <= 0:
@@ -1107,13 +1147,98 @@ def generate_dataset(config, save_dir, log=None):
 
     device = _get_generation_device(config.get("device"))
     dataset_path = os.path.join(save_dir, "dataset.pt")
-
     os.makedirs(save_dir, exist_ok=True)
-
     save_every_hands = config.get("save_every_hands", 1000)
 
+    # -----------------------------------------------------------------
+    # Resume bookkeeping
+    # -----------------------------------------------------------------
+    # `start_attempts` = how many hands the prior run already attempted
+    # (good + failed). `start_hand_id` = the next monotonic hand_id to
+    # assign. Carried over via meta.json. When not resuming or no usable
+    # meta exists, both stay zero and behaviour matches the legacy path.
+    scenarios = []
+    start_attempts = 0
+    start_hand_id = 0
+    initial_failed = 0
+
+    if resume:
+        meta = _read_meta(save_dir)
+        if meta is not None:
+            # Config-hash mismatch invalidates the on-disk dataset entirely.
+            if config_hash is not None \
+                    and meta.get("config_hash") != config_hash:
+                stale = (f"{dataset_path}.stale."
+                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                if log:
+                    log(f"Dataset config_hash mismatch (was "
+                        f"{meta.get('config_hash')!r}, now {config_hash!r}). "
+                        f"Renaming existing to {os.path.basename(stale)} "
+                        f"and starting fresh.")
+                if os.path.exists(dataset_path):
+                    os.replace(dataset_path, stale)
+                # also drop the stale meta — it would otherwise confuse
+                # the next resume.
+                try:
+                    os.unlink(_meta_path(save_dir))
+                except OSError:
+                    pass
+            elif meta.get("done") and meta.get("target", 0) >= n_scenarios:
+                # Fully generated previously with at least as many attempts
+                # as we want now — just load and return.
+                if log:
+                    log(f"Dataset already complete at {save_dir} "
+                        f"(target={meta['target']} >= {n_scenarios})")
+                return torch.load(dataset_path, weights_only=False)
+            elif os.path.exists(dataset_path):
+                # Partial dataset compatible with current config — load and
+                # continue from where the prior run stopped. Parallel mode
+                # has no way to safely resume mid-flight (workers don't
+                # checkpoint individually), so we fall back to from-scratch
+                # there.
+                if n_workers > 1 and n_scenarios >= n_workers * 2:
+                    if log:
+                        log(f"Partial dataset present but n_workers>1; "
+                            f"parallel mode does not support mid-generation "
+                            f"resume — regenerating from scratch.")
+                    os.unlink(dataset_path)
+                    try:
+                        os.unlink(_meta_path(save_dir))
+                    except OSError:
+                        pass
+                else:
+                    scenarios = torch.load(dataset_path, weights_only=False)
+                    start_attempts = int(meta.get("completed_attempts", 0))
+                    start_hand_id = int(meta.get("completed_hands", 0))
+                    initial_failed = max(0, start_attempts - start_hand_id)
+                    if log:
+                        log(f"Resuming dataset at {save_dir}: "
+                            f"{start_attempts}/{n_scenarios} attempts done, "
+                            f"{len(scenarios)} samples on disk, "
+                            f"next hand_id={start_hand_id}")
+
+    # If we reach here without a partial-resume and the dataset is already
+    # present (legacy non-resume usage), short-circuit as before.
+    if not resume and start_attempts == 0:
+        existing = load_dataset(save_dir, log=log)
+        if existing is not None:
+            return existing
+
+    def _persist(meta_done):
+        atomic_torch_save(scenarios, dataset_path)
+        if config_hash is not None or resume:
+            _write_meta(save_dir, {
+                "version":            1,
+                "target":             n_scenarios,
+                "completed_attempts": completed_attempts,
+                "completed_hands":    completed_hands,
+                "done":               bool(meta_done),
+                "config_hash":        config_hash,
+                "n_workers":          n_workers,
+            })
+
     if n_workers > 1 and n_scenarios >= n_workers * 2:
-        # --- Multiprocessing path ---
+        # --- Multiprocessing path (no mid-generation resume) ---
         worker_device = _get_generation_device(config.get("device"))
         if log:
             log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
@@ -1136,6 +1261,8 @@ def generate_dataset(config, save_dir, log=None):
         total_ok = 0
         total_failed = 0
         last_save_count = 0
+        completed_attempts = 0
+        completed_hands = 0
 
         pbar = tqdm(total=n_scenarios, desc="Generating hands")
 
@@ -1144,11 +1271,13 @@ def generate_dataset(config, save_dir, log=None):
                 scenarios.extend(worker_scenarios)
                 total_ok += ok
                 total_failed += failed
+                completed_attempts = counter.value
+                completed_hands = total_ok
                 pbar.n = counter.value
                 pbar.refresh()
 
                 if counter.value - last_save_count >= save_every_hands:
-                    torch.save(scenarios, dataset_path)
+                    _persist(meta_done=False)
                     last_save_count = counter.value
                     if log:
                         log(f"  Incremental save: {len(scenarios)} samples ({counter.value} hands)")
@@ -1162,39 +1291,51 @@ def generate_dataset(config, save_dir, log=None):
 
     else:
         # --- Sequential path (n_workers=1 or very few scenarios) ---
+        # Supports partial-resume: continues attempts counter and hand_id
+        # from where the prior run stopped.
+        remaining_attempts = n_scenarios - start_attempts
         if log:
-            log(f"Generating {n_scenarios} hands on {device} (saving every {save_every_hands} hands)...")
+            if start_attempts > 0:
+                log(f"Resuming sequential generation on {device}: "
+                    f"{remaining_attempts} attempts remaining "
+                    f"(saving every {save_every_hands} hands)")
+            else:
+                log(f"Generating {n_scenarios} hands on {device} "
+                    f"(saving every {save_every_hands} hands)...")
 
-        scenarios = []
-        failed = 0
-        hands_done = 0
-        last_save_at = 0
-        hand_id = 0
-        for _ in tqdm(range(n_scenarios), desc="Generating hands"):
+        failed = initial_failed
+        completed_attempts = start_attempts
+        completed_hands = start_hand_id
+        hand_id = start_hand_id
+        last_save_at = start_attempts
+        for _ in tqdm(range(remaining_attempts), desc="Generating hands"):
             result = generate_scenario(config, device=device)
             if result is not None:
                 for s in result:
                     s["hand_id"] = hand_id
                 scenarios.extend(result)
                 hand_id += 1
+                completed_hands = hand_id
             else:
                 failed += 1
-            hands_done += 1
+            completed_attempts += 1
 
-            if hands_done - last_save_at >= save_every_hands:
-                torch.save(scenarios, dataset_path)
-                last_save_at = hands_done
+            if completed_attempts - last_save_at >= save_every_hands:
+                _persist(meta_done=False)
+                last_save_at = completed_attempts
                 if log:
-                    log(f"  Incremental save: {len(scenarios)} samples ({hands_done} hands)")
+                    log(f"  Incremental save: {len(scenarios)} samples "
+                        f"({completed_attempts} hands)")
 
         if log:
-            log(f"Generated {len(scenarios)} samples from {n_scenarios - failed} hands ({failed} failed)")
+            log(f"Generated {len(scenarios)} samples from "
+                f"{completed_attempts - failed} hands ({failed} failed)")
 
     if log and scenarios:
         lengths = [s["n_events"] for s in scenarios]
         log(f"Sequence lengths: min={min(lengths)}, max={max(lengths)}, avg={sum(lengths)/len(lengths):.1f}")
 
-    torch.save(scenarios, dataset_path)
+    _persist(meta_done=True)
     if log:
         log(f"Dataset saved to {dataset_path}")
 

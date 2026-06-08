@@ -4,6 +4,9 @@ import copy
 
 from utils import Logger
 from agent.agent import ASI
+from agent.resume import (
+    PipelineState, compute_config_hash, atomic_torch_save,
+)
 
 
 def _find_latest_best_ckpt(scenario_dir):
@@ -22,8 +25,13 @@ def _find_latest_best_ckpt(scenario_dir):
 
 
 def _run_or_skip_phase(scenario_name, agent, agent_base, agent_log, train_fn):
-    """If scenario already has a best.pt, load it and skip. Otherwise run train_fn()
-    and load its best.pt. Returns the path to the loaded best.pt (or None)."""
+    """Legacy non-resume helper: if scenario already has a best.pt, load it
+    and skip. Otherwise run train_fn() and load its best.pt. Returns the
+    path to the loaded best.pt (or None).
+
+    Used only when `pipeline.resume` is False. The resume-aware variant
+    `_run_or_resume_phase` lives next to it.
+    """
     existing = _find_latest_best_ckpt(os.path.join(agent_base, scenario_name))
     if existing is not None:
         agent_log(f"  [resume] {scenario_name}: loading existing {existing}, "
@@ -39,6 +47,103 @@ def _run_or_skip_phase(scenario_name, agent, agent_base, agent_log, train_fn):
     return None
 
 
+def _run_or_resume_phase(state, agent, agent_name, scenario_name,
+                         agent_base, agent_log, device, train_fn):
+    """Resume-aware phase runner.
+
+    `train_fn(run_dir, resume_state) -> (history, run_dir)` is invoked with
+    the run directory and (when applicable) a `resume_state` dict that the
+    train scripts use to restore optimizer/scheduler/global_step/etc. The
+    pipeline state is updated to `in_progress` before the call and `done`
+    after a successful return.
+
+    Status transitions:
+      pending     → run from scratch, fresh run_dir
+      in_progress → load latest.pt, continue from saved epoch
+      done        → skip; load best.pt and return immediately
+      force flag  → treat as `pending` (ignore on-disk progress)
+    """
+    import torch
+
+    force = state.should_force_restart_phase(agent_name, scenario_name)
+    phase = state.get_phase(agent_name, scenario_name)
+
+    if not force and phase and phase.get("status") == "done":
+        # Already complete in a prior run — just load the best.pt and skip.
+        agent_log(f"  [resume] {scenario_name}: status=done, "
+                  f"loading existing best.pt")
+        agent.load_checkpoint(os.path.join(agent_base, scenario_name))
+        return
+
+    resume_state = None
+    run_dir = None
+    if not force and phase and phase.get("status") == "in_progress":
+        run_dir = phase.get("run_dir")
+        if run_dir and os.path.isdir(run_dir):
+            latest_path = os.path.join(run_dir, "latest.pt")
+            if os.path.exists(latest_path):
+                ckpt = torch.load(
+                    latest_path, weights_only=False, map_location=device)
+                agent.load_state_dict(ckpt["model_state_dict"], strict=False)
+                ns = ckpt.get("norm_stats")
+                if ns is not None:
+                    agent._checkpoint_norm_stats = ns
+                resume_state = {
+                    "optimizer_state_dict": ckpt["optimizer_state_dict"],
+                    "scheduler_state_dict": ckpt["scheduler_state_dict"],
+                    "start_epoch":     int(ckpt.get("next_epoch", 0)),
+                    "global_step":     int(ckpt.get("global_step", 0)),
+                    "best_val_loss":   float(ckpt.get("best_val_loss",
+                                                       float("inf"))),
+                    "fails_since_best": int(ckpt.get("fails_since_best", 0)),
+                    "norm_stats":      ns,
+                }
+                agent_log(
+                    f"  [resume] {scenario_name}: starting from "
+                    f"epoch={resume_state['start_epoch']}, "
+                    f"step={resume_state['global_step']}")
+            else:
+                agent_log(
+                    f"  [resume] {scenario_name}: status=in_progress but "
+                    f"no latest.pt at {run_dir} — restarting fresh")
+                run_dir = None
+
+    if run_dir is None:
+        run_dir = agent_log.run_dir(scenario_name)
+    state.set_phase(agent_name, scenario_name,
+                    status="in_progress", run_dir=run_dir)
+
+    train_fn(run_dir=run_dir, resume_state=resume_state)
+
+    best_ckpt = os.path.join(run_dir, "best.pt")
+    if os.path.exists(best_ckpt):
+        agent.load_checkpoint(best_ckpt)
+    state.set_phase(agent_name, scenario_name,
+                    status="done", run_dir=run_dir)
+
+
+def _run_phase(state, scenario_name, agent, agent_name, agent_base,
+               agent_log, device, train_fn):
+    """Unified phase entry point.
+
+    `train_fn(run_dir, resume_state) -> (history, run_dir)` must accept the
+    two kwargs — resume-aware train scripts already do.
+
+    Dispatches:
+      state.resume=True  -> resume-aware path (per-epoch latest.pt,
+                            optimizer/scheduler restore, pipeline_state.json).
+      state.resume=False -> legacy behaviour (skip if any best.pt exists in
+                            the scenario dir; otherwise fresh run).
+    """
+    if state.resume:
+        _run_or_resume_phase(state, agent, agent_name, scenario_name,
+                             agent_base, agent_log, device, train_fn)
+    else:
+        _run_or_skip_phase(
+            scenario_name, agent, agent_base, agent_log,
+            lambda: train_fn(run_dir=None, resume_state=None))
+
+
 def _merge_train_config(config, scenario_key):
     """Merge game + solver + dataset + scenario-specific config into a flat dict."""
     merged = {}
@@ -51,10 +156,21 @@ def _merge_train_config(config, scenario_key):
     return merged
 
 
-def _load_or_generate_dataset(config, base_dir, device, log):
-    """Load dataset from dataset_dir, or generate into it / base_dir.
+def _load_or_generate_dataset(config, base_dir, device, log,
+                              state=None, config_hash=None, resume=False):
+    """Load dataset from `dataset_dir`, or generate into it / base_dir.
 
     Returns raw (unnormalized) scenarios list.
+
+    When `resume=True`:
+    - The default save directory is `<base_dir>/dataset/` (no timestamp), so
+      successive runs find the same file. Pass `dataset.save_dir` or
+      `dataset.dataset_dir` to override.
+    - `generate_dataset` is invoked with `resume=True, config_hash=...`. It
+      reads `meta.json`, returns immediately if `done=true` and target is
+      sufficient, otherwise continues a partial run (sequential mode only).
+    - The pipeline-state file mirrors the per-dataset status so other
+      operations (force_restart, hash mismatch) see one source of truth.
     """
     import torch
     from agent.train_scenarios.generation.generate import generate_dataset, load_dataset
@@ -71,23 +187,36 @@ def _load_or_generate_dataset(config, base_dir, device, log):
     gen_cfg.update(solver_cfg)
     gen_cfg.update(dataset_cfg)
 
-    if dataset_dir:
-        # Try loading from specified dir
+    # Determine where to read/save the dataset.
+    if save_dir:
+        dataset_save_dir = save_dir
+    elif dataset_dir:
+        dataset_save_dir = dataset_dir
+    elif resume:
+        # Stable path so the SAME location is found on every restart.
+        dataset_save_dir = os.path.join(base_dir, "dataset")
+    else:
+        # Legacy path with init_time — fresh dir per run.
+        dataset_save_dir = os.path.join(base_dir, "dataset", log.init_time)
+
+    if not resume and dataset_dir:
+        # Legacy non-resume: try loading from the explicit dataset_dir first.
         scenarios = load_dataset(dataset_dir, log=log)
         if scenarios is not None:
             return scenarios
         log(f"Dataset not found at {dataset_dir}, generating...")
 
-    # Determine where to save the generated dataset
-    if save_dir:
-        dataset_save_dir = save_dir
-    elif dataset_dir:
-        dataset_save_dir = dataset_dir
-    else:
-        dataset_save_dir = os.path.join(base_dir, "dataset", log.init_time)
-
     os.makedirs(dataset_save_dir, exist_ok=True)
-    return generate_dataset(gen_cfg, dataset_save_dir, log=log)
+
+    scenarios = generate_dataset(
+        gen_cfg, dataset_save_dir, log=log,
+        resume=resume, config_hash=config_hash)
+
+    if state is not None and scenarios:
+        state.set_dataset(
+            "gto", path=dataset_save_dir, target=int(gen_cfg.get("n_scenarios", 0)),
+            completed_hands=len(scenarios), done=True, config_hash=config_hash)
+    return scenarios
 
 
 def main():
@@ -130,6 +259,40 @@ def main():
     pipeline_cfg = config.get("pipeline", {})
     multi_agent = config.get("multi_agent")
 
+    # ----- resume configuration --------------------------------------
+    resume = bool(pipeline_cfg.get("resume", False))
+    force_phases = pipeline_cfg.get("force_restart_phases", []) or []
+    force_agents = pipeline_cfg.get("force_restart_agents", []) or []
+    config_hash = compute_config_hash(config)
+
+    # State file lives next to the per-agent save dirs in multi-agent runs;
+    # for single-agent it sits in the experiment base_dir.
+    if multi_agent:
+        save_dir_cfg = multi_agent.get("save_dir", "")
+        if save_dir_cfg and os.path.isabs(save_dir_cfg):
+            state_root = save_dir_cfg
+        else:
+            state_root = os.path.join(project_root, "data", version,
+                                       save_dir_cfg or name)
+    else:
+        state_root = base_dir
+    os.makedirs(state_root, exist_ok=True)
+    state_path = os.path.join(state_root, "pipeline_state.json")
+
+    state = PipelineState.load_or_create(
+        state_path, resume=resume, config_hash=config_hash, log=log,
+        force_phases=force_phases, force_agents=force_agents)
+
+    # First-time bootstrap: scan on-disk best.pt artefacts and pre-fill
+    # `done` statuses so the user can enable resume on an already-trained
+    # experiment without losing prior phases.
+    if resume and multi_agent:
+        state.bootstrap_from_disk(
+            state_root, [a["name"] for a in multi_agent.get("agents", [])])
+    if resume:
+        log(f"Resume mode: ON. force_phases={force_phases}, "
+            f"force_agents={force_agents}")
+
     needs_training = (pipeline_cfg.get("run_gto_ev", True)
                       or pipeline_cfg.get("run_gto_probs", False)
                       or pipeline_cfg.get("run_gto_training", False)
@@ -138,7 +301,9 @@ def main():
     # --- Load/generate dataset only if training is enabled ---
     base_scenarios = None
     if needs_training:
-        base_scenarios = _load_or_generate_dataset(config, base_dir, device, log)
+        base_scenarios = _load_or_generate_dataset(
+            config, base_dir, device, log,
+            state=state, config_hash=config_hash, resume=resume)
         if not base_scenarios:
             log("No dataset available. Aborting.")
             return
@@ -205,34 +370,46 @@ def main():
             probs_train_cfg = _merge_train_config(config, "gto_probs_train")
 
             if pipeline_cfg.get("run_gto_ev", True):
-                _run_or_skip_phase(
-                    "gto_ev_predict", agent, agent_base, agent_log,
-                    lambda: train_gto_ev(agent, ev_train_cfg, device, agent_log,
-                                         scenarios_override=modified,
-                                         temperature=agent_temperature))
+                _run_phase(
+                    state, "gto_ev_predict", agent, agent_name,
+                    agent_base, agent_log, device,
+                    lambda run_dir, resume_state: train_gto_ev(
+                        agent, ev_train_cfg, device, agent_log,
+                        scenarios_override=modified,
+                        temperature=agent_temperature,
+                        run_dir=run_dir, resume_state=resume_state))
 
             if pipeline_cfg.get("run_gto_probs", False):
-                _run_or_skip_phase(
-                    "gto_probs_predict", agent, agent_base, agent_log,
-                    lambda: train_gto_probs(agent, probs_train_cfg, device, agent_log,
-                                            scenarios_override=modified,
-                                            temperature=agent_temperature))
+                _run_phase(
+                    state, "gto_probs_predict", agent, agent_name,
+                    agent_base, agent_log, device,
+                    lambda run_dir, resume_state: train_gto_probs(
+                        agent, probs_train_cfg, device, agent_log,
+                        scenarios_override=modified,
+                        temperature=agent_temperature,
+                        run_dir=run_dir, resume_state=resume_state))
 
             if pipeline_cfg.get("run_gto_training", False):
                 gto_train_cfg = _merge_train_config(config, "gto_train")
-                _run_or_skip_phase(
-                    "gto_predict", agent, agent_base, agent_log,
-                    lambda: train_gto(agent, gto_train_cfg, device, agent_log,
-                                      scenarios_override=modified,
-                                      temperature=agent_temperature))
+                _run_phase(
+                    state, "gto_predict", agent, agent_name,
+                    agent_base, agent_log, device,
+                    lambda run_dir, resume_state: train_gto(
+                        agent, gto_train_cfg, device, agent_log,
+                        scenarios_override=modified,
+                        temperature=agent_temperature,
+                        run_dir=run_dir, resume_state=resume_state))
 
             if pipeline_cfg.get("run_modelling", False):
                 modelling_cfg = _merge_train_config(config, "modelling_train")
-                _run_or_skip_phase(
-                    "modelling_predict", agent, agent_base, agent_log,
-                    lambda: train_modelling(agent, modelling_cfg, device, agent_log,
-                                            scenarios_override=modified,
-                                            temperature=agent_temperature))
+                _run_phase(
+                    state, "modelling_predict", agent, agent_name,
+                    agent_base, agent_log, device,
+                    lambda run_dir, resume_state: train_modelling(
+                        agent, modelling_cfg, device, agent_log,
+                        scenarios_override=modified,
+                        temperature=agent_temperature,
+                        run_dir=run_dir, resume_state=resume_state))
 
     elif needs_training:
         # --- Single-agent training ---
@@ -285,10 +462,26 @@ def main():
         opp_save_cfg = opp_cfg.get("save_dir", "")
         if opp_save_cfg and os.path.isabs(opp_save_cfg):
             opp_save_dir = opp_save_cfg
+        elif opp_save_cfg:
+            # Relative path — anchor at project_root/data/<version>/.
+            opp_save_dir = os.path.join(project_root, "data", version, opp_save_cfg)
+        elif resume:
+            # Stable path so resume always points at the same file.
+            opp_save_dir = os.path.join(base_dir, "opponent_dataset")
         else:
+            # Legacy: timestamped fresh dir.
             opp_save_dir = os.path.join(base_dir, "opponent_dataset", log.init_time)
 
-        opp_scenarios = generate_opponent_dataset(config, opp_save_dir, device, log)
+        opp_scenarios = generate_opponent_dataset(
+            config, opp_save_dir, device, log,
+            resume=resume, config_hash=config_hash)
+
+        if resume and opp_scenarios:
+            state.set_dataset(
+                "opponent", path=opp_save_dir,
+                target=int(opp_cfg.get("n_hands", 0)),
+                completed_hands=len(opp_scenarios),
+                done=True, config_hash=config_hash)
 
         if pipeline_cfg.get("run_opponent_action_train", False) and opp_scenarios:
             from agent.train_scenarios.opponent_action_predict.train import train_opponent_action
@@ -318,18 +511,21 @@ def main():
 
                     agent = ASI(agent_log, config)
                     agent.set_device(device)
-                    # Load best checkpoint for this agent
+                    # Load best checkpoint for this agent. For resume runs
+                    # the model state will be overwritten from latest.pt
+                    # inside `_run_or_resume_phase` if the phase was
+                    # in_progress.
                     agent.load_checkpoint(agent_base)
 
-                    _, opp_run_dir = train_opponent_action(
-                        agent, opp_train_cfg, device, agent_log,
-                        scenarios_override=opp_scenarios,
-                        temperature=agent_temperature,
-                    )
-                    if opp_run_dir:
-                        best_ckpt = os.path.join(opp_run_dir, "best.pt")
-                        if os.path.exists(best_ckpt):
-                            agent.load_checkpoint(best_ckpt)
+                    _run_phase(
+                        state, "opponent_action_predict", agent, agent_name,
+                        agent_base, agent_log, device,
+                        lambda run_dir, resume_state, _agent=agent,
+                               _temp=agent_temperature: train_opponent_action(
+                            _agent, opp_train_cfg, device, agent_log,
+                            scenarios_override=opp_scenarios,
+                            temperature=_temp,
+                            run_dir=run_dir, resume_state=resume_state))
             else:
                 # Single-agent
                 agent = ASI(log, config)
@@ -486,6 +682,14 @@ def main():
                 agent_log(msg)
                 return opt, sched
 
+            # Resume state for MCTS (no-op when state.resume == False).
+            mcts_state = state.get_mcts() or {}
+            saved_run_dirs = mcts_state.get("run_dirs", {}) or {}
+            saved_cum_steps = mcts_state.get("cumulative_steps", {}) or {}
+            saved_examples_paths = mcts_state.get("examples_paths", {}) or {}
+            start_cycle = int(mcts_state.get("next_cycle", 0))
+            resume_stage = mcts_state.get("stage", "collecting")
+
             # Build the persistent agent registry once
             trained_agents = []  # list of dicts kept across cycles
             if multi_agent:
@@ -512,15 +716,20 @@ def main():
                         if mod.get("type") == "temperature":
                             temp = mod["value"]
 
-                    # New timestamp dir for THIS run's best.pt (cycle-aware
-                    # save). History lives at scenario level (one above the
-                    # timestamp dir) so it accumulates across pipeline runs
-                    # — required for continuous loss curves.
-                    run_dir = agent_log.run_dir("mcts_predict")
+                    # Reuse run_dir from pipeline_state when resuming — keeps
+                    # best.pt and history.pt in the same place across runs.
+                    saved_run_dir = saved_run_dirs.get(agent_name)
+                    if state.resume and saved_run_dir and os.path.isdir(saved_run_dir):
+                        run_dir = saved_run_dir
+                        agent_log(f"  [resume] reusing run_dir {run_dir}")
+                    else:
+                        run_dir = agent_log.run_dir("mcts_predict")
                     scenario_dir = os.path.dirname(run_dir)
                     history_path = os.path.join(scenario_dir, "history.pt")
                     cumulative_step = 0
-                    if os.path.exists(history_path):
+                    if state.resume and agent_name in saved_cum_steps:
+                        cumulative_step = int(saved_cum_steps[agent_name])
+                    elif os.path.exists(history_path):
                         existing = torch.load(history_path, weights_only=False)
                         steps = existing.get("step_loss", []) or []
                         if steps and isinstance(steps[-1], dict):
@@ -548,11 +757,19 @@ def main():
                 agent_obj.set_device(device)
                 agent_obj.load_checkpoint(single_load_dir)
                 agent_obj.eval()
-                run_dir = log.run_dir("mcts_predict")
+                saved_run_dir_single = saved_run_dirs.get(name)
+                if state.resume and saved_run_dir_single \
+                        and os.path.isdir(saved_run_dir_single):
+                    run_dir = saved_run_dir_single
+                    log(f"  [resume] reusing single-agent MCTS run_dir {run_dir}")
+                else:
+                    run_dir = log.run_dir("mcts_predict")
                 scenario_dir = os.path.dirname(run_dir)
                 history_path = os.path.join(scenario_dir, "history.pt")
                 cumulative_step = 0
-                if os.path.exists(history_path):
+                if state.resume and name in saved_cum_steps:
+                    cumulative_step = int(saved_cum_steps[name])
+                elif os.path.exists(history_path):
                     existing = torch.load(history_path, weights_only=False)
                     steps = existing.get("step_loss", []) or []
                     if steps and isinstance(steps[-1], dict):
@@ -602,7 +819,11 @@ def main():
                                        "mcts_ev_ratio_min",
                                        "mcts_ev_ratio_max")
 
-            for cycle in range(n_cycles):
+            if state.resume and start_cycle > 0:
+                log(f"\n[resume] MCTS resuming at cycle {start_cycle}/{n_cycles} "
+                    f"(stage={resume_stage})")
+
+            for cycle in range(start_cycle, n_cycles):
                 log(f"\n=== MCTS Cycle {cycle + 1}/{n_cycles} ===")
 
                 # Re-bootstrap value norm? (only on non-zero cycle id, every N)
@@ -640,16 +861,60 @@ def main():
                                 f"mcts_value_scale rebootstrap this cycle "
                                 f"(keeping old scale={old_scale_s} for search)")
 
-                # Use in-memory agents directly for collection (no disk reload)
-                agents_for_play = [
-                    {"agent": a["agent"], "norm_stats": a["norm_stats"],
-                     "name": a["name"], "temperature": a["temperature"]}
-                    for a in trained_agents
-                ]
+                # --- Collection (or resume from saved examples) ---
+                per_agent_examples = None
+                if (state.resume and cycle == start_cycle
+                        and resume_stage == "training"):
+                    # Prior run crashed mid-training of this cycle — reload
+                    # the examples we saved before training started.
+                    per_agent_examples = {}
+                    all_loaded = True
+                    for a in trained_agents:
+                        p = saved_examples_paths.get(a["name"])
+                        if p and os.path.exists(p):
+                            per_agent_examples[a["name"]] = torch.load(
+                                p, weights_only=False)
+                            a["agent_log"](
+                                f"  [resume] loaded {len(per_agent_examples[a['name']])} "
+                                f"examples from {os.path.basename(p)}")
+                        else:
+                            all_loaded = False
+                            a["agent_log"](
+                                f"  [resume] examples missing for {a['name']}; "
+                                f"will recollect")
+                    if not all_loaded:
+                        per_agent_examples = None
 
-                per_agent_examples = run_mcts_collection(
-                    agents_for_play, config, device, log, n_hands_per_cycle,
-                    cycle_idx=cycle, n_cycles=n_cycles)
+                if per_agent_examples is None:
+                    # Fresh collection. Mark stage so a crash here is recovered
+                    # by re-collecting (collection is non-deterministic; we
+                    # don't try to checkpoint mid-collection).
+                    state.set_mcts(next_cycle=cycle, stage="collecting")
+
+                    agents_for_play = [
+                        {"agent": a["agent"], "norm_stats": a["norm_stats"],
+                         "name": a["name"], "temperature": a["temperature"]}
+                        for a in trained_agents
+                    ]
+                    per_agent_examples = run_mcts_collection(
+                        agents_for_play, config, device, log, n_hands_per_cycle,
+                        cycle_idx=cycle, n_cycles=n_cycles)
+
+                    # Persist examples atomically BEFORE training so a crash
+                    # during train_mcts can resume the SAME data on next start.
+                    new_examples_paths = {}
+                    for a in trained_agents:
+                        exs = per_agent_examples.get(a["name"], [])
+                        if not exs:
+                            continue
+                        ex_dir = os.path.join(a["run_dir"], "examples")
+                        os.makedirs(ex_dir, exist_ok=True)
+                        p = os.path.join(ex_dir, f"cycle_{cycle:04d}.pt")
+                        atomic_torch_save(exs, p)
+                        new_examples_paths[a["name"]] = p
+                    state.set_mcts(stage="training",
+                                   examples_paths=new_examples_paths)
+                    saved_examples_paths = new_examples_paths
 
                 is_save_cycle = (cycle % save_every_cycles == 0
                                  or cycle == n_cycles - 1)
@@ -682,6 +947,43 @@ def main():
                         scheduler=agent_info["scheduler"],
                     )
                     agent_info["cumulative_step"] = new_step
+
+                # End of cycle — record progress so a crash in the NEXT
+                # cycle starts at cycle+1 rather than re-running this one.
+                state.set_mcts(
+                    next_cycle=cycle + 1,
+                    stage="collecting",
+                    run_dirs={a["name"]: a["run_dir"]
+                              for a in trained_agents},
+                    cumulative_steps={a["name"]: a["cumulative_step"]
+                                       for a in trained_agents},
+                    examples_paths=saved_examples_paths,
+                )
+                # When this cycle wrote a permanent checkpoint, the saved
+                # examples for any cycle through this one are no longer
+                # needed (the model state subsumes them). Delete them to
+                # avoid unbounded disk usage.
+                if is_save_cycle:
+                    for a in trained_agents:
+                        ex_dir = os.path.join(a["run_dir"], "examples")
+                        if not os.path.isdir(ex_dir):
+                            continue
+                        for fname in os.listdir(ex_dir):
+                            if not (fname.startswith("cycle_")
+                                    and fname.endswith(".pt")):
+                                continue
+                            try:
+                                prev_cid = int(fname[len("cycle_"):-3])
+                            except ValueError:
+                                continue
+                            if prev_cid <= cycle:
+                                try:
+                                    os.remove(os.path.join(ex_dir, fname))
+                                except OSError:
+                                    pass
+                    # Clear examples_paths in state — they're gone from disk.
+                    state.set_mcts(examples_paths={})
+                    saved_examples_paths = {}
 
     # --- Evaluation (after all training stages) ---
     if pipeline_cfg.get("run_evaluation", False):

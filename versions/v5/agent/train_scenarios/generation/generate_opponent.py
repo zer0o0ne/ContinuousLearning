@@ -19,6 +19,7 @@ import os
 import copy
 import random
 import argparse
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -27,9 +28,12 @@ from tqdm.auto import tqdm
 
 from env.table import Table
 from evaluation.evaluate import _normalize_events_inplace
-from agent.train_scenarios.generation.generate import _get_raise_sizes, load_dataset
+from agent.train_scenarios.generation.generate import (
+    _get_raise_sizes, load_dataset, _read_meta, _write_meta, _meta_path,
+)
 from agent.agent import ASI
 from agent.mcts.game_state import GameState
+from agent.resume import atomic_torch_save
 from utils import get_amp_config
 
 
@@ -503,7 +507,8 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
 # ---------------------------------------------------------------------------
 
 def generate_opponent_dataset(config, save_dir, device, log,
-                              agents_override=None):
+                              agents_override=None, resume=False,
+                              config_hash=None):
     """Generate full opponent action dataset.
 
     Loads trained agents, plays them against each other with range tracking,
@@ -521,20 +526,78 @@ def generate_opponent_dataset(config, save_dir, device, log,
             don't exist or for unit tests where you want to pin specific
             weights. Data quality with random-init agents is meaningless
             but throughput numbers are valid.
+        resume: if True, look at `meta.json` and continue from where a
+            prior interrupted run left off (sequential mode only — parallel
+            mode is all-or-nothing). On `config_hash` mismatch the existing
+            dataset is renamed to `dataset.pt.stale.<ts>` and generation
+            restarts.
+        config_hash: hash of game.* + solver.* — see
+            `agent.resume.compute_config_hash`. Stored in `meta.json` so
+            subsequent resumes can detect stale data.
 
     Returns:
         list of scenario dicts
     """
-    existing = load_dataset(save_dir, log=log)
-    if existing is not None:
-        return existing
-
     opp_cfg = config.get("opponent_data", {})
     game_cfg = config.get("game", {})
-
     n_hands = opp_cfg.get("n_hands", 5000)
     fallback_temperature = opp_cfg.get("action_temperature", 0.3)
     save_every = opp_cfg.get("save_every_hands", 500)
+
+    os.makedirs(save_dir, exist_ok=True)
+    dataset_path = os.path.join(save_dir, "dataset.pt")
+
+    # -----------------------------------------------------------------
+    # Resume bookkeeping (sequential path only; parallel mode is
+    # all-or-nothing because actors don't checkpoint individually).
+    # -----------------------------------------------------------------
+    prior_scenarios = []
+    start_attempts = 0
+    n_workers_cfg = int(opp_cfg.get("n_workers", 1) or 1)
+
+    if resume:
+        meta = _read_meta(save_dir)
+        if meta is not None:
+            if config_hash is not None \
+                    and meta.get("config_hash") != config_hash:
+                stale = (f"{dataset_path}.stale."
+                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                log(f"Opponent dataset config_hash mismatch (was "
+                    f"{meta.get('config_hash')!r}, now {config_hash!r}). "
+                    f"Renaming existing to {os.path.basename(stale)} and "
+                    f"starting fresh.")
+                if os.path.exists(dataset_path):
+                    os.replace(dataset_path, stale)
+                try:
+                    os.unlink(_meta_path(save_dir))
+                except OSError:
+                    pass
+            elif meta.get("done") and meta.get("target", 0) >= n_hands:
+                log(f"Opponent dataset already complete at {save_dir} "
+                    f"(target={meta['target']} >= {n_hands})")
+                return torch.load(dataset_path, weights_only=False)
+            elif os.path.exists(dataset_path):
+                if n_workers_cfg > 1:
+                    log(f"Partial opponent dataset present but n_workers>1; "
+                        f"parallel mode does not support mid-generation "
+                        f"resume — regenerating from scratch.")
+                    os.unlink(dataset_path)
+                    try:
+                        os.unlink(_meta_path(save_dir))
+                    except OSError:
+                        pass
+                else:
+                    prior_scenarios = torch.load(
+                        dataset_path, weights_only=False)
+                    start_attempts = int(meta.get("completed_attempts", 0))
+                    log(f"Resuming opponent dataset: "
+                        f"{start_attempts}/{n_hands} attempts done, "
+                        f"{len(prior_scenarios)} scenarios on disk")
+    else:
+        # Legacy non-resume: prefer any existing dataset.pt as-is.
+        existing = load_dataset(save_dir, log=log)
+        if existing is not None:
+            return existing
 
     # Merge game params into generation config
     gen_cfg = {}
@@ -578,24 +641,40 @@ def generate_opponent_dataset(config, save_dir, device, log,
     table_roster = list(player_pool[:max_players])
     log(f"Player pool: {n_player_pool} IDs, swap_prob={swap_prob}")
 
-    os.makedirs(save_dir, exist_ok=True)
-    dataset_path = os.path.join(save_dir, "dataset.pt")
+    def _persist(scenarios_list, completed_attempts, meta_done):
+        atomic_torch_save(scenarios_list, dataset_path)
+        if config_hash is not None or resume:
+            _write_meta(save_dir, {
+                "version":            1,
+                "target":             n_hands,
+                "completed_attempts": completed_attempts,
+                "completed_hands":    len(scenarios_list),
+                "done":               bool(meta_done),
+                "config_hash":        config_hash,
+                "n_workers":          n_workers_cfg,
+            })
 
     # Dispatch: parallel (opponent_data.n_workers > 1) reuses the MCTS GPU
     # inference server — CPU actors play hands + range bookkeeping and offload
     # the action-head combo inference (FORWARD_BATCH) to one GPU server. The
     # default (n_workers <= 1) keeps the original sequential path unchanged.
-    n_workers = int(opp_cfg.get("n_workers", 1) or 1)
+    n_workers = n_workers_cfg
     if n_workers > 1:
+        # All-or-nothing parallel path. No prior partial scenarios are used.
         scenarios = _run_parallel_opponent(
             agents_list, config, gen_cfg, device, log, n_hands, n_workers,
             max_players, n_player_pool, swap_prob, player_pool)
         log(f"Generated {len(scenarios)} scenarios (parallel, {n_workers} actors)")
     else:
-        scenarios = []
-        failed = 0
+        scenarios = list(prior_scenarios)
+        failed = max(0, start_attempts - len(prior_scenarios))
+        remaining = n_hands - start_attempts
+        if start_attempts > 0:
+            log(f"Resuming sequential opponent generation: "
+                f"{remaining} attempts remaining")
 
-        for hand_i in tqdm(range(n_hands), desc="Generating opponent data"):
+        for offset in tqdm(range(remaining), desc="Generating opponent data"):
+            hand_i = start_attempts + offset
             # Simulate player rotation — occasionally swap seat identities
             for pos in range(max_players):
                 if random.random() < swap_prob:
@@ -611,18 +690,18 @@ def generate_opponent_dataset(config, save_dir, device, log,
                 failed += 1
 
             if (hand_i + 1) % save_every == 0:
-                torch.save(scenarios, dataset_path)
+                _persist(scenarios, hand_i + 1, meta_done=False)
                 log(f"  Incremental save: {len(scenarios)} scenarios ({hand_i + 1} hands)")
 
-        log(f"Generated {len(scenarios)} scenarios from {n_hands - failed} hands "
-            f"({failed} failed)")
+        log(f"Generated {len(scenarios)} scenarios from "
+            f"{n_hands - failed} hands ({failed} failed)")
 
     if scenarios:
         range_sizes = [s["range_size"] for s in scenarios]
         log(f"Range sizes: min={min(range_sizes)}, max={max(range_sizes)}, "
             f"avg={sum(range_sizes) / len(range_sizes):.0f}")
 
-    torch.save(scenarios, dataset_path)
+    _persist(scenarios, n_hands, meta_done=True)
     log(f"Dataset saved to {dataset_path}")
 
     return scenarios

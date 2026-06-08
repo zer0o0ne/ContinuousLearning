@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from agent.train_scenarios.opponent_action_predict.dataset import (
     OpponentActionDataset, batch_collate,
 )
+from agent.resume import atomic_torch_save
 
 
 class LengthGroupedBatchSampler(Sampler):
@@ -124,11 +125,32 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
 
 
 def _save_history(history, run_dir):
-    torch.save(history, os.path.join(run_dir, "history.pt"))
+    atomic_torch_save(history, os.path.join(run_dir, "history.pt"))
+
+
+def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
+                 next_epoch, global_step, best_val_loss, fails_since_best,
+                 val_loss, temperature=None):
+    """Atomic per-epoch checkpoint for pipeline.resume."""
+    ckpt = {
+        "model_state_dict":     agent.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "next_epoch":           next_epoch,
+        "global_step":          global_step,
+        "best_val_loss":        best_val_loss,
+        "fails_since_best":     fails_since_best,
+        "norm_stats":           norm_stats,
+        "val_loss":             val_loss,
+    }
+    if temperature is not None:
+        ckpt["temperature"] = temperature
+    atomic_torch_save(ckpt, os.path.join(run_dir, "latest.pt"))
 
 
 def train_opponent_action(agent, train_cfg, device, log,
-                          scenarios_override=None, temperature=None):
+                          scenarios_override=None, temperature=None,
+                          run_dir=None, resume_state=None):
     """Train opponent_action_head on range-based opponent action data.
 
     Freezes perception, value_head, action_head, modelling_head.
@@ -141,6 +163,9 @@ def train_opponent_action(agent, train_cfg, device, log,
         log: logger callable
         scenarios_override: raw opponent scenarios (shared event format)
         temperature: agent temperature (saved in checkpoint)
+        run_dir: pre-existing run directory (reused on resume).
+        resume_state: optimizer/scheduler/counters from a prior interrupted
+            run — see gto_ev_predict.train for the schema.
 
     Returns:
         (history, run_dir)
@@ -184,7 +209,10 @@ def train_opponent_action(agent, train_cfg, device, log,
 
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
 
-    run_dir = log.run_dir("opponent_action_predict")
+    if run_dir is None:
+        run_dir = log.run_dir("opponent_action_predict")
+    else:
+        os.makedirs(run_dir, exist_ok=True)
 
     # AMP
     from utils import get_amp_config
@@ -202,14 +230,19 @@ def train_opponent_action(agent, train_cfg, device, log,
     log(f"Using {len(scenarios)} raw scenarios")
 
     # Use norm stats from checkpoint (same distribution perception was trained on)
-    # to avoid distribution mismatch with frozen perception.
-    checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
-    if checkpoint_norm_stats is not None:
-        norm_stats = checkpoint_norm_stats
-        log("Using norm stats from agent checkpoint (matches perception training)")
+    # to avoid distribution mismatch with frozen perception. On resume, the
+    # stats in `resume_state` take precedence.
+    if resume_state is not None and resume_state.get("norm_stats"):
+        norm_stats = resume_state["norm_stats"]
+        log("Using norm stats from resume_state")
     else:
-        norm_stats = _compute_norm_stats(scenarios)
-        log("No checkpoint norm stats — computing from opponent scenarios")
+        checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
+        if checkpoint_norm_stats is not None:
+            norm_stats = checkpoint_norm_stats
+            log("Using norm stats from agent checkpoint (matches perception training)")
+        else:
+            norm_stats = _compute_norm_stats(scenarios)
+            log("No checkpoint norm stats — computing from opponent scenarios")
     log("Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
 
     # Train/val split (hand-aware, mapped to expanded indices)
@@ -246,12 +279,39 @@ def train_opponent_action(agent, train_cfg, device, log,
 
     best_val_loss = float("inf")
     fails_since_best = 0
-    history = {"step_loss": [], "val_loss": [], "val_accuracy": [],
-               "epoch_train_loss": [], "epoch_val_loss": []}
     global_step = 0
+    start_epoch = 0
+
+    history_path = os.path.join(run_dir, "history.pt")
+    if os.path.exists(history_path):
+        history = torch.load(history_path, weights_only=False)
+        for k in ("step_loss", "val_loss", "val_accuracy",
+                  "epoch_train_loss", "epoch_val_loss"):
+            history.setdefault(k, [])
+        log(f"Resumed history from {history_path} "
+            f"(step_loss n={len(history['step_loss'])})")
+    else:
+        history = {"step_loss": [], "val_loss": [], "val_accuracy": [],
+                   "epoch_train_loss": [], "epoch_val_loss": []}
+
+    if resume_state is not None:
+        try:
+            optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+            scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        except Exception as e:
+            log(f"  Optimizer/scheduler restore failed: {e}. "
+                f"Continuing with fresh ones.")
+        start_epoch = int(resume_state.get("start_epoch", 0))
+        global_step = int(resume_state.get("global_step", 0))
+        best_val_loss = float(resume_state.get("best_val_loss", float("inf")))
+        fails_since_best = int(resume_state.get("fails_since_best", 0))
+        log(f"  [resume] start_epoch={start_epoch}, global_step={global_step}, "
+            f"best_val_loss={best_val_loss:.6f}, "
+            f"fails_since_best={fails_since_best}")
+
     stopped_early = False
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         if stopped_early:
             break
 
@@ -342,12 +402,23 @@ def train_opponent_action(agent, train_cfg, device, log,
             fails_since_best = 0
             _save_best(agent, optimizer, scheduler, norm_stats, run_dir,
                        global_step, epoch, val_loss, log, temperature=temperature)
+            should_break_after_latest = False
         else:
             fails_since_best += 1
-            if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
+            should_break_after_latest = (interrupt_after_fails
+                                          and fails_since_best >= interrupt_after_fails)
+            if should_break_after_latest:
                 log(f"  Early stopping: {fails_since_best} validations "
                     f"without improvement")
-                break
+
+        _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
+                     next_epoch=epoch + 1, global_step=global_step,
+                     best_val_loss=best_val_loss,
+                     fails_since_best=fails_since_best,
+                     val_loss=val_loss, temperature=temperature)
+
+        if should_break_after_latest:
+            break
 
     # Unfreeze all
     for param in agent.perception.parameters():

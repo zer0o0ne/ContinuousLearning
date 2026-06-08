@@ -988,6 +988,7 @@ def _init_worker(counter):
     """Initializer for pool workers — stores shared counter."""
     global _shared_counter
     _shared_counter = counter
+    torch.set_num_threads(1)
 
 
 def _generate_worker(args):

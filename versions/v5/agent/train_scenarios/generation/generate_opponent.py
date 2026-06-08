@@ -502,7 +502,8 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
 # Dataset generation
 # ---------------------------------------------------------------------------
 
-def generate_opponent_dataset(config, save_dir, device, log):
+def generate_opponent_dataset(config, save_dir, device, log,
+                              agents_override=None):
     """Generate full opponent action dataset.
 
     Loads trained agents, plays them against each other with range tracking,
@@ -513,6 +514,13 @@ def generate_opponent_dataset(config, save_dir, device, log):
         save_dir: directory to save dataset.pt
         device: torch device string
         log: logger callable
+        agents_override: optional pre-built list of agent dicts
+            (`[{"agent": ASI, "norm_stats": dict, "name": str,
+                 "temperature": float}, ...]`). When provided, skips
+            `_load_agents` — useful for benchmarking where checkpoints
+            don't exist or for unit tests where you want to pin specific
+            weights. Data quality with random-init agents is meaningless
+            but throughput numbers are valid.
 
     Returns:
         list of scenario dicts
@@ -523,14 +531,6 @@ def generate_opponent_dataset(config, save_dir, device, log):
 
     opp_cfg = config.get("opponent_data", {})
     game_cfg = config.get("game", {})
-
-    agents_dir = opp_cfg.get("agents_dir", "")
-    if agents_dir and not os.path.isabs(agents_dir):
-        version = os.path.basename(os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-        project_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".."))
-        agents_dir = os.path.join(project_root, "data", version, agents_dir)
 
     n_hands = opp_cfg.get("n_hands", 5000)
     fallback_temperature = opp_cfg.get("action_temperature", 0.3)
@@ -545,12 +545,26 @@ def generate_opponent_dataset(config, save_dir, device, log):
     amp_config = (amp_enabled, device_type, amp_dtype)
 
     log("=== Opponent Action Data Generation ===")
-    log(f"Loading agents from {agents_dir}")
 
-    agents_list = _load_agents(agents_dir, config, device, log, fallback_temperature)
-    if not agents_list:
-        log("No agents loaded. Aborting.")
-        return []
+    if agents_override is not None:
+        agents_list = agents_override
+        log(f"Using {len(agents_list)} caller-provided agent(s) "
+            f"(skipping disk load): {[a['name'] for a in agents_list]}")
+    else:
+        agents_dir = opp_cfg.get("agents_dir", "")
+        if agents_dir and not os.path.isabs(agents_dir):
+            version = os.path.basename(os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+            project_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                             "..", ".."))
+            agents_dir = os.path.join(project_root, "data", version, agents_dir)
+        log(f"Loading agents from {agents_dir}")
+        agents_list = _load_agents(agents_dir, config, device, log,
+                                   fallback_temperature)
+        if not agents_list:
+            log("No agents loaded. Aborting.")
+            return []
 
     log(f"Loaded {len(agents_list)} agents: {[a['name'] for a in agents_list]}")
     log(f"Generating {n_hands} hands, threshold={gen_cfg.get('range_threshold', 0.5)}, "

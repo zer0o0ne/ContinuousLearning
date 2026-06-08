@@ -103,8 +103,26 @@ def _build_agents(config, n_agents, device, log, agents_dir=None):
     return agents
 
 
+def _cleanup_cuda():
+    """Free cached CUDA memory between benchmark iterations. Without this,
+    PyTorch's caching allocator can hold many GiB of reserved-but-unused
+    memory after a phase ends, which OOMs the next iteration's inference
+    server when it tries to load agents."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
 def _bench_mcts(config, n_workers, n_hands, n_sims, device, log, agents_dir):
-    """Run a single-cycle MCTS collection and return (wall_seconds, n_examples)."""
+    """Run a single-cycle MCTS collection and return (wall_seconds, n_examples).
+
+    In parallel mode (n_workers > 1) the parent process does NOT need agents
+    on CUDA — the inference server holds its own GPU copies built from CPU
+    state_dicts. Loading on CPU here roughly halves total GPU memory pressure
+    and avoids the server OOM'ing into the parent's tensors. Sequential mode
+    still loads on `device` because LocalEvaluator runs forwards in-process."""
     from agent.mcts.collect import run_mcts_collection
 
     cfg = copy.deepcopy(config)
@@ -115,18 +133,32 @@ def _bench_mcts(config, n_workers, n_hands, n_sims, device, log, agents_dir):
     log(f"\n--- MCTS bench: n_workers={n_workers}, n_hands={n_hands}, "
         f"n_sims={n_sims}, n_agents={n_agents} ---")
 
-    agents = _build_agents(cfg, n_agents, device, log, agents_dir)
+    build_device = "cpu" if n_workers > 1 else device
+    if build_device != device:
+        log(f"  parallel mode: building agents on CPU "
+            f"(server takes {device} copies)")
+    agents = _build_agents(cfg, n_agents, build_device, log, agents_dir)
 
     t0 = time.monotonic()
     per_agent_examples = run_mcts_collection(
         agents, cfg, device, log, n_hands, cycle_idx=0, n_cycles=1)
     t1 = time.monotonic()
     n_examples = sum(len(v) for v in per_agent_examples.values())
+
+    del per_agent_examples, agents
+    _cleanup_cuda()
     return t1 - t0, n_examples
 
 
 def _bench_opponent(config, n_workers, n_hands, device, log, agents_dir):
-    """Run a single opponent_data generation and return (wall_seconds, n_scenarios)."""
+    """Run a single opponent_data generation and return (wall_seconds, n_scenarios).
+
+    If `agents_dir` is provided, agents are loaded from disk via the normal
+    `_load_agents` path. If not, this builds random-init agents on the same
+    device convention as MCTS bench (CPU when parallel, `device` otherwise)
+    and passes them to `generate_opponent_dataset` via `agents_override`.
+    Random-init data is garbage but throughput numbers are valid — exactly
+    what a parallel-scaling benchmark cares about."""
     from agent.train_scenarios.generation.generate_opponent import (
         generate_opponent_dataset)
 
@@ -134,17 +166,38 @@ def _bench_opponent(config, n_workers, n_hands, device, log, agents_dir):
     cfg["opponent_data"]["n_workers"] = n_workers
     cfg["opponent_data"]["n_hands"] = n_hands
     if agents_dir:
-        cfg["opponent_data"]["agents_dir"] = agents_dir
+        cfg["opponent_data"]["agents_dir"] = os.path.abspath(agents_dir)
     # Always regen — point to a fresh tmp dir so the cache hit doesn't skip work.
     save_dir = f"/tmp/bench_opp_{n_workers}_{int(time.monotonic()*1000)}"
     cfg["opponent_data"]["save_dir"] = save_dir
     os.makedirs(save_dir, exist_ok=True)
 
     log(f"\n--- Opponent bench: n_workers={n_workers}, n_hands={n_hands} ---")
+
+    agents_override = None
+    if not agents_dir:
+        # Build random-init agents matching the multi_agent config layout.
+        # In parallel mode keep them on CPU — the inference server holds the
+        # GPU copies (same memory trick as the MCTS bench path).
+        n_agents = len(config.get("multi_agent", {}).get("agents", [])) or 1
+        build_device = "cpu" if n_workers > 1 else device
+        if build_device != device:
+            log(f"  parallel mode: building agents on CPU "
+                f"(server takes {device} copies)")
+        log(f"  no --agents-dir given: using {n_agents} random-init agents "
+            f"(throughput numbers valid; data quality meaningless)")
+        agents_override = _build_agents(
+            cfg, n_agents, build_device, log, agents_dir=None)
+
     t0 = time.monotonic()
-    scenarios = generate_opponent_dataset(cfg, save_dir, device, log)
+    scenarios = generate_opponent_dataset(
+        cfg, save_dir, device, log, agents_override=agents_override)
     t1 = time.monotonic()
-    return t1 - t0, len(scenarios)
+    n_scenarios = len(scenarios)
+
+    del scenarios, agents_override
+    _cleanup_cuda()
+    return t1 - t0, n_scenarios
 
 
 def _aggregate_timing(jsonl_glob):
@@ -258,6 +311,9 @@ def main():
                 f"{ex_per_s:.1f} ex/s")
 
         if not args.skip_opp:
+            # `_bench_opponent` builds random-init agents internally when
+            # `--agents-dir` is not provided. Throughput is meaningful even
+            # with random weights (same forward passes, same IPC volume).
             wall, n_sc = _bench_opponent(
                 config, nw, args.opp_hands, device, log,
                 args.agents_dir or None)

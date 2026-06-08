@@ -1003,6 +1003,27 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
         spec.append({"name": a["name"], "config": config,
                      "state_dict": sd, "norm_stats": a.get("norm_stats")})
 
+    # Move parent's agents off the GPU for the duration of parallel collection.
+    # The inference server holds its own GPU copies built from `spec`; the
+    # parent does not use the live models while waiting for actor results, so
+    # keeping them on CUDA just doubles GPU memory pressure and was OOM'ing
+    # the server at agent build time (24GB cards, multi-agent runs).
+    # Restored to their original device in the `finally` block below so that
+    # downstream training in `pipeline.py` finds them where it left them.
+    parent_devices = []
+    if str(device).startswith("cuda"):
+        import torch as _torch_local
+        for a in agents_list:
+            parent_devices.append(getattr(a["agent"], "device_", "cpu"))
+            a["agent"].cpu()
+            # `device_` is a custom attr on ASI maintained by set_device; keep
+            # it in sync so any inadvertent forward in the parent doesn't try
+            # to target the previous CUDA device.
+            a["agent"].device_ = "cpu"
+        _torch_local.cuda.empty_cache()
+        log(f"  parallel collect: moved {len(agents_list)} parent agent(s) "
+            f"to CPU during server lifetime (freed CUDA cache)")
+
     # Model-free metadata for actors (the server holds the live model).
     agents_meta = [{"name": a["name"], "norm_stats": a.get("norm_stats"),
                     "temperature": a.get("temperature")} for a in agents_list]
@@ -1141,6 +1162,16 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
             _shutil.rmtree(payload_dir, ignore_errors=True)
         except BaseException:
             pass
+        # Restore parent's agents to their original device(s). Done in
+        # `finally` so even on RuntimeError above (server died, actor died)
+        # the caller's downstream code (training) still finds the agents
+        # where it expects them.
+        if parent_devices:
+            for a, dev in zip(agents_list, parent_devices):
+                try:
+                    a["agent"].set_device(dev)
+                except BaseException:
+                    pass
 
     if error is not None:
         raise RuntimeError(error)

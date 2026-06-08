@@ -467,49 +467,42 @@ def _compute_reraise_threshold(call_cost, pot_after_raise, street, stack, pot):
     return max(0.5, min(0.95, base * street_factor * spr_factor))
 
 
-def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
-                  pot, facing_bet, stack, hero_invested,
-                  raise_frac=1.0, n_iters=3000, device="mps",
-                  hero_position=0, street=0, n_players=6,
-                  eqr_enabled=True,
-                  combo_response_iters=30,
-                  reraise_threshold=0.75,
-                  weighted_sampling=True,
-                  action_history=None,
-                  opponent_positions=None,
-                  dynamic_reraise=False):
-    """Compute EV for fold/call/raise with per-combo response and EQR.
+def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
+                          n_iters=3000, device="mps",
+                          hero_position=0, street=0, n_players=6,
+                          eqr_enabled=True,
+                          combo_response_iters=30,
+                          reraise_threshold=0.75,
+                          weighted_sampling=True,
+                          action_history=None,
+                          opponent_positions=None):
+    """Pre-compute all raise_frac-independent quantities for compute_ev_v3.
 
-    Args:
-        hero_cards: (2,) int64 tensor
-        board_cards: (B,) int64 tensor
-        opponent_range_hand_types: list of lists of hand type strings, one per opponent
-        pot, facing_bet, stack, hero_invested: floats
-        raise_frac: raise size as fraction of (pot + facing_bet)
-        n_iters: MC iterations for equity computation
-        device: torch device
-        hero_position: int, hero's seat index
-        street: int, 0=preflop, 1=flop, 2=turn, 3=river
-        n_players: int, table size
-        eqr_enabled: bool, apply EQR multiplier
-        combo_response_iters: int, MC iters per combo for response modeling
-        reraise_threshold: float, opponent equity above which they reraise
-        weighted_sampling: bool, use action-weighted combo sampling
-        action_history: list of (position, action_type) tuples for the hand
-        opponent_positions: list of int, seat indices of opponents (same order as ranges)
+    Splits compute_ev_v3's expensive MC work into a one-shot prep step so a
+    caller that wants EVs at many raise sizes (e.g. dataset generation
+    iterating all raise bins for the same decision point) can amortise the
+    MC cost. Pair with _compute_ev_v3_from_state.
 
-    Returns:
-        (fold_ev, call_ev, raise_ev, best_ev) all floats
+    Returns a state dict carrying:
+      - raw_equity (scalar): hero equity vs full opp ranges (any raise size)
+      - opp_eq_cpu (tensor or None): per-primary-combo hero equity, used for
+        fold/call/reraise classification (raise size only changes the
+        threshold cuts, not these values)
+      - reraise_mask (tensor or None): reraise_threshold is constant, so
+        which primary combos reraise is raise-size independent
+      - eq_vs_reraisers (scalar or None): hero equity vs reraisers, also
+        raise-size independent for the same reason
+
+    NOTE: eq_vs_callers is NOT cached here — call_mask depends on
+    fold_threshold which depends on raise_frac. It is computed inside
+    _compute_ev_v3_from_state.
     """
-    # Dead cards
     dead = set(hero_cards.tolist())
     if len(board_cards) > 0:
         dead.update(board_cards.tolist())
 
-    # Expand opponent ranges to card combos
     opp_combos = [expand_range(ht_list, dead) for ht_list in opponent_range_hand_types]
 
-    # Build combo weights (Improvement 3)
     combo_weights = None
     if weighted_sampling and action_history and opponent_positions:
         combo_weights = []
@@ -522,68 +515,128 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
             w = compute_combo_weights(ht_list, opp_actions, dead_cards=dead)
             combo_weights.append(w)
 
-    # EQR multiplier (Improvement 2)
     active_positions = list(opponent_positions) + [hero_position] if opponent_positions else None
-    eqr = _get_eqr(hero_position, street, n_players, active_positions) if eqr_enabled else 1.0
+    eqr_raw = _get_eqr(hero_position, street, n_players, active_positions) if eqr_enabled else 1.0
 
-    # Fix 11: SPR-adjusted EQR — positional advantage vanishes at shallow SPR
-    spr = stack / max(pot, 1e-6)
-    spr_eqr_factor = min(1.0, spr / 6.0)
-    eqr = 1.0 + (eqr - 1.0) * spr_eqr_factor
-
-    # --- Fold EV ---
-    fold_ev = -hero_invested
-
-    # --- Call EV ---
     raw_equity = gpu_equity_v3(hero_cards, board_cards, opp_combos, n_iters, device, combo_weights)
-    eff_equity = max(0.0, min(1.0, raw_equity * eqr))
-    total_call_investment = hero_invested + facing_bet
-    call_ev = eff_equity * (pot - hero_invested) + (1 - eff_equity) * (-total_call_investment)
 
-    # Fix 13: street discount — earlier streets have more uncertainty ahead
-    _street_discount = {0: 0.92, 1: 0.95, 2: 0.98, 3: 1.0}.get(street, 1.0)
-    call_ev *= _street_discount
+    state = {
+        "hero_cards": hero_cards,
+        "board_cards": board_cards,
+        "opp_combos": opp_combos,
+        "combo_weights": combo_weights,
+        "eqr_raw": eqr_raw,
+        "eqr_enabled": eqr_enabled,
+        "raw_equity": raw_equity,
+        "reraise_threshold": reraise_threshold,
+        "street": street,
+        "hero_position": hero_position,
+        "opponent_positions": opponent_positions,
+        "n_iters": n_iters,
+        "device": device,
+        "primary_idx": 0,
+        "opp_eq_cpu": None,
+        "reraise_mask": None,
+        "primary_combos": None,
+        "eq_vs_reraisers": None,
+    }
 
-    # --- Raise EV with per-combo opponent response (Improvement 1) ---
-    raise_amount = min(facing_bet + raise_frac * (pot + facing_bet), stack)
-    total_raise = hero_invested + raise_amount
-    new_pot = pot + facing_bet + raise_amount
-
-    # Pot-odds based fold threshold
-    call_cost = raise_amount  # what opponent must put in to call
-    pot_after_raise = new_pot
-
-    # Fix 8: nonlinear fold threshold — S-curve closer to real solver outputs
-    raw_fold_threshold = call_cost / pot_after_raise if pot_after_raise > 0 else 0.5
-    fold_threshold = raw_fold_threshold ** 0.85
-
-    # Fix 14: IP/OOP fold threshold correction
-    if opponent_positions and street > 0:
-        max_opp_pos = max(opponent_positions)
-        if max_opp_pos < hero_position:
-            fold_threshold *= 1.08  # opponents OOP → fold more
-        elif min(opponent_positions) > hero_position:
-            fold_threshold *= 0.95  # opponents IP → fold less
-
-    # Use primary opponent (first) for per-combo response classification
-    # For multiway: use first opponent's response, but equity vs all callers
     primary_idx = 0
     if len(opp_combos) > 0 and opp_combos[primary_idx].shape[0] > 0:
         primary_combos = opp_combos[primary_idx]
 
-        # Per-combo hero equity vs primary opponent
         hero_eq_per_combo = gpu_equity_per_combo(
             hero_cards, board_cards, primary_combos,
             combo_response_iters, device
         )
         opp_eq_per_combo = 1.0 - hero_eq_per_combo
-
-        # Move mask to CPU for indexing into CPU tensor
         opp_eq_cpu = opp_eq_per_combo.cpu()
-
-        # Classify opponent response
-        fold_mask = opp_eq_cpu < fold_threshold
         reraise_mask = opp_eq_cpu > reraise_threshold
+
+        state["primary_combos"] = primary_combos
+        state["opp_eq_cpu"] = opp_eq_cpu
+        state["reraise_mask"] = reraise_mask
+
+        if reraise_mask.any():
+            reraising_combos = primary_combos[reraise_mask]
+            all_reraise_combos = [
+                reraising_combos if j == primary_idx else c
+                for j, c in enumerate(opp_combos)
+            ]
+            reraise_weights = None
+            if combo_weights is not None and combo_weights[primary_idx] is not None:
+                rw = combo_weights[primary_idx][reraise_mask]
+                rw_sum = rw.sum()
+                if rw_sum > 0:
+                    rw = rw / rw_sum
+                reraise_weights = [
+                    rw if j == primary_idx else
+                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
+                    for j in range(len(opp_combos))
+                ]
+            state["eq_vs_reraisers"] = gpu_equity_v3(
+                hero_cards, board_cards, all_reraise_combos,
+                n_iters, device, reraise_weights
+            )
+
+    return state
+
+
+def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
+                               raise_frac=1.0, dynamic_reraise=False):
+    """Compute (fold_ev, call_ev, raise_ev, best_ev) from precomputed state.
+
+    Reuses raw_equity, opp_eq_cpu, reraise_mask, eq_vs_reraisers from state.
+    Only re-runs MC for eq_vs_callers (call_mask depends on raise_frac).
+    """
+    eqr_raw = state["eqr_raw"]
+    eqr_enabled = state["eqr_enabled"]
+    raw_equity = state["raw_equity"]
+    street = state["street"]
+    opp_combos = state["opp_combos"]
+    hero_cards = state["hero_cards"]
+    board_cards = state["board_cards"]
+    n_iters = state["n_iters"]
+    device = state["device"]
+    combo_weights = state["combo_weights"]
+    opponent_positions = state["opponent_positions"]
+    hero_position = state["hero_position"]
+
+    spr = stack / max(pot, 1e-6)
+    spr_eqr_factor = min(1.0, spr / 6.0)
+    eqr = 1.0 + (eqr_raw - 1.0) * spr_eqr_factor
+
+    fold_ev = -hero_invested
+
+    eff_equity = max(0.0, min(1.0, raw_equity * eqr))
+    total_call_investment = hero_invested + facing_bet
+    call_ev = eff_equity * (pot - hero_invested) + (1 - eff_equity) * (-total_call_investment)
+    _street_discount = {0: 0.92, 1: 0.95, 2: 0.98, 3: 1.0}.get(street, 1.0)
+    call_ev *= _street_discount
+
+    raise_amount = min(facing_bet + raise_frac * (pot + facing_bet), stack)
+    total_raise = hero_invested + raise_amount
+    new_pot = pot + facing_bet + raise_amount
+
+    call_cost = raise_amount
+    pot_after_raise = new_pot
+    raw_fold_threshold = call_cost / pot_after_raise if pot_after_raise > 0 else 0.5
+    fold_threshold = raw_fold_threshold ** 0.85
+    if opponent_positions and street > 0:
+        max_opp_pos = max(opponent_positions)
+        if max_opp_pos < hero_position:
+            fold_threshold *= 1.08
+        elif min(opponent_positions) > hero_position:
+            fold_threshold *= 0.95
+
+    opp_eq_cpu = state["opp_eq_cpu"]
+    reraise_mask = state["reraise_mask"]
+    primary_combos = state["primary_combos"]
+    primary_idx = state["primary_idx"]
+    eq_vs_reraisers = state["eq_vs_reraisers"]
+
+    if opp_eq_cpu is not None:
+        fold_mask = opp_eq_cpu < fold_threshold
         call_mask = ~fold_mask & ~reraise_mask
 
         n_total = float(len(opp_eq_cpu))
@@ -591,7 +644,6 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
         p_reraise = reraise_mask.float().sum().item() / n_total if n_total > 0 else 0.0
         p_call = call_mask.float().sum().item() / n_total if n_total > 0 else 1.0
 
-        # Fix 15: blocker-adjusted fold equity
         mean_opp_eq = opp_eq_cpu.mean().item()
         blocker_adj = 1.0 + (0.5 - mean_opp_eq) * 0.12
         p_fold = p_fold * blocker_adj
@@ -601,19 +653,14 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
             p_call /= p_total
             p_reraise /= p_total
 
-        # Equity vs callers only
         if call_mask.any():
             calling_combos = primary_combos[call_mask]
-
-            # Build calling range for all opponents (non-primary keep full range)
             all_calling_combos = []
             for j, c in enumerate(opp_combos):
                 if j == primary_idx:
                     all_calling_combos.append(calling_combos)
                 else:
                     all_calling_combos.append(c)
-
-            # Weights for calling combos
             calling_weights = None
             if combo_weights is not None and combo_weights[primary_idx] is not None:
                 w = combo_weights[primary_idx]
@@ -629,52 +676,23 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
                         calling_weights.append(combo_weights[j])
                     else:
                         calling_weights.append(None)
-
             eq_vs_callers = gpu_equity_v3(
                 hero_cards, board_cards, all_calling_combos,
                 n_iters, device, calling_weights
             )
         else:
-            # No callers — use full equity as fallback
             eq_vs_callers = raw_equity
 
         eff_eq_callers = max(0.0, min(1.0, eq_vs_callers * eqr)) if eqr_enabled else eq_vs_callers
-
         showdown_ev = eff_eq_callers * (new_pot - total_raise) + (1 - eff_eq_callers) * (-total_raise)
 
-        # Fix 2+7+10+12: hero continuing on reraise
-        if p_reraise > 0 and reraise_mask.any():
-            reraising_combos = primary_combos[reraise_mask]
-            all_reraise_combos = [
-                reraising_combos if j == primary_idx else c
-                for j, c in enumerate(opp_combos)
-            ]
-
-            # Weights for reraising combos
-            reraise_weights = None
-            if combo_weights is not None and combo_weights[primary_idx] is not None:
-                rw = combo_weights[primary_idx][reraise_mask]
-                rw_sum = rw.sum()
-                if rw_sum > 0:
-                    rw = rw / rw_sum
-                reraise_weights = [
-                    rw if j == primary_idx else
-                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
-                    for j in range(len(opp_combos))
-                ]
-
-            eq_vs_reraisers = gpu_equity_v3(
-                hero_cards, board_cards, all_reraise_combos,
-                n_iters, device, reraise_weights
-            )
-
-            # Fix 12: dynamic reraise sizing — SPR/street-aware
+        if p_reraise > 0 and eq_vs_reraisers is not None:
             if dynamic_reraise:
                 actual_reraise_threshold_val = _compute_reraise_threshold(
                     call_cost, pot_after_raise, street, stack, pot)
             _reraise_spr = stack / max(pot, 1e-6)
             if _reraise_spr < 3.0:
-                reraise_size = stack  # shallow → jam
+                reraise_size = stack
             else:
                 _street_mult = {0: 3.0, 1: 2.5, 2: 2.2, 3: 2.0}.get(street, 2.5)
                 reraise_size = min(raise_amount * _street_mult, stack)
@@ -685,15 +703,11 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
                 hero_call_cost / (reraise_pot + hero_call_cost)
                 if (reraise_pot + hero_call_cost) > 0 else 0.5
             )
-
-            # Fix 7: soft continue — sigmoid instead of binary threshold
             p_hero_continues = 1.0 / (1.0 + math.exp(-15.0 * (eq_vs_reraisers - hero_continue_threshold)))
             eff_eq_reraise = max(0.0, min(1.0, eq_vs_reraisers * eqr)) if eqr_enabled else eq_vs_reraisers
             ev_continue = eff_eq_reraise * (reraise_pot - total_reraise_cost) + \
                           (1 - eff_eq_reraise) * (-total_reraise_cost)
             ev_on_reraise = p_hero_continues * ev_continue + (1 - p_hero_continues) * (-total_raise)
-
-            # Fix 10: geometric approximation for infinite reraise tree
             reraise_discount = 0.3
             geometric_factor = min(1.5, 1.0 / max(0.5, 1.0 - p_reraise * reraise_discount))
             ev_on_reraise *= geometric_factor
@@ -701,13 +715,46 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
             ev_on_reraise = -total_raise
 
         raise_ev = (
-            p_fold * (pot - hero_invested)     # opponent folds, we win pot
-            + p_call * showdown_ev             # opponent calls, showdown
-            + p_reraise * ev_on_reraise        # opponent reraises, hero decides
+            p_fold * (pot - hero_invested)
+            + p_call * showdown_ev
+            + p_reraise * ev_on_reraise
         )
     else:
-        # No opponents — raise always wins pot
         raise_ev = pot - hero_invested
 
     best_ev = max(fold_ev, call_ev, raise_ev)
     return fold_ev, call_ev, raise_ev, best_ev
+
+
+def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
+                  pot, facing_bet, stack, hero_invested,
+                  raise_frac=1.0, n_iters=3000, device="mps",
+                  hero_position=0, street=0, n_players=6,
+                  eqr_enabled=True,
+                  combo_response_iters=30,
+                  reraise_threshold=0.75,
+                  weighted_sampling=True,
+                  action_history=None,
+                  opponent_positions=None,
+                  dynamic_reraise=False):
+    """Compute EV for fold/call/raise with per-combo response and EQR.
+
+    Thin wrapper that prepares state and computes EV for a single raise_frac.
+    For multi-raise_frac use cases (e.g. dataset generation), call
+    _prepare_ev_state_v3 once and _compute_ev_v3_from_state per raise_frac.
+    """
+    state = _prepare_ev_state_v3(
+        hero_cards, board_cards, opponent_range_hand_types,
+        n_iters=n_iters, device=device,
+        hero_position=hero_position, street=street, n_players=n_players,
+        eqr_enabled=eqr_enabled,
+        combo_response_iters=combo_response_iters,
+        reraise_threshold=reraise_threshold,
+        weighted_sampling=weighted_sampling,
+        action_history=action_history,
+        opponent_positions=opponent_positions,
+    )
+    return _compute_ev_v3_from_state(
+        state, pot, facing_bet, stack, hero_invested,
+        raise_frac=raise_frac, dynamic_reraise=dynamic_reraise,
+    )

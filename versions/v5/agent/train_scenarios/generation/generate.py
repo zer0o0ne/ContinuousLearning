@@ -87,11 +87,17 @@ def _get_solver(solver_name):
             "expand_range": expand_range,
         }
     elif solver_name == "v3":
-        from gpu_solver_v3 import gpu_equity_v3, compute_ev_v3, get_position_range, narrow_range, expand_range
+        from gpu_solver_v3 import (
+            gpu_equity_v3, compute_ev_v3,
+            _prepare_ev_state_v3, _compute_ev_v3_from_state,
+            get_position_range, narrow_range, expand_range,
+        )
         return gpu_equity_v3, compute_ev_v3, {
             "get_position_range": get_position_range,
             "narrow_range": narrow_range,
             "expand_range": expand_range,
+            "prepare_ev_state": _prepare_ev_state_v3,
+            "compute_ev_from_state": _compute_ev_v3_from_state,
         }
     elif solver_name == "v4":
         from gpu_solver_v4 import (
@@ -99,6 +105,7 @@ def _get_solver(solver_name):
             get_position_range, narrow_range, expand_range,
             compute_marginalized_action_probs, bayesian_range_update, filter_dead_combos,
         )
+        from gpu_solver_v3 import _prepare_ev_state_v3, _compute_ev_v3_from_state
         return gpu_equity_v3, compute_ev_v3, {
             "get_position_range": get_position_range,
             "narrow_range": narrow_range,
@@ -106,6 +113,8 @@ def _get_solver(solver_name):
             "compute_marginalized_action_probs": compute_marginalized_action_probs,
             "bayesian_range_update": bayesian_range_update,
             "filter_dead_combos": filter_dead_combos,
+            "prepare_ev_state": _prepare_ev_state_v3,
+            "compute_ev_from_state": _compute_ev_v3_from_state,
         }
     else:
         raise ValueError(f"Unknown solver: {solver_name}. Use 'v1', 'v2', 'v3', or 'v4'.")
@@ -439,66 +448,114 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
             return evs, meta
 
         if solver_name == "v3":
-            ev_extra = {
-                "hero_position": player_pos,
-                "street": table.turn,
-                "n_players": table.num_players,
-                "eqr_enabled": eqr_enabled,
-                "combo_response_iters": combo_response_iters,
-                "reraise_threshold": reraise_threshold,
-                "weighted_sampling": weighted_sampling,
-                "action_history": action_history,
-                "opponent_positions": opp_positions,
-                "dynamic_reraise": True,
-            }
+            # Optimized path: prepare per-decision MC state once, then run cheap
+            # arithmetic per raise_frac. Eliminates ~12× redundant equity calls.
+            prepare_ev_state = solver_modules["prepare_ev_state"]
+            compute_ev_from_state = solver_modules["compute_ev_from_state"]
+
+            try:
+                state = prepare_ev_state(
+                    hero_t, board_t, opp_range_types,
+                    n_iters=mc_iters, device=device,
+                    hero_position=player_pos,
+                    street=table.turn,
+                    n_players=table.num_players,
+                    eqr_enabled=eqr_enabled,
+                    combo_response_iters=combo_response_iters,
+                    reraise_threshold=reraise_threshold,
+                    weighted_sampling=weighted_sampling,
+                    action_history=action_history,
+                    opponent_positions=opp_positions,
+                )
+            except Exception:
+                return None, None
+
+            eq = state["raw_equity"]
+
+            try:
+                _, call_ev, _, _ = compute_ev_from_state(
+                    state, pot, facing_bet, stack, hero_invested,
+                    raise_frac=1.0, dynamic_reraise=True,
+                )
+            except Exception:
+                return None, None
+            evs[1] = call_ev
+
+            allin_frac = stack / max(pot + facing_bet, 1e-6)
+            try:
+                _, _, allin_ev_val, _ = compute_ev_from_state(
+                    state, pot, facing_bet, stack, hero_invested,
+                    raise_frac=allin_frac, dynamic_reraise=True,
+                )
+                allin_ev = allin_ev_val
+            except Exception:
+                allin_ev = evs[0]
+
+            for b in range(2, n_raise_bins + 2):
+                raise_pct = street_raises[b - 2]
+                actual_bet = facing_bet + raise_pct * effective_pot
+                if actual_bet >= stack:
+                    evs[b] = allin_ev
+                else:
+                    try:
+                        solver_frac = _raise_to_solver_frac(raise_pct)
+                        _, _, r_ev, _ = compute_ev_from_state(
+                            state, pot, facing_bet, stack, hero_invested,
+                            raise_frac=solver_frac, dynamic_reraise=True,
+                        )
+                        evs[b] = r_ev
+                    except Exception:
+                        evs[b] = allin_ev
+
+            evs[n_raise_bins + 2] = allin_ev
         else:
+            # v2 path: per-raise_frac compute_ev_fn (no state caching).
             ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
 
-        try:
-            _, call_ev, _, _ = compute_ev_fn(
-                hero_t, board_t, opp_range_types,
-                pot, facing_bet, stack, hero_invested,
-                raise_frac=1.0, n_iters=mc_iters, device=device, **ev_extra
-            )
-            dead = set(hero_t.tolist())
-            if len(board_t) > 0:
-                dead.update(board_t.tolist())
-            opp_combos = [expand_range(ht_list, dead) for ht_list in opp_range_types]
-            eq = gpu_equity_fn(hero_t, board_t, opp_combos, mc_iters, device)
-        except Exception:
-            return None, None
-        evs[1] = call_ev
+            try:
+                _, call_ev, _, _ = compute_ev_fn(
+                    hero_t, board_t, opp_range_types,
+                    pot, facing_bet, stack, hero_invested,
+                    raise_frac=1.0, n_iters=mc_iters, device=device, **ev_extra
+                )
+                dead = set(hero_t.tolist())
+                if len(board_t) > 0:
+                    dead.update(board_t.tolist())
+                opp_combos = [expand_range(ht_list, dead) for ht_list in opp_range_types]
+                eq = gpu_equity_fn(hero_t, board_t, opp_combos, mc_iters, device)
+            except Exception:
+                return None, None
+            evs[1] = call_ev
 
-        allin_frac = stack / max(pot + facing_bet, 1e-6)
-        allin_ev = None
-        try:
-            _, _, allin_ev_val, _ = compute_ev_fn(
-                hero_t, board_t, opp_range_types,
-                pot, facing_bet, stack, hero_invested,
-                raise_frac=allin_frac, n_iters=mc_iters, device=device, **ev_extra
-            )
-            allin_ev = allin_ev_val
-        except Exception:
-            allin_ev = evs[0]
+            allin_frac = stack / max(pot + facing_bet, 1e-6)
+            try:
+                _, _, allin_ev_val, _ = compute_ev_fn(
+                    hero_t, board_t, opp_range_types,
+                    pot, facing_bet, stack, hero_invested,
+                    raise_frac=allin_frac, n_iters=mc_iters, device=device, **ev_extra
+                )
+                allin_ev = allin_ev_val
+            except Exception:
+                allin_ev = evs[0]
 
-        for b in range(2, n_raise_bins + 2):
-            raise_pct = street_raises[b - 2]
-            actual_bet = facing_bet + raise_pct * effective_pot
-            if actual_bet >= stack:
-                evs[b] = allin_ev
-            else:
-                try:
-                    solver_frac = _raise_to_solver_frac(raise_pct)
-                    _, _, r_ev, _ = compute_ev_fn(
-                        hero_t, board_t, opp_range_types,
-                        pot, facing_bet, stack, hero_invested,
-                        raise_frac=solver_frac, n_iters=mc_iters, device=device, **ev_extra
-                    )
-                    evs[b] = r_ev
-                except Exception:
+            for b in range(2, n_raise_bins + 2):
+                raise_pct = street_raises[b - 2]
+                actual_bet = facing_bet + raise_pct * effective_pot
+                if actual_bet >= stack:
                     evs[b] = allin_ev
+                else:
+                    try:
+                        solver_frac = _raise_to_solver_frac(raise_pct)
+                        _, _, r_ev, _ = compute_ev_fn(
+                            hero_t, board_t, opp_range_types,
+                            pot, facing_bet, stack, hero_invested,
+                            raise_frac=solver_frac, n_iters=mc_iters, device=device, **ev_extra
+                        )
+                        evs[b] = r_ev
+                    except Exception:
+                        evs[b] = allin_ev
 
-        evs[n_raise_bins + 2] = allin_ev
+            evs[n_raise_bins + 2] = allin_ev
 
     meta = {
         "equity": eq,

@@ -81,11 +81,11 @@
     },
     "solver": {
         "type": "v3",
-        "mc_iterations": 5000,
+        "mc_iterations": 15000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 30,
+        "combo_response_iters": 100,
         "reraise_threshold": 0.72,
         "weighted_sampling": true,
         "marginal_mc_iters": 0,
@@ -94,10 +94,10 @@
     "dataset": {
         "dataset_dir": "",
         "save_dir": "",
-        "n_scenarios": 50000,
+        "n_scenarios": 500000,
         "val_split": 0.05,
         "n_workers": 8,
-        "save_every_hands": 1000,
+        "save_every_hands": 10000,
         "device": "cuda"
     },
     "gto_ev_train": {
@@ -144,7 +144,7 @@
     },
     "opponent_data": {
         "agents_dir": "5_final_agents",
-        "n_hands": 7500,
+        "n_hands": 75000,
         "n_workers": 1,
         "server_max_batch": 512,
         "server_linger_ms": 2,
@@ -170,15 +170,15 @@
         "val_split": 0.05
     },
     "mcts": {
-        "n_simulations": 3000,
+        "n_simulations": 10000,
         "c_puct": 1.5,
         "dirichlet_alpha": 0.3,
         "dirichlet_epsilon": 0.25,
         "dirichlet_alpha_inner": 0.3,
         "dirichlet_epsilon_inner": 0.05,
         "temperature": 1.0,
-        "n_equity_iters": 5000,
-        "batch_size": 32,
+        "n_equity_iters": 15000,
+        "batch_size": 64,
         "virtual_loss": 0.5,
         "opp_prior_smoothing": 0.15,
         "opp_pessimism_alpha": 0.5,

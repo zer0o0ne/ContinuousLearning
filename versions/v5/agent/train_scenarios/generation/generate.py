@@ -1140,8 +1140,10 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
         save_dir: directory to save dataset.pt
         log: optional logger
         resume: if True, look at meta.json and continue from where a prior
-            interrupted run left off (sequential mode only — parallel mode
-            still treats partial datasets as all-or-nothing). Verifies
+            interrupted run left off. Supported in both sequential and
+            parallel modes; in parallel mode resume granularity is
+            `save_every_hands` (tasks dispatched but not yet incrementally
+            persisted before the kill are regenerated). Verifies
             `meta.config_hash == config_hash`; on mismatch the existing
             dataset is renamed to `dataset.pt.stale.<ts>` and generation
             starts from scratch.
@@ -1203,31 +1205,21 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                         f"(target={meta['target']} >= {n_scenarios})")
                 return torch.load(dataset_path, weights_only=False)
             elif os.path.exists(dataset_path):
-                # Partial dataset compatible with current config — load and
-                # continue from where the prior run stopped. Parallel mode
-                # has no way to safely resume mid-flight (workers don't
-                # checkpoint individually), so we fall back to from-scratch
-                # there.
-                if n_workers > 1 and n_scenarios >= n_workers * 2:
-                    if log:
-                        log(f"Partial dataset present but n_workers>1; "
-                            f"parallel mode does not support mid-generation "
-                            f"resume — regenerating from scratch.")
-                    os.unlink(dataset_path)
-                    try:
-                        os.unlink(_meta_path(save_dir))
-                    except OSError:
-                        pass
-                else:
-                    scenarios = torch.load(dataset_path, weights_only=False)
-                    start_attempts = int(meta.get("completed_attempts", 0))
-                    start_hand_id = int(meta.get("completed_hands", 0))
-                    initial_failed = max(0, start_attempts - start_hand_id)
-                    if log:
-                        log(f"Resuming dataset at {save_dir}: "
-                            f"{start_attempts}/{n_scenarios} attempts done, "
-                            f"{len(scenarios)} samples on disk, "
-                            f"next hand_id={start_hand_id}")
+                # Partial dataset compatible with current config — load it
+                # and continue from where the prior run stopped. Both the
+                # sequential and parallel paths below honour `start_attempts`
+                # / `start_hand_id`; in parallel mode resume granularity is
+                # `save_every_hands` (anything between the last incremental
+                # _persist and the kill is regenerated).
+                scenarios = torch.load(dataset_path, weights_only=False)
+                start_attempts = int(meta.get("completed_attempts", 0))
+                start_hand_id = int(meta.get("completed_hands", 0))
+                initial_failed = max(0, start_attempts - start_hand_id)
+                if log:
+                    log(f"Resuming dataset at {save_dir}: "
+                        f"{start_attempts}/{n_scenarios} attempts done, "
+                        f"{len(scenarios)} samples on disk, "
+                        f"next hand_id={start_hand_id}")
 
     # If we reach here without a partial-resume and the dataset is already
     # present (legacy non-resume usage), short-circuit as before.
@@ -1250,56 +1242,69 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
             })
 
     if n_workers > 1 and n_scenarios >= n_workers * 2:
-        # --- Multiprocessing path (no mid-generation resume) ---
+        # --- Multiprocessing path with mid-generation resume ---
+        # Worker tasks are 1 hand each, dispatched by `worker_id` =
+        # `start_attempts..n_scenarios-1`. Already-completed scenarios are
+        # carried over in `scenarios` from the prior run's incremental
+        # save; resume granularity is `save_every_hands` (any tasks whose
+        # results were received but not yet persisted before the kill are
+        # regenerated with the same `worker_id`, harmless).
         worker_device = _get_generation_device(config.get("device"))
         if log:
-            log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
+            if start_attempts > 0:
+                log(f"Resuming parallel generation on {worker_device}: "
+                    f"{n_scenarios - start_attempts} attempts remaining of "
+                    f"{n_scenarios} (prior: {start_attempts} attempts, "
+                    f"{len(scenarios)} samples loaded)")
+            else:
+                log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
             log(f"Incremental save every {save_every_hands} hands")
 
-        # Small chunks so progress bar updates frequently (1 hand per task)
         chunk_size = 1
         worker_args = []
-        remaining = n_scenarios
-        worker_id = 0
-        while remaining > 0:
-            n_hands = min(chunk_size, remaining)
+        worker_id = start_attempts
+        while worker_id < n_scenarios:
+            n_hands = min(chunk_size, n_scenarios - worker_id)
             worker_args.append((config, worker_device, n_hands, worker_id))
-            remaining -= n_hands
-            worker_id += 1
+            worker_id += n_hands
 
         ctx = mp.get_context("spawn")
-        counter = ctx.Value("i", 0)
-        scenarios = []
-        total_ok = 0
-        total_failed = 0
-        last_save_count = 0
-        completed_attempts = 0
-        completed_hands = 0
+        # Shared counter starts at start_attempts so meta's `completed_attempts`
+        # and the progress bar reflect cumulative work across all runs.
+        counter = ctx.Value("i", start_attempts)
+        total_ok = start_hand_id
+        total_failed = initial_failed
+        completed_attempts = start_attempts
+        completed_hands = start_hand_id
+        last_save_count = start_attempts
 
-        pbar = tqdm(total=n_scenarios, desc="Generating hands")
+        pbar = tqdm(total=n_scenarios, desc="Generating hands",
+                    initial=start_attempts)
 
-        with ctx.Pool(n_workers, initializer=_init_worker, initargs=(counter,)) as pool:
-            for worker_scenarios, ok, failed in pool.imap_unordered(_generate_worker, worker_args):
-                scenarios.extend(worker_scenarios)
-                total_ok += ok
-                total_failed += failed
-                completed_attempts = counter.value
-                completed_hands = total_ok
-                pbar.n = counter.value
-                pbar.refresh()
+        if worker_args:
+            with ctx.Pool(n_workers, initializer=_init_worker, initargs=(counter,)) as pool:
+                for worker_scenarios, ok, failed in pool.imap_unordered(_generate_worker, worker_args):
+                    scenarios.extend(worker_scenarios)
+                    total_ok += ok
+                    total_failed += failed
+                    completed_attempts = counter.value
+                    completed_hands = total_ok
+                    pbar.n = counter.value
+                    pbar.refresh()
 
-                if counter.value - last_save_count >= save_every_hands:
-                    _persist(meta_done=False)
-                    last_save_count = counter.value
-                    if log:
-                        log(f"  Incremental save: {len(scenarios)} samples ({counter.value} hands)")
+                    if counter.value - last_save_count >= save_every_hands:
+                        _persist(meta_done=False)
+                        last_save_count = counter.value
+                        if log:
+                            log(f"  Incremental save: {len(scenarios)} samples ({counter.value} hands)")
 
         pbar.n = n_scenarios
         pbar.refresh()
         pbar.close()
 
         if log:
-            log(f"Generated {len(scenarios)} samples from {total_ok} hands ({total_failed} failed)")
+            log(f"Generated {len(scenarios)} samples total "
+                f"({total_ok} successful hands, {total_failed} failed)")
 
     else:
         # --- Sequential path (n_workers=1 or very few scenarios) ---

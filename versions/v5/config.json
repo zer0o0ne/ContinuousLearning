@@ -85,7 +85,7 @@
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 200,
+        "combo_response_iters": 100,
         "reraise_threshold": 0.72,
         "weighted_sampling": true,
         "marginal_mc_iters": 0,
@@ -96,9 +96,9 @@
         "save_dir": "",
         "n_scenarios": 500000,
         "val_split": 0.05,
-        "n_workers": 128,
+        "n_workers": 8,
         "save_every_hands": 10000,
-        "device": "cpu"
+        "device": "cuda"
     },
     "gto_ev_train": {
         "lr": 1e-4,

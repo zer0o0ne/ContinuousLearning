@@ -276,7 +276,6 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
             # Send template once + N hand pairs. Server replicates and runs.
             logits = proxy.forward_batch_templated(
                 agent_name, template, batch_combos, heads=("action",))
-            probs = F.softmax(logits / temperature, dim=-1)
         elif proxy is not None:
             # Legacy parallel path: actor builds N event copies and ships them.
             batch_events = []
@@ -286,7 +285,6 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
                     e["hand"] = [c1, c2]
                 batch_events.append(events)
             logits = proxy.forward_batch(agent_name, batch_events, heads=("action",))
-            probs = F.softmax(logits / temperature, dim=-1)
         else:
             # Sequential path: in-process forward, unchanged.
             batch_events = []
@@ -299,7 +297,15 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                     out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})
                 logits = out["action_logits"]  # (batch, n_actions)
-                probs = F.softmax(logits / temperature, dim=-1)
+
+        # Softmax in fp32 even when the forward ran under fp16 autocast.
+        # fp16 softmax can emit slight negatives / nan at the edge, which
+        # torch.multinomial rejects ("element < 0 / nan / inf"). Casting
+        # logits → fp32 here also turns finite-but-very-large fp16 values
+        # into safe fp32 numbers; only true ±inf survives and is handled
+        # by the row-level fallback downstream in generate_opponent_hand.
+        logits = logits.float()
+        probs = F.softmax(logits / temperature, dim=-1)
         all_probs.append(probs.cpu())
 
     per_combo_probs = torch.cat(all_probs, dim=0)  # (n_combos, n_actions)
@@ -431,9 +437,28 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         legal_mask = torch.tensor(
             gs.get_legal_action_mask(n_actions), dtype=torch.bool,
         )
+        # Sanitize: any nan/±inf from the network forward becomes 0, then
+        # clip negatives (fp16 softmax can produce small negatives). Without
+        # this `torch.multinomial` rejects the row with "inf / nan / element
+        # < 0" — exactly the crash we hit on long-event-sequence hands.
+        per_combo_probs = torch.nan_to_num(
+            per_combo_probs, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
         per_combo_probs = per_combo_probs.masked_fill(~legal_mask, 0.0)
-        row_sums = per_combo_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-        per_combo_probs = per_combo_probs / row_sums
+        row_sums = per_combo_probs.sum(dim=-1, keepdim=True)
+        # Any row whose probabilities all zeroed out (either everything was
+        # nan/inf, or the network put all its mass on illegal actions) falls
+        # back to uniform-over-legal so we can still sample an action and the
+        # training target stays well-defined.
+        legal_count = int(legal_mask.sum().item())
+        if legal_count == 0:
+            # Defensive: caller already checks via GameState, but stay safe.
+            break
+        bad_rows = (row_sums.squeeze(-1) <= 1e-12)
+        if bool(bad_rows.any()):
+            uniform_legal = (legal_mask.float() / legal_count).unsqueeze(0)
+            per_combo_probs[bad_rows] = uniform_legal
+            row_sums = per_combo_probs.sum(dim=-1, keepdim=True)
+        per_combo_probs = per_combo_probs / row_sums.clamp(min=1e-12)
         avg_probs = per_combo_probs.mean(dim=0)
 
         # Fix hand at first action of this player

@@ -7,11 +7,20 @@ import torch
 def get_amp_config(device):
     """Return AMP configuration for the given device.
 
+    On CUDA we prefer bfloat16 (same exponent range as fp32 → no overflow
+    in deep transformers; this fixes `inf`/`nan` logits that previously
+    poisoned opponent-data generation through softmax). bf16 also doesn't
+    need a GradScaler since it can't underflow gradients in any range
+    fp32 reaches. Older GPUs that don't support bf16 fall back to fp16
+    with a scaler, matching the previous behaviour exactly.
+
     Returns:
         (amp_enabled, device_type, amp_dtype, use_scaler)
     """
     device_str = str(device)
     if device_str.startswith("cuda"):
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return True, "cuda", torch.bfloat16, False
         return True, "cuda", torch.float16, True
     elif device_str == "mps":
         return True, "mps", torch.bfloat16, False

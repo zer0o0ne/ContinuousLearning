@@ -69,11 +69,33 @@ def _run_or_resume_phase(state, agent, agent_name, scenario_name,
     phase = state.get_phase(agent_name, scenario_name)
 
     if not force and phase and phase.get("status") == "done":
-        # Already complete in a prior run — just load the best.pt and skip.
-        agent_log(f"  [resume] {scenario_name}: status=done, "
-                  f"loading existing best.pt")
-        agent.load_checkpoint(os.path.join(agent_base, scenario_name))
-        return
+        # Already complete in a prior run — load the recorded best.pt and skip.
+        # We pass the FILE path (not the agent dir) so ASI.load_checkpoint
+        # doesn't fall into _find_best_checkpoint's scenario-priority search,
+        # which would either miss this phase entirely or pick up a later
+        # phase's checkpoint instead.
+        saved_run_dir = phase.get("run_dir")
+        best_ckpt = None
+        if saved_run_dir:
+            candidate = os.path.join(saved_run_dir, "best.pt")
+            if os.path.exists(candidate):
+                best_ckpt = candidate
+        if best_ckpt is None:
+            # State recorded done but file is gone (manual move, etc.).
+            # Fall back to scanning the scenario dir for any best.pt.
+            best_ckpt = _find_latest_best_ckpt(
+                os.path.join(agent_base, scenario_name))
+        if best_ckpt is None:
+            agent_log(
+                f"  [resume] {scenario_name}: status=done but no best.pt on "
+                f"disk (run_dir={saved_run_dir}). Re-running from scratch.")
+            state.set_phase(agent_name, scenario_name, status="pending")
+            # fall through to fresh-run path below
+        else:
+            agent_log(f"  [resume] {scenario_name}: status=done, "
+                      f"loading {best_ckpt}")
+            agent.load_checkpoint(best_ckpt)
+            return
 
     resume_state = None
     run_dir = None

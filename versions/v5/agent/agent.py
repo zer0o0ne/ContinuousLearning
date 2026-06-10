@@ -144,7 +144,7 @@ class ASI(nn.Module):
             self.log(f"WARNING: checkpoint {path} not found, agent initialized randomly")
             return
 
-        ckpt = torch.load(ckpt_path, weights_only=False, map_location=self.device_)
+        ckpt = torch.load(ckpt_path, weights_only=False, map_location="cpu")
         state_dict = ckpt.get("model_state_dict", ckpt)
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
 

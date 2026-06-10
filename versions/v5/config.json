@@ -200,7 +200,7 @@
         "max_stack": 3000,
         "examples_dir": "",
         "lr": 1e-5,
-        "batch_size": 32,
+        "batch_size": 16,
         "epochs": 1,
         "max_grad_norm": 1.0,
         "log_every": 1,

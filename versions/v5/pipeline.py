@@ -7,6 +7,10 @@ from agent.agent import ASI
 from agent.resume import (
     PipelineState, compute_config_hash, atomic_torch_save,
 )
+from agent.train_scenarios._checkpoint_io import (
+    is_legacy_mcts_ckpt,
+    restore_optim_sched,
+)
 
 
 def _find_latest_best_ckpt(scenario_dir):
@@ -646,14 +650,18 @@ def main():
                     agent_obj._checkpoint_norm_stats = norm_stats
                 return norm_stats
 
-            def _build_persistent_optim(agent_obj, ckpt, mcts_train_cfg,
-                                         n_cycles, agent_log):
+            def _build_persistent_optim(agent_obj, ckpt, ckpt_path,
+                                         mcts_train_cfg, n_cycles, agent_log):
                 """Construct a single Adam + warmup→cosine that survives
                 across all cycles AND across pipeline runs.
 
-                Restores Adam moments and scheduler state from the
-                checkpoint when present, so cosine doesn't restart and β2
-                moments don't reset every cycle.
+                Optimizer / scheduler state is only restored when the
+                source checkpoint was written by a previous MCTS run
+                (phase tag == "mcts_predict") AND the agent's trainable
+                parameter signature matches. On the first MCTS cycle the
+                source ckpt comes from `opponent_action_predict` (or
+                another earlier phase via `_find_best_checkpoint`) — that
+                state is meaningless here and is silently skipped.
                 """
                 from torch.optim.lr_scheduler import (
                     LinearLR, CosineAnnealingLR, SequentialLR)
@@ -680,20 +688,20 @@ def main():
                 restored_opt = False
                 restored_sched = False
                 if ckpt is not None:
-                    opt_state = ckpt.get("optimizer_state_dict")
-                    if opt_state is not None:
-                        try:
-                            opt.load_state_dict(opt_state)
-                            restored_opt = True
-                        except Exception as e:
-                            agent_log(f"  optimizer state ignored: {e}")
-                    sched_state = ckpt.get("scheduler_state_dict")
-                    if sched_state is not None:
-                        try:
-                            sched.load_state_dict(sched_state)
-                            restored_sched = True
-                        except Exception as e:
-                            agent_log(f"  scheduler state ignored: {e}")
+                    if is_legacy_mcts_ckpt(ckpt_path, ckpt):
+                        agent_log(
+                            "  WARNING: loaded model weights from a legacy "
+                            "untagged mcts_predict checkpoint at "
+                            f"{ckpt_path}. These weights were almost "
+                            "certainly produced by the negative-LR bug — "
+                            "delete this mcts_predict/ subdirectory and "
+                            "restart MCTS from the prior phase's checkpoint."
+                        )
+                    restored_opt, restored_sched, _ = restore_optim_sched(
+                        optimizer=opt, scheduler=sched, ckpt=ckpt,
+                        expected_phase="mcts_predict", model=agent_obj,
+                        strict=False, log=agent_log,
+                    )
                 msg = (
                     f"  Persistent optim: lr_now={opt.param_groups[0]['lr']:.2e}, "
                     f"horizon={total_steps} steps "
@@ -758,8 +766,8 @@ def main():
                             cumulative_step = int(steps[-1].get("step", 0)) + 1
 
                     optimizer, scheduler = _build_persistent_optim(
-                        agent_obj, loaded_ckpt, mcts_train_cfg,
-                        n_cycles, agent_log)
+                        agent_obj, loaded_ckpt, ckpt_path,
+                        mcts_train_cfg, n_cycles, agent_log)
 
                     trained_agents.append({
                         "agent": agent_obj,
@@ -804,7 +812,8 @@ def main():
                     single_ckpt = torch.load(
                         single_ckpt_path, weights_only=False, map_location=device)
                 optimizer, scheduler = _build_persistent_optim(
-                    agent_obj, single_ckpt, mcts_train_cfg, n_cycles, log)
+                    agent_obj, single_ckpt, single_ckpt_path,
+                    mcts_train_cfg, n_cycles, log)
 
                 trained_agents.append({
                     "agent": agent_obj,

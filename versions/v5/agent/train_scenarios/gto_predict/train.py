@@ -18,7 +18,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
     _compute_norm_stats, _normalize_scenarios
 from agent.train_scenarios.gto_predict.dataset import GTODataset, batch_collate
+from agent.train_scenarios._checkpoint_io import (
+    make_checkpoint,
+    restore_optim_sched,
+)
 from agent.resume import atomic_torch_save
+
+
+_PHASE = "gto_predict"
 
 
 class LengthGroupedBatchSampler(Sampler):
@@ -115,16 +122,13 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
                global_step, epoch, val_loss, log, temperature=None):
     """Save best model checkpoint."""
     best_path = os.path.join(ckpt_dir, "best.pt")
-    ckpt = {
-        "step": global_step, "epoch": epoch + 1,
-        "model_state_dict": agent.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "norm_stats": norm_stats,
-        "val_loss": val_loss,
-    }
+    extra = {"step": global_step, "epoch": epoch + 1}
     if temperature is not None:
-        ckpt["temperature"] = temperature
+        extra["temperature"] = temperature
+    ckpt = make_checkpoint(
+        phase=_PHASE, model=agent, optimizer=optimizer, scheduler=scheduler,
+        norm_stats=norm_stats, val_loss=val_loss, extra=extra,
+    )
     torch.save(ckpt, best_path)
     log(f"  New best model (val loss: {val_loss:.6f})")
 
@@ -138,19 +142,18 @@ def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
                  next_epoch, global_step, best_val_loss, fails_since_best,
                  val_loss, temperature=None):
     """Atomic per-epoch checkpoint for pipeline.resume."""
-    ckpt = {
-        "model_state_dict":     agent.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "next_epoch":           next_epoch,
-        "global_step":          global_step,
-        "best_val_loss":        best_val_loss,
-        "fails_since_best":     fails_since_best,
-        "norm_stats":           norm_stats,
-        "val_loss":             val_loss,
+    extra = {
+        "next_epoch":       next_epoch,
+        "global_step":      global_step,
+        "best_val_loss":    best_val_loss,
+        "fails_since_best": fails_since_best,
     }
     if temperature is not None:
-        ckpt["temperature"] = temperature
+        extra["temperature"] = temperature
+    ckpt = make_checkpoint(
+        phase=_PHASE, model=agent, optimizer=optimizer, scheduler=scheduler,
+        norm_stats=norm_stats, val_loss=val_loss, extra=extra,
+    )
     atomic_torch_save(ckpt, os.path.join(run_dir, "latest.pt"))
 
 
@@ -305,12 +308,12 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
         }
 
     if resume_state is not None:
-        try:
-            optimizer.load_state_dict(resume_state["optimizer_state_dict"])
-            scheduler.load_state_dict(resume_state["scheduler_state_dict"])
-        except Exception as e:
-            log(f"  Optimizer/scheduler restore failed: {e}. "
-                f"Continuing with fresh ones.")
+        restore_optim_sched(
+            optimizer=optimizer, scheduler=scheduler,
+            ckpt=resume_state, expected_phase=_PHASE, model=agent,
+            strict=True, log=log,
+            legacy_path_phase_hint=_PHASE,
+        )
         start_epoch = int(resume_state.get("start_epoch", 0))
         global_step = int(resume_state.get("global_step", 0))
         best_val_loss = float(resume_state.get("best_val_loss", float("inf")))

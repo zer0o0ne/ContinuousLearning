@@ -19,6 +19,10 @@ from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from agent.train_scenarios.mcts_predict.dataset import MCTSDataset, batch_collate
+from agent.train_scenarios._checkpoint_io import make_checkpoint
+
+
+_PHASE = "mcts_predict"
 
 
 class LengthGroupedBatchSampler(Sampler):
@@ -841,19 +845,18 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
     `_find_best_checkpoint` loads (latest state); the per-cycle snapshot is
     permanent and gated by `save_every_cycles` via `write_snapshot`.
     """
-    ckpt = {
+    extra = {
         "step": global_step, "epoch": epoch + 1,
         "cycle_id": cycle_id,
         "examples_in_cycle": examples_in_cycle,
-        "model_state_dict": agent.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "norm_stats": norm_stats,
-        "val_loss": val_loss,
         "save_reason": reason,
     }
     if temperature is not None:
-        ckpt["temperature"] = temperature
+        extra["temperature"] = temperature
+    ckpt = make_checkpoint(
+        phase=_PHASE, model=agent, optimizer=optimizer, scheduler=scheduler,
+        norm_stats=norm_stats, val_loss=val_loss, extra=extra,
+    )
 
     best_path = os.path.join(ckpt_dir, "best.pt")
     torch.save(ckpt, best_path)

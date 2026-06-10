@@ -330,6 +330,10 @@ class Perception(nn.Module):
             self.opponent_gru = OpponentGRUUpdater(d_model)
         self.d_model = d_model
 
+    def set_gradient_checkpointing(self, enabled: bool):
+        self.encoder.gradient_checkpointing = bool(enabled)
+        self.decoder.gradient_checkpointing = bool(enabled)
+
     def forward_batch(self, event_sequences, device="cpu", skip_memory=True,
                       skip_opponent_emb=True, opponent_emb_table=None):
         """

@@ -224,6 +224,7 @@
         "terminal_value_weight": 1.0,
         "terminal_value_k_worst": 4,
         "terminal_value_k_best": 4,
+        "gradient_checkpointing": false,
         "teacher_forcing": {
             "p_start": 1.0,
             "p_end": 0.0,

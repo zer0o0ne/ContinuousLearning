@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as ckpt
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm
 
@@ -21,13 +22,14 @@ class Encoder(nn.Module):
             num_hidden_layers=n_layers,
             max_position_embeddings=max_seq_len,
         )
-        self.config._attn_implementation = "eager"
+        self.config._attn_implementation = "sdpa"
 
         self.rope = Qwen3RotaryEmbedding(config=self.config)
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(self.config, layer_idx=i) for i in range(n_layers)]
         )
         self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
+        self.gradient_checkpointing = False
 
     def forward(self, x, mask=None):
         """
@@ -44,9 +46,20 @@ class Encoder(nn.Module):
         if mask is not None:
             attn_mask = (1.0 - mask[:, None, None, :]) * torch.finfo(x.dtype).min
 
+        use_ckpt = (self.gradient_checkpointing and self.training
+                    and torch.is_grad_enabled())
         for layer in self.layers:
-            layer_out = layer(x, position_ids=position_ids, position_embeddings=position_embeddings,
-                              attention_mask=attn_mask)
+            if use_ckpt:
+                layer_out = ckpt.checkpoint(
+                    layer, x,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attn_mask,
+                    use_reentrant=False)
+            else:
+                layer_out = layer(x, position_ids=position_ids,
+                                  position_embeddings=position_embeddings,
+                                  attention_mask=attn_mask)
             x = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         return self.norm(x)

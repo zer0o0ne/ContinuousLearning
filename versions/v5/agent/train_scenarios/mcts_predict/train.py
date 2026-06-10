@@ -522,6 +522,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     stop_grad_old_embs = bool(train_cfg.get("stop_grad_old_embs", True))
     entropy_weight = float(train_cfg.get("entropy_weight", 0.0))
     terminal_value_weight = float(train_cfg.get("terminal_value_weight", 0.0))
+    gradient_checkpointing = bool(train_cfg.get("gradient_checkpointing", False))
     weights = {"value_weight": value_weight, "action_weight": action_weight,
                "chain_weight": chain_weight, "recon_weight": recon_weight,
                "value_chain_weight": value_chain_weight,
@@ -645,6 +646,10 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     global_step = int(global_step_offset)
     cycle_step_start = global_step
     stopped_early = False
+
+    agent.perception.set_gradient_checkpointing(gradient_checkpointing)
+    if gradient_checkpointing:
+        log("Gradient checkpointing enabled on perception encoder/decoder")
 
     for epoch in range(epochs):
         if stopped_early:
@@ -823,6 +828,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     torch.save(history, history_path)
     log(f"=== MCTS Cycle {cycle_id} Complete. "
         f"Best val: {best_val_loss:.6f}, saved=cycle_end ===")
+    agent.perception.set_gradient_checkpointing(False)
     return history, run_dir, global_step
 
 

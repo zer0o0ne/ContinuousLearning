@@ -647,9 +647,9 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     cycle_step_start = global_step
     stopped_early = False
 
-    agent.perception.set_gradient_checkpointing(gradient_checkpointing)
+    agent.set_gradient_checkpointing(gradient_checkpointing)
     if gradient_checkpointing:
-        log("Gradient checkpointing enabled on perception encoder/decoder")
+        log("Gradient checkpointing enabled on perception + all heads")
 
     for epoch in range(epochs):
         if stopped_early:
@@ -828,7 +828,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     torch.save(history, history_path)
     log(f"=== MCTS Cycle {cycle_id} Complete. "
         f"Best val: {best_val_loss:.6f}, saved=cycle_end ===")
-    agent.perception.set_gradient_checkpointing(False)
+    agent.set_gradient_checkpointing(False)
     return history, run_dir, global_step
 
 

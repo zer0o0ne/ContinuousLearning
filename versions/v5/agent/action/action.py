@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as ckpt
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm
 
@@ -20,7 +21,7 @@ class ActionHead(nn.Module):
             num_hidden_layers=n_layers,
             max_position_embeddings=max_seq_len,
         )
-        self.config._attn_implementation = "eager"
+        self.config._attn_implementation = "sdpa"
 
         self.rope = Qwen3RotaryEmbedding(config=self.config)
         self.layers = nn.ModuleList(
@@ -28,6 +29,7 @@ class ActionHead(nn.Module):
         )
         self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
         self.output_proj = nn.Linear(d_model, n_actions, bias=False)
+        self.gradient_checkpointing = False
 
     def forward(self, context, mask=None):
         """
@@ -45,9 +47,20 @@ class ActionHead(nn.Module):
             attn_mask = (1.0 - mask[:, None, None, :]) * torch.finfo(context.dtype).min
 
         x = context
+        use_ckpt = (self.gradient_checkpointing and self.training
+                    and torch.is_grad_enabled())
         for layer in self.layers:
-            layer_out = layer(x, position_ids=position_ids, position_embeddings=position_embeddings,
-                              attention_mask=attn_mask)
+            if use_ckpt:
+                layer_out = ckpt.checkpoint(
+                    layer, x,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attn_mask,
+                    use_reentrant=False)
+            else:
+                layer_out = layer(x, position_ids=position_ids,
+                                  position_embeddings=position_embeddings,
+                                  attention_mask=attn_mask)
             x = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         x = self.norm(x)

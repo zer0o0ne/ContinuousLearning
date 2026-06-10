@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as ckpt
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm, repeat_kv,
@@ -102,7 +103,7 @@ class ModellingHead(nn.Module):
             num_hidden_layers=n_layers,
             max_position_embeddings=max_seq_len,
         )
-        self.config._attn_implementation = "eager"
+        self.config._attn_implementation = "sdpa"
 
         # Each block: pre-norm cross-attention + Qwen3 self-attention with FFN
         self.cross_norms = nn.ModuleList()
@@ -117,6 +118,7 @@ class ModellingHead(nn.Module):
         self.rope = Qwen3RotaryEmbedding(config=self.config)
         self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
         self.resid_dropout = nn.Dropout(dropout)
+        self.gradient_checkpointing = False
 
     def forward(self, context, mask=None):
         """
@@ -139,18 +141,27 @@ class ModellingHead(nn.Module):
         kv_position_ids = torch.arange(seq_len, device=context.device).unsqueeze(0).expand(batch_size, -1)
         kv_position_embeddings = self.rope(context, kv_position_ids)
 
-        for cross_norm, cross_attn, self_attn in zip(
-            self.cross_norms, self.cross_attns, self.self_attn_layers
-        ):
-            # Cross-attention: action embeddings (Q) attend to decoder output (K, V)
+        use_ckpt = (self.gradient_checkpointing and self.training
+                    and torch.is_grad_enabled())
+
+        def _block(x, cross_norm, cross_attn, self_attn, context, mask):
             residual = x
             x = residual + self.resid_dropout(cross_attn(
                 cross_norm(x), context, mask=mask,
                 q_position_embeddings=position_embeddings,
                 kv_position_embeddings=kv_position_embeddings))
+            layer_out = self_attn(x, position_ids=position_ids,
+                                  position_embeddings=position_embeddings)
+            return layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-            # Qwen3 self-attention + FFN among action tokens (has its own pre-norm)
-            layer_out = self_attn(x, position_ids=position_ids, position_embeddings=position_embeddings)
-            x = layer_out[0] if isinstance(layer_out, tuple) else layer_out
+        for cross_norm, cross_attn, self_attn in zip(
+            self.cross_norms, self.cross_attns, self.self_attn_layers
+        ):
+            if use_ckpt:
+                x = ckpt.checkpoint(
+                    _block, x, cross_norm, cross_attn, self_attn,
+                    context, mask, use_reentrant=False)
+            else:
+                x = _block(x, cross_norm, cross_attn, self_attn, context, mask)
 
         return self.norm(x)

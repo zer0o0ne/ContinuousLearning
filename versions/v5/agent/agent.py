@@ -194,3 +194,9 @@ class ASI(nn.Module):
             self.optimizer = torch.optim.Adam(
                 self.parameters(), lr=self.config.get("lr", 1e-4)
             )
+
+    def set_gradient_checkpointing(self, enabled: bool):
+        self.perception.set_gradient_checkpointing(enabled)
+        for head in (self.value_head, self.action_head,
+                     self.opponent_action_head, self.modelling_head):
+            head.gradient_checkpointing = bool(enabled)

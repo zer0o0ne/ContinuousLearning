@@ -160,7 +160,7 @@
     },
     "opponent_action_train": {
         "lr": 2e-5,
-        "batch_size": 96,
+        "batch_size": 48,
         "epochs": 2,
         "max_grad_norm": 1.0,
         "log_every": 20,
@@ -200,7 +200,7 @@
         "max_stack": 3000,
         "examples_dir": "",
         "lr": 1e-5,
-        "batch_size": 96,
+        "batch_size": 48,
         "epochs": 1,
         "max_grad_norm": 1.0,
         "log_every": 1,

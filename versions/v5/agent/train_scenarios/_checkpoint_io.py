@@ -23,12 +23,90 @@ the model weights".
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+
+
+# Keys that represent accumulated training progress (counters). Everything
+# ELSE in a scheduler's state_dict is configuration — T_max, eta_min,
+# warmup duration, base_lrs, milestones, ... — and MUST come from the code
+# that built the scheduler this run, NOT from a saved checkpoint. PyTorch's
+# `_LRScheduler.state_dict()` is `{k: v for k, v in self.__dict__.items()
+# if k != 'optimizer'}`, so a blind `load_state_dict` overwrites the freshly
+# computed T_max with the value used by the prior run. If the user changed
+# `mcts_train.estimated_steps_per_cycle` (or `n_cycles`) between runs, the
+# cosine schedule then decays at the OLD horizon and the lr crashes through
+# eta_min over the wrong number of steps.
+# `_last_lr` is a cache of the most recent computed lr — neither config
+# nor progress; the next `step()` overwrites it anyway. Treating it as a
+# counter (preserved silently) keeps the drift warning focused on the
+# attrs that actually change scheduler behaviour (T_max, eta_min, ...).
+_SCHED_COUNTER_KEYS = frozenset({"last_epoch", "_step_count", "_last_lr"})
+
+_MISSING = object()
+
+
+def _snapshot_sched_config(scheduler) -> dict[str, Any]:
+    """Capture every non-counter attribute of a scheduler hierarchy.
+
+    Result is intended to be re-applied with ``_restore_sched_config``
+    AFTER ``scheduler.load_state_dict()`` overwrote the freshly built
+    attributes with checkpoint values.
+    """
+    snap: dict[str, Any] = {}
+    for k, v in scheduler.__dict__.items():
+        if k == "optimizer":
+            continue
+        if k == "_schedulers":  # SequentialLR / ChainedScheduler nesting
+            snap[k] = [_snapshot_sched_config(child) for child in v]
+        elif k not in _SCHED_COUNTER_KEYS:
+            snap[k] = copy.deepcopy(v)
+    return snap
+
+
+def _attrs_equal(a: Any, b: Any) -> bool:
+    if a is _MISSING:
+        return False
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        try:
+            return torch.equal(torch.as_tensor(a), torch.as_tensor(b))
+        except Exception:
+            return False
+    return a == b
+
+
+def _restore_sched_config(scheduler, snap: dict[str, Any]) -> list[str]:
+    """Re-apply ``snap`` onto ``scheduler``.
+
+    Returns a list of human-readable diffs for any attribute whose
+    saved-state value didn't match the freshly built value. Used to
+    surface scheduler config drift (e.g. T_max changed between runs) in
+    the restore log line — the caller upgrades that into a warning.
+    """
+    diffs: list[str] = []
+    cls = type(scheduler).__name__
+    for k, fresh_v in snap.items():
+        if k == "_schedulers":
+            inner_list = getattr(scheduler, "_schedulers", None) or []
+            if len(inner_list) != len(fresh_v):
+                diffs.append(
+                    f"{cls}._schedulers length: "
+                    f"saved={len(inner_list)} != fresh={len(fresh_v)}"
+                )
+                continue
+            for child, child_snap in zip(inner_list, fresh_v):
+                diffs.extend(_restore_sched_config(child, child_snap))
+        else:
+            cur_v = getattr(scheduler, k, _MISSING)
+            if not _attrs_equal(cur_v, fresh_v):
+                diffs.append(f"{cls}.{k}: saved={cur_v!r} != fresh={fresh_v!r}")
+                setattr(scheduler, k, fresh_v)
+    return diffs
 
 
 VALID_PHASES = (
@@ -200,14 +278,27 @@ def restore_optim_sched(
         opt_skip_reason = ""
 
     # --- Scheduler ----------------------------------------------------
+    # `_LRScheduler.state_dict()` serializes ALL non-optimizer attributes,
+    # including config (T_max, eta_min, total_iters, base_lrs, milestones).
+    # If those changed between runs, blind load_state_dict silently rolls
+    # the scheduler back to the old horizon — observed: lr crashed from
+    # 1e-5 → 1.8e-6 over ~250 batches because saved T_max=400 from an
+    # earlier `estimated_steps_per_cycle` value beat the fresh T_max=3400.
+    # We snapshot the fresh config, load saved state for the counters, and
+    # re-impose fresh config; counters survive, hyperparams stay current.
     restored_sched = False
+    sched_skip_reason = ""
+    sched_config_drifts: list[str] = []
     sched_state = ckpt.get("scheduler_state_dict")
     if sched_state is None:
         sched_skip_reason = "no scheduler_state_dict in ckpt"
     else:
+        sched_config_snapshot = _snapshot_sched_config(scheduler)
         scheduler.load_state_dict(sched_state)
+        sched_config_drifts = _restore_sched_config(
+            scheduler, sched_config_snapshot
+        )
         restored_sched = True
-        sched_skip_reason = ""
 
     bits = []
     if restored_opt:
@@ -215,11 +306,24 @@ def restore_optim_sched(
     else:
         bits.append(f"opt=skip({opt_skip_reason})")
     if restored_sched:
-        bits.append("sched=ok")
+        if sched_config_drifts:
+            bits.append(f"sched=ok(config_drift={len(sched_config_drifts)})")
+        else:
+            bits.append("sched=ok")
     else:
         bits.append(f"sched=skip({sched_skip_reason})")
     reason = ", ".join(bits)
     _log(log, f"  [restore] {reason}")
+    if sched_config_drifts:
+        _log(
+            log,
+            "  [restore] WARNING: scheduler config drift between this run "
+            "and the saved checkpoint. Preserving counters "
+            "(last_epoch, _step_count) from the checkpoint but re-imposing "
+            "fresh hyperparams (T_max / eta_min / warmup / base_lrs / "
+            "milestones) from the current config. Overwritten attrs: "
+            + "; ".join(sched_config_drifts),
+        )
     return restored_opt, restored_sched, reason
 
 

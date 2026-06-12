@@ -744,7 +744,8 @@ def generate_opponent_dataset(config, save_dir, device, log,
 
 def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
                     seed, max_players, player_pool, swap_prob,
-                    req_q, resp_q, result_q, progress, output_dir):
+                    req_q, resp_q, result_q, progress, output_dir,
+                    progress_counter=None):
     """Actor process: play `n_hands` opponent hands with an EvalProxy (action
     inference offloaded to the server), write scenarios to a per-actor pickle
     file on disk, then signal completion via `result_q` (path only, no payload).
@@ -774,8 +775,14 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
         amp_config = (False, "cpu", _torch.float32)  # unused on the proxy path
         table_roster = list(player_pool[:max_players])
         scenarios = []
-        it = tqdm(range(n_hands), desc=f"opp actor {worker_id}") if progress \
-            else range(n_hands)
+        # When a `progress_counter` is set (parallel mode), forward per-hand
+        # progress to the shared counter that the parent's tqdm thread polls,
+        # and skip our own per-actor tqdm.
+        if progress_counter is not None:
+            it = range(n_hands)
+        else:
+            it = tqdm(range(n_hands), desc=f"opp actor {worker_id}") \
+                if progress else range(n_hands)
         for hand_i in it:
             for pos in range(max_players):
                 if random.random() < swap_prob:
@@ -788,6 +795,9 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
                 for s in result:
                     s["hand_id"] = hid
                 scenarios.extend(result)
+            if progress_counter is not None:
+                with progress_counter.get_lock():
+                    progress_counter.value += 1
 
         # Persist payload to disk atomically (write to .tmp then rename).
         out_path = _os.path.join(output_dir, f"actor_{worker_id}.pkl")
@@ -910,13 +920,20 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
         offsets.append(acc)
         acc += h
 
+    # Shared progress counter — actors increment after each completed hand
+    # under its built-in lock; a parent daemon thread polls and updates a
+    # single tqdm for the whole generation. `progress=False` on actors
+    # disables their local per-actor tqdm.
+    progress_counter = ctx.Value("i", 0)
+
     actors = []
     for wid in range(n_workers):
         p = ctx.Process(
             target=_opp_actor_main,
             args=(wid, agents_meta, gen_cfg, hands_per[wid], offsets[wid],
                   1000 + wid, max_players, player_pool, swap_prob,
-                  req_q, resp_qs[wid], result_q, True, payload_dir),
+                  req_q, resp_qs[wid], result_q, False, payload_dir,
+                  progress_counter),
             daemon=True)
         p.start()
         actors.append(p)
@@ -924,6 +941,26 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
     log(f"Opponent parallel generation: {n_workers} actors, server on {device}, "
         f"max_batch={server_cfg['server_max_batch']}, hands/actor={hands_per}, "
         f"payload_dir={payload_dir}")
+
+    # Single unified tqdm for the whole generation; updated by a daemon
+    # thread reading `progress_counter`. Refreshes every 100ms.
+    import threading as _threading
+    pbar = tqdm(total=n_hands, desc="Generating opponent data")
+    pbar_stop = _threading.Event()
+
+    def _pbar_loop():
+        while not pbar_stop.is_set():
+            try:
+                cur = progress_counter.value
+                if cur != pbar.n:
+                    pbar.n = cur
+                    pbar.refresh()
+            except BaseException:
+                pass
+            pbar_stop.wait(0.1)
+
+    pbar_thread = _threading.Thread(target=_pbar_loop, daemon=True)
+    pbar_thread.start()
 
     import pickle as _pickle
     import os as _os
@@ -1002,6 +1039,18 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
         if server.is_alive():
             server.terminate()
     finally:
+        # Stop the tqdm refresh thread, flush the final count, close the bar.
+        pbar_stop.set()
+        try:
+            pbar_thread.join(timeout=2)
+        except BaseException:
+            pass
+        try:
+            pbar.n = progress_counter.value
+            pbar.refresh()
+            pbar.close()
+        except BaseException:
+            pass
         # Always clean up the payload directory, even on error / Ctrl+C.
         try:
             _shutil.rmtree(payload_dir, ignore_errors=True)

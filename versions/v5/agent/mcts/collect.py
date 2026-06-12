@@ -403,7 +403,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
     if n_workers > 1:
         per_agent_examples = _run_parallel_collection(
             agents_list, config, device, log, n_hands, n_workers,
-            search_scales, strange_p_by_agent, cycle_idx)
+            search_scales, strange_p_by_agent, cycle_idx, n_cycles)
     else:
         def make_mcts(agent_info, gs):
             asi = agent_info["agent"]
@@ -440,7 +440,8 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
 
 def _play_hands(agents_list, config, device, n_hands, make_mcts,
                 terminal_proxy, equity_device, search_scales,
-                strange_p_by_agent, log, progress=True):
+                strange_p_by_agent, log, progress=True,
+                progress_counter=None):
     """Play `n_hands` hands and return per-agent MCTSTrainingExamples.
 
     Value targets are RAW chip deltas at this stage — `_finalize_value_targets`
@@ -487,8 +488,14 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     num_players = random.randint(min_players, max_players)
     hand_seated = random.choices(agents_list, k=num_players)
 
-    hand_iter = (tqdm(range(n_hands), desc="MCTS collection")
-                 if progress else range(n_hands))
+    # When `progress_counter` is set (parallel actor), forward per-hand
+    # progress to the shared counter that the parent's tqdm thread polls,
+    # and skip our own tqdm. Sequential mode keeps its local tqdm.
+    if progress_counter is not None:
+        hand_iter = range(n_hands)
+    else:
+        hand_iter = (tqdm(range(n_hands), desc="MCTS collection")
+                     if progress else range(n_hands))
     for hand_i in hand_iter:
         # With swap_prob, reshuffle the entire table: new count + new agents
         if random.random() < swap_prob:
@@ -772,6 +779,10 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             agent_name = hand_seated[hero_pos]["name"]
             per_agent_examples[agent_name].append(ex)
 
+        if progress_counter is not None:
+            with progress_counter.get_lock():
+                progress_counter.value += 1
+
     return per_agent_examples
 
 
@@ -895,7 +906,7 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
 
 def _actor_main(worker_id, agents_meta, config, n_hands, seed,
                 search_scales, strange_p_by_agent, req_q, resp_q,
-                result_q, progress, output_dir):
+                result_q, progress, output_dir, progress_counter=None):
     """Actor process: play `n_hands` with a RemoteEvaluator (forwards offloaded
     to the inference server), write per_agent examples to a per-actor pickle
     file on disk, signal completion via `result_q` (path only, no payload).
@@ -940,7 +951,8 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
             agents_meta, config, "cpu", n_hands, make_mcts=make_mcts,
             terminal_proxy=terminal_proxy, equity_device="cpu",
             search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
-            log=lambda *a, **k: None, progress=progress)
+            log=lambda *a, **k: None, progress=progress,
+            progress_counter=progress_counter)
         n_items = sum(len(v) for v in per_agent.values())
 
         # Persist payload to disk atomically (write to .tmp then rename).
@@ -982,7 +994,7 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
 
 def _run_parallel_collection(agents_list, config, device, log, n_hands,
                              n_workers, search_scales, strange_p_by_agent,
-                             cycle_idx):
+                             cycle_idx, n_cycles=1):
     """Spawn the inference server + `n_workers` CPU actors, gather and merge
     their per-agent examples. Returns the merged (still RAW) per_agent_examples
     dict; the caller runs `_finalize_value_targets` once over it."""
@@ -1062,13 +1074,20 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
     hands_per = [base + (1 if i < rem else 0) for i in range(n_workers)]
     base_seed = 1000 * (int(cycle_idx) + 1)
 
+    # Shared progress counter — actors increment after each completed hand
+    # under its built-in lock; a parent daemon thread polls and updates a
+    # single tqdm for the whole collection. `progress=False` on actors
+    # disables their local tqdm.
+    progress_counter = ctx.Value("i", 0)
+
     actors = []
     for wid in range(n_workers):
         p = ctx.Process(
             target=_actor_main,
             args=(wid, agents_meta, config, hands_per[wid],
                   base_seed + wid, search_scales, strange_p_by_agent,
-                  req_q, resp_qs[wid], result_q, True, payload_dir),
+                  req_q, resp_qs[wid], result_q, False, payload_dir,
+                  progress_counter),
             daemon=True)
         p.start()
         actors.append(p)
@@ -1076,6 +1095,27 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
     log(f"MCTS parallel collection: {n_workers} actors, server on {device}, "
         f"max_batch={server_cfg['server_max_batch']}, hands/actor={hands_per}, "
         f"payload_dir={payload_dir}")
+
+    # Single unified tqdm for the whole collection; updated by a daemon
+    # thread reading `progress_counter`. Refreshes every 100ms.
+    import threading as _threading
+    pbar = tqdm(total=n_hands,
+                desc=f"MCTS collect cycle {cycle_idx + 1}/{n_cycles}")
+    pbar_stop = _threading.Event()
+
+    def _pbar_loop():
+        while not pbar_stop.is_set():
+            try:
+                cur = progress_counter.value
+                if cur != pbar.n:
+                    pbar.n = cur
+                    pbar.refresh()
+            except BaseException:
+                pass
+            pbar_stop.wait(0.1)
+
+    pbar_thread = _threading.Thread(target=_pbar_loop, daemon=True)
+    pbar_thread.start()
 
     # Gather results; fail loudly on any actor error or unexpected death.
     import pickle as _pickle
@@ -1157,6 +1197,18 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
         if server.is_alive():
             server.terminate()
     finally:
+        # Stop the tqdm refresh thread, flush the final count, close the bar.
+        pbar_stop.set()
+        try:
+            pbar_thread.join(timeout=2)
+        except BaseException:
+            pass
+        try:
+            pbar.n = progress_counter.value
+            pbar.refresh()
+            pbar.close()
+        except BaseException:
+            pass
         # Always clean up the payload directory, even on error / Ctrl+C.
         try:
             _shutil.rmtree(payload_dir, ignore_errors=True)

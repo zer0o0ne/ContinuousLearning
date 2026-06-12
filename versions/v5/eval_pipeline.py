@@ -57,12 +57,17 @@ def _build_internal_config(eval_config, internal_cfg):
 
 
 def _build_slumbot_config(eval_config, slumbot_cfg):
-    """Map slumbot_evaluation -> slumbot_eval key for slumbot_eval module."""
+    """Map slumbot_evaluation -> slumbot_eval key for slumbot_eval module.
+
+    The "solver" section is forwarded so type=="solver" entries in
+    slumbot_eval can use the same EV machinery as dataset generation.
+    """
     return {
         "name": eval_config.get("name", "eval"),
         "architecture": eval_config.get("architecture", {}),
         "game": eval_config.get("game", {}),
         "mcts": eval_config.get("mcts", {}),
+        "solver": eval_config.get("solver", {}),
         "slumbot_eval": slumbot_cfg,
     }
 

@@ -29,6 +29,146 @@ from evaluation.evaluate import _rebuild_events, _normalize_events_inplace
 # trigger equity evaluation.
 
 
+def _materialize_past(spec, config, device, big_blind, log):
+    """Load weights from `spec['ckpt_path']` into a fresh ASI on `device`.
+
+    Returns an agent_info dict shaped like entries in `agents_list` so the
+    collection code path treats past snapshots identically to active agents.
+
+    Cheap GRU table omitted: past agents do NOT share an opponent_emb_table —
+    they're seated only briefly between reshuffles, no GRU accumulation is
+    meaningful.
+    """
+    from agent.agent import ASI
+    asi = ASI(lambda *a, **k: None, config)
+    asi.set_device(device)
+    ckpt = torch.load(
+        spec["ckpt_path"], weights_only=False, map_location=device)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    asi.load_state_dict(state_dict, strict=False)
+    asi.eval()
+    ns = ckpt.get("norm_stats") or {}
+    temp = ckpt.get("temperature", 1.0)
+    search_scale = float(ns.get("mcts_value_scale", float(big_blind)))
+    log(f"  [past] materialised {spec['name']} on {device} "
+        f"(temp={temp:.3f}, search_scale={search_scale:.2f})")
+    return {
+        "agent": asi,
+        "norm_stats": ns,
+        "name": spec["name"],
+        "temperature": float(temp),
+        "is_active": False,
+        "is_past": True,
+        "search_scale": search_scale,
+    }
+
+
+def _sample_past_action(agent_info, norm_events, legal_actions, n_actions,
+                        device):
+    """Sample an action for a past-snapshot agent: one action_head forward,
+    softmax with temperature + legal-action mask, multinomial sample.
+
+    Returns ``(action_idx, action_distribution_over_full_space)`` where
+    `action_distribution_over_full_space` is a length-`n_actions` list of
+    floats (illegal slots are 0). The distribution serves as the chain-
+    target for opponent_action_head when this state is referenced in any
+    active hero's chain.
+    """
+    import torch.nn.functional as F
+    asi = agent_info["agent"]
+    with torch.no_grad():
+        out = asi.forward_batch(
+            [norm_events], skip_memory=True, heads={"action"},
+            skip_opponent_emb=True, opponent_emb_table=None)
+    logits = out["action_logits"][0].to("cpu")  # (n_actions,)
+    legal_mask = torch.zeros(n_actions, dtype=torch.bool)
+    legal_mask[list(legal_actions)] = True
+    masked = logits.masked_fill(~legal_mask, float("-inf"))
+    temp = max(1e-3, float(agent_info.get("temperature", 1.0)))
+    probs = F.softmax(masked / temp, dim=0)
+    if not torch.isfinite(probs).all() or probs.sum().item() <= 0.0:
+        # Pathological case (all illegal → -inf everywhere). Fall back to
+        # uniform over legal.
+        probs = legal_mask.float()
+        probs = probs / probs.sum().clamp(min=1e-8)
+    action_idx = int(torch.multinomial(probs, 1).item())
+    return action_idx, probs.tolist()
+
+
+def _reseat_with_past(agents_list, past_specs, min_players, max_players,
+                       materialized_past, device, config, big_blind, log):
+    """Pick a new num_players + seating subject to floor(n/2) active.
+
+    Updates `materialized_past` in place: loads past snapshots needed for the
+    new seating; drops past snapshots no longer seated and frees CUDA cache.
+    Moves active agents on/off `device` based on whether they're seated.
+
+    Returns the new `hand_seated` list (length num_players) of agent_info
+    dicts (active live entries OR materialized past entries).
+    """
+    num_players = random.randint(min_players, max_players)
+    n_forced_active = num_players // 2
+    n_free = num_players - n_forced_active
+
+    # Forced active seats: uniform over active pool (with replacement).
+    forced = random.choices(agents_list, k=n_forced_active)
+
+    # Free seats: uniform over (active ∪ past_specs). We mix the two pools
+    # element-wise (each past spec is one candidate); resolution to a live
+    # ASI happens after we know which spec ids made it.
+    pool = list(agents_list) + list(past_specs or [])
+    free_picks = random.choices(pool, k=n_free) if pool else []
+
+    # Resolve seating: anything that looks like a spec dict (has "ckpt_path")
+    # is a past snapshot we need to materialize.
+    seated = []
+    seated_past_names = set()
+    for entry in forced + free_picks:
+        if isinstance(entry, dict) and "ckpt_path" in entry:
+            name = entry["name"]
+            seated_past_names.add(name)
+            if name not in materialized_past:
+                materialized_past[name] = _materialize_past(
+                    entry, config, device, big_blind, log)
+            seated.append(materialized_past[name])
+        else:
+            seated.append(entry)
+
+    # Drop past snapshots no longer seated → frees their GPU memory.
+    stale = [n for n in materialized_past.keys() if n not in seated_past_names]
+    for n in stale:
+        log(f"  [past] dropping {n} from materialized pool")
+        del materialized_past[n]
+    if stale and str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+
+    # Move active agents on/off device based on seating membership. The
+    # `device_` attribute tracks where ASI parameters currently live (set by
+    # ASI.set_device); we mirror the parallel-mode pattern in
+    # `_run_parallel_collection` for keeping it consistent with a manual
+    # `.cpu()` move.
+    active_on_table = {
+        a["name"] for a in seated
+        if not isinstance(a, dict) or "ckpt_path" not in a
+    }
+    # ^^ a in `seated` is always a dict here (live agent_info); the
+    # ckpt_path test will be False for active entries.
+    for a in agents_list:
+        cur = getattr(a["agent"], "device_", "cpu")
+        if a["name"] in active_on_table:
+            if str(cur) != str(device):
+                a["agent"].set_device(device)
+        else:
+            if str(cur) != "cpu":
+                a["agent"].cpu()
+                a["agent"].device_ = "cpu"
+    if str(device).startswith("cuda"):
+        # Cleanup after CPU offloads + past drops.
+        torch.cuda.empty_cache()
+
+    return seated, num_players
+
+
 @dataclass
 class ChainStep:
     """One step in the modelling chain: action taken + target distribution.
@@ -197,7 +337,11 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
             targets so they live on the same calibrated scale.
 
     Returns:
-        list of MCTSTrainingExample, one per tree
+        list of (decision_idx, MCTSTrainingExample) tuples — one per tree.
+        Past-opponent decisions (where ``decision["mcts_root"] is None``)
+        are skipped, so the list may be shorter than ``decisions``; the
+        original index lets callers align with ``realized_by_dec`` /
+        ``decisions``.
     """
     decisions = hand_record["decisions"]
     examples = []
@@ -206,6 +350,11 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
     for t, decision in enumerate(decisions):
         hero_pos = decision["player_pos"]
         root = decision["mcts_root"]
+        # Past-opponent decisions have no MCTS tree — no training example
+        # is produced for them (they're not trained), but they DO contribute
+        # to game-state evolution and chain steps of other (active) examples.
+        if root is None:
+            continue
         action_target = get_n_distribution(
             root, n_actions, label_smoothing=action_label_smoothing)
 
@@ -222,11 +371,28 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
             if max_chain_depth is not None and i >= max_chain_depth:
                 break
             future_root = future_dec["mcts_root"]
-            target_dist = get_n_distribution(
-                future_root, n_actions, label_smoothing=action_label_smoothing)
             # action that advances state(t+i) → state(t+i+1):
             action_taken = decisions[t + i]["action_idx"]
             events_at_step = future_dec.get("events_at_root", []) or []
+            if future_root is None:
+                # Future decision was taken by a past-snapshot opponent —
+                # no MCTS tree exists. The opponent's actual policy at that
+                # state is their action_head distribution (computed when the
+                # decision was made) and stored as fallback_action_distribution.
+                # That IS their "true" policy in this collection, so it's the
+                # right KL target for opponent_action_head.
+                target_dist = list(future_dec.get("fallback_action_distribution") or [])
+                if len(target_dist) != n_actions:
+                    target_dist = [1.0 / n_actions] * n_actions
+                # No root.Q to TD-blend against → caller falls back to pure MC.
+                step_root_q_ratio = float("nan")
+            else:
+                target_dist = get_n_distribution(
+                    future_root, n_actions, label_smoothing=action_label_smoothing)
+                # future_root.Q is in `search_scale` units (same per-cycle scale
+                # used for terminal Q in every tree of this hand), so a single
+                # `search_scale → new_scale` lift applies uniformly to root + chain.
+                step_root_q_ratio = float(future_root.Q)
 
             value_target_step = 0.0
             if has_value_targets:
@@ -238,11 +404,6 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                     # bootstrapped value scale.
                     value_target_step = float(final_credits[hero_pos]
                                                 - hero_credits)
-
-            # future_root.Q is in `search_scale` units (same per-cycle scale
-            # used for terminal Q in every tree of this hand), so a single
-            # `search_scale → new_scale` lift applies uniformly to root + chain.
-            step_root_q_ratio = float(future_root.Q)
 
             chain.append(ChainStep(
                 action_taken=action_taken,
@@ -257,20 +418,25 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
             root, terminal_k_worst, terminal_k_best,
             clip_val=terminal_clip_val)
 
-        examples.append(MCTSTrainingExample(
+        # Tuple keeps the original decision index `t` so callers can map back
+        # into `decisions` / `realized_by_dec` even when past-opponent
+        # decisions skip example creation (no positional alignment with
+        # `decisions`).
+        examples.append((t, MCTSTrainingExample(
             events=decision["events_at_root"],
             value_target=root.Q,  # placeholder; overwritten in run_mcts_collection
             action_target=action_target,
             chain=chain,
             root_q_ratio=example_root_q_ratio,
             terminal_targets=terminal_targets,
-        ))
+        )))
 
     return examples
 
 
 def run_mcts_collection(agents_list, config, device, log, n_hands,
-                          cycle_idx=0, n_cycles=1):
+                          cycle_idx=0, n_cycles=1,
+                          past_snapshot_specs=None):
     """Play hands with MCTS decisions and collect training examples.
 
     Each agent uses MCTS for its decisions. After each hand, training
@@ -299,6 +465,18 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
         n_hands: number of hands to play
         cycle_idx: current MCTS cycle index (0-based)
         n_cycles: total number of MCTS cycles in this run
+        past_snapshot_specs: optional list of past-snapshot specs (each:
+            ``{"name", "agent_name", "ckpt_path", "cycle_id"}``). When
+            non-empty AND running in sequential mode (``mcts_train.n_workers
+            <= 1``), past snapshots join active agents in seating: each
+            reshuffle keeps at least ``floor(num_players / 2)`` seats for
+            active agents and samples remaining seats uniformly from
+            active∪past. Past agents pick actions via
+            ``softmax(action_head)`` (no MCTS) and generate no training
+            examples (their model never trains in this loop). Disabled with
+            a warning when ``n_workers > 1`` — the inference server's spec
+            is frozen at startup, so on-demand past loading is not yet
+            supported there.
 
     Returns:
         dict mapping agent_name -> list[MCTSTrainingExample]
@@ -401,6 +579,11 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
     # ── Dispatch: sequential (n_workers<=1) vs parallel CPU actors + GPU server ──
     n_workers = int(mcts_train_cfg.get("n_workers", 1) or 1)
     if n_workers > 1:
+        if past_snapshot_specs:
+            log(f"  WARNING: past_opponents pool ({len(past_snapshot_specs)} "
+                f"snapshot(s)) is disabled in parallel mode (n_workers={n_workers}) "
+                f"— inference-server spec is frozen at startup. Seating "
+                f"falls back to active-only.")
         per_agent_examples = _run_parallel_collection(
             agents_list, config, device, log, n_hands, n_workers,
             search_scales, strange_p_by_agent, cycle_idx, n_cycles)
@@ -416,7 +599,8 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
             agents_list, config, device, n_hands, make_mcts=make_mcts,
             terminal_proxy=None, equity_device=device,
             search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
-            log=log, progress=True)
+            log=log, progress=True,
+            past_snapshot_specs=past_snapshot_specs)
 
     # Per-agent bootstrap + hybrid + clip. See
     # `versions/v5/PLAN_MCTS_VALUE_REDESIGN.md` §4 + §5 for math.
@@ -441,7 +625,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
 def _play_hands(agents_list, config, device, n_hands, make_mcts,
                 terminal_proxy, equity_device, search_scales,
                 strange_p_by_agent, log, progress=True,
-                progress_counter=None):
+                progress_counter=None, past_snapshot_specs=None):
     """Play `n_hands` hands and return per-agent MCTSTrainingExamples.
 
     Value targets are RAW chip deltas at this stage — `_finalize_value_targets`
@@ -452,6 +636,14 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     `terminal_proxy` is None in sequential mode (terminal equity uses the live
     ASI on `device`); in an actor it is an EvalProxy routing range-narrowing
     forwards to the server, with the equity Monte Carlo on `equity_device`.
+
+    Past-snapshot opponents (`past_snapshot_specs` non-empty, sequential mode
+    only) are seated alongside active agents on reshuffle. Each reshuffle
+    keeps at least ``floor(num_players / 2)`` active seats; remaining seats
+    sample uniformly from active∪past. Past agents pick actions by
+    softmax-sampling their `action_head` (no MCTS), and contribute to
+    chain-step targets via that distribution; they produce no training
+    examples themselves.
     """
     from agent.train_scenarios.generation.generate import _get_raise_sizes
     from agent.mcts.terminal_eval import (
@@ -484,9 +676,30 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     per_agent_examples = {a["name"]: [] for a in agents_list}
     MAX_ACTIONS = 10000
 
-    # Initial table: random player count + random agents from pool (with replacement)
-    num_players = random.randint(min_players, max_players)
-    hand_seated = random.choices(agents_list, k=num_players)
+    # Tag live agents as `is_active` so seating / decision dispatch can
+    # distinguish them from materialised past snapshots. We mutate the dicts
+    # in place — the same objects are shared with the caller, and the flag
+    # is harmless for downstream consumers.
+    for a in agents_list:
+        a.setdefault("is_active", True)
+        a.setdefault("is_past", False)
+
+    past_pool = list(past_snapshot_specs or [])
+    # Registry of currently-materialised past snapshots: name → agent_info.
+    # Updated only by `_reseat_with_past` (so creation cost is one-shot per
+    # reshuffle, not per hand).
+    materialized_past = {}
+    has_past = bool(past_pool)
+
+    # Initial table: respect the floor(n/2)-active constraint from the start
+    # so the first hand isn't trivially active-only by accident.
+    if has_past:
+        hand_seated, num_players = _reseat_with_past(
+            agents_list, past_pool, min_players, max_players,
+            materialized_past, device, config, big_blind, log)
+    else:
+        num_players = random.randint(min_players, max_players)
+        hand_seated = random.choices(agents_list, k=num_players)
 
     # When `progress_counter` is set (parallel actor), forward per-hand
     # progress to the shared counter that the parent's tqdm thread polls,
@@ -499,8 +712,13 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     for hand_i in hand_iter:
         # With swap_prob, reshuffle the entire table: new count + new agents
         if random.random() < swap_prob:
-            num_players = random.randint(min_players, max_players)
-            hand_seated = random.choices(agents_list, k=num_players)
+            if has_past:
+                hand_seated, num_players = _reseat_with_past(
+                    agents_list, past_pool, min_players, max_players,
+                    materialized_past, device, config, big_blind, log)
+            else:
+                num_players = random.randint(min_players, max_players)
+                hand_seated = random.choices(agents_list, k=num_players)
         seated_names = [a["name"] for a in hand_seated]
 
         dummy_action = torch.zeros(n_actions, dtype=torch.float32)
@@ -606,13 +824,28 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             # is computed post-hand by `evaluate_all_terminals` and propagated
             # via `re_backup_terminals`. No search-time terminal evaluator.
             gs = GameState.from_table(table, active_pos)
-            mcts = make_mcts(agent_info, gs)
-            action_idx = mcts.search([norm_events], gs)
+            is_past = bool(agent_info.get("is_past", False))
+            if is_past:
+                # Past snapshots act via `softmax(action_head)` sampling — no
+                # MCTS, no tree. The sampled distribution is stored on the
+                # decision as a fallback target for any active hero's chain
+                # step that references this state (see
+                # `collect_training_data` chain branch on `future_root is None`).
+                legal = gs.get_legal_actions()
+                action_idx, fallback_dist = _sample_past_action(
+                    agent_info, norm_events, legal, n_actions, device)
+                last_root = None
+            else:
+                mcts = make_mcts(agent_info, gs)
+                action_idx = mcts.search([norm_events], gs)
+                last_root = mcts.last_root
+                fallback_dist = None
 
             decisions.append({
                 "player_pos": active_pos,
                 "action_idx": action_idx,
-                "mcts_root": mcts.last_root,
+                "mcts_root": last_root,
+                "fallback_action_distribution": fallback_dist,
                 "events_at_root": norm_events,
                 "pot_at_decision": pot_at_dec,
                 "facing_bet_at_decision": facing_at_dec,
@@ -763,7 +996,11 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         )
 
         # Overwrite raw realized targets with equity-based ones.
-        for t, (ex, dec) in enumerate(zip(examples, decisions)):
+        # `examples` is now [(orig_t, MCTSTrainingExample), ...] — past-
+        # opponent decisions skipped, so the original index `t` is required
+        # to index `realized_by_dec` / `decisions` correctly.
+        for t, ex in examples:
+            dec = decisions[t]
             hero_pos = dec["player_pos"]
             ex.value_target = float(realized_by_dec[t])
             for i, step in enumerate(ex.chain):
@@ -782,6 +1019,21 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         if progress_counter is not None:
             with progress_counter.get_lock():
                 progress_counter.value += 1
+
+    # Cleanup: drop any still-materialised past snapshots and restore every
+    # active agent to `device` (some were offloaded to CPU during reshuffles
+    # while not seated; the caller expects them ready for training).
+    if has_past:
+        if materialized_past:
+            log(f"  [past] releasing {len(materialized_past)} "
+                f"materialised snapshot(s) at end of collection")
+            materialized_past.clear()
+        for a in agents_list:
+            cur = getattr(a["agent"], "device_", "cpu")
+            if str(cur) != str(device):
+                a["agent"].set_device(device)
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
     return per_agent_examples
 

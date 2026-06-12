@@ -5,13 +5,32 @@ Plays a list of trained agents heads-up against the public Slumbot HTTP API
 (slumbot.com/slumbot/api). Reports raw and baseline-corrected BB/100.
 
 Per-agent options (config.slumbot_eval.agents[*]):
-  - path: directory containing a checkpoint (file or scenario subdirs)
-  - use_opponent_embedding: bool — feed events through OpponentEmbeddingTable
-  - use_mcts: bool — pick actions via MCTS.search instead of action-head sampling.
-                     If use_opponent_embedding is also true, the opp_emb_table
-                     is injected at the root perception call (inner-tree nodes
-                     don't re-run perception).
-  - action_temperature: float (optional) — overrides checkpoint temperature
+  - type: "model" (default) or "solver". Selects whether to play with a trained
+          ASI checkpoint or directly with the GTO solver used for dataset gen.
+  - name: display name in logs / result JSON
+
+  Model entries (type == "model"):
+    - path: directory containing a checkpoint (file or scenario subdirs)
+    - use_opponent_embedding: bool — feed events through OpponentEmbeddingTable
+    - use_mcts: bool — pick actions via MCTS.search instead of action-head
+                       sampling. If use_opponent_embedding is also true, the
+                       opp_emb_table is injected at the root perception call
+                       (inner-tree nodes don't re-run perception).
+    - action_temperature: float (optional) — overrides checkpoint temperature
+
+  Solver entries (type == "solver"):
+    - solver_overrides: dict — any keys override the top-level config.solver
+                               (e.g. {"mc_iterations": 20000, "gto_temperature":
+                               0.15}). Defaults come from the top-level "solver"
+                               and "game" sections, so the solver plays with the
+                               same EV machinery used for dataset generation.
+    - action_temperature: float (optional) — used only if neither solver_overrides
+                                              nor config.solver provide
+                                              "gto_temperature".
+    Notes:
+      * Solver entries always run in the sequential session path even when
+        slumbot_eval.n_workers > 1 — the solver doesn't need replicated GPU
+        state, and the parallel worker is hard-wired for ASI.
 
 Standalone:
     python -m evaluation.slumbot_eval --config config.json
@@ -20,8 +39,10 @@ Standalone:
 import argparse
 import json
 import os
+import random
 import traceback
 from collections import defaultdict
+from types import SimpleNamespace
 
 import numpy as np
 import requests
@@ -33,7 +54,10 @@ from agent.agent import ASI
 from agent.mcts.game_state import GameState
 from agent.mcts.mcts import MCTS
 from agent.perception.opponent_embeddings import OpponentEmbeddingTable
-from agent.train_scenarios.generation.generate import _get_raise_sizes
+from agent.train_scenarios.generation.generate import (
+    _compute_all_action_evs,
+    _get_raise_sizes,
+)
 from evaluation.evaluate import (
     _find_best_checkpoint,
     _normalize_events_inplace,
@@ -162,6 +186,156 @@ def _action_idx_to_incr(state_pre, action_idx, raise_sizes_for_street,
         new_total = cap
 
     return f"b{int(round(new_total))}"
+
+
+# ============================================================================
+# Solver helpers (used by type == "solver" agent entries)
+# ============================================================================
+
+def _action_idx_to_history_act_type(action_idx, n_raise_bins, street):
+    """Map an action_idx applied at the given street to generate.py's act_type.
+
+    Mirrors the classification in generate.py so the solver's opponent-range
+    narrowing matches what the dataset generator does. Folds return None and
+    are not appended to action_history (narrow_range has no "fold" key).
+    """
+    if action_idx == 0:
+        return None
+    if action_idx == 1:
+        return "call" if street == 0 else "call_postflop"
+    if action_idx == n_raise_bins + 2:
+        return "3bet" if street == 0 else "bet_postflop"
+    return "open" if street == 0 else "bet_postflop"
+
+
+def _make_solver_table_stub(hero_user_pos, hole_cards_int, board_ints, state,
+                            raise_sizes, big_blind_internal, small_blind_internal,
+                            chip_scale, num_players=2):
+    """Build a Table-like SimpleNamespace from current Slumbot state.
+
+    Only carries the attributes that the solver actually reads
+    (deck / credits / bets / players_state / pot / high_bet / turn / ...).
+    Chip values are scaled into training units (divided by chip_scale).
+    Hero hole cards go to deck[5+2*hero_user_pos : 7+2*hero_user_pos]; the
+    board occupies deck[:5]. Slumbot frame pos 0 (BB) maps to user pos 1, and
+    pos 1 (SB) maps to user pos 0 — consistent with the rest of the eval.
+    """
+    inv = 1.0 / chip_scale
+
+    placed = set()
+    for c in hole_cards_int:
+        placed.add(int(c))
+    for c in board_ints:
+        if c >= 0:
+            placed.add(int(c))
+    remaining = [c for c in range(52) if c not in placed]
+    random.shuffle(remaining)
+
+    deck = [0] * 52
+    for i in range(5):
+        if i < len(board_ints) and board_ints[i] >= 0:
+            deck[i] = int(board_ints[i])
+        else:
+            deck[i] = remaining.pop()
+    deck[5 + 2 * hero_user_pos] = int(hole_cards_int[0])
+    deck[5 + 2 * hero_user_pos + 1] = int(hole_cards_int[1])
+    for i in range(5, 5 + 2 * num_players):
+        if i == 5 + 2 * hero_user_pos or i == 5 + 2 * hero_user_pos + 1:
+            continue
+        deck[i] = remaining.pop()
+    for i in range(5 + 2 * num_players, 52):
+        if remaining:
+            deck[i] = remaining.pop()
+
+    # Use float64 to match env.table.Table's default dtype — np.float32 elements
+    # propagate through the solver and break the torch tensor assignment in
+    # _compute_all_action_evs on torch>=2.5 (only np.float32 is rejected).
+    bets_user = np.zeros(num_players, dtype=np.float64)
+    credits_user = [0.0] * num_players
+    players_state_user = np.ones(num_players, dtype=np.float64)
+    for slumbot_pos in range(2):
+        u = 1 - slumbot_pos
+        bets_user[u] = float(state["bets"][slumbot_pos]) * inv
+        credits_user[u] = float(state["credits"][slumbot_pos]) * inv
+        ss = int(state["players_state"][slumbot_pos])
+        if ss < 0:
+            players_state_user[u] = -1.0
+        elif ss == 2:
+            players_state_user[u] = 2.0
+        else:
+            players_state_user[u] = 1.0
+
+    start_credits_scaled = float(SLUMBOT_STACK_SIZE) * inv
+
+    return SimpleNamespace(
+        deck=np.array(deck, dtype=np.int64),
+        num_players=num_players,
+        start_credits=start_credits_scaled,
+        credits=credits_user,
+        bets=bets_user,
+        players_state=players_state_user,
+        pot=float(state["pot"]) * inv,
+        high_bet=float(state["high_bet"]) * inv,
+        turn=int(state["turn"]),
+        raise_sizes=raise_sizes,
+        n_raise_bins=len(raise_sizes[0]),
+        big_blind=float(big_blind_internal),
+        small_blind=float(small_blind_internal),
+    )
+
+
+def _solver_choose_action(bundle, state, hero_user_pos, hole_cards_int,
+                          board_ints, action_history, raise_sizes, n_raise_bins,
+                          n_actions, chip_scale, big_blind_internal,
+                          small_blind_internal):
+    """Run the GTO solver on the current Slumbot state and sample an action.
+
+    Sampling mirrors generate.py exactly:
+        normalizer = max(pot + facing_bet, big_blind) * temperature
+        probs = softmax(all_evs / normalizer)
+    Legal-action mask is applied before the softmax so the sampled index can
+    be played as-is (with the usual clamp in _action_idx_to_incr for edge
+    cases like raise-degraded-to-call).
+    """
+    scfg = bundle["solver_cfg"]
+    table_stub = _make_solver_table_stub(
+        hero_user_pos, hole_cards_int, board_ints, state,
+        raise_sizes, big_blind_internal, small_blind_internal, chip_scale,
+        num_players=2,
+    )
+
+    evs, meta = _compute_all_action_evs(
+        table_stub, hero_user_pos, action_history, n_actions,
+        solver_name=scfg.get("type", "v3"),
+        device=scfg.get("device", "cpu"),
+        mc_iters=int(scfg.get("mc_iterations", 5000)),
+        eqr_enabled=bool(scfg.get("eqr_enabled", True)),
+        combo_response_iters=int(scfg.get("combo_response_iters", 30)),
+        reraise_threshold=float(scfg.get("reraise_threshold", 0.72)),
+        weighted_sampling=bool(scfg.get("weighted_sampling", True)),
+    )
+    if evs is None or meta is None:
+        # Solver failure (rare — usually MC OOM/timeout). Fall back to
+        # check/call: matches the dataset-gen behaviour of skipping the
+        # sample, but here we must still return something playable.
+        return 1
+
+    gs = _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins,
+                           chip_scale)
+    legal_mask = torch.tensor(
+        gs.get_legal_action_mask(n_actions), dtype=torch.bool,
+    )
+
+    temperature = max(float(bundle["temperature"]), 1e-3)
+    normalizer = max(float(meta["pot"]) + float(meta["facing_bet"]),
+                     float(big_blind_internal)) * temperature
+    evs_masked = evs.masked_fill(~legal_mask, float("-inf"))
+    probs = F.softmax(evs_masked / max(normalizer, 1e-6), dim=0)
+    if not torch.isfinite(probs).all() or probs.sum() <= 0:
+        # All legal actions masked or numerical blow-up — pick first legal.
+        legal_idx = torch.nonzero(legal_mask, as_tuple=False).flatten()
+        return int(legal_idx[0].item()) if len(legal_idx) else 1
+    return int(torch.multinomial(probs, 1).item())
 
 
 # ============================================================================
@@ -335,16 +509,22 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
     initial pre-decision snap, then for each action (pre-decision, post-action)
     pairs. Pre-decision snap mirrors the prior post-action snap with action=None.
 
-    Returns: (state, snapshots, hero_moves_seen)
+    Also returns `action_history`: list of (user_pos, act_type) tuples in the
+    same shape generate.py produces for the GTO solver. Folds are excluded
+    (narrow_range has no "fold" key). Solver-mode decision making consumes
+    this; model mode ignores it.
+
+    Returns: (state, snapshots, hero_moves_seen, action_history)
     """
     state = _initial_state(hole_cards_int, board_ints)
     state["_first_in_street"] = True
     # Initial snap also serves as pre-decision for the first action
     snapshots = [_make_snapshot(state, n_actions, None, client_pos)]
     hero_moves_seen = 0
+    action_history = []
 
     if not action_str:
-        return state, snapshots, hero_moves_seen
+        return state, snapshots, hero_moves_seen, action_history
 
     i = 0
     sz = len(action_str)
@@ -373,6 +553,11 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
             snapshots.append(_make_snapshot(state, n_actions, None, client_pos))
         is_first_token = False
 
+        # Capture the acting position and street BEFORE the token mutates state,
+        # so action_history is built in the same frame generate.py uses.
+        acting_pos_user = 1 - state["active_pos"]
+        street_pre = int(state["turn"])
+
         is_hero = (state["active_pos"] == client_pos)
         if is_hero and hero_moves_seen < len(hero_action_indices):
             action_idx = hero_action_indices[hero_moves_seen]
@@ -382,6 +567,12 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
             action_idx = _apply_token(state, token, raise_sizes, n_raise_bins)
             if is_hero:
                 hero_moves_seen += 1
+
+        act_type = _action_idx_to_history_act_type(
+            action_idx, n_raise_bins, street_pre,
+        )
+        if act_type is not None:
+            action_history.append((acting_pos_user, act_type))
 
         if state["is_terminal"]:
             snapshots.append(_make_snapshot(state, n_actions, action_idx, client_pos))
@@ -393,7 +584,7 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
         if state["is_terminal"]:
             break
 
-    return state, snapshots, hero_moves_seen
+    return state, snapshots, hero_moves_seen, action_history
 
 
 # ============================================================================
@@ -568,9 +759,59 @@ def _resolve_agent_path(path, project_root, version):
     return os.path.join(project_root, "data", version, path)
 
 
+def _load_solver_bundle(agent_entry, config, device, fallback_temperature, log):
+    """Build a solver bundle (no ASI / no MCTS / no opp embedding).
+
+    Defaults come from config.solver and config.game; any key in the entry's
+    `solver_overrides` dict takes precedence. Sampling temperature priority:
+        solver_overrides.gto_temperature
+        > config.solver.gto_temperature
+        > agent_entry.action_temperature
+        > slumbot_eval.action_temperature
+    """
+    name = agent_entry.get("name") or "solver"
+    base_solver_cfg = dict(config.get("solver", {}))
+    overrides = dict(agent_entry.get("solver_overrides", {}) or {})
+    for k, v in overrides.items():
+        base_solver_cfg[k] = v
+    base_solver_cfg["device"] = device
+
+    if "gto_temperature" in overrides:
+        temperature = float(overrides["gto_temperature"])
+    elif "gto_temperature" in base_solver_cfg:
+        temperature = float(base_solver_cfg["gto_temperature"])
+    else:
+        entry_temp = agent_entry.get("action_temperature")
+        temperature = float(entry_temp) if entry_temp is not None else fallback_temperature
+
+    log(f"Loaded solver '{name}' (type={base_solver_cfg.get('type', 'v3')}, "
+        f"mc_iters={base_solver_cfg.get('mc_iterations', 5000)}, "
+        f"combo_response_iters={base_solver_cfg.get('combo_response_iters', 30)}, "
+        f"gto_temperature={temperature}, device={device})")
+
+    return {
+        "name": name,
+        "type": "solver",
+        "agent": None,
+        "norm_stats": None,
+        "temperature": float(temperature),
+        "opp_table": None,
+        "mcts": None,
+        "solver_cfg": base_solver_cfg,
+        "use_opp_emb": False,
+    }
+
+
 def _load_one_agent(agent_entry, config, device, project_root, version,
                     fallback_temperature, log):
     """Load one agent from a path. Returns dict bundle or None on failure."""
+    entry_type = (agent_entry.get("type") or "model").lower()
+    if entry_type == "solver":
+        return _load_solver_bundle(agent_entry, config, device,
+                                   fallback_temperature, log)
+    if entry_type != "model":
+        log(f"WARNING: unknown agent type {entry_type!r}, treating as 'model'")
+
     path = _resolve_agent_path(agent_entry["path"], project_root, version)
     name = agent_entry.get("name") or os.path.basename(path.rstrip("/"))
 
@@ -621,6 +862,7 @@ def _load_one_agent(agent_entry, config, device, project_root, version,
 
     return {
         "name": name,
+        "type": "model",
         "agent": asi,
         "norm_stats": norm_stats,
         "temperature": float(temperature),
@@ -634,10 +876,21 @@ def _load_one_agent(agent_entry, config, device, project_root, version,
 # Decision making
 # ============================================================================
 
-def _choose_action(bundle, events, state, hero_user_pos, raise_sizes,
-                   n_raise_bins, n_actions, chip_scale,
-                   amp_enabled, device_type, amp_dtype):
-    """Run the agent (or MCTS) on the events and return the chosen action_idx."""
+def _choose_action(bundle, events, state, hero_user_pos, hole_cards_int,
+                   board_ints, action_history, raise_sizes, n_raise_bins,
+                   n_actions, chip_scale, big_blind_internal,
+                   small_blind_internal, amp_enabled, device_type, amp_dtype):
+    """Run the agent (model / MCTS / solver) and return the chosen action_idx.
+
+    Solver path uses hole_cards/board/action_history; model path ignores them.
+    """
+    if bundle.get("type") == "solver":
+        return _solver_choose_action(
+            bundle, state, hero_user_pos, hole_cards_int, board_ints,
+            action_history, raise_sizes, n_raise_bins, n_actions, chip_scale,
+            big_blind_internal, small_blind_internal,
+        )
+
     asi = bundle["agent"]
     norm_stats = bundle["norm_stats"]
     # Normalize a copy in place (events are local to this hand)
@@ -697,7 +950,7 @@ def _play_one_hand(client, bundle, config, raise_sizes, n_raise_bins, n_actions,
         if "winnings" in r and r["winnings"] is not None:
             return float(r["winnings"]), float(r.get("baseline_winnings") or 0.0)
 
-        state, snapshots, _ = _replay_action_string(
+        state, snapshots, _, action_history = _replay_action_string(
             action_str, hole_cards_int, board_ints, client_pos,
             raise_sizes, n_raise_bins, n_actions, hero_action_indices,
         )
@@ -732,8 +985,9 @@ def _play_one_hand(client, bundle, config, raise_sizes, n_raise_bins, n_actions,
         )
 
         action_idx = _choose_action(
-            bundle, events, state, hero_user_pos, raise_sizes,
-            n_raise_bins, n_actions, chip_scale,
+            bundle, events, state, hero_user_pos, hole_cards_int, board_ints,
+            action_history, raise_sizes, n_raise_bins, n_actions, chip_scale,
+            big_blind_internal, small_blind_internal,
             amp_enabled, device_type, amp_dtype,
         )
 
@@ -1238,6 +1492,277 @@ def _run_agent_session_parallel(
     return buffers
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallel solver path
+#
+# The ASI parallel worker replicates `state_dict` to each worker process; the
+# solver has no model state, only an MC equity kernel that lives in
+# `agent.gto_utils.gpu_solver_v3`. We still benefit from N processes because:
+#   1. Each hand spends ~half its wall time blocked on Slumbot HTTP — fully
+#      parallel across processes (no shared GIL).
+#   2. CUDA contexts created per worker allow the MC kernels to interleave on
+#      the GPU. Throughput scales sub-linearly (contention on a single device),
+#      typically 2-4x with 6 workers, but that's a large win over sequential.
+# Sequential bit-for-bit behaviour is preserved on `n_workers <= 1`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _solver_worker_process(
+    worker_id, name, solver_cfg, temperature, device, config,
+    raise_sizes, n_raise_bins, n_actions, chip_scale,
+    big_blind_internal, small_blind_internal,
+    host, username, password, timeout, retries, backoff,
+    counter, n_hands_total, stop_event, result_q,
+    max_consecutive_failures,
+):
+    """Worker process for `type=="solver"` entries.
+
+    No ASI / no MCTS / no opp embedding — just a SlumbotClient and a solver
+    bundle. Same hand-claim / report / shutdown protocol as the ASI worker so
+    the parent's drain loop is shared in spirit (parallel/_consume helpers).
+    """
+    import sys as _sys
+    import torch as _torch
+
+    def worker_log(text):
+        try:
+            result_q.put((_MSG_WARN, worker_id, str(text)))
+        except Exception:
+            pass
+
+    try:
+        _torch.set_num_threads(max(1, int(os.environ.get(
+            "SLUMBOT_TORCH_THREADS", "2"))))
+
+        bundle = {
+            "name": name,
+            "type": "solver",
+            "agent": None,
+            "norm_stats": None,
+            "temperature": float(temperature),
+            "opp_table": None,
+            "mcts": None,
+            "solver_cfg": dict(solver_cfg),
+        }
+
+        # Solver path doesn't use autocast — set inert values so `_play_one_hand`
+        # can still pass them through `_choose_action`.
+        amp_enabled, device_type, amp_dtype = False, "cpu", _torch.float32
+
+        client = SlumbotClient(host=host, username=username, password=password,
+                               timeout=timeout, retries=retries, backoff=backoff,
+                               log=worker_log)
+
+        local_clamps = defaultdict(int)
+        local_hist = np.zeros(n_actions, dtype=np.int64)
+        local_hist_by_street = np.zeros((4, n_actions), dtype=np.int64)
+        consecutive_failures = 0
+
+        while not stop_event.is_set():
+            with counter.get_lock():
+                if counter.value >= n_hands_total:
+                    hand_idx = -1
+                else:
+                    hand_idx = counter.value
+                    counter.value += 1
+            if hand_idx < 0:
+                break
+
+            try:
+                w, b = _play_one_hand(
+                    client, bundle, config, raise_sizes, n_raise_bins,
+                    n_actions, chip_scale, big_blind_internal,
+                    small_blind_internal, amp_enabled, device_type, amp_dtype,
+                    local_clamps, log=worker_log,
+                    action_hist=local_hist,
+                    action_hist_by_street=local_hist_by_street,
+                )
+            except Exception as e:
+                consecutive_failures += 1
+                err_str = f"{type(e).__name__}: {e}"
+                result_q.put((_MSG_HAND_FAIL, worker_id, hand_idx, err_str))
+                if _is_rate_limit_error(e) or consecutive_failures > 1:
+                    wait = min(backoff * (2 ** min(consecutive_failures, 6)), 30.0)
+                    if stop_event.wait(timeout=wait):
+                        break
+                if consecutive_failures >= max_consecutive_failures:
+                    result_q.put((
+                        _MSG_WORKER_ABORT, worker_id,
+                        f"{consecutive_failures} consecutive failures, "
+                        f"last={err_str}"))
+                    result_q.put((_MSG_DONE, worker_id, dict(local_clamps),
+                                  local_hist.tolist(),
+                                  local_hist_by_street.tolist()))
+                    return
+                continue
+            consecutive_failures = 0
+            result_q.put((_MSG_OK, worker_id, float(w), float(b)))
+
+        result_q.put((_MSG_DONE, worker_id, dict(local_clamps),
+                      local_hist.tolist(), local_hist_by_street.tolist()))
+    except BaseException:
+        tb = traceback.format_exc()
+        try:
+            result_q.put((_MSG_FATAL, worker_id, tb))
+        except Exception:
+            pass
+        _sys.stderr.write(f"[solver worker {worker_id}] FATAL:\n{tb}\n")
+        _sys.stderr.flush()
+    finally:
+        try:
+            result_q.close()
+            result_q.join_thread()
+        except Exception:
+            pass
+
+
+def _run_agent_session_parallel_solver(
+    bundle, n_hands, n_workers, log_every, max_consecutive_failures,
+    host, username, password, timeout, retries, backoff,
+    config, raise_sizes, n_raise_bins, n_actions, chip_scale,
+    big_blind_internal, small_blind_internal, device, log,
+):
+    """Multiprocess parallel path for solver entries — no model replication.
+
+    Each worker process opens its own CUDA context (if device is cuda) and
+    runs its own solver instance. Throughput scales sub-linearly because all
+    workers share one GPU; the wall-time win comes from overlapping Slumbot
+    HTTP RTT across workers (each hand is half blocked on the network)."""
+    import torch.multiprocessing as tmp
+
+    name = bundle["name"]
+    solver_cfg = bundle["solver_cfg"]
+    temperature = bundle["temperature"]
+
+    buffers = _make_session_buffers(n_actions)
+
+    log(f"  multiprocess solver: {n_workers} workers, "
+        f"max_consecutive_failures={max_consecutive_failures}, device={device}, "
+        f"mc_iters={solver_cfg.get('mc_iterations')}, "
+        f"combo_response_iters={solver_cfg.get('combo_response_iters')}")
+
+    ctx = tmp.get_context("spawn")
+    counter = ctx.Value("i", 0)
+    stop_event = ctx.Event()
+    result_q = ctx.Queue(maxsize=max(256, n_workers * 8))
+
+    procs = []
+    for wid in range(n_workers):
+        p = ctx.Process(
+            target=_solver_worker_process,
+            args=(
+                wid, name, solver_cfg, temperature, device, config,
+                raise_sizes, n_raise_bins, n_actions, chip_scale,
+                big_blind_internal, small_blind_internal,
+                host, username, password, timeout, retries, backoff,
+                counter, n_hands, stop_event, result_q,
+                max_consecutive_failures,
+            ),
+            daemon=False,
+        )
+        p.start()
+        procs.append(p)
+
+    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand")
+    workers_alive = n_workers
+    fatal_tb = None
+    aborted = []
+
+    def _fold_done(msg):
+        _, _wid, clamps, hist, hist_by_street = msg
+        for k, v in clamps.items():
+            buffers["clamp_counters"][k] += v
+        buffers["action_hist"] += np.asarray(hist, dtype=np.int64)
+        buffers["action_hist_by_street"] += np.asarray(hist_by_street,
+                                                       dtype=np.int64)
+
+    try:
+        while workers_alive > 0:
+            try:
+                msg = result_q.get(timeout=2.0)
+            except Exception:
+                if all(not p.is_alive() for p in procs):
+                    silent = [p.pid for p in procs
+                              if p.exitcode not in (0, None)]
+                    if silent and fatal_tb is None:
+                        fatal_tb = (
+                            f"solver worker(s) died without reporting "
+                            f"(pids/exitcodes="
+                            f"{[(p.pid, p.exitcode) for p in procs]})")
+                    break
+                continue
+
+            tag = msg[0]
+            if tag == _MSG_OK:
+                _, _wid, w, b = msg
+                buffers["per_hand_chips"].append(w)
+                buffers["per_hand_baseline"].append(b)
+                _update_progress(buffers, name, n_hands, log_every, pbar, log)
+            elif tag == _MSG_HAND_FAIL:
+                _, wid, hand_idx, err_str = msg
+                buffers["hands_failed"] += 1
+                log(f"  [{name} w{wid}] hand {hand_idx + 1} failed: {err_str}")
+                pbar.update(1)
+            elif tag == _MSG_WARN:
+                _, wid, text = msg
+                log(f"  [{name} w{wid}] {text}")
+            elif tag == _MSG_WORKER_ABORT:
+                _, wid, reason = msg
+                log(f"  [{name} w{wid}] aborted: {reason}")
+                aborted.append(wid)
+            elif tag == _MSG_DONE:
+                _fold_done(msg)
+                workers_alive -= 1
+            elif tag == _MSG_FATAL:
+                _, wid, tb = msg
+                if fatal_tb is None:
+                    fatal_tb = f"solver worker {wid} fatal:\n{tb}"
+                stop_event.set()
+                workers_alive -= 1
+    except KeyboardInterrupt:
+        log("  KeyboardInterrupt — signalling workers to stop")
+        stop_event.set()
+        raise
+    finally:
+        pbar.close()
+        stop_event.set()
+        for p in procs:
+            p.join(timeout=60)
+            if p.is_alive():
+                log(f"  solver worker pid={p.pid} still alive after 60s, "
+                    f"terminating")
+                p.terminate()
+                p.join(timeout=5)
+
+        while True:
+            try:
+                msg = result_q.get_nowait()
+            except Exception:
+                break
+            tag = msg[0]
+            if tag == _MSG_OK:
+                _, _wid, w, b = msg
+                buffers["per_hand_chips"].append(w)
+                buffers["per_hand_baseline"].append(b)
+            elif tag == _MSG_HAND_FAIL:
+                buffers["hands_failed"] += 1
+            elif tag == _MSG_DONE:
+                _fold_done(msg)
+            elif tag == _MSG_FATAL and fatal_tb is None:
+                _, wid, tb = msg
+                fatal_tb = f"solver worker {wid} fatal:\n{tb}"
+
+    if fatal_tb is not None:
+        raise RuntimeError(
+            f"slumbot solver eval parallel session failed: {fatal_tb}")
+    if aborted and len(aborted) == n_workers:
+        raise RuntimeError(
+            f"all {n_workers} solver workers aborted — check Slumbot "
+            f"connectivity / auth / rate-limit (aborted workers: {aborted})")
+
+    return buffers
+
+
 def _run_agent_session(
     bundle, n_hands, n_workers, log_every, max_consecutive_failures, host,
     username, password, timeout, retries, backoff, config, raise_sizes,
@@ -1247,13 +1772,22 @@ def _run_agent_session(
     """Run `n_hands` for one agent. Dispatch sequential vs parallel.
 
     Sequential (`n_workers <= 1`) is bit-for-bit equivalent to the
-    pre-parallel implementation."""
+    pre-parallel implementation. For `n_workers > 1`, solver and model
+    entries use distinct parallel paths because the ASI worker replicates
+    `state_dict` to each process (irrelevant + costly for the solver)."""
     if n_workers <= 1:
         return _run_agent_session_sequential(
             bundle, n_hands, log_every, host, username, password, timeout,
             retries, backoff, config, raise_sizes, n_raise_bins, n_actions,
             chip_scale, big_blind_internal, small_blind_internal, amp_enabled,
             device_type, amp_dtype, log,
+        )
+    if bundle.get("type") == "solver":
+        return _run_agent_session_parallel_solver(
+            bundle, n_hands, n_workers, log_every, max_consecutive_failures,
+            host, username, password, timeout, retries, backoff, config,
+            raise_sizes, n_raise_bins, n_actions, chip_scale,
+            big_blind_internal, small_blind_internal, device, log,
         )
     return _run_agent_session_parallel(
         bundle, n_hands, n_workers, log_every, max_consecutive_failures,
@@ -1366,9 +1900,11 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
             "stderr_bb_per_100": round(stderr_bb100, 4),
             "stderr_bb_per_100_baseline_corrected": round(stderr_bb100_bcorr, 4),
             "clamps": dict(clamp_counters),
+            "type": bundle.get("type", "model"),
             "use_mcts": bundle["mcts"] is not None,
             "use_opponent_embedding": bundle["opp_table"] is not None,
             "temperature": bundle["temperature"],
+            "solver_cfg": bundle.get("solver_cfg"),
             "decisions_made": total_actions,
             "fold_rate": round(action_dist[0], 4) if total_actions else 0.0,
             "allin_rate": round(action_dist[n_actions - 1], 4) if total_actions else 0.0,

@@ -240,7 +240,9 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
                        device="mps", mc_iters=10000, n_raise_samples=3,
                        mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10,
                        eqr_enabled=True, combo_response_iters=30,
-                       reraise_threshold=0.75, weighted_sampling=True):
+                       reraise_threshold=0.75, weighted_sampling=True,
+                       threshold_smoothing=None,
+                       polarized_reraise=None):
     """Compute EV for a player (sampled raise bins for GTO action sampling).
 
     Returns dict with keys: equity, fold_ev, call_ev, raise_evs, etc.
@@ -318,6 +320,8 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
                 "action_history": action_history,
                 "opponent_positions": opp_positions,
                 "dynamic_reraise": True,
+                "threshold_smoothing": threshold_smoothing,
+                "polarized_reraise": polarized_reraise,
             }
         else:
             ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
@@ -383,7 +387,9 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                             solver_name="v2", device="mps", mc_iters=10000,
                             mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10,
                             eqr_enabled=True, combo_response_iters=30,
-                            reraise_threshold=0.75, weighted_sampling=True):
+                            reraise_threshold=0.75, weighted_sampling=True,
+                            threshold_smoothing=None,
+                            polarized_reraise=None):
     """Compute EV for ALL possible actions (fold, call, each raise bin, all-in).
 
     Returns:
@@ -462,6 +468,10 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
             compute_ev_from_state = solver_modules["compute_ev_from_state"]
 
             try:
+                # R2: `dynamic_reraise=True` is stored on state so the
+                # per-raise_frac calls below derive the reraise threshold
+                # from (call_cost, pot_after_raise, street, stack, pot)
+                # instead of the static config value.
                 state = prepare_ev_state(
                     hero_t, board_t, opp_range_types,
                     n_iters=mc_iters, device=device,
@@ -474,6 +484,9 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                     weighted_sampling=weighted_sampling,
                     action_history=action_history,
                     opponent_positions=opp_positions,
+                    threshold_smoothing=threshold_smoothing,
+                    dynamic_reraise=True,
+                    polarized_reraise=polarized_reraise,
                 )
             except Exception:
                 return None, None
@@ -691,6 +704,8 @@ def generate_scenario(config, device="mps"):
     combo_response_iters = config.get("combo_response_iters", 30)
     reraise_threshold = config.get("reraise_threshold", 0.75)
     weighted_sampling = config.get("weighted_sampling", True)
+    threshold_smoothing = config.get("threshold_smoothing", None)
+    polarized_reraise = config.get("polarized_reraise", None)
     marginal_mc_iters = config.get("marginal_mc_iters", 3000)
     marginal_response_iters = config.get("marginal_response_iters", 30)
 
@@ -710,6 +725,8 @@ def generate_scenario(config, device="mps"):
             "combo_response_iters": combo_response_iters,
             "reraise_threshold": reraise_threshold,
             "weighted_sampling": weighted_sampling,
+            "threshold_smoothing": threshold_smoothing,
+            "polarized_reraise": polarized_reraise,
         })
 
     # V4: initialize Bayesian state for opponent modeling

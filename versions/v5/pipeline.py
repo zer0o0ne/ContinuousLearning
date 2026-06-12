@@ -28,6 +28,66 @@ def _find_latest_best_ckpt(scenario_dir):
     return candidates[-1][1]
 
 
+def _discover_past_snapshots(trained_agents, max_per_agent, log):
+    """Scan ``<run_dir>/cycles/cycle_NNNN.pt`` for each active agent.
+
+    Returns a list of dicts suitable for `run_mcts_collection(...
+    past_snapshot_specs=...)`:
+
+        {"name": "agent_a@cycle_0015",
+         "agent_name": "agent_a",
+         "cycle_id": 15,
+         "ckpt_path": "<run_dir>/cycles/cycle_0015.pt"}
+
+    For each active agent, if more than ``max_per_agent`` snapshots are
+    available, picks ``max_per_agent`` uniformly at random WITHOUT
+    replacement (so older / newer snapshots both get represented over
+    cycles). ``max_per_agent <= 0`` or ``None`` → use all available.
+    """
+    import random as _random
+    snapshots = []
+    for a in trained_agents:
+        run_dir = a.get("run_dir")
+        if not run_dir:
+            continue
+        cycles_dir = os.path.join(run_dir, "cycles")
+        if not os.path.isdir(cycles_dir):
+            continue
+        agent_name = a["name"]
+        candidates = []
+        for fname in os.listdir(cycles_dir):
+            if not (fname.startswith("cycle_") and fname.endswith(".pt")):
+                continue
+            try:
+                cid = int(fname[len("cycle_"):-3])
+            except ValueError:
+                continue
+            candidates.append((cid, os.path.join(cycles_dir, fname)))
+        if not candidates:
+            continue
+        if max_per_agent and len(candidates) > int(max_per_agent):
+            candidates = _random.sample(candidates, int(max_per_agent))
+        for cid, path in candidates:
+            snapshots.append({
+                "name": f"{agent_name}@cycle_{cid:04d}",
+                "agent_name": agent_name,
+                "cycle_id": cid,
+                "ckpt_path": path,
+            })
+    if snapshots:
+        log(f"  past_opponents pool: {len(snapshots)} snapshot(s) across "
+            f"{len(trained_agents)} active agent(s)")
+        # Compact per-agent breakdown for quick eyeballing.
+        per_agent = {}
+        for s in snapshots:
+            per_agent.setdefault(s["agent_name"], []).append(s["cycle_id"])
+        for name, cids in per_agent.items():
+            log(f"    {name}: cycles {sorted(cids)}")
+    else:
+        log("  past_opponents pool: empty (no cycle snapshots on disk yet)")
+    return snapshots
+
+
 def _run_or_skip_phase(scenario_name, agent, agent_base, agent_log, train_fn):
     """Legacy non-resume helper: if scenario already has a best.pt, load it
     and skip. Otherwise run train_fn() and load its best.pt. Returns the
@@ -957,9 +1017,30 @@ def main():
                          "name": a["name"], "temperature": a["temperature"]}
                         for a in trained_agents
                     ]
+
+                    # Past-opponent snapshots: fresh disk scan each cycle so
+                    # newly-written cycle_NNNN.pt files are picked up. Empty
+                    # the first time (no snapshots exist before the first
+                    # save-cycle).
+                    past_snapshot_specs = []
+                    past_cfg = (mcts_train_cfg.get("past_opponents") or {})
+                    n_workers_cfg = int(
+                        mcts_train_cfg.get("n_workers", 1) or 1)
+                    if (past_cfg.get("enabled", False)
+                            and n_workers_cfg <= 1):
+                        past_snapshot_specs = _discover_past_snapshots(
+                            trained_agents,
+                            past_cfg.get("max_snapshots_per_agent"),
+                            log)
+                    elif (past_cfg.get("enabled", False)
+                          and n_workers_cfg > 1):
+                        log("  past_opponents enabled but n_workers>1 — "
+                            "disabled (inference-server spec is frozen).")
+
                     per_agent_examples = run_mcts_collection(
                         agents_for_play, config, device, log, n_hands_per_cycle,
-                        cycle_idx=cycle, n_cycles=n_cycles)
+                        cycle_idx=cycle, n_cycles=n_cycles,
+                        past_snapshot_specs=past_snapshot_specs)
 
                     # Persist examples atomically BEFORE training so a crash
                     # during train_mcts can resume the SAME data on next start.

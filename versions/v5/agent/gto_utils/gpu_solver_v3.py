@@ -475,7 +475,10 @@ def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
                           reraise_threshold=0.75,
                           weighted_sampling=True,
                           action_history=None,
-                          opponent_positions=None):
+                          opponent_positions=None,
+                          threshold_smoothing=None,
+                          dynamic_reraise=False,
+                          polarized_reraise=None):
     """Pre-compute all raise_frac-independent quantities for compute_ev_v3.
 
     Splits compute_ev_v3's expensive MC work into a one-shot prep step so a
@@ -488,14 +491,21 @@ def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
       - opp_eq_cpu (tensor or None): per-primary-combo hero equity, used for
         fold/call/reraise classification (raise size only changes the
         threshold cuts, not these values)
-      - reraise_mask (tensor or None): reraise_threshold is constant, so
-        which primary combos reraise is raise-size independent
-      - eq_vs_reraisers (scalar or None): hero equity vs reraisers, also
-        raise-size independent for the same reason
 
-    NOTE: eq_vs_callers is NOT cached here — call_mask depends on
-    fold_threshold which depends on raise_frac. It is computed inside
-    _compute_ev_v3_from_state.
+    NOTE post-R2: `p_reraise_per_combo`, `reraise_mask` and `eq_vs_reraisers`
+    were precomputed here in R1 because `reraise_threshold` was static. R2
+    introduces dynamic per-raise_frac thresholds (`call_cost` depends on
+    `raise_frac`), so the reraise weights/mask + downstream
+    `eq_vs_reraisers` MC must move into `_compute_ev_v3_from_state`. These
+    slots stay in state as `None` placeholders for backward-compat with any
+    external code that reads them; the per-call function recomputes locally.
+
+    `eq_vs_callers` is also NOT cached here — call_mask depends on
+    fold_threshold which depends on raise_frac.
+
+    The `dynamic_reraise` flag is stored on state so the per-call function
+    can derive the threshold from `(call_cost, pot_after_raise, street,
+    stack, pot)` instead of using the static `reraise_threshold` fallback.
     """
     dead = set(hero_cards.tolist())
     if len(board_cards) > 0:
@@ -537,8 +547,12 @@ def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
         "primary_idx": 0,
         "opp_eq_cpu": None,
         "reraise_mask": None,
+        "p_reraise_per_combo": None,
         "primary_combos": None,
         "eq_vs_reraisers": None,
+        "threshold_smoothing": threshold_smoothing,
+        "dynamic_reraise": bool(dynamic_reraise),
+        "polarized_reraise": polarized_reraise,
     }
 
     primary_idx = 0
@@ -551,33 +565,12 @@ def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
         )
         opp_eq_per_combo = 1.0 - hero_eq_per_combo
         opp_eq_cpu = opp_eq_per_combo.cpu()
-        reraise_mask = opp_eq_cpu > reraise_threshold
 
+        # State carries the precomputed per-combo equity only. Reraise
+        # weights/mask + eq_vs_reraisers depend on raise_frac (post-R2) and
+        # are recomputed per-call in _compute_ev_v3_from_state.
         state["primary_combos"] = primary_combos
         state["opp_eq_cpu"] = opp_eq_cpu
-        state["reraise_mask"] = reraise_mask
-
-        if reraise_mask.any():
-            reraising_combos = primary_combos[reraise_mask]
-            all_reraise_combos = [
-                reraising_combos if j == primary_idx else c
-                for j, c in enumerate(opp_combos)
-            ]
-            reraise_weights = None
-            if combo_weights is not None and combo_weights[primary_idx] is not None:
-                rw = combo_weights[primary_idx][reraise_mask]
-                rw_sum = rw.sum()
-                if rw_sum > 0:
-                    rw = rw / rw_sum
-                reraise_weights = [
-                    rw if j == primary_idx else
-                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
-                    for j in range(len(opp_combos))
-                ]
-            state["eq_vs_reraisers"] = gpu_equity_v3(
-                hero_cards, board_cards, all_reraise_combos,
-                n_iters, device, reraise_weights
-            )
 
     return state
 
@@ -586,8 +579,14 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
                                raise_frac=1.0, dynamic_reraise=False):
     """Compute (fold_ev, call_ev, raise_ev, best_ev) from precomputed state.
 
-    Reuses raw_equity, opp_eq_cpu, reraise_mask, eq_vs_reraisers from state.
-    Only re-runs MC for eq_vs_callers (call_mask depends on raise_frac).
+    Reuses raw_equity and opp_eq_cpu from state. Recomputes reraise weights/
+    eq_vs_reraisers per raise_frac because the reraise threshold is now
+    raise_frac-dependent when `state["dynamic_reraise"]` is True
+    (call_cost = raise_amount enters `_compute_reraise_threshold`). When
+    `state["dynamic_reraise"]` is False the static `state["reraise_threshold"]`
+    is reused on every call, matching R1 numerics for the static path.
+    Also runs MC for eq_vs_callers (call_mask depends on fold_threshold which
+    depends on raise_frac).
     """
     eqr_raw = state["eqr_raw"]
     eqr_enabled = state["eqr_enabled"]
@@ -629,20 +628,160 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
         elif min(opponent_positions) > hero_position:
             fold_threshold *= 0.95
 
+    # ------------------------------------------------------------------
+    # R2: derive the effective reraise threshold for this raise_frac.
+    # When dynamic_reraise is on, `_compute_reraise_threshold` consumes
+    # `(call_cost=raise_amount, pot_after_raise=new_pot, street, stack, pot)`
+    # → threshold varies across raise sizes (clamped to [0.5, 0.95]).
+    # When off, fall back to the static config value for backward-compat.
+    # The flag is read from state (set by `_prepare_ev_state_v3`). If a
+    # caller also passes `dynamic_reraise` as a kwarg, the state value
+    # takes precedence (and the kwarg is ignored) — same source of truth.
+    # ------------------------------------------------------------------
+    dyn_th = bool(state.get("dynamic_reraise", False))
+    static_th = state["reraise_threshold"]
+    if dyn_th:
+        actual_reraise_threshold = _compute_reraise_threshold(
+            call_cost, pot_after_raise, street, stack, pot)
+    else:
+        actual_reraise_threshold = static_th
+
     opp_eq_cpu = state["opp_eq_cpu"]
-    reraise_mask = state["reraise_mask"]
     primary_combos = state["primary_combos"]
     primary_idx = state["primary_idx"]
-    eq_vs_reraisers = state["eq_vs_reraisers"]
+    smoothing_cfg = state.get("threshold_smoothing") or {}
+    smoothing_enabled = bool(smoothing_cfg.get("enabled", False))
+    beta_reraise = float(smoothing_cfg.get("beta_reraise", 0.07))
+
+    # Per-raise_frac reraise weights/mask. Moved here from
+    # `_prepare_ev_state_v3` (R2) because `actual_reraise_threshold` now
+    # depends on `raise_frac`.
+    if opp_eq_cpu is not None:
+        if smoothing_enabled:
+            p_reraise_per_combo = torch.sigmoid(
+                (opp_eq_cpu - actual_reraise_threshold) / beta_reraise
+            )
+            reraise_mask = None
+        else:
+            p_reraise_per_combo = None
+            reraise_mask = opp_eq_cpu > actual_reraise_threshold
+    else:
+        p_reraise_per_combo = None
+        reraise_mask = None
+
+    # ------------------------------------------------------------------
+    # R3: polarize the reraise range — add a bluff component (low-equity
+    # blockers) on top of the value side just computed above. Real GTO
+    # 3-bet ranges are top-equity value + low-equity blockers; the pure
+    # sigmoid above captures only the value side, so trained agents see
+    # under-bluffed opponents and converge to over-folds in response.
+    #
+    # blocker_strength is high when opp_eq is low (good blocker / weak
+    # hand). bluff_score sigmoids the blocker_strength against a
+    # bluff_threshold; bluff_frequency caps the bluff additive mass.
+    # The final `p_reraise_per_combo` may exceed 1.0 on some combos when
+    # value and bluff overlap (rare) — clamp at 1.0 here; cross-combo
+    # bookkeeping is handled by the `denom.clamp(min=1.0)` step below
+    # in the smoothing block, so the per-action probability sum stays in
+    # [0, 1].
+    #
+    # Polarization is structurally tied to smoothing: hard masks have no
+    # concept of fractional weight, so when `threshold_smoothing.enabled`
+    # is False we skip polarization regardless of `polarized_reraise.enabled`.
+    # ------------------------------------------------------------------
+    polar_cfg = state.get("polarized_reraise") or {}
+    polar_enabled = bool(polar_cfg.get("enabled", False))
+
+    if smoothing_enabled and polar_enabled and opp_eq_cpu is not None:
+        value_score = p_reraise_per_combo
+        bluff_thresh = float(polar_cfg.get("bluff_threshold", 0.25))
+        beta_bluff = float(polar_cfg.get("beta_bluff", 0.10))
+        bluff_freq = float(polar_cfg.get("bluff_frequency", 0.30))
+
+        blocker_strength = (0.5 - opp_eq_cpu).clamp(min=0.0)
+        bluff_score = torch.sigmoid((blocker_strength - bluff_thresh) / beta_bluff)
+
+        p_reraise_per_combo = (value_score + bluff_freq * bluff_score).clamp(max=1.0)
+
+    # Per-raise_frac eq_vs_reraisers MC. Was cached in state pre-R2 when
+    # the reraise threshold was static; must move here for the dynamic
+    # threshold to take effect. One extra MC per raise_frac is acceptable
+    # — see plan §"Edge cases / safety".
+    eq_vs_reraisers = None
+    if opp_eq_cpu is not None:
+        if smoothing_enabled and p_reraise_per_combo.sum().item() > 1e-6:
+            if combo_weights is not None and combo_weights[primary_idx] is not None:
+                base_w = combo_weights[primary_idx]
+                combined = base_w * p_reraise_per_combo
+                csum = combined.sum()
+                if csum.item() > 0:
+                    combined = combined / csum
+            else:
+                combined = p_reraise_per_combo / p_reraise_per_combo.sum()
+            reraise_weights = [
+                combined if j == primary_idx else
+                (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
+                for j in range(len(opp_combos))
+            ]
+            # Full primary range — soft selection via multinomial weights.
+            all_reraise_combos = list(opp_combos)
+            eq_vs_reraisers = gpu_equity_v3(
+                hero_cards, board_cards, all_reraise_combos,
+                n_iters, device, reraise_weights
+            )
+        elif (not smoothing_enabled) and reraise_mask is not None and reraise_mask.any():
+            reraising_combos = primary_combos[reraise_mask]
+            all_reraise_combos = [
+                reraising_combos if j == primary_idx else c
+                for j, c in enumerate(opp_combos)
+            ]
+            reraise_weights = None
+            if combo_weights is not None and combo_weights[primary_idx] is not None:
+                rw = combo_weights[primary_idx][reraise_mask]
+                rw_sum = rw.sum()
+                if rw_sum > 0:
+                    rw = rw / rw_sum
+                reraise_weights = [
+                    rw if j == primary_idx else
+                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
+                    for j in range(len(opp_combos))
+                ]
+            eq_vs_reraisers = gpu_equity_v3(
+                hero_cards, board_cards, all_reraise_combos,
+                n_iters, device, reraise_weights
+            )
 
     if opp_eq_cpu is not None:
-        fold_mask = opp_eq_cpu < fold_threshold
-        call_mask = ~fold_mask & ~reraise_mask
+        if smoothing_enabled:
+            beta_fold = float(smoothing_cfg.get("beta_fold", 0.07))
 
-        n_total = float(len(opp_eq_cpu))
-        p_fold = fold_mask.float().sum().item() / n_total if n_total > 0 else 0.0
-        p_reraise = reraise_mask.float().sum().item() / n_total if n_total > 0 else 0.0
-        p_call = call_mask.float().sum().item() / n_total if n_total > 0 else 1.0
+            # Sigmoid soft weights — symmetric across combos. Fold dominates
+            # when opp_eq is well below fold_threshold; reraise dominates well
+            # above actual_reraise_threshold; call fills the rest. The clamp
+            # below prevents the edge case where both fold and reraise sigmoids
+            # exceed 1 on the same combo (rare but possible if the two
+            # thresholds overlap).
+            p_fold_per_combo = torch.sigmoid(
+                (fold_threshold - opp_eq_cpu) / beta_fold
+            )
+            denom = (p_fold_per_combo + p_reraise_per_combo).clamp(min=1.0)
+            p_fold_per_combo = p_fold_per_combo / denom
+            p_reraise_per_combo = p_reraise_per_combo / denom
+            p_call_per_combo = (1.0 - p_fold_per_combo - p_reraise_per_combo).clamp(min=0.0)
+
+            p_fold = p_fold_per_combo.mean().item()
+            p_reraise = p_reraise_per_combo.mean().item()
+            p_call = p_call_per_combo.mean().item()
+        else:
+            # Legacy hard-mask path (preserved bit-for-bit vs R1).
+            fold_mask = opp_eq_cpu < fold_threshold
+            call_mask = ~fold_mask & ~reraise_mask
+
+            n_total = float(len(opp_eq_cpu))
+            p_fold = fold_mask.float().sum().item() / n_total if n_total > 0 else 0.0
+            p_reraise = reraise_mask.float().sum().item() / n_total if n_total > 0 else 0.0
+            p_call = call_mask.float().sum().item() / n_total if n_total > 0 else 1.0
+            p_call_per_combo = None  # unused on legacy path
 
         mean_opp_eq = opp_eq_cpu.mean().item()
         blocker_adj = 1.0 + (0.5 - mean_opp_eq) * 0.12
@@ -653,7 +792,30 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
             p_call /= p_total
             p_reraise /= p_total
 
-        if call_mask.any():
+        if smoothing_enabled:
+            if p_call_per_combo.sum().item() > 1e-6:
+                if combo_weights is not None and combo_weights[primary_idx] is not None:
+                    base_w = combo_weights[primary_idx]
+                    combined = base_w * p_call_per_combo
+                    csum = combined.sum()
+                    if csum.item() > 0:
+                        combined = combined / csum
+                else:
+                    combined = p_call_per_combo / p_call_per_combo.sum()
+
+                calling_weights = [
+                    combined if j == primary_idx else
+                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
+                    for j in range(len(opp_combos))
+                ]
+                all_calling_combos = list(opp_combos)
+                eq_vs_callers = gpu_equity_v3(
+                    hero_cards, board_cards, all_calling_combos,
+                    n_iters, device, calling_weights
+                )
+            else:
+                eq_vs_callers = raw_equity
+        elif call_mask.any():
             calling_combos = primary_combos[call_mask]
             all_calling_combos = []
             for j, c in enumerate(opp_combos):
@@ -687,9 +849,6 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
         showdown_ev = eff_eq_callers * (new_pot - total_raise) + (1 - eff_eq_callers) * (-total_raise)
 
         if p_reraise > 0 and eq_vs_reraisers is not None:
-            if dynamic_reraise:
-                actual_reraise_threshold_val = _compute_reraise_threshold(
-                    call_cost, pot_after_raise, street, stack, pot)
             _reraise_spr = stack / max(pot, 1e-6)
             if _reraise_spr < 3.0:
                 reraise_size = stack
@@ -736,7 +895,9 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
                   weighted_sampling=True,
                   action_history=None,
                   opponent_positions=None,
-                  dynamic_reraise=False):
+                  dynamic_reraise=False,
+                  threshold_smoothing=None,
+                  polarized_reraise=None):
     """Compute EV for fold/call/raise with per-combo response and EQR.
 
     Thin wrapper that prepares state and computes EV for a single raise_frac.
@@ -753,6 +914,9 @@ def compute_ev_v3(hero_cards, board_cards, opponent_range_hand_types,
         weighted_sampling=weighted_sampling,
         action_history=action_history,
         opponent_positions=opponent_positions,
+        threshold_smoothing=threshold_smoothing,
+        dynamic_reraise=dynamic_reraise,
+        polarized_reraise=polarized_reraise,
     )
     return _compute_ev_v3_from_state(
         state, pot, facing_bet, stack, hero_invested,

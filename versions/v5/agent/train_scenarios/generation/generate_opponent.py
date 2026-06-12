@@ -99,6 +99,7 @@ def _load_agents(agents_dir, config, device, log, fallback_temperature):
 # ---------------------------------------------------------------------------
 
 _ALL_COMBOS = None
+_COMBO_TO_IDX = None
 
 
 def _get_all_combos():
@@ -107,6 +108,98 @@ def _get_all_combos():
     if _ALL_COMBOS is None:
         _ALL_COMBOS = [(c1, c2) for c1 in range(52) for c2 in range(c1 + 1, 52)]
     return _ALL_COMBOS
+
+
+def _get_combo_to_idx():
+    """Map from (c1,c2) with c1<c2 to combo index 0..1325."""
+    global _COMBO_TO_IDX
+    if _COMBO_TO_IDX is None:
+        _COMBO_TO_IDX = {c: i for i, c in enumerate(_get_all_combos())}
+    return _COMBO_TO_IDX
+
+
+def _dead_mask_array(dead_cards):
+    """Return shape (1326,) bool array: True where the combo conflicts with a dead card."""
+    combos = _get_all_combos()
+    if not dead_cards:
+        return np.zeros(len(combos), dtype=bool)
+    dead_set = set(dead_cards)
+    return np.array(
+        [c1 in dead_set or c2 in dead_set for (c1, c2) in combos],
+        dtype=bool,
+    )
+
+
+_M_COMPAT = None
+
+
+def _get_compat_matrix():
+    """1326x1326 bool matrix. M[i,j] = True iff combos i and j share NO card.
+
+    Used for factored card-removal correction across players' belief ranges.
+    Computed once (vectorized), cached. Float32 storage (~7 MB) for fast CPU
+    matmul — numpy bool matmul is awkward and the result is a (1326,) float
+    vector anyway.
+    """
+    global _M_COMPAT
+    if _M_COMPAT is None:
+        combos = np.array(_get_all_combos(), dtype=np.int16)  # (1326, 2)
+        ci = combos[:, None, :]  # (1326, 1, 2)
+        cj = combos[None, :, :]  # (1, 1326, 2)
+        overlap = (
+            (ci[..., 0:1] == cj[..., 0:1]) |
+            (ci[..., 0:1] == cj[..., 1:2]) |
+            (ci[..., 1:2] == cj[..., 0:1]) |
+            (ci[..., 1:2] == cj[..., 1:2])
+        ).squeeze(-1)  # (1326, 1326) bool
+        _M_COMPAT = (~overlap).astype(np.float32)
+    return _M_COMPAT
+
+
+def _apply_joint_card_removal(w_live, player_weights, active_pos, players_state):
+    """Factored card-removal correction across opponents' belief ranges.
+
+    For the acting player at `active_pos`: multiply `w_live` by, for each
+    other LIVE (non-folded, non-acting) player j, the compatibility mass
+    `M @ player_weights[j]`. The result is the observer's view of acting
+    player's effective range, accounting for the fact that combos held by
+    other players cannot be held by the actor.
+
+    IMPORTANT: this is an INFERENCE-VIEW correction only. It does NOT
+    update any per-player marginal posterior `w_i`. Use the returned
+    `w_eff` for ESS top-K subset selection, target weighted averaging,
+    and fixed_hand sampling — but use the original `w_live` to drive
+    the Bayes posterior update on the acting player.
+
+    Args:
+        w_live: (1326,) np.float32 — acting player's live (dead-masked,
+                normalized) weights.
+        player_weights: dict[pos -> np.ndarray(1326,)] — per-player
+                marginals (raw, NOT dead-masked here).
+        active_pos: int — acting player position.
+        players_state: indexable — table.players_state; values >= 0 mean
+                the player is live (not folded).
+
+    Returns:
+        (1326,) np.float32, normalized. Falls back to `w_live` if the
+        correction collapses (rare numerical edge case where opponents'
+        beliefs are joint-incompatible with all of acting's combos).
+    """
+    M = _get_compat_matrix()
+    w_eff = w_live.copy()
+    for j, w_j in player_weights.items():
+        if j == active_pos:
+            continue
+        if players_state[j] < 0:  # folded
+            continue
+        compat_mass = M @ w_j  # (1326,) float32 in [0, 1]
+        w_eff = w_eff * compat_mass
+    s = float(w_eff.sum())
+    if s < 1e-9:
+        # Degenerate: opponents' beliefs are joint-incompatible with all
+        # of acting's live combos. Fall back to plain w_live (normalized).
+        return w_live
+    return w_eff / s
 
 
 def _filter_dead(combos, dead_cards):
@@ -229,12 +322,17 @@ def _shared_to_standard(shared_events, hero_pos, hero_hand):
 def _compute_range_probs(agent, shared_events, combos, active_pos,
                          norm_stats, temperature, device, n_actions,
                          max_batch, amp_config, proxy=None, agent_name=None):
-    """Compute action distributions for all combos in range via batched inference.
+    """Compute action distributions for the given combo subset via batched inference.
+
+    The caller (`generate_opponent_hand`) decides which combos to forward
+    (typically the top-K-by-mass subset under the current belief). Caller
+    also performs the weighted average — this function only returns the
+    per-combo distributions.
 
     Args:
         agent: ASI model in eval mode
         shared_events: shared event sequence up to decision point
-        combos: list of (c1,c2) — acting player's live range
+        combos: list of (c1,c2) — combos to forward
         active_pos: acting player's position
         norm_stats: z-score normalization stats from checkpoint
         temperature: softmax temperature
@@ -244,8 +342,7 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
         amp_config: (amp_enabled, device_type, amp_dtype)
 
     Returns:
-        avg_probs: (n_actions,) averaged action distribution (the TARGET)
-        per_combo_probs: (n_combos, n_actions) per-combo distributions
+        per_combo_probs: (len(combos), n_actions) per-combo distributions (CPU fp32)
     """
     amp_enabled, device_type, amp_dtype = amp_config
 
@@ -309,9 +406,7 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
         all_probs.append(probs.cpu())
 
     per_combo_probs = torch.cat(all_probs, dim=0)  # (n_combos, n_actions)
-    avg_probs = per_combo_probs.mean(dim=0)          # (n_actions,)
-
-    return avg_probs, per_combo_probs
+    return per_combo_probs
 
 
 # ---------------------------------------------------------------------------
@@ -336,11 +431,21 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
     small_blind = big_blind // 2
     max_stack = config.get("max_stack", 1000)
     max_players = config.get("max_players", 9)
-    range_threshold = config.get("range_threshold", 0.5)
     max_batch = config.get("max_batch_combos", 256)
     raise_sizes = _get_raise_sizes(config)
     n_raise_bins = len(raise_sizes[0])
     n_actions = n_raise_bins + 3
+
+    # Soft-Bayes belief update config (R5/R6/R8).
+    bayes_cfg = config.get("bayes") or {}
+    bayes_enabled = bool(bayes_cfg.get("enabled", True))
+    if not bayes_enabled:
+        raise NotImplementedError(
+            "Legacy hard-cut opponent_data path was removed in Stage 4 "
+            "refactor. Set opponent_data.bayes.enabled=true."
+        )
+    tau_belief = float(bayes_cfg.get("tau_belief", 2.0))
+    ess_mass = float(bayes_cfg.get("ess_truncation_mass", 0.995))
 
     min_stack = config.get("min_stack", big_blind * 10)
     num_players = random.randint(2, max_players)
@@ -364,9 +469,13 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
     # Select agents for each seat WITH REPLACEMENT
     seated = random.choices(agents_list, k=num_players)
 
-    # Per-player state
+    # Per-player state: soft belief = float32 weight per combo (uniform prior).
+    n_combos = 1326
     all_combos = _get_all_combos()
-    player_ranges = {pos: list(all_combos) for pos in range(num_players)}
+    player_weights = {
+        pos: np.ones(n_combos, dtype=np.float32) / n_combos
+        for pos in range(num_players)
+    }
     fixed_hands = {pos: None for pos in range(num_players)}
 
     # Snapshots for event reconstruction
@@ -394,12 +503,41 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         agent = None if proxy is not None else agent_info["agent"]
         agent_name = agent_info["name"]
 
-        # Filter range by dead board cards
+        # ----- Soft-belief live weights (mask dead, renormalize) ---------
         dead = _get_board_dead(table)
-        live_range = _filter_dead(player_ranges[active_pos], dead)
-
-        if not live_range:
+        dead_mask = _dead_mask_array(dead)
+        w_live = player_weights[active_pos].copy()
+        w_live[dead_mask] = 0.0
+        live_mass = float(w_live.sum())
+        if live_mass < 1e-9:
             break
+        w_live /= live_mass
+
+        # ----- Joint card-removal correction (R7) -----------------------
+        # IMPORTANT: `w_live` drives the POSTERIOR (per-player marginal w_i).
+        # `w_eff` drives INFERENCE (target, top-K subset, sampling, metrics).
+        # Card-removal correction is a marginalization step over OTHER
+        # players' beliefs — it gives the observer's view of the acting
+        # player's effective range — but does NOT update the marginal
+        # posterior for the acting player (their own actions only update
+        # their own w). Keep this split — do not merge `w_eff` back into
+        # `player_weights[active_pos]`.
+        w_eff = _apply_joint_card_removal(
+            w_live, player_weights, active_pos, table.players_state,
+        )
+
+        # ----- ESS-based top-K forward subset ---------------------------
+        sorted_idx = np.argsort(-w_eff)
+        cumsum = np.cumsum(w_eff[sorted_idx])
+        top_k = int(np.searchsorted(cumsum, ess_mass)) + 1
+        top_k = max(1, min(top_k, n_combos))
+        forward_indices = sorted_idx[:top_k]
+        forward_combos = [all_combos[i] for i in forward_indices]
+        forward_weights = w_eff[forward_indices].copy()
+        fw_sum = float(forward_weights.sum())
+        if fw_sum < 1e-12:
+            break
+        forward_weights /= fw_sum  # renormalize over forward subset
 
         # Decision snapshot (before action)
         snapshots.append({
@@ -422,9 +560,9 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         if len(shared_events) < 2:
             break
 
-        # Compute action distributions for entire range
-        avg_probs, per_combo_probs = _compute_range_probs(
-            agent, shared_events, live_range, active_pos,
+        # ----- Per-combo action distributions for forward subset --------
+        per_combo_probs = _compute_range_probs(
+            agent, shared_events, forward_combos, active_pos,
             agent_info["norm_stats"], agent_info["temperature"],
             device, n_actions, max_batch, amp_config,
             proxy=proxy, agent_name=agent_name,
@@ -459,23 +597,41 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             per_combo_probs[bad_rows] = uniform_legal
             row_sums = per_combo_probs.sum(dim=-1, keepdim=True)
         per_combo_probs = per_combo_probs / row_sums.clamp(min=1e-12)
-        avg_probs = per_combo_probs.mean(dim=0)
 
-        # Fix hand at first action of this player
+        # ----- Belief-weighted training target --------------------------
+        # `forward_weights` is float32 on CPU; lift to torch and match the
+        # device per_combo_probs lives on (CPU after `_compute_range_probs`).
+        forward_weights_t = torch.from_numpy(forward_weights).to(
+            per_combo_probs.device, dtype=per_combo_probs.dtype)
+        # If any combo's row collapsed to all-zero before the uniform-legal
+        # rescue (shouldn't happen after the rescue, but stay defensive),
+        # zero its weight contribution and renormalize.
+        row_mask = per_combo_probs.sum(dim=-1) > 1e-9
+        if not bool(row_mask.all()):
+            forward_weights_t = forward_weights_t * row_mask.to(
+                forward_weights_t.dtype)
+            fw_sum_t = forward_weights_t.sum().clamp(min=1e-9)
+            forward_weights_t = forward_weights_t / fw_sum_t
+
+        target = (per_combo_probs * forward_weights_t.unsqueeze(-1)).sum(dim=0)
+        target = target / target.sum().clamp(min=1e-9)  # safety renorm
+        avg_probs = target  # name kept for downstream scenario field
+
+        # ----- Fix hand at first action of this player ------------------
         if fixed_hands[active_pos] is None:
-            combo_idx = random.randint(0, len(live_range) - 1)
-            fixed_hands[active_pos] = live_range[combo_idx]
+            chosen_idx = int(np.random.choice(top_k, p=forward_weights))
+            fixed_hands[active_pos] = forward_combos[chosen_idx]
 
-        # Get probs for the fixed hand
         fixed = fixed_hands[active_pos]
         try:
-            fixed_idx = live_range.index(fixed)
+            fixed_idx_in_forward = forward_combos.index(fixed)
         except ValueError:
-            # Fixed hand removed by dead cards — degenerate
+            # Fixed hand was sampled before but dropped out of the forward
+            # subset (its weight collapsed below the ESS truncation mass).
+            # Cannot honestly sample an action for the fixed hand → stop.
             break
 
-        fixed_probs = per_combo_probs[fixed_idx]
-
+        fixed_probs = per_combo_probs[fixed_idx_in_forward]
         # Sample action from fixed hand's distribution
         chosen_action = torch.multinomial(fixed_probs, 1).item()
 
@@ -490,6 +646,16 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
 
         facing_bet = max(0, table.high_bet - table.bets[active_pos])
 
+        # ----- ESS / top-mass scenario metadata (R8) --------------------
+        # Computed over `w_eff` (observer's view) so metrics reflect the
+        # belief the training target actually averages against. With joint
+        # card removal, ESS tends to be slightly LOWER than over `w_live`
+        # because the correction concentrates mass on combos compatible
+        # with other players' holdings.
+        ess = float(1.0 / float(np.power(w_eff, 2).sum().clip(min=1e-9)))
+        max_w = float(w_eff.max())
+        top_mass_size = int((w_eff >= 0.99 * max_w).sum()) if max_w > 0 else 0
+
         # Record scenario
         scenarios.append({
             "events": copy.deepcopy(shared_events),
@@ -500,7 +666,8 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             "pot": float(table.pot),
             "facing_bet": float(facing_bet),
             "n_events": len(shared_events),
-            "range_size": len(live_range),
+            "range_ess": ess,
+            "range_top_mass_size": top_mass_size,
             "opponent_ids": dict(opponent_ids),
         })
 
@@ -517,15 +684,32 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             "action": action,
         })
 
-        # Narrow range: remove combos where P(chosen)/P(best) < threshold
-        if range_threshold > 0:
-            new_range = []
-            for i, combo in enumerate(live_range):
-                best_prob = per_combo_probs[i].max().item()
-                action_prob = per_combo_probs[i][chosen_action].item()
-                if best_prob <= 0 or action_prob / best_prob >= range_threshold:
-                    new_range.append(combo)
-            player_ranges[active_pos] = new_range
+        # ----- Soft Bayes posterior update on the active player ---------
+        # Likelihood π(a*|c) for each forward combo; tempered by τ. Combos
+        # outside the forward subset have no observation — keep their
+        # current weight under the live (dead-masked) belief and renormalize.
+        likelihood = per_combo_probs[:, chosen_action].cpu().numpy().astype(np.float32)
+        tempered = np.power(np.clip(likelihood, 1e-12, None), 1.0 / tau_belief)
+
+        new_w_full = np.zeros(n_combos, dtype=np.float32)
+        new_w_full[forward_indices] = w_live[forward_indices] * tempered
+        # Carry non-forward live combos at their renormalized prior weight
+        # (no observation → keep as-is, just under the renormalized scale).
+        non_forward_live_mask = np.ones(n_combos, dtype=bool)
+        non_forward_live_mask[forward_indices] = False
+        non_forward_live_mask &= ~dead_mask
+        new_w_full[non_forward_live_mask] = w_live[non_forward_live_mask]
+
+        total = float(new_w_full.sum())
+        if total < 1e-12:
+            # Pathological: posterior collapsed everywhere. Fall back to
+            # the renormalized live belief (no update this step).
+            new_w_full = w_live.astype(np.float32, copy=True)
+            total = float(new_w_full.sum())
+            if total < 1e-12:
+                break
+        new_w_full /= total
+        player_weights[active_pos] = new_w_full
 
         if end or several_all_in:
             break
@@ -661,7 +845,10 @@ def generate_opponent_dataset(config, save_dir, device, log,
             return []
 
     log(f"Loaded {len(agents_list)} agents: {[a['name'] for a in agents_list]}")
-    log(f"Generating {n_hands} hands, threshold={gen_cfg.get('range_threshold', 0.5)}, "
+    bayes_log_cfg = gen_cfg.get("bayes") or {}
+    log(f"Generating {n_hands} hands, "
+        f"tau_belief={bayes_log_cfg.get('tau_belief', 2.0)}, "
+        f"ess_truncation_mass={bayes_log_cfg.get('ess_truncation_mass', 0.995)}, "
         f"max_batch={gen_cfg.get('max_batch_combos', 256)}")
 
     # Persistent player IDs — simulate realistic table dynamics
@@ -728,9 +915,13 @@ def generate_opponent_dataset(config, save_dir, device, log,
             f"{n_hands - failed} hands ({failed} failed)")
 
     if scenarios:
-        range_sizes = [s["range_size"] for s in scenarios]
-        log(f"Range sizes: min={min(range_sizes)}, max={max(range_sizes)}, "
-            f"avg={sum(range_sizes) / len(range_sizes):.0f}")
+        ess_values = [s["range_ess"] for s in scenarios]
+        top_mass_values = [s["range_top_mass_size"] for s in scenarios]
+        log(f"Range ESS: min={min(ess_values):.1f}, max={max(ess_values):.1f}, "
+            f"avg={sum(ess_values) / len(ess_values):.1f}")
+        log(f"Range top_mass: min={min(top_mass_values)}, "
+            f"max={max(top_mass_values)}, "
+            f"avg={sum(top_mass_values) / len(top_mass_values):.1f}")
 
     _persist(scenarios, n_hands, meta_done=True)
     log(f"Dataset saved to {dataset_path}")

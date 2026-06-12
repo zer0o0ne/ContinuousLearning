@@ -3,8 +3,8 @@
     "agent_dir": "",
     "architecture": {
         "d_model": 384,
-        "n_heads": 16,
-        "n_kv_heads": 4,
+        "n_heads": 8,
+        "n_kv_heads": 2,
         "d_ff": 1280,
         "n_encoder_layers": 6,
         "n_decoder_layers": 6,
@@ -36,9 +36,9 @@
             {
                 "name": "lag_bluffer",
                 "modifiers": [
-                    {"type": "action_bias", "actions": "aggressive", "factor": 0.35},
+                    {"type": "action_bias", "actions": "aggressive", "factor": 0.75},
                     {"type": "action_bias", "actions": "fold", "factor": -0.25},
-                    {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.4},
+                    {"type": "conditional_bias", "condition": "equity < 0.3", "actions": "raises", "factor": 0.5},
                     {"type": "temperature", "value": 0.3}
                 ]
             },
@@ -53,16 +53,16 @@
             {
                 "name": "value_heavy",
                 "modifiers": [
-                    {"type": "conditional_bias", "condition": "equity > 0.6", "actions": "aggressive", "factor": 0.5},
-                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.3},
+                    {"type": "conditional_bias", "condition": "equity > 0.6", "actions": "aggressive", "factor": 0.8},
+                    {"type": "conditional_bias", "condition": "equity < 0.4", "actions": "fold", "factor": 0.45},
                     {"type": "temperature", "value": 0.3}
                 ]
             },
             {
                 "name": "mid_raise_specialist",
                 "modifiers": [
-                    {"type": "action_bias", "actions": "4:8", "factor": 0.4},
-                    {"type": "action_bias", "actions": [0, 1, 10], "factor": -0.15},
+                    {"type": "action_bias", "actions": "4:10", "factor": 0.7},
+                    {"type": "action_bias", "actions": [0, 1, 13], "factor": -0.15},
                     {"type": "temperature", "value": 0.3}
                 ]
             }
@@ -89,7 +89,18 @@
         "reraise_threshold": 0.72,
         "weighted_sampling": true,
         "marginal_mc_iters": 0,
-        "marginal_response_iters": 0
+        "marginal_response_iters": 0,
+        "threshold_smoothing": {
+            "enabled": true,
+            "beta_fold": 0.07,
+            "beta_reraise": 0.07
+        },
+        "polarized_reraise": {
+            "enabled": true,
+            "bluff_threshold": 0.25,
+            "beta_bluff": 0.10,
+            "bluff_frequency": 0.30
+        }
     },
     "dataset": {
         "dataset_dir": "",
@@ -156,7 +167,12 @@
         "player_swap_prob": 0.02,
         "n_player_pool": 27,
         "min_stack": 100,
-        "max_stack": 3000
+        "max_stack": 3000,
+        "bayes": {
+            "enabled": true,
+            "tau_belief": 2.0,
+            "ess_truncation_mass": 0.995
+        }
     },
     "opponent_action_train": {
         "lr": 2e-5,
@@ -192,7 +208,7 @@
         "n_workers": 1,
         "server_max_batch": 256,
         "server_linger_ms": 2,
-        "save_every_cycles": 5,
+        "save_every_cycles": 3,
         "value_norm_rebootstrap_every": 25,
         "min_players": 2,
         "max_players": 9,
@@ -230,6 +246,10 @@
             "p_start": 1.0,
             "p_end": 0.0,
             "decay_cycles": 50
+        },
+        "past_opponents": {
+            "enabled": true,
+            "max_snapshots_per_agent": 4
         }
     },
     "evaluation": {
@@ -258,10 +278,21 @@
         "agents": [
             {
                 "name": "gto_pure_vs_slumbot",
+                "type": "model",
                 "path": "5_final_agents/gto_pure",
                 "use_opponent_embedding": false,
                 "use_mcts": false,
                 "action_temperature": 0.3
+            },
+            {
+                "name": "solver_v3_baseline",
+                "type": "solver",
+                "solver_overrides": {
+                    "type": "v3",
+                    "mc_iterations": 5000,
+                    "combo_response_iters": 30,
+                    "gto_temperature": 0.2
+                }
             }
         ]
     },

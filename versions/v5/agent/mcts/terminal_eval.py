@@ -75,6 +75,13 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
     # Process each tree
     for dec_idx, decision in enumerate(decisions):
         root = decision["mcts_root"]
+        if root is None:
+            # Past-opponent decision: no MCTS tree, nothing to evaluate.
+            # (Range-narrowing through `_precompute_combo_probs` still uses
+            # the past agent's action_head when other heroes' equity is
+            # computed — see `_precompute_combo_probs` which does not depend
+            # on `mcts_root`.)
+            continue
         hero_pos = decision["player_pos"]
         root_gs = decision["game_state_at_root"]
         root_turn = root_gs.turn

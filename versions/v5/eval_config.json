@@ -1,15 +1,15 @@
 {
     "name": "eval",
     "architecture": {
-        "d_model": 256,
-        "n_heads": 8,
-        "n_kv_heads": 2,
-        "d_ff": 512,
+        "d_model": 384,
+        "n_heads": 16,
+        "n_kv_heads": 4,
+        "d_ff": 1280,
         "n_encoder_layers": 6,
-        "n_decoder_layers": 4,
-        "n_value_layers": 4,
+        "n_decoder_layers": 6,
+        "n_value_layers": 6,
         "n_action_layers": 6,
-        "n_opponent_action_layers": 6,
+        "n_opponent_action_layers": 8,
         "n_modelling_layers": 4,
         "max_seq_len": 1024,
         "max_players": 9,
@@ -35,14 +35,17 @@
         "big_blind": 10
     },
     "mcts": {
-        "n_simulations": 2000,
+        "n_simulations": 512,                                
         "c_puct": 1.5,
         "dirichlet_alpha": 0.3,
-        "dirichlet_epsilon": 0.2,
+        "dirichlet_epsilon": 0.0,                                                                                                                              
+        "dirichlet_alpha_inner": 0.3,
+        "dirichlet_epsilon_inner": 0.0,                                                                                                                        
         "temperature": 0.1,
-        "n_equity_iters": 5000,
-        "batch_size": 16,
-        "virtual_loss": 1.0
+        "batch_size": 64,                                                                                                                                      
+        "virtual_loss": 0.5,                                  
+        "opp_prior_smoothing": 0.15,                                                                                                                           
+        "opp_pessimism_alpha": 0.5
     },
 
     "internal_evaluation": {
@@ -60,42 +63,7 @@
         "n_player_pool": 6,
         "action_temperature": 0.3,
         "agents": [
-            {
-                "name": "gto_pure_gto_only",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/gto_predict",
-                "use_opponent_embedding": false,
-                "use_mcts": false
-            },
-            {
-                "name": "lag_bluffer_gto_only",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/lag_bluffer/gto_predict",
-                "use_opponent_embedding": false,
-                "use_mcts": false
-            },
-            {
-                "name": "value_heavy_gto_only",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/value_heavy/gto_predict",
-                "use_opponent_embedding": false,
-                "use_mcts": false
-            },
-            {
-                "name": "gto_pure_mcts",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict",
-                "use_opponent_embedding": true,
-                "use_mcts": true
-            },
-            {
-                "name": "lag_bluffer_mcts",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/lag_bluffer/mcts_predict",
-                "use_opponent_embedding": true,
-                "use_mcts": true
-            },
-            {
-                "name": "value_heavy_mcts",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/value_heavy/mcts_predict",
-                "use_opponent_embedding": true,
-                "use_mcts": true
-            }
+            
         ]
     },
 
@@ -105,13 +73,25 @@
         "username": "",
         "password": "",
         "request_timeout": 30,
-        "log_every": 200,
+        "log_every": 5000,
         "n_hands": 30000,
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "gto_pure_mcts_10",
-                "path": "/Users/zer0o0ne/Documents/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_05_19_09_39_14/best.pt",
+                "name": "gto_pure_gto_train",
+                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/gto_predict/2026_06_09_05_50_26/best.pt",
+                "use_opponent_embedding": false,
+                "use_mcts": false
+            },
+            {
+                "name": "gto_pure_mcts_1",
+                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_06_10_20_01_49/cycles/cycle_0000.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
+            },
+            {
+                "name": "gto_pure_mcts_5",
+                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_06_10_20_01_49/best.pt",
                 "use_opponent_embedding": true,
                 "use_mcts": true
             }

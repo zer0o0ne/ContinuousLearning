@@ -849,6 +849,23 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
     agents_meta = [{"name": a["name"], "norm_stats": a.get("norm_stats"),
                     "temperature": a.get("temperature")} for a in agents_list]
 
+    # Move parent's agents off the GPU for the duration of parallel generation.
+    # Mirrors `agent/mcts/collect.py:_run_parallel_mcts`: the inference server
+    # holds its own GPU copies built from `spec`, parent does not use the live
+    # models while waiting for actor results, so keeping both on CUDA doubles
+    # pressure and OOMs the server during agent build (24GB cards, multi-agent).
+    # Restored in the `finally` block below so downstream code finds them where
+    # it left them.
+    parent_devices = []
+    if str(device).startswith("cuda"):
+        for a in agents_list:
+            parent_devices.append(getattr(a["agent"], "device_", "cpu"))
+            a["agent"].cpu()
+            a["agent"].device_ = "cpu"
+        torch.cuda.empty_cache()
+        log(f"  parallel opp_data: moved {len(agents_list)} parent agent(s) "
+            f"to CPU during server lifetime (freed CUDA cache)")
+
     ctx = tmp.get_context("spawn")
     req_q = ctx.Queue(maxsize=max(64, 8 * n_workers))
     resp_qs = [ctx.Queue() for _ in range(n_workers)]
@@ -875,6 +892,14 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
     if not ready_event.wait(timeout=600):
         stop_event.set()
         server.terminate()
+        # Restore parent devices before propagating — caller may try to
+        # reuse `agents_list` (e.g. retry, fallback to sequential).
+        if parent_devices:
+            for a, dev in zip(agents_list, parent_devices):
+                try:
+                    a["agent"].set_device(dev)
+                except BaseException:
+                    pass
         raise RuntimeError("inference server failed to become ready in 600s")
 
     base = n_hands // n_workers
@@ -982,6 +1007,15 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
             _shutil.rmtree(payload_dir, ignore_errors=True)
         except BaseException:
             pass
+        # Restore parent's agents to their original device(s). Done in
+        # `finally` so even on RuntimeError above (server died, actor died)
+        # the caller's downstream code finds the agents where it expects them.
+        if parent_devices:
+            for a, dev in zip(agents_list, parent_devices):
+                try:
+                    a["agent"].set_device(dev)
+                except BaseException:
+                    pass
 
     if error is not None:
         raise RuntimeError(error)

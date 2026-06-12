@@ -190,10 +190,6 @@ class ASI(nn.Module):
     def set_device(self, device):
         self.device_ = device
         self.to(device)
-        if self.optimizer is None:
-            self.optimizer = torch.optim.Adam(
-                self.parameters(), lr=self.config.get("lr", 1e-4)
-            )
 
     def set_gradient_checkpointing(self, enabled: bool):
         self.perception.set_gradient_checkpointing(enabled)

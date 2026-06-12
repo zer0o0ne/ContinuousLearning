@@ -437,6 +437,16 @@ def main():
                         temperature=agent_temperature,
                         run_dir=run_dir, resume_state=resume_state))
 
+            # Per-agent cleanup: drop the agent + its train-local Adam state
+            # before the next agent allocates. CPython refcounting reclaims
+            # them at the next reassignment anyway, but `empty_cache` returns
+            # fragmented blocks to the allocator so the next ASI gets a clean
+            # contiguous arena. Especially helpful with multi-agent runs on
+            # 24GB cards where each phase's optim ~= 2× params.
+            del agent
+            if str(device).startswith("cuda"):
+                torch.cuda.empty_cache()
+
     elif needs_training:
         # --- Single-agent training ---
         agent = ASI(log, config)
@@ -502,6 +512,12 @@ def main():
             config, opp_save_dir, device, log,
             resume=resume, config_hash=config_hash)
 
+        # `_load_agents` inside puts N agents on CUDA; they go out of scope
+        # when the function returns but the caching allocator holds the
+        # fragments. Free them before the next phase allocates fresh agents.
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
         if resume and opp_scenarios:
             state.set_dataset(
                 "opponent", path=opp_save_dir,
@@ -552,6 +568,10 @@ def main():
                             scenarios_override=opp_scenarios,
                             temperature=_temp,
                             run_dir=run_dir, resume_state=resume_state))
+
+                    del agent
+                    if str(device).startswith("cuda"):
+                        torch.cuda.empty_cache()
             else:
                 # Single-agent
                 agent = ASI(log, config)
@@ -569,6 +589,10 @@ def main():
                     best_ckpt = os.path.join(opp_run_dir, "best.pt")
                     if os.path.exists(best_ckpt):
                         agent.load_checkpoint(best_ckpt)
+
+                del agent
+                if str(device).startswith("cuda"):
+                    torch.cuda.empty_cache()
 
     # --- MCTS cyclic collect → train ---
     if pipeline_cfg.get("run_mcts_train", False):
@@ -711,6 +735,12 @@ def main():
                     f"sched_restored={restored_sched}")
                 agent_log(msg)
                 return opt, sched
+
+            # MCTS phase will hold N agents + N persistent optimizers on GPU
+            # for the entire run. Clear caching allocator first so it starts
+            # from as clean an arena as possible.
+            if str(device).startswith("cuda"):
+                torch.cuda.empty_cache()
 
             # Resume state for MCTS (no-op when state.resume == False).
             mcts_state = state.get_mcts() or {}

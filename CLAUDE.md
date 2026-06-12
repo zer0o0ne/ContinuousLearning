@@ -5,7 +5,7 @@ All project was written by Claude Code, so you are responsible for every bug in 
 
 ## Running
 
-Current working <version> - v5
+Current working <version> - v6
 
 ```bash
 # Always use the venv

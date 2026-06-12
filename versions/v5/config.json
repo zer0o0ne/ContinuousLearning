@@ -1,5 +1,5 @@
 {
-    "name": "big_train",
+    "name": "small_train",
     "agent_dir": "",
     "architecture": {
         "d_model": 384,
@@ -25,7 +25,7 @@
         }
     },
     "multi_agent": {
-        "save_dir": "5_final_agents",
+        "save_dir": "5_test_agents",
         "agents": [
             {
                 "name": "gto_pure",
@@ -94,7 +94,7 @@
     "dataset": {
         "dataset_dir": "",
         "save_dir": "",
-        "n_scenarios": 50000,
+        "n_scenarios": 500,
         "val_split": 0.05,
         "n_workers": 8,
         "save_every_hands": 5000,
@@ -143,8 +143,8 @@
         "action_loss_weight": 0.7
     },
     "opponent_data": {
-        "agents_dir": "5_final_agents",
-        "n_hands": 8500,
+        "agents_dir": "5_test_agents",
+        "n_hands": 850,
         "n_workers": 4,
         "server_max_batch": 256,
         "server_linger_ms": 2,

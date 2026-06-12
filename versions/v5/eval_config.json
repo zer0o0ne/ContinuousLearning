@@ -82,6 +82,12 @@
         "action_temperature": 0.3,
         "agents": [
             {
+                "name": "gto_pure_mcts_5",
+                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_06_10_20_01_49/best.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
+            },
+            {
                 "name": "gto_pure_gto_train",
                 "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/gto_predict/2026_06_09_05_50_26/best.pt",
                 "use_opponent_embedding": false,
@@ -90,12 +96,6 @@
             {
                 "name": "gto_pure_mcts_1",
                 "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_06_10_20_01_49/cycles/cycle_0000.pt",
-                "use_opponent_embedding": true,
-                "use_mcts": true
-            },
-            {
-                "name": "gto_pure_mcts_5",
-                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_06_10_20_01_49/best.pt",
                 "use_opponent_embedding": true,
                 "use_mcts": true
             }

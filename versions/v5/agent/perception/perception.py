@@ -335,7 +335,8 @@ class Perception(nn.Module):
         self.decoder.gradient_checkpointing = bool(enabled)
 
     def forward_batch(self, event_sequences, device="cpu", skip_memory=True,
-                      skip_opponent_emb=True, opponent_emb_table=None):
+                      skip_opponent_emb=True, opponent_emb_table=None,
+                      gru_window=1):
         """
         Batch-parallel forward over event sequences.
 
@@ -347,12 +348,19 @@ class Perception(nn.Module):
             opponent_emb_table: optional OpponentEmbeddingTable instance.
                 Only used when skip_opponent_emb=False. When provided and
                 opp_emb_enabled, each opponent's embedding is updated via GRU
-                BEFORE the encoder forward (signal = embedder pre-injection
-                features of that opponent's LAST event in the batch), and the
-                fresh embedding is then injected into hand-slot tokens so the
-                encoder sees the updated value. This keeps GRU parameters on
-                the gradient path from loss back through the encoder.
-                The table is mutated in-place.
+                BEFORE the encoder forward and the fresh embedding is then
+                injected into hand-slot tokens so the encoder sees the updated
+                value. This keeps GRU parameters on the gradient path from
+                loss back through the encoder. The table is mutated in-place.
+            gru_window: number of past events of each opponent to unroll the
+                GRU over within this forward (truncated BPTT window). With K=1
+                only that opponent's LAST event in the batch feeds the GRU
+                (legacy behavior). With K>1, the last K events of that
+                opponent in the batch are taken in chronological order and
+                the GRU is unrolled K steps: h_0 = old_emb (detached),
+                h_i = GRU(signal_i, h_{i-1}), final h_K injected. The final
+                embedding is the only one injected — intermediate h_i are not
+                used at the injection site.
 
         Returns: tuple (output, encoded, mask)
             output: (B, seq_len, d_model)
@@ -381,20 +389,28 @@ class Perception(nn.Module):
 
             new_opp_embs = {}
             if out_pre is not None:
-                # Per opp_id, take the LAST event where this opponent acted.
-                # Signal = mean over its 7 card vectors of out_pre at that
-                # event. GRU sees only one signal per opp per forward.
-                last_flat_idx = {}
+                # Per opp_id, collect the LAST K events where this opponent
+                # acted (chronological order). Unroll GRU K steps:
+                #   h_0 = opponent_emb_table[opp_id] (detached / zeros),
+                #   h_i = GRU(signal_i, h_{i-1}),
+                # where signal_i = mean over 7 card vectors of out_pre at the
+                # i-th selected event. Final h_K is injected.
+                k = max(1, int(gru_window))
+                last_k_flat = {}
                 for flat_idx, opp_id in enumerate(opp_event_map):
                     if opp_id is not None:
-                        last_flat_idx[opp_id] = flat_idx
+                        lst = last_k_flat.setdefault(opp_id, [])
+                        lst.append(flat_idx)
+                        if len(lst) > k:
+                            lst.pop(0)
 
-                for opp_id, flat_idx in last_flat_idx.items():
-                    signal = out_pre[flat_idx].mean(dim=0)            # (d_model,)
-                    old_emb = opponent_emb_table.get(opp_id, device)  # detached / zeros
-                    new_emb = self.opponent_gru(signal, old_emb)      # in graph → GRU params
-                    new_opp_embs[opp_id] = new_emb
-                    opponent_emb_table.embeddings[opp_id] = new_emb
+                for opp_id, idx_list in last_k_flat.items():
+                    h = opponent_emb_table.get(opp_id, device)        # detached / zeros
+                    for idx in idx_list:
+                        signal = out_pre[idx].mean(dim=0)             # (d_model,)
+                        h = self.opponent_gru(signal, h)              # in graph → GRU params
+                    new_opp_embs[opp_id] = h
+                    opponent_emb_table.embeddings[opp_id] = h
 
             # Build per-event opp_emb list using the FRESH embedding so the
             # encoder forward depends on new_emb → gradient reaches GRU.

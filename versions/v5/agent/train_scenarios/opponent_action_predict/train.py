@@ -87,7 +87,8 @@ def _kl_loss(logits, target_probs):
     return F.kl_div(log_probs, target_probs, reduction="batchmean")
 
 
-def _run_validation(agent, val_loader, device, amp_config=None, opponent_emb_table=None):
+def _run_validation(agent, val_loader, device, amp_config=None,
+                    opponent_emb_table=None, gru_window=1):
     """Run validation. Returns (avg_loss, top1_accuracy)."""
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     skip_opp = (opponent_emb_table is None)
@@ -102,7 +103,8 @@ def _run_validation(agent, val_loader, device, amp_config=None, opponent_emb_tab
                 out = agent.forward_batch(event_sequences, skip_memory=True,
                                           heads={"opponent_action"},
                                           skip_opponent_emb=skip_opp,
-                                          opponent_emb_table=opponent_emb_table)
+                                          opponent_emb_table=opponent_emb_table,
+                                          gru_window=gru_window)
                 logits = out["opponent_action_logits"]
                 batch_loss = _kl_loss(logits, target_probs)
             loss_sum += batch_loss.item() * len(event_sequences)
@@ -181,6 +183,7 @@ def train_opponent_action(agent, train_cfg, device, log,
     val_every = train_cfg.get("val_every", None)
     interrupt_after_fails = train_cfg.get("interrupt_after_fails", None)
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
+    gru_window = max(1, int(train_cfg.get("gru_window", 1)))
 
     log("=== Opponent Action Prediction Training ===")
 
@@ -209,6 +212,8 @@ def train_opponent_action(agent, train_cfg, device, log,
     log("Frozen: perception (encoder/decoder/embedder), value_head, action_head, modelling_head")
     log(f"Training: opponent_action_head" +
         (", opponent_gru" if use_opp_emb else ""))
+    if use_opp_emb:
+        log(f"GRU window: {gru_window} step(s)")
 
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
 
@@ -330,7 +335,8 @@ def train_opponent_action(agent, train_cfg, device, log,
                 out = agent.forward_batch(event_sequences, skip_memory=True,
                                           heads={"opponent_action"},
                                           skip_opponent_emb=(opp_table is None),
-                                          opponent_emb_table=opp_table)
+                                          opponent_emb_table=opp_table,
+                                          gru_window=gru_window)
                 logits = out["opponent_action_logits"]
                 batch_loss = _kl_loss(logits, target_probs)
 
@@ -361,7 +367,7 @@ def train_opponent_action(agent, train_cfg, device, log,
             if val_every and (global_step % val_every == 0):
                 val_loss, val_acc = _run_validation(
                     agent, val_loader, device, amp_config=amp_cfg,
-                    opponent_emb_table=opp_table)
+                    opponent_emb_table=opp_table, gru_window=gru_window)
                 history["val_loss"].append((global_step, val_loss))
                 history["val_accuracy"].append((global_step, val_acc))
                 _save_history(history, run_dir)
@@ -390,7 +396,7 @@ def train_opponent_action(agent, train_cfg, device, log,
         # End-of-epoch validation
         val_loss, val_acc = _run_validation(
             agent, val_loader, device, amp_config=amp_cfg,
-            opponent_emb_table=opp_table)
+            opponent_emb_table=opp_table, gru_window=gru_window)
         history["val_loss"].append((global_step, val_loss))
         history["val_accuracy"].append((global_step, val_acc))
         history["epoch_train_loss"].append(train_loss_avg)

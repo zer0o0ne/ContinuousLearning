@@ -252,7 +252,7 @@
         "request_timeout": 30,
         "log_every": 50,
         "n_hands": 1000,
-        "n_workers": 16,
+        "n_workers": 1,
         "max_consecutive_failures": 20,
         "agents": [
             {

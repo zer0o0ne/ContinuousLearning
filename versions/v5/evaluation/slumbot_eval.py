@@ -20,12 +20,8 @@ Standalone:
 import argparse
 import json
 import os
-import queue
-import threading
-import time
 import traceback
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -873,30 +869,43 @@ def _run_agent_session_sequential(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parallel path
+# Parallel path — MULTIPROCESS (not threads)
 #
-# N worker threads each play hands claimed dynamically from a shared counter.
-# Per-worker isolation:
+# Threads do NOT speed up this workload. Two reasons that both bite:
+#   1. Python dispatch holds the GIL. Each PyTorch op (Linear, attention,
+#      LayerNorm, ...) needs Python-side dispatch *before* the GPU kernel
+#      launches. For batch=1 forwards (one hand at a time), dispatch is
+#      50-90% of wall time, and GIL serializes it across threads.
+#   2. All threads' CUDA kernels queue on the default stream — even when the
+#      GIL is briefly released, the GPU executes them sequentially.
+# Even though `requests.Session.post` releases the GIL during socket recv,
+# the Python overhead between HTTP calls (event building, MCTS tree, model
+# dispatch) is the actual bottleneck, and that part is fully serialized.
+#
+# Multiprocess solves both: N independent processes, each with its OWN Python
+# interpreter (no shared GIL) and its OWN model copy on the GPU (own CUDA
+# context, own stream). Scales linearly until either Slumbot rate-limits or
+# the GPU runs out of memory for replicas.
+#
+# Per-worker isolation (implicit by being a separate process):
 #   - SlumbotClient (own requests.Session + token)
-#   - OpponentEmbeddingTable (mutated by per-decision GRU updates)
-#   - MCTS instance (heavy internal state in search())
-#   - action_hist / action_hist_by_street / clamp_counters (reduced at end)
-# Shared (read-only / pure):
-#   - bundle["agent"] in eval() mode — LayerNorm/Linear/attention are pure;
-#     CUDA dispatch is GIL-serialized but kernels release the GIL so HTTP
-#     waits overlap with one another. That's the whole speedup.
-# Workers never call `log` directly — they push messages to a result queue
-# and the main thread renders them so log file lines don't interleave.
+#   - ASI model + opp_table + MCTS instance
+#   - action_hist / action_hist_by_street / clamp_counters
+# Cross-worker comms:
+#   - shared mp.Value counter for dynamic hand allocation
+#   - mp.Queue for per-hand outcomes + warnings + completion
+# Workers never call the parent's `log` directly — they push warnings to the
+# queue and the main process renders them.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# Result-queue message tags.
+# Inter-process message tags.
 _MSG_OK = "OK"           # (tag, worker_id, w, b)
 _MSG_HAND_FAIL = "HFAIL" # (tag, worker_id, hand_idx, err_str)
 _MSG_WORKER_ABORT = "ABORT"  # (tag, worker_id, reason)
 _MSG_FATAL = "FATAL"     # (tag, worker_id, traceback_str)
-_MSG_DONE = "DONE"       # (tag, worker_id, clamp_counters, action_hist,
-                         #                  action_hist_by_street)
+_MSG_DONE = "DONE"       # (tag, worker_id, clamp_counters, action_hist_list,
+                         #                  action_hist_by_street_list)
 _MSG_WARN = "WARN"       # (tag, worker_id, text) — informational, not counted
 
 
@@ -907,40 +916,71 @@ def _is_rate_limit_error(exc):
             or "throttle" in msg)
 
 
-def _slumbot_worker(
-    worker_id, bundle, asi, device, mcts_cfg, use_opp_emb, use_mcts,
-    claim_fn, stop_event, result_q, max_consecutive_failures,
-    config, raise_sizes, n_raise_bins, n_actions, chip_scale,
-    big_blind_internal, small_blind_internal, amp_enabled, device_type,
-    amp_dtype, host, username, password, timeout, retries, backoff,
+def _no_op_logger(*_args, **_kwargs):
+    """Logger stub for ASI constructed inside worker processes."""
+    pass
+
+
+def _slumbot_worker_process(
+    worker_id, state_dict, norm_stats, temperature, agent_name,
+    use_opp_emb, use_mcts, device, config,
+    raise_sizes, n_raise_bins, n_actions, chip_scale,
+    big_blind_internal, small_blind_internal,
+    host, username, password, timeout, retries, backoff,
+    counter, n_hands_total, stop_event, result_q,
+    max_consecutive_failures,
 ):
-    """One worker thread. Plays hands claimed from `claim_fn` until the source
-    is exhausted or `stop_event` is set or its consecutive-failure budget is
-    drained. Sends each outcome / failure / completion via `result_q`."""
+    """Worker process entry point. Builds its own ASI from `state_dict` on
+    `device`, then loops: claim next hand from `counter`, play it, push
+    outcome. Sends DONE with reduced per-worker buffers on exit.
+
+    Runs in a fresh Python interpreter (spawn start method), so this function
+    must be top-level (picklable) and rebuild everything from primitives.
+    """
+    import sys as _sys
+    import torch as _torch
+
     def worker_log(text):
-        # Thread-safe log — main thread renders the message so file lines
-        # don't interleave. Used by SlumbotClient retries and by
-        # _play_one_hand parser-warning paths.
         try:
             result_q.put((_MSG_WARN, worker_id, str(text)))
         except Exception:
             pass
 
     try:
-        # Per-worker state.
-        client = SlumbotClient(host=host, username=username, password=password,
-                               timeout=timeout, retries=retries, backoff=backoff,
-                               log=worker_log)
+        # CPU/BLAS threading: each worker is one process with one model on
+        # GPU. Don't oversubscribe the host CPU when N workers run in parallel
+        # — torch defaults to OMP_NUM_THREADS=#cores per process, which means
+        # 16 workers × 16 threads = 256 contended OS threads.
+        _torch.set_num_threads(max(1, int(os.environ.get("SLUMBOT_TORCH_THREADS", "2"))))
+
+        # Build agent on this process's GPU context.
+        asi = ASI(_no_op_logger, config)
+        asi.load_state_dict(state_dict, strict=False)
+        asi.set_device(device)
+        asi.eval()
+
+        amp_enabled, device_type, amp_dtype, _ = get_amp_config(device)
+
         opp_table = None
         if use_opp_emb and asi.perception.opp_emb_enabled:
             opp_table = OpponentEmbeddingTable(asi.perception.d_model)
         mcts = None
         if use_mcts:
+            mcts_cfg = config.get("mcts", {})
             mcts = MCTS(asi, device, mcts_cfg, opponent_emb_table=opp_table)
 
-        local_bundle = dict(bundle)
-        local_bundle["opp_table"] = opp_table
-        local_bundle["mcts"] = mcts
+        bundle = {
+            "name": agent_name,
+            "agent": asi,
+            "norm_stats": norm_stats,
+            "temperature": float(temperature),
+            "opp_table": opp_table,
+            "mcts": mcts,
+        }
+
+        client = SlumbotClient(host=host, username=username, password=password,
+                               timeout=timeout, retries=retries, backoff=backoff,
+                               log=worker_log)
 
         local_clamps = defaultdict(int)
         local_hist = np.zeros(n_actions, dtype=np.int64)
@@ -948,12 +988,19 @@ def _slumbot_worker(
         consecutive_failures = 0
 
         while not stop_event.is_set():
-            hand_idx = claim_fn()
+            # Claim next hand from shared atomic counter.
+            with counter.get_lock():
+                if counter.value >= n_hands_total:
+                    hand_idx = -1
+                else:
+                    hand_idx = counter.value
+                    counter.value += 1
             if hand_idx < 0:
-                break  # all hands claimed
+                break
+
             try:
                 w, b = _play_one_hand(
-                    client, local_bundle, config, raise_sizes, n_raise_bins,
+                    client, bundle, config, raise_sizes, n_raise_bins,
                     n_actions, chip_scale, big_blind_internal,
                     small_blind_internal, amp_enabled, device_type, amp_dtype,
                     local_clamps, log=worker_log,
@@ -964,10 +1011,9 @@ def _slumbot_worker(
                 consecutive_failures += 1
                 err_str = f"{type(e).__name__}: {e}"
                 result_q.put((_MSG_HAND_FAIL, worker_id, hand_idx, err_str))
-                # Per-worker exponential backoff on transient failures —
-                # protects Slumbot from a stuck worker hammering /act after
-                # a token went bad and gives rate-limited workers a chance
-                # to recover. Bounded at 30 s.
+                # Per-worker exponential backoff on transient failures.
+                # Bounded at 30 s. Rate-limit errors trigger backoff immediately;
+                # other errors trigger after 2+ in a row.
                 if _is_rate_limit_error(e) or consecutive_failures > 1:
                     wait = min(backoff * (2 ** min(consecutive_failures, 6)), 30.0)
                     if stop_event.wait(timeout=wait):
@@ -977,24 +1023,35 @@ def _slumbot_worker(
                         _MSG_WORKER_ABORT, worker_id,
                         f"{consecutive_failures} consecutive failures, "
                         f"last={err_str}"))
-                    # Send DONE so the main thread folds in whatever this
-                    # worker did manage before giving up.
+                    # Send DONE so the parent folds in whatever this worker
+                    # managed before giving up.
                     result_q.put((_MSG_DONE, worker_id, dict(local_clamps),
-                                  local_hist, local_hist_by_street))
+                                  local_hist.tolist(), local_hist_by_street.tolist()))
                     return
                 continue
             consecutive_failures = 0
-            result_q.put((_MSG_OK, worker_id, w, b))
+            result_q.put((_MSG_OK, worker_id, float(w), float(b)))
 
+        # Normal exit. Ship aggregates back as plain Python types so pickling
+        # through mp.Queue stays cheap and avoids any shared-memory tensor
+        # storage paths (per project memory: tensors in mp IPC payloads
+        # exhaust vm.max_map_count at scale).
         result_q.put((_MSG_DONE, worker_id, dict(local_clamps),
-                      local_hist, local_hist_by_street))
+                      local_hist.tolist(), local_hist_by_street.tolist()))
     except BaseException:
-        # Catch BaseException so SystemExit / KeyboardInterrupt inside torch
-        # or requests bubble up to the main thread instead of silently killing
-        # this worker.
         tb = traceback.format_exc()
         try:
             result_q.put((_MSG_FATAL, worker_id, tb))
+        except Exception:
+            pass
+        _sys.stderr.write(f"[slumbot worker {worker_id}] FATAL:\n{tb}\n")
+        _sys.stderr.flush()
+    finally:
+        # Flush the queue's feeder thread so the parent definitely sees our
+        # last message before this process exits.
+        try:
+            result_q.close()
+            result_q.join_thread()
         except Exception:
             pass
 
@@ -1006,71 +1063,96 @@ def _run_agent_session_parallel(
     big_blind_internal, small_blind_internal, amp_enabled, device_type,
     amp_dtype, device, log,
 ):
-    """Thread-pool path. Shared agent model, per-worker SlumbotClient /
-    OpponentEmbeddingTable / MCTS. Errors come back through `result_q` and are
-    logged by the main thread."""
+    """Multiprocess parallel path. Each worker has its OWN model copy on the
+    GPU device — that's the only way to bypass the GIL + single-CUDA-stream
+    bottleneck that kills threaded inference on small batches. Per-hand
+    outcomes flow back through an mp.Queue."""
+    import torch as _torch
+    import torch.multiprocessing as tmp
+
     name = bundle["name"]
     asi = bundle["agent"]
     use_opp_emb = bundle["opp_table"] is not None
     use_mcts = bundle["mcts"] is not None
-    mcts_cfg = config.get("mcts", {})
 
     buffers = _make_session_buffers(n_actions)
 
-    # Dynamic hand allocation: workers claim from a shared counter. Robust to
-    # one worker stalling (no fixed shard sits idle behind it).
-    claim_lock = threading.Lock()
-    claimed = [0]
+    # Pull state_dict to CPU once — workers receive it via spawn-pickle and
+    # rebuild their own ASI on the target device. norm_stats / temperature
+    # ride along.
+    state_dict = {k: v.detach().cpu() for k, v in asi.state_dict().items()}
+    norm_stats = bundle["norm_stats"]
+    temperature = bundle["temperature"]
 
-    def claim_fn():
-        with claim_lock:
-            if claimed[0] >= n_hands:
-                return -1
-            idx = claimed[0]
-            claimed[0] += 1
-            return idx
+    # Move parent's model off the GPU during the parallel session. We don't
+    # use it while workers run, and dropping it frees ~one model's worth of
+    # VRAM so the N worker copies (+ N CUDA contexts) have room.
+    parent_device = getattr(asi, "device_", device)
+    moved_parent = False
+    if str(device).startswith("cuda"):
+        try:
+            asi.cpu()
+            asi.device_ = "cpu"
+            _torch.cuda.empty_cache()
+            moved_parent = True
+        except BaseException:
+            moved_parent = False
 
-    stop_event = threading.Event()
-    result_q = queue.Queue()
+    log(f"  multiprocess mode: {n_workers} workers, "
+        f"max_consecutive_failures={max_consecutive_failures}, "
+        f"use_mcts={use_mcts}, use_opp_emb={use_opp_emb}, device={device}")
+
+    ctx = tmp.get_context("spawn")
+    counter = ctx.Value("i", 0)  # has its own internal Lock; workers use .get_lock()
+    stop_event = ctx.Event()
+    result_q = ctx.Queue(maxsize=max(256, n_workers * 8))
+
+    procs = []
+    for wid in range(n_workers):
+        p = ctx.Process(
+            target=_slumbot_worker_process,
+            args=(
+                wid, state_dict, norm_stats, temperature, name,
+                use_opp_emb, use_mcts, device, config,
+                raise_sizes, n_raise_bins, n_actions, chip_scale,
+                big_blind_internal, small_blind_internal,
+                host, username, password, timeout, retries, backoff,
+                counter, n_hands, stop_event, result_q,
+                max_consecutive_failures,
+            ),
+            daemon=False,  # let workers finish their current hand on parent exit
+        )
+        p.start()
+        procs.append(p)
+
+    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand")
     workers_alive = n_workers
     fatal_tb = None
     aborted = []
 
-    log(f"  parallel mode: {n_workers} workers, max_consecutive_failures="
-        f"{max_consecutive_failures}, use_mcts={use_mcts}, "
-        f"use_opp_emb={use_opp_emb}")
-
-    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand")
-
-    executor = ThreadPoolExecutor(max_workers=n_workers,
-                                  thread_name_prefix=f"slumbot-{name}")
-    futures = [
-        executor.submit(
-            _slumbot_worker,
-            wid, bundle, asi, device, mcts_cfg, use_opp_emb, use_mcts,
-            claim_fn, stop_event, result_q, max_consecutive_failures,
-            config, raise_sizes, n_raise_bins, n_actions, chip_scale,
-            big_blind_internal, small_blind_internal, amp_enabled, device_type,
-            amp_dtype, host, username, password, timeout, retries, backoff,
-        )
-        for wid in range(n_workers)
-    ]
+    def _fold_done(msg):
+        _, _wid, clamps, hist, hist_by_street = msg
+        for k, v in clamps.items():
+            buffers["clamp_counters"][k] += v
+        buffers["action_hist"] += np.asarray(hist, dtype=np.int64)
+        buffers["action_hist_by_street"] += np.asarray(hist_by_street,
+                                                       dtype=np.int64)
 
     try:
         while workers_alive > 0:
             try:
-                msg = result_q.get(timeout=1.0)
-            except queue.Empty:
-                # If every future has finished but workers_alive > 0, we'd
-                # otherwise spin forever. This happens only on pathological
-                # paths (worker died before/after its try-block) — drain the
-                # exit codes and bail out.
-                if all(f.done() for f in futures):
-                    for wid, f in enumerate(futures):
-                        exc = f.exception()
-                        if exc is not None and fatal_tb is None:
-                            fatal_tb = (f"worker {wid} thread exited with "
-                                        f"unreported exception: {exc!r}")
+                msg = result_q.get(timeout=2.0)
+            except Exception:
+                # Idle timeout: if every worker process has died without
+                # signalling DONE/FATAL (e.g. SIGKILL from OOM-killer),
+                # break out to avoid hanging forever.
+                if all(not p.is_alive() for p in procs):
+                    silent = [p.pid for p in procs
+                              if p.exitcode not in (0, None)]
+                    if silent and fatal_tb is None:
+                        fatal_tb = (
+                            f"worker(s) died without reporting "
+                            f"(pids/exitcodes={[(p.pid, p.exitcode) for p in procs]})")
                     break
                 continue
 
@@ -1093,36 +1175,38 @@ def _run_agent_session_parallel(
                 log(f"  [{name} w{wid}] aborted: {reason}")
                 aborted.append(wid)
             elif tag == _MSG_DONE:
-                _, wid, clamps, hist, hist_by_street = msg
-                for k, v in clamps.items():
-                    buffers["clamp_counters"][k] += v
-                buffers["action_hist"] += hist
-                buffers["action_hist_by_street"] += hist_by_street
+                _fold_done(msg)
                 workers_alive -= 1
             elif tag == _MSG_FATAL:
                 _, wid, tb = msg
-                fatal_tb = f"worker {wid} fatal:\n{tb}"
+                if fatal_tb is None:
+                    fatal_tb = f"worker {wid} fatal:\n{tb}"
                 stop_event.set()
                 workers_alive -= 1
-                # Don't break — drain remaining DONE/HFAIL to keep counts
-                # consistent and let other workers exit cleanly.
+                # Don't break — let surviving workers send DONE for clean
+                # buffer accounting.
     except KeyboardInterrupt:
         log("  KeyboardInterrupt — signalling workers to stop")
         stop_event.set()
         raise
     finally:
         pbar.close()
-        stop_event.set()  # in case we broke out due to fatal/abort
-        # Drain any in-flight messages so workers' `result_q.put` doesn't block.
-        # `_slumbot_worker` checks `stop_event` only between hands, so we may
-        # wait up to one hand's worth of HTTP latency per worker here.
-        executor.shutdown(wait=True)
-        # Final drain — pick up DONE / FATAL messages emitted during shutdown
-        # so the buffers reflect every hand that did get played.
+        stop_event.set()
+        # Join workers. They check stop_event only between hands so we may
+        # wait up to one HTTP RTT per worker. Hard-terminate after 60 s.
+        for p in procs:
+            p.join(timeout=60)
+            if p.is_alive():
+                log(f"  worker pid={p.pid} still alive after 60s, terminating")
+                p.terminate()
+                p.join(timeout=5)
+
+        # Final drain — pick up any DONE / FATAL messages emitted during
+        # shutdown so the buffers reflect every hand that did get played.
         while True:
             try:
                 msg = result_q.get_nowait()
-            except queue.Empty:
+            except Exception:
                 break
             tag = msg[0]
             if tag == _MSG_OK:
@@ -1132,14 +1216,17 @@ def _run_agent_session_parallel(
             elif tag == _MSG_HAND_FAIL:
                 buffers["hands_failed"] += 1
             elif tag == _MSG_DONE:
-                _, _wid, clamps, hist, hist_by_street = msg
-                for k, v in clamps.items():
-                    buffers["clamp_counters"][k] += v
-                buffers["action_hist"] += hist
-                buffers["action_hist_by_street"] += hist_by_street
+                _fold_done(msg)
             elif tag == _MSG_FATAL and fatal_tb is None:
                 _, wid, tb = msg
                 fatal_tb = f"worker {wid} fatal:\n{tb}"
+
+        # Restore parent's model to its original device.
+        if moved_parent:
+            try:
+                asi.set_device(parent_device)
+            except BaseException:
+                pass
 
     if fatal_tb is not None:
         raise RuntimeError(f"slumbot eval parallel session failed: {fatal_tb}")

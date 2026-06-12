@@ -75,7 +75,7 @@
         "request_timeout": 30,
         "log_every": 5000,
         "n_hands": 30000,
-        "n_workers": 16,
+        "n_workers": 6,
         "max_consecutive_failures": 20,
         "retries": 4,
         "backoff": 1.0,

@@ -8,8 +8,13 @@ class OpponentEmbeddingTable:
     Not an nn.Module — size varies between sessions. The GRU updater
     (which has fixed parameters) lives in Perception as a registered submodule.
 
-    Embeddings are plain tensors with requires_grad=True so they participate
-    in the computation graph for BPTT across hands in a session.
+    Each entry holds the latest GRU hidden state for an opponent. These are
+    plain tensors, NEVER nn.Parameters: optimizer.step() does not touch them;
+    they are advanced only by replacement with fresh GRU output (A.4 detach
+    semantics). Within a forward the stored tensor stays in the autograd graph
+    so gradients reach the GRU (truncated BPTT); `detach_all()` is called
+    between training steps to cut the graph — the embedding VALUE carries
+    forward across steps, the gradient history does not.
     """
 
     def __init__(self, d_model):
@@ -17,17 +22,20 @@ class OpponentEmbeddingTable:
         self.embeddings = {}  # str -> Tensor(d_model)
 
     def get(self, opponent_id, device):
-        """Return embedding for opponent_id, creating zero-init if new.
+        """Return the stored embedding for opponent_id (detached zero if new).
 
-        Embeddings do NOT require grad — they are updated only by GRU forward
-        output replacement, never by optimizer.step().
+        Never an optimizer parameter — see the class docstring for the detach
+        semantics.
         """
         if opponent_id not in self.embeddings:
             self.embeddings[opponent_id] = torch.zeros(
                 self.d_model, device=device,
             )
         emb = self.embeddings[opponent_id]
-        if emb.device != torch.device(device):
+        # A.4.5: compare device TYPE, not the full device. `torch.device("cuda")`
+        # has index None while a tensor lives on "cuda:0", so a plain `!=` was
+        # always true and re-moved/re-detached the embedding on every access.
+        if emb.device.type != torch.device(device).type:
             self.embeddings[opponent_id] = emb.to(device).detach()
         return self.embeddings[opponent_id]
 
@@ -35,6 +43,17 @@ class OpponentEmbeddingTable:
         """Detach all embeddings from computation graph (truncated BPTT)."""
         for key in self.embeddings:
             self.embeddings[key] = self.embeddings[key].detach()
+
+    def clone(self):
+        """Deep copy with detached, cloned embeddings.
+
+        A.4.3: validation runs forward passes that mutate the table; pass a
+        clone so the live training table is never advanced by the val set.
+        Detaching makes this safe even if entries are still in the graph.
+        """
+        new = OpponentEmbeddingTable(self.d_model)
+        new.embeddings = {k: v.detach().clone() for k, v in self.embeddings.items()}
+        return new
 
     def __len__(self):
         return len(self.embeddings)

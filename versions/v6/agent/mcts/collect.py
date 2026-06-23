@@ -389,10 +389,18 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
             else:
                 target_dist = get_n_distribution(
                     future_root, n_actions, label_smoothing=action_label_smoothing)
-                # future_root.Q is in `search_scale` units (same per-cycle scale
-                # used for terminal Q in every tree of this hand), so a single
-                # `search_scale → new_scale` lift applies uniformly to root + chain.
-                step_root_q_ratio = float(future_root.Q)
+                # C.2: `future_root.Q` is the backed-up value of the FUTURE
+                # tree — from the perspective of whoever decided there and on
+                # THAT agent's value scale. It is a valid TD anchor for THIS
+                # example's value target only when the future decision is the
+                # same hero/seat (within a hand a seat is one fixed agent, so
+                # same seat ⇒ same perspective AND same scale). Otherwise write
+                # NaN → pure-MC fallback in `_finalize_value_targets` (no
+                # cross-perspective / cross-scale TD contamination).
+                if future_dec["player_pos"] == hero_pos:
+                    step_root_q_ratio = float(future_root.Q)
+                else:
+                    step_root_q_ratio = float("nan")
 
             value_target_step = 0.0
             if has_value_targets:
@@ -414,6 +422,12 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                 root_q_ratio=step_root_q_ratio,
             ))
 
+        # C.3: store terminal Q RAW (in `search_scale` units, like `root.Q`).
+        # `_finalize_value_targets` rescales by `search_scale/new_scale` onto
+        # the fresh target axis and clips THERE — clipping on the stale axis at
+        # collection time would turn a scale mismatch into sign-only noise. The
+        # pipeline therefore passes `terminal_clip_val=None` here (no
+        # collection-time clip); the param stays for explicit callers/tests.
         terminal_targets = _select_terminal_targets(
             root, terminal_k_worst, terminal_k_best,
             clip_val=terminal_clip_val)
@@ -593,7 +607,9 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
             asi.eval()
             return MCTS(asi, device, mcts_cfg,
                         opponent_emb_table=opp_tables.get(agent_info["name"]),
-                        strange_p=strange_p_by_agent[agent_info["name"]])
+                        strange_p=strange_p_by_agent[agent_info["name"]],
+                        search_scale=search_scales.get(
+                            agent_info["name"], float(big_blind)))
 
         per_agent_examples = _play_hands(
             agents_list, config, device, n_hands, make_mcts=make_mcts,
@@ -671,7 +687,6 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         mcts_train_cfg.get("action_label_smoothing", 0.0))
     terminal_k_worst = int(mcts_train_cfg.get("terminal_value_k_worst", 0))
     terminal_k_best = int(mcts_train_cfg.get("terminal_value_k_best", 0))
-    terminal_clip_val = float(mcts_train_cfg.get("value_target_clip", 5.0))
 
     per_agent_examples = {a["name"]: [] for a in agents_list}
     MAX_ACTIONS = 10000
@@ -722,12 +737,15 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         seated_names = [a["name"] for a in hand_seated]
 
         dummy_action = torch.zeros(n_actions, dtype=torch.float32)
-        start_stack = random.randint(min_stack, max_stack)
+        # B.6.1: independent per-seat starting stacks (asymmetric effective
+        # stacks). collect derives invested chips from initial_credits +
+        # cumulative_bets (not table.start_credits), so per-seat credits suffice.
+        start_stacks = [random.randint(min_stack, max_stack) for _ in range(num_players)]
 
         table = Table(
             num_players=num_players,
             raise_sizes=raise_sizes,
-            start_credits=start_stack,
+            start_credits=start_stacks,
             big_blind=big_blind,
             small_blind=small_blind,
         )
@@ -819,10 +837,12 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             credits_at_dec = float(table.credits[active_pos])
 
             # MCTS search (opponent_emb at root only — see MCTS._evaluate_root).
-            # Terminals during search no longer contribute value to ancestors
-            # (`_backup_terminal` only bumps N) — their proper game-theoretic Q
-            # is computed post-hand by `evaluate_all_terminals` and propagated
-            # via `re_backup_terminals`. No search-time terminal evaluator.
+            # Terminals DO contribute value during search (C.4): fold terminals
+            # get a deterministic chip value (no NN, the anti fold-spiral
+            # anchor), showdown terminals get the value head. Their proper
+            # game-theoretic Q is then recomputed post-hand by
+            # `evaluate_all_terminals` (equity + range narrowing) and propagated
+            # via `re_backup_terminals`, overriding the search-time estimate.
             gs = GameState.from_table(table, active_pos)
             is_past = bool(agent_info.get("is_past", False))
             if is_past:
@@ -935,6 +955,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             "final_pot": final_pot,
             "final_active_positions": final_active,
             "credits_pre_distribution": credits_pre_dist,
+            "initial_credits": initial_credits,
         }
 
         # 1) Backfill equity-based Q on EVERY terminal across every tree in
@@ -942,7 +963,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         # `decision["mcts_root"].Q` reflects equity. Done before
         # collect_training_data because that function reads `root.Q` to fill
         # `root_q_ratio`.
-        evaluate_all_terminals(
+        combo_probs_cache = evaluate_all_terminals(
             hand_record, agents_by_position, device,
             config=mcts_cfg,
             value_scales_by_position=value_scales_by_position,
@@ -955,15 +976,24 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         # `final_credits[hero] − credits_at(t)[hero]`. Same equity machinery
         # as (1); the only difference is the board is fully revealed (river)
         # and opponent ranges are narrowed by ALL of the hand's real decisions.
+        # E.1.1: reuse combo_probs_cache from (1) — exact same data.
         ref_credits = [dec["all_credits_before_decision"] for dec in decisions]
         equity_pkt = compute_equity_outcome(
             hand_record, agents_by_position, device,
             ref_credits_by_decision=ref_credits, config=mcts_cfg,
             proxy=terminal_proxy, agent_name_by_pos=agent_name_by_pos,
             equity_device=equity_device,
+            combo_probs_cache=combo_probs_cache,
         )
         realized_by_dec = equity_pkt["realized_by_decision"]
         equity_by_hero = equity_pkt["equity_by_hero"]
+
+        # C.5: per-player total contributions for side-pot cap.
+        contributions = [float(initial_credits[p]) - float(credits_pre_dist[p])
+                         for p in range(num_players)]
+        # Cache side-pot-capped hero_base per hero (same across all
+        # decisions by that hero — only invested_from_t varies).
+        _chain_hero_base = {}
 
         # Build per-(hero_pos, dec_idx) lookup of realized chips for chain
         # steps. Chain step i of example t uses HERO_T's perspective at
@@ -982,7 +1012,17 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             equity = equity_by_hero.get(hero_pos)
             if equity is None:
                 return -invested
-            return equity * final_pot - invested
+            # C.5: side-pot-correct chip delta
+            if hero_pos not in _chain_hero_base:
+                inv_total = float(contributions[hero_pos])
+                opp_c = [float(contributions[p]) for p in final_active
+                         if p != hero_pos]
+                max_opp = max(opp_c) if opp_c else 0.0
+                eff = min(inv_total, max_opp)
+                excess = inv_total - eff
+                share_pot = sum(min(float(c), eff) for c in contributions)
+                _chain_hero_base[hero_pos] = excess + equity * share_pot
+            return _chain_hero_base[hero_pos] - invested
 
         examples = collect_training_data(
             hand_record, n_actions,
@@ -992,7 +1032,9 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             action_label_smoothing=action_label_smoothing,
             terminal_k_worst=terminal_k_worst,
             terminal_k_best=terminal_k_best,
-            terminal_clip_val=terminal_clip_val,
+            # C.3: do NOT clip terminal Q at collection — _finalize_value_targets
+            # rescales to the fresh value axis and clips there.
+            terminal_clip_val=None,
         )
 
         # Overwrite raw realized targets with equity-based ones.
@@ -1038,6 +1080,34 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     return per_agent_examples
 
 
+def _robust_scale(chips, fallback):
+    """Robust scale (in chips) for the value-target normalizer (C.7.4).
+
+    Self-play chip-delta distributions are fat-tailed (rare all-in swings) and
+    the bootstrap sample is small at low `n_hands_per_cycle`, so a plain `std`
+    over-inflates from a handful of extreme hands — which then shrinks every
+    example's normalized target. Use a robust estimator instead: MAD·1.4826
+    (≈ σ for a Gaussian), falling back to IQR/1.349, then `std`, then
+    `fallback` (BB) — the first that is finite and > 0.
+    """
+    chips = np.asarray(chips, dtype=np.float64)
+    if chips.size == 0:
+        return float(fallback)
+    med = np.median(chips)
+    mad = float(np.median(np.abs(chips - med)))
+    scale = 1.4826 * mad
+    if scale >= 1e-8:
+        return float(scale)
+    q75, q25 = np.percentile(chips, [75, 25])
+    iqr_scale = float(q75 - q25) / 1.349
+    if iqr_scale >= 1e-8:
+        return iqr_scale
+    std_c = float(chips.std())
+    if std_c >= 1e-8:
+        return std_c
+    return float(fallback)
+
+
 def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
                               alpha, clip_val, big_blind, log):
     """Bootstrap `mcts_value_scale` and apply hybrid blend + clip in place.
@@ -1054,13 +1124,19 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
         divided terminal Q by, so `root.Q` lives on `search_scale` axis
         (fallback `big_blind` on the first-ever cycle, before any bootstrap).
       - `new_scale` is either the existing `mcts_value_scale` from
-        `norm_stats`, or freshly bootstrapped as `std(chip_deltas)` if the
-        key is absent (first cycle or post-rebootstrap).
+        `norm_stats`, or freshly bootstrapped as a robust scale (MAD/IQR, see
+        `_robust_scale` — C.7.4) of the chip deltas if the key is absent
+        (first cycle or post-rebootstrap).
       - `root_q_ratio` is stored in `search_scale`-units; rescaling by
         `search_scale / new_scale` lifts it onto the same target axis as
         `realized_chips / new_scale`. The multiplication is **not** a
         double normalization — it undoes the search-time division so we
         can re-apply the cycle's fresh scale (see PLAN §4.1).
+      - C.2: the chain TD half uses `step.root_q_ratio` only for hero-owned
+        steps (NaN / opp steps fall back to pure MC).
+      - C.3: `ex.terminal_targets` (RAW `search_scale`-unit equity Q) are
+        rescaled by the same `search_scale / new_scale` and clipped here, on
+        the fresh axis — not at collection time.
 
     Operates in place. Returns nothing.
     """
@@ -1089,19 +1165,19 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
                 [float(ex.value_target) for ex in examples],
                 dtype=np.float64,
             )
-            std_c = float(chips.std())
-            if std_c < 1e-8:
-                std_c = bb
+            # C.7.4: robust scale (MAD/IQR) instead of std — fat tails + tiny
+            # samples make std over-inflate.
+            scale_c = _robust_scale(chips, bb)
             old_scale = ns.get("mcts_value_scale")
-            ns["mcts_value_scale"] = std_c
+            ns["mcts_value_scale"] = scale_c
             ns["mcts_value_scale_n_samples"] = int(len(chips))
             ns["mcts_value_chip_min"] = float(chips.min())
             ns["mcts_value_chip_max"] = float(chips.max())
             origin = "rebootstrapped" if pending else "bootstrapped"
             old_s = (f" (was {old_scale:.2f})"
                       if isinstance(old_scale, (int, float)) else "")
-            log(f"  {name}: {origin} mcts_value_scale = {std_c:.2f} "
-                f"chips{old_s} (n={len(chips)}, range "
+            log(f"  {name}: {origin} mcts_value_scale = {scale_c:.2f} "
+                f"chips (robust MAD/IQR){old_s} (n={len(chips)}, range "
                 f"[{chips.min():.1f}, {chips.max():.1f}])")
         else:
             log(f"  {name}: reusing mcts_value_scale = "
@@ -1129,10 +1205,13 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
             for step in ex.chain:
                 step_realized = float(step.value_target)
                 step_q_raw = float(step.root_q_ratio)
-                if not np.isnan(step_q_raw):
+                # C.2: only TD-blend the future tree's root.Q when that future
+                # decision is the SAME hero (same perspective AND scale). Opp
+                # chain steps (and legacy/past-opp steps with NaN) → pure-MC
+                # realized target.
+                if step.is_hero and not np.isnan(step_q_raw):
                     step_q_in_new = step_q_raw * rescale_q
                 else:
-                    # Legacy step without root.Q → fall back to pure MC.
                     step_q_in_new = step_realized / new_scale
                 step_blend = (
                     alpha * step_q_in_new
@@ -1142,6 +1221,17 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
                 n_chain += 1
                 if abs(step_blend) > clip_val:
                     n_clipped_chain += 1
+
+            # C.3: lift tree-terminal value targets onto the SAME fresh axis as
+            # root/chain (they were stored RAW in `search_scale` units), THEN
+            # clip — same `rescale_q` and `clip_val` as above.
+            if ex.terminal_targets:
+                rescaled_terms = []
+                for action_path, q_search in ex.terminal_targets:
+                    q_new = float(q_search) * rescale_q
+                    q_new = max(-clip_val, min(clip_val, q_new))
+                    rescaled_terms.append((action_path, q_new))
+                ex.terminal_targets = rescaled_terms
 
         log(f"  {name}: blended (α={alpha:.2f}, clip=±{clip_val:.1f}) — "
             f"root: {n_clipped_root}/{n_root} clipped; "
@@ -1197,7 +1287,9 @@ def _actor_main(worker_id, agents_meta, config, n_hands, seed,
             name = agent_info["name"]
             ev = RemoteEvaluator(worker_id, name, req_q, resp_q, n_actions)
             return MCTS(None, "cpu", mcts_cfg,
-                        strange_p=strange_p_by_agent[name], evaluator=ev)
+                        strange_p=strange_p_by_agent[name], evaluator=ev,
+                        search_scale=search_scales.get(
+                            name, float(game_cfg.get("big_blind", 10))))
 
         per_agent = _play_hands(
             agents_meta, config, "cpu", n_hands, make_mcts=make_mcts,
@@ -1258,6 +1350,7 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
         "device": device,
         "server_max_batch": int(mcts_train_cfg.get("server_max_batch", 256)),
         "server_linger_ms": float(mcts_train_cfg.get("server_linger_ms", 2)),
+        "n_workers": n_workers,
     }
 
     # Server spec: each agent's config + CPU state_dict + norm_stats.

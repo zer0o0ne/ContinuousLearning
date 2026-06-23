@@ -1,6 +1,8 @@
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import json
 import copy
+from math import ceil
 
 from utils import Logger
 from agent.agent import ASI
@@ -11,6 +13,7 @@ from agent.train_scenarios._checkpoint_io import (
     is_legacy_mcts_ckpt,
     restore_optim_sched,
 )
+from agent.train_scenarios._history import IncrementalHistory
 
 
 def _find_latest_best_ckpt(scenario_dir):
@@ -736,34 +739,52 @@ def main():
 
             def _build_persistent_optim(agent_obj, ckpt, ckpt_path,
                                          mcts_train_cfg, n_cycles, agent_log):
-                """Construct a single Adam + warmup→cosine that survives
+                """Construct a single Adam + warmup→clamped-cosine that survives
                 across all cycles AND across pipeline runs.
 
-                Optimizer / scheduler state is only restored when the
-                source checkpoint was written by a previous MCTS run
+                D.1: T_max is derived from config params (not the old
+                estimated_steps_per_cycle). A clamped cosine holds eta_min
+                once T_max is reached — no oscillation on late cycles.
+                Warmup runs only on cycle 0 (first warmup_steps global
+                steps). Optimizer / scheduler state is only restored when
+                the source checkpoint was written by a previous MCTS run
                 (phase tag == "mcts_predict") AND the agent's trainable
-                parameter signature matches. On the first MCTS cycle the
-                source ckpt comes from `opponent_action_predict` (or
-                another earlier phase via `_find_best_checkpoint`) — that
-                state is meaningless here and is silently skipped.
+                parameter signature matches.
                 """
                 from torch.optim.lr_scheduler import (
                     LinearLR, CosineAnnealingLR, SequentialLR)
+
+                # D.1: clamped cosine — holds eta_min instead of wrapping
+                class _ClampedCosineAnnealingLR(CosineAnnealingLR):
+                    def get_lr(self):
+                        if self.last_epoch >= self.T_max:
+                            return [self.eta_min
+                                    for _ in self.base_lrs]
+                        return super().get_lr()
+
                 lr = float(mcts_train_cfg.get("lr", 1e-5))
                 opt = torch.optim.Adam(agent_obj.parameters(), lr=lr)
 
-                est_steps = int(mcts_train_cfg.get(
-                    "estimated_steps_per_cycle", 20))
-                # Generous horizon — slight over-estimation just delays
-                # eta_min, under-estimation freezes early.
-                total_steps = max(1, n_cycles * est_steps)
+                # D.1: compute T_max from actual config (no
+                # estimated_steps_per_cycle). Upper-bound examples per
+                # cycle from n_hands × ~6 decisions, then steps from
+                # epochs × ceil(train_examples / batch_size).
+                epochs = int(mcts_train_cfg.get("epochs", 5))
+                batch_size = int(mcts_train_cfg.get("batch_size", 16))
+                n_hands = int(mcts_train_cfg.get(
+                    "n_hands_per_cycle", 100))
+                val_split = float(mcts_train_cfg.get("val_split", 0.1))
+                est_examples = n_hands * 6
+                est_steps_per_cycle = epochs * ceil(
+                    est_examples * (1.0 - val_split) / batch_size)
+                total_steps = max(1, n_cycles * est_steps_per_cycle)
                 warmup_steps = min(100, max(1, total_steps // 5))
                 eta_min = float(mcts_train_cfg.get(
                     "scheduler_eta_min", 1e-6))
 
                 warmup = LinearLR(opt, start_factor=0.01,
                                   total_iters=warmup_steps)
-                cosine = CosineAnnealingLR(
+                cosine = _ClampedCosineAnnealingLR(
                     opt, T_max=max(1, total_steps - warmup_steps),
                     eta_min=eta_min)
                 sched = SequentialLR(opt, [warmup, cosine],
@@ -789,8 +810,9 @@ def main():
                 msg = (
                     f"  Persistent optim: lr_now={opt.param_groups[0]['lr']:.2e}, "
                     f"horizon={total_steps} steps "
-                    f"(={n_cycles} cycles × {est_steps}), "
+                    f"(={n_cycles} cycles × ~{est_steps_per_cycle}), "
                     f"warmup={warmup_steps}, eta_min={eta_min:.0e}, "
+                    f"clamped_cosine=True, "
                     f"adam_restored={restored_opt}, "
                     f"sched_restored={restored_sched}")
                 agent_log(msg)
@@ -849,8 +871,14 @@ def main():
                     cumulative_step = 0
                     if state.resume and agent_name in saved_cum_steps:
                         cumulative_step = int(saved_cum_steps[agent_name])
-                    elif os.path.exists(history_path):
-                        existing = torch.load(history_path, weights_only=False)
+                    elif (os.path.exists(history_path)
+                          or os.path.isdir(os.path.join(scenario_dir,
+                                                        "history_shards"))):
+                        existing = IncrementalHistory(
+                            scenario_dir,
+                            keys=["step_loss", "val_loss",
+                                  "epoch_train_loss", "epoch_val_loss",
+                                  "cycles"]).data
                         steps = existing.get("step_loss", []) or []
                         if steps and isinstance(steps[-1], dict):
                             cumulative_step = int(steps[-1].get("step", 0)) + 1
@@ -889,8 +917,14 @@ def main():
                 cumulative_step = 0
                 if state.resume and name in saved_cum_steps:
                     cumulative_step = int(saved_cum_steps[name])
-                elif os.path.exists(history_path):
-                    existing = torch.load(history_path, weights_only=False)
+                elif (os.path.exists(history_path)
+                      or os.path.isdir(os.path.join(scenario_dir,
+                                                    "history_shards"))):
+                    existing = IncrementalHistory(
+                        scenario_dir,
+                        keys=["step_loss", "val_loss",
+                              "epoch_train_loss", "epoch_val_loss",
+                              "cycles"]).data
                     steps = existing.get("step_loss", []) or []
                     if steps and isinstance(steps[-1], dict):
                         cumulative_step = int(steps[-1].get("step", 0)) + 1

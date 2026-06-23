@@ -16,40 +16,44 @@ from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
-    _compute_norm_stats, _normalize_scenarios
-from agent.train_scenarios.gto_predict.dataset import GTODataset, batch_collate
+    _compute_norm_stats, _normalize_scenarios, _shallow_copy_scenarios
+from agent.train_scenarios.gto_predict.dataset import GTODataset, batch_collate, make_tensor_collate
 from agent.train_scenarios._checkpoint_io import (
     make_checkpoint,
     restore_optim_sched,
 )
 from agent.resume import atomic_torch_save
+from agent.train_scenarios._history import IncrementalHistory
 
 
 _PHASE = "gto_predict"
 
 
 class LengthGroupedBatchSampler(Sampler):
-    """Sampler that groups samples by sequence length into batches."""
+    """Sampler that groups samples by sequence length into batches.
+
+    Batch composition is re-randomized every epoch: indices are shuffled
+    before stable-sorting by length, so same-length samples get different
+    neighbours each time (E.5.6).
+    """
 
     def __init__(self, dataset, batch_size):
         self.batch_size = batch_size
-        indices = list(range(len(dataset)))
-        lengths = []
-        for i in indices:
-            sample = dataset[i]
-            lengths.append(len(sample[0]))
-        sorted_indices = sorted(indices, key=lambda i: lengths[i])
-        self.batches = [sorted_indices[i:i + batch_size]
-                        for i in range(0, len(sorted_indices), batch_size)]
+        self.n = len(dataset)
+        self.lengths = [len(dataset[i][0]) for i in range(self.n)]
 
     def __iter__(self):
-        batch_order = list(range(len(self.batches)))
-        random.shuffle(batch_order)
-        for idx in batch_order:
-            yield self.batches[idx]
+        indices = list(range(self.n))
+        random.shuffle(indices)
+        indices.sort(key=lambda i: self.lengths[i])
+        batches = [indices[i:i + self.batch_size]
+                   for i in range(0, len(indices), self.batch_size)]
+        random.shuffle(batches)
+        for batch in batches:
+            yield batch
 
     def __len__(self):
-        return len(self.batches)
+        return (self.n + self.batch_size - 1) // self.batch_size
 
 
 def _kl_loss(logits, target_probs):
@@ -96,17 +100,19 @@ def _run_validation(agent, val_loader, value_loss_fn, device, action_loss_weight
     wrc_sum = 0.0
     val_count = 0
     with torch.no_grad():
-        for event_sequences, ev_targets, target_probs in val_loader:
+        for precomputed, ev_targets, target_probs in val_loader:
             ev_targets = ev_targets.to(device)
             target_probs = target_probs.to(device)
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                result = agent.forward_batch(event_sequences, skip_memory=True)
+                result = agent.forward_batch(None, skip_memory=True,
+                                             heads={"value", "action"},
+                                             precomputed=precomputed)
                 predicted_ev = result["value"].squeeze(-1)
                 action_logits = result["action_logits"]
                 v_loss = value_loss_fn(predicted_ev, ev_targets)
                 a_loss = _kl_loss(action_logits, target_probs)
                 combined = v_loss + action_loss_weight * a_loss
-            n = len(event_sequences)
+            n = precomputed["B"] if precomputed is not None else 0
             val_combined_sum += combined.item() * n
             val_value_sum += v_loss.item() * n
             val_action_sum += a_loss.item() * n
@@ -133,9 +139,9 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
     log(f"  New best model (val loss: {val_loss:.6f})")
 
 
-def _save_history(history, run_dir):
-    """Save training history incrementally for real-time monitoring."""
-    atomic_torch_save(history, os.path.join(run_dir, "history.pt"))
+def _save_history(hist):
+    """Save training history incrementally (E.5.3: append-only shards)."""
+    hist.save()
 
 
 def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
@@ -247,8 +253,7 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
 
     # Compute norm_stats and normalize (per-agent). On resume, reuse
     # the stats from the prior run.
-    import copy
-    scenarios = copy.deepcopy(scenarios)
+    scenarios = _shallow_copy_scenarios(scenarios)
     if resume_state is not None and resume_state.get("norm_stats"):
         norm_stats = resume_state["norm_stats"]
         log(f"Norm stats (resumed): " + ", ".join(
@@ -264,9 +269,15 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
     dataset = GTODataset(scenarios)
     train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
 
+    max_players = agent.perception.embedder.max_players
+    _tensor_collate = make_tensor_collate(max_players)
     train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=batch_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=batch_collate)
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                              collate_fn=_tensor_collate, num_workers=2,
+                              persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            collate_fn=_tensor_collate, num_workers=2,
+                            persistent_workers=True)
 
     log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:
@@ -289,23 +300,14 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
     global_step = 0
     start_epoch = 0
 
-    history_path = os.path.join(run_dir, "history.pt")
-    if os.path.exists(history_path):
-        history = torch.load(history_path, weights_only=False)
-        for k in ("step_loss", "step_value_loss", "step_action_loss",
-                  "val_loss", "val_value_loss", "val_action_loss",
-                  "val_accuracy", "val_wrc",
-                  "epoch_train_loss", "epoch_val_loss"):
-            history.setdefault(k, [])
-        log(f"Resumed history from {history_path} "
-            f"(step_loss n={len(history['step_loss'])})")
-    else:
-        history = {
-            "step_loss": [], "step_value_loss": [], "step_action_loss": [],
-            "val_loss": [], "val_value_loss": [], "val_action_loss": [],
-            "val_accuracy": [], "val_wrc": [],
-            "epoch_train_loss": [], "epoch_val_loss": [],
-        }
+    hist = IncrementalHistory(run_dir,
+                              keys=["step_loss", "step_value_loss",
+                                    "step_action_loss", "val_loss",
+                                    "val_value_loss", "val_action_loss",
+                                    "val_accuracy", "val_wrc",
+                                    "epoch_train_loss", "epoch_val_loss"])
+    history = hist.data
+    log(f"Loaded history (step_loss n={len(history['step_loss'])})")
 
     if resume_state is not None:
         restore_optim_sched(
@@ -335,12 +337,14 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
         train_a_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_sequences, ev_targets, target_probs) in enumerate(train_loader):
+        for batch_idx, (precomputed, ev_targets, target_probs) in enumerate(train_loader):
             ev_targets = ev_targets.to(device)
             target_probs = target_probs.to(device)
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                result = agent.forward_batch(event_sequences, skip_memory=True)
+                result = agent.forward_batch(None, skip_memory=True,
+                                             heads={"value", "action"},
+                                             precomputed=precomputed)
                 predicted_ev = result["value"].squeeze(-1)  # (B,)
                 action_logits = result["action_logits"]      # (B, n_actions)
                 v_loss = value_loss_fn(predicted_ev, ev_targets)
@@ -361,7 +365,7 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
             history["step_action_loss"].append((global_step, a_loss.item()))
             global_step += 1
 
-            n = len(event_sequences)
+            n = precomputed["B"] if precomputed is not None else 0
             train_loss_sum += step_loss * n
             train_v_loss_sum += v_loss.item() * n
             train_a_loss_sum += a_loss.item() * n
@@ -386,7 +390,7 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
                 history["val_action_loss"].append((global_step, val_a))
                 history["val_accuracy"].append((global_step, val_acc))
                 history["val_wrc"].append((global_step, val_wrc))
-                _save_history(history, run_dir)
+                _save_history(hist)
                 log(f"  [Step {global_step}] Val Loss: {val_combined:.6f} "
                     f"(V: {val_v:.4f}, A: {val_a:.4f}), Acc: {val_acc:.4f}, WRC: {val_wrc:.4f}")
 
@@ -420,7 +424,7 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
         history["epoch_train_loss"].append(train_loss_avg)
         history["epoch_val_loss"].append(val_combined)
 
-        _save_history(history, run_dir)
+        _save_history(hist)
         log(f"Epoch {epoch+1}/{epochs} — Loss: {train_loss_avg:.6f}, "
             f"Val Loss: {val_combined:.6f} (V: {val_v:.4f}, A: {val_a:.4f}), "
             f"Acc: {val_acc:.4f}, WRC: {val_wrc:.4f}")
@@ -449,6 +453,6 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
         param.requires_grad = True
 
     log(f"=== Combined GTO Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
-    _save_history(history, run_dir)
+    hist.compact()
 
     return history, run_dir

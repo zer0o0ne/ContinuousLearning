@@ -73,9 +73,10 @@ def _get_eqr(hero_position, street, n_players, active_positions=None):
     """
     if active_positions is not None and len(active_positions) > 1:
         if street == 0:
-            # Preflop: higher position index = later to act = more IP
-            # (in standard rotation, BTN acts last preflop in 2-player, BB last in multi)
-            is_ip = hero_position == max(active_positions)
+            # B.5.9: preflop the BB (seat 1) closes the action — it acts LAST,
+            # hence in position. The old `max(active_positions)` (e.g. the BTN)
+            # acts BEFORE the blinds preflop, so it was the wrong closer.
+            is_ip = (hero_position == 1)
         else:
             # Postflop: highest seat index acts last (BTN position)
             is_ip = hero_position == max(active_positions)
@@ -115,34 +116,54 @@ def compute_combo_weights(hand_types, action_history, dead_cards=None):
     if n == 0:
         return None
 
+    idx = torch.arange(n, dtype=torch.float32)
     type_weights = torch.ones(n, dtype=torch.float32)
 
     for action in action_history:
         if action in ("call", "call_postflop"):
-            # Bell curve: middle of range weighted highest
             center = n / 2.0
-            for i in range(n):
-                dist = abs(i - center) / max(n, 1)
-                type_weights[i] *= max(0.1, 1.0 - dist * 1.5)
+            dist = (idx - center).abs() / max(n, 1)
+            type_weights *= (1.0 - dist * 1.5).clamp(min=0.1)
         elif action in ("3bet", "bet_postflop"):
-            # Skew to top: strongest hands most likely
-            for i in range(n):
-                frac = i / max(n - 1, 1)
-                type_weights[i] *= max(0.1, 1.0 - frac * 0.9)
-        # "open" → uniform, no change
+            frac = idx / max(n - 1, 1)
+            type_weights *= (1.0 - frac * 0.9).clamp(min=0.1)
 
-    # Expand type-level weights to combo-level weights
+    # Vectorized combo expansion and dead-card filtering
     dead = dead_cards or set()
-    combo_weights_list = []
-    for i, ht in enumerate(hand_types):
-        combos = _ALL_COMBOS_CACHE[ht]
-        n_valid = sum(1 for c1, c2 in combos if c1 not in dead and c2 not in dead)
-        combo_weights_list.extend([type_weights[i].item()] * n_valid)
 
-    if not combo_weights_list:
+    # 1. Pre-build flat tensor of all combos and a counts tensor for repeat_interleave
+    all_combos_flat = []
+    combo_counts = []
+    for ht in hand_types:
+        combos = _ALL_COMBOS_CACHE[ht]
+        all_combos_flat.extend(combos)
+        combo_counts.append(len(combos))
+
+    if not all_combos_flat:
         return None
 
-    w = torch.tensor(combo_weights_list, dtype=torch.float32)
+    # (total_combos, 2) tensor of card pairs
+    all_combos = torch.tensor(all_combos_flat, dtype=torch.long)
+    combo_counts_t = torch.tensor(combo_counts, dtype=torch.long)
+
+    # 2. Create dead-card boolean mask (size 52)
+    dead_mask = torch.zeros(52, dtype=torch.bool)
+    if dead:
+        dead_indices = torch.tensor(sorted(dead), dtype=torch.long)
+        dead_mask[dead_indices] = True
+
+    # 3. Filter combos: neither card is dead
+    c1_dead = dead_mask[all_combos[:, 0]]
+    c2_dead = dead_mask[all_combos[:, 1]]
+    alive = ~c1_dead & ~c2_dead
+
+    if not alive.any():
+        return None
+
+    # 4. Repeat type_weights per combo count, then apply alive filter
+    w = torch.repeat_interleave(type_weights, combo_counts_t)
+    w = w[alive]
+
     return w / w.sum()
 
 
@@ -530,6 +551,18 @@ def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
 
     raw_equity = gpu_equity_v3(hero_cards, board_cards, opp_combos, n_iters, device, combo_weights)
 
+    # B.5.4: model the AGGRESSOR (the last opponent to raise this hand) as the
+    # primary opponent for the detailed call/reraise response, not seat 0. The
+    # aggressor is whom a raise most directly contests. Fall back to the first
+    # opponent when no opponent has raised yet (hero is opening the pot).
+    primary_idx = 0
+    if opponent_positions and action_history:
+        _raise_acts = {"open", "3bet", "bet_postflop"}
+        _opp_pos_list = list(opponent_positions)
+        for p, a in action_history:
+            if a in _raise_acts and p in _opp_pos_list:
+                primary_idx = _opp_pos_list.index(p)  # keep the LAST such raiser
+
     state = {
         "hero_cards": hero_cards,
         "board_cards": board_cards,
@@ -544,8 +577,9 @@ def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
         "opponent_positions": opponent_positions,
         "n_iters": n_iters,
         "device": device,
-        "primary_idx": 0,
+        "primary_idx": primary_idx,
         "opp_eq_cpu": None,
+        "opp_eq_by_opp": None,
         "reraise_mask": None,
         "p_reraise_per_combo": None,
         "primary_combos": None,
@@ -555,22 +589,26 @@ def _prepare_ev_state_v3(hero_cards, board_cards, opponent_range_hand_types,
         "polarized_reraise": polarized_reraise,
     }
 
-    primary_idx = 0
-    if len(opp_combos) > 0 and opp_combos[primary_idx].shape[0] > 0:
-        primary_combos = opp_combos[primary_idx]
+    # B.5.4: per-opponent hero-equity-per-combo for EVERY live opponent (not
+    # just the primary), so `_compute_ev_v3_from_state` can derive each
+    # opponent's fold probability and combine them as Π p_fold. ~N× the
+    # per-combo MC of the old primary-only path. The primary's slice still
+    # drives the detailed call/reraise response.
+    opp_eq_by_opp = [None] * len(opp_combos)
+    for j, combos_j in enumerate(opp_combos):
+        if combos_j.shape[0] > 0:
+            hero_eq_j = gpu_equity_per_combo(
+                hero_cards, board_cards, combos_j, combo_response_iters, device
+            )
+            opp_eq_by_opp[j] = (1.0 - hero_eq_j).cpu()
+    state["opp_eq_by_opp"] = opp_eq_by_opp
 
-        hero_eq_per_combo = gpu_equity_per_combo(
-            hero_cards, board_cards, primary_combos,
-            combo_response_iters, device
-        )
-        opp_eq_per_combo = 1.0 - hero_eq_per_combo
-        opp_eq_cpu = opp_eq_per_combo.cpu()
-
+    if len(opp_combos) > primary_idx and opp_combos[primary_idx].shape[0] > 0:
         # State carries the precomputed per-combo equity only. Reraise
         # weights/mask + eq_vs_reraisers depend on raise_frac (post-R2) and
         # are recomputed per-call in _compute_ev_v3_from_state.
-        state["primary_combos"] = primary_combos
-        state["opp_eq_cpu"] = opp_eq_cpu
+        state["primary_combos"] = opp_combos[primary_idx]
+        state["opp_eq_cpu"] = opp_eq_by_opp[primary_idx]
 
     return state
 
@@ -611,11 +649,24 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
     total_call_investment = hero_invested + facing_bet
     call_ev = eff_equity * (pot - hero_invested) + (1 - eff_equity) * (-total_call_investment)
     _street_discount = {0: 0.92, 1: 0.95, 2: 0.98, 3: 1.0}.get(street, 1.0)
-    call_ev *= _street_discount
+    # B.5.5: apply the street discount only to a POSITIVE call EV. The discount
+    # models equity-realization risk on a marginal call; multiplying a NEGATIVE
+    # call_ev by <1 would make a losing call look BETTER. `min(x, x*d)` discounts
+    # when x > 0 and is a no-op when x <= 0.
+    call_ev = min(call_ev, call_ev * _street_discount)
 
     raise_amount = min(facing_bet + raise_frac * (pot + facing_bet), stack)
     total_raise = hero_invested + raise_amount
-    new_pot = pot + facing_bet + raise_amount
+    # Audit B.1: `pot` already contains the opponent's `facing_bet` (see call_ev
+    # above: a win pays `pot - hero_invested`). When the opponent calls hero's
+    # raise they add `raise_amount - facing_bet` on top of what they already
+    # have in. So the final pot is the existing `pot` (hero matched + dead money)
+    # plus hero's `raise_amount` plus the opponent's call of the raise.
+    # The old `pot + facing_bet + raise_amount` double-counted facing_bet and
+    # omitted the opponent's call, making EV(raise) - EV(check) = -(1-eq)*b < 0
+    # for any equity at facing_bet=0 (value bets never paid). Fixed:
+    #   EV(raise|call) - EV(check) = b*(2*eq - 1)  (> 0 for eq > 0.5).
+    new_pot = pot + raise_amount + (raise_amount - facing_bet)
 
     call_cost = raise_amount
     pot_after_raise = new_pot
@@ -718,38 +769,22 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
                     combined = combined / csum
             else:
                 combined = p_reraise_per_combo / p_reraise_per_combo.sum()
-            reraise_weights = [
-                combined if j == primary_idx else
-                (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
-                for j in range(len(opp_combos))
-            ]
-            # Full primary range — soft selection via multinomial weights.
-            all_reraise_combos = list(opp_combos)
-            eq_vs_reraisers = gpu_equity_v3(
-                hero_cards, board_cards, all_reraise_combos,
-                n_iters, device, reraise_weights
-            )
+            # E.3.1: analytical equity from per-combo table
+            hero_eq_per_combo = 1.0 - opp_eq_cpu
+            eq_vs_reraisers = float((hero_eq_per_combo * combined).sum().item())
         elif (not smoothing_enabled) and reraise_mask is not None and reraise_mask.any():
-            reraising_combos = primary_combos[reraise_mask]
-            all_reraise_combos = [
-                reraising_combos if j == primary_idx else c
-                for j, c in enumerate(opp_combos)
-            ]
-            reraise_weights = None
+            # E.3.1: analytical equity from per-combo table
+            hero_eq_per_combo = 1.0 - opp_eq_cpu
+            masked_eq = hero_eq_per_combo[reraise_mask]
             if combo_weights is not None and combo_weights[primary_idx] is not None:
                 rw = combo_weights[primary_idx][reraise_mask]
                 rw_sum = rw.sum()
-                if rw_sum > 0:
-                    rw = rw / rw_sum
-                reraise_weights = [
-                    rw if j == primary_idx else
-                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
-                    for j in range(len(opp_combos))
-                ]
-            eq_vs_reraisers = gpu_equity_v3(
-                hero_cards, board_cards, all_reraise_combos,
-                n_iters, device, reraise_weights
-            )
+                if rw_sum.item() > 0:
+                    eq_vs_reraisers = float((masked_eq * rw / rw_sum).sum().item())
+                else:
+                    eq_vs_reraisers = float(masked_eq.mean().item())
+            else:
+                eq_vs_reraisers = float(masked_eq.mean().item())
 
     if opp_eq_cpu is not None:
         if smoothing_enabled:
@@ -769,18 +804,45 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
             p_reraise_per_combo = p_reraise_per_combo / denom
             p_call_per_combo = (1.0 - p_fold_per_combo - p_reraise_per_combo).clamp(min=0.0)
 
-            p_fold = p_fold_per_combo.mean().item()
-            p_reraise = p_reraise_per_combo.mean().item()
-            p_call = p_call_per_combo.mean().item()
+            # B.5.8: aggregate the per-combo response probabilities with the
+            # SAME combo weights that gate the equities (weighted_sampling),
+            # not a flat mean over combos. `combo_weights[primary_idx]` is
+            # already normalized to sum 1; fall back to a flat mean when no
+            # weights are present.
+            w_primary = (combo_weights[primary_idx]
+                         if combo_weights is not None
+                         and combo_weights[primary_idx] is not None
+                         else None)
+            if w_primary is not None and len(w_primary) == len(p_fold_per_combo):
+                p_fold = float((p_fold_per_combo * w_primary).sum().item())
+                p_reraise = float((p_reraise_per_combo * w_primary).sum().item())
+                p_call = float((p_call_per_combo * w_primary).sum().item())
+            else:
+                p_fold = p_fold_per_combo.mean().item()
+                p_reraise = p_reraise_per_combo.mean().item()
+                p_call = p_call_per_combo.mean().item()
         else:
             # Legacy hard-mask path (preserved bit-for-bit vs R1).
             fold_mask = opp_eq_cpu < fold_threshold
             call_mask = ~fold_mask & ~reraise_mask
 
+            # B.5.8: weight the fold/call/reraise fractions by combo weights
+            # (consistent with the equities they gate), not a flat combo count.
+            w_primary = (combo_weights[primary_idx]
+                         if combo_weights is not None
+                         and combo_weights[primary_idx] is not None
+                         else None)
             n_total = float(len(opp_eq_cpu))
-            p_fold = fold_mask.float().sum().item() / n_total if n_total > 0 else 0.0
-            p_reraise = reraise_mask.float().sum().item() / n_total if n_total > 0 else 0.0
-            p_call = call_mask.float().sum().item() / n_total if n_total > 0 else 1.0
+            if w_primary is not None and len(w_primary) == len(opp_eq_cpu):
+                p_fold = float((fold_mask.float() * w_primary).sum().item())
+                p_reraise = float((reraise_mask.float() * w_primary).sum().item())
+                p_call = float((call_mask.float() * w_primary).sum().item())
+            elif n_total > 0:
+                p_fold = fold_mask.float().sum().item() / n_total
+                p_reraise = reraise_mask.float().sum().item() / n_total
+                p_call = call_mask.float().sum().item() / n_total
+            else:
+                p_fold, p_reraise, p_call = 0.0, 0.0, 1.0
             p_call_per_combo = None  # unused on legacy path
 
         mean_opp_eq = opp_eq_cpu.mean().item()
@@ -791,6 +853,32 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
             p_fold /= p_total
             p_call /= p_total
             p_reraise /= p_total
+
+        # B.5.4: probability that EVERY OTHER live opponent (besides the
+        # primary) also folds to the raise. Together with the primary's fold
+        # probability this yields Π p_fold_i — the only way hero wins the pot
+        # uncontested with >1 opponent. With a single opponent this product is
+        # empty (== 1) and the raise EV below reduces EXACTLY to the heads-up
+        # model. Each opponent's fold prob uses the same fold_threshold and
+        # smoothing as the primary, weighted by that opponent's combo weights.
+        opp_eq_by_opp = state.get("opp_eq_by_opp") or []
+        beta_fold_mw = float((state.get("threshold_smoothing") or {}).get("beta_fold", 0.07))
+        p_others_all_fold = 1.0
+        for j, oeq in enumerate(opp_eq_by_opp):
+            if j == primary_idx or oeq is None:
+                continue
+            if smoothing_enabled:
+                pf_j = torch.sigmoid((fold_threshold - oeq) / beta_fold_mw)
+            else:
+                pf_j = (oeq < fold_threshold).float()
+            wj = (combo_weights[j]
+                  if combo_weights is not None and j < len(combo_weights)
+                  and combo_weights[j] is not None else None)
+            if wj is not None and len(wj) == len(pf_j):
+                p_fold_j = float((pf_j * wj).sum().item())
+            else:
+                p_fold_j = float(pf_j.mean().item())
+            p_others_all_fold *= p_fold_j
 
         if smoothing_enabled:
             if p_call_per_combo.sum().item() > 1e-6:
@@ -803,45 +891,24 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
                 else:
                     combined = p_call_per_combo / p_call_per_combo.sum()
 
-                calling_weights = [
-                    combined if j == primary_idx else
-                    (combo_weights[j] if combo_weights is not None and j < len(combo_weights) else None)
-                    for j in range(len(opp_combos))
-                ]
-                all_calling_combos = list(opp_combos)
-                eq_vs_callers = gpu_equity_v3(
-                    hero_cards, board_cards, all_calling_combos,
-                    n_iters, device, calling_weights
-                )
+                # E.3.1: analytical equity from per-combo table
+                hero_eq_per_combo = 1.0 - opp_eq_cpu
+                eq_vs_callers = float((hero_eq_per_combo * combined).sum().item())
             else:
                 eq_vs_callers = raw_equity
         elif call_mask.any():
-            calling_combos = primary_combos[call_mask]
-            all_calling_combos = []
-            for j, c in enumerate(opp_combos):
-                if j == primary_idx:
-                    all_calling_combos.append(calling_combos)
-                else:
-                    all_calling_combos.append(c)
-            calling_weights = None
+            # E.3.1: analytical equity from per-combo table
+            hero_eq_per_combo = 1.0 - opp_eq_cpu
+            masked_eq = hero_eq_per_combo[call_mask]
             if combo_weights is not None and combo_weights[primary_idx] is not None:
-                w = combo_weights[primary_idx]
-                calling_w = w[call_mask]
-                w_sum = calling_w.sum()
-                if w_sum > 0:
-                    calling_w = calling_w / w_sum
-                calling_weights = []
-                for j in range(len(opp_combos)):
-                    if j == primary_idx:
-                        calling_weights.append(calling_w)
-                    elif combo_weights is not None and j < len(combo_weights):
-                        calling_weights.append(combo_weights[j])
-                    else:
-                        calling_weights.append(None)
-            eq_vs_callers = gpu_equity_v3(
-                hero_cards, board_cards, all_calling_combos,
-                n_iters, device, calling_weights
-            )
+                cw = combo_weights[primary_idx][call_mask]
+                cw_sum = cw.sum()
+                if cw_sum.item() > 0:
+                    eq_vs_callers = float((masked_eq * cw / cw_sum).sum().item())
+                else:
+                    eq_vs_callers = float(masked_eq.mean().item())
+            else:
+                eq_vs_callers = float(masked_eq.mean().item())
         else:
             eq_vs_callers = raw_equity
 
@@ -869,15 +936,26 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
             ev_on_reraise = p_hero_continues * ev_continue + (1 - p_hero_continues) * (-total_raise)
             reraise_discount = 0.3
             geometric_factor = min(1.5, 1.0 / max(0.5, 1.0 - p_reraise * reraise_discount))
-            ev_on_reraise *= geometric_factor
+            # B.5.7: the geometric pot-growth bonus only amplifies a POSITIVE
+            # ev_on_reraise; applying the (>= 1) factor to a negative EV would
+            # over-penalize a fold-to-reraise line.
+            if ev_on_reraise > 0:
+                ev_on_reraise *= geometric_factor
         else:
             ev_on_reraise = -total_raise
 
-        raise_ev = (
-            p_fold * (pot - hero_invested)
-            + p_call * showdown_ev
-            + p_reraise * ev_on_reraise
+        # B.5.4: multiway-aware fold term. When the primary folds, hero wins the
+        # pot uncontested ONLY if every other opponent folds too
+        # (p_others_all_fold); otherwise it is a showdown vs the remaining field
+        # (approximated by showdown_ev — the equity-vs-callers term that already
+        # includes the non-primary opponents' full ranges). For a single
+        # opponent p_others_all_fold == 1 and this is exactly the old model:
+        #   p_fold*(pot-hero_invested) + p_call*showdown + p_reraise*ev_reraise.
+        fold_term = p_fold * (
+            p_others_all_fold * (pot - hero_invested)
+            + (1.0 - p_others_all_fold) * showdown_ev
         )
+        raise_ev = fold_term + p_call * showdown_ev + p_reraise * ev_on_reraise
     else:
         raise_ev = pot - hero_invested
 

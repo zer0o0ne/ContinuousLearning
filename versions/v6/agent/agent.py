@@ -80,7 +80,7 @@ class ASI(nn.Module):
 
     def forward_batch(self, event_sequences, skip_memory=True, heads=None,
                       skip_opponent_emb=True, opponent_emb_table=None,
-                      gru_window=1):
+                      gru_window=1, precomputed=None):
         """
         Batch-parallel forward pass over event sequences.
 
@@ -88,17 +88,12 @@ class ASI(nn.Module):
             event_sequences: list of lists of event dicts
             skip_memory: bypass memory retrieval (True for gto_ev_predict)
             heads: optional set of head names to compute, e.g. {"action"}.
-                Valid names: "action", "value", "opponent_action", "modelling".
-                If None, all heads are computed (backwards compatible).
             skip_opponent_emb: if True, skip opponent GRU embedding injection
-            opponent_emb_table: OpponentEmbeddingTable instance (required when
-                skip_opponent_emb=False and perception.opp_emb_enabled=True)
-            gru_window: BPTT window length for opponent GRU updates — number
-                of past events per opponent to unroll the GRU over within this
-                forward. Default 1 = legacy single-step update.
+            opponent_emb_table: OpponentEmbeddingTable instance
+            gru_window: BPTT window length for opponent GRU updates
+            precomputed: dict from extract_event_tensors() — skips dict extraction
         Returns: dict with computed head outputs
         """
-        # Skip gradient tracking for frozen modules (saves memory/compute)
         perception_frozen = not any(p.requires_grad for p in self.perception.parameters())
         if perception_frozen:
             with torch.no_grad():
@@ -106,7 +101,7 @@ class ASI(nn.Module):
                     event_sequences, device=self.device_, skip_memory=skip_memory,
                     skip_opponent_emb=skip_opponent_emb,
                     opponent_emb_table=opponent_emb_table,
-                    gru_window=gru_window,
+                    gru_window=gru_window, precomputed=precomputed,
                 )
             perception_out = perception_out.detach()
         else:
@@ -114,7 +109,7 @@ class ASI(nn.Module):
                 event_sequences, device=self.device_, skip_memory=skip_memory,
                 skip_opponent_emb=skip_opponent_emb,
                 opponent_emb_table=opponent_emb_table,
-                gru_window=gru_window,
+                gru_window=gru_window, precomputed=precomputed,
             )
 
         result = {}

@@ -10,6 +10,12 @@ playtime and no agent occupies more than one seat simultaneously.
 Uses multi-table batching: runs multiple tables in parallel and batches
 agent decisions across tables for efficient GPU utilization.
 
+E.4.2: when MCTS agents are present and n_tables is large, an inference server
+is spun up (reusing agent/mcts/inference_server.py) and MCTS decisions across
+tables are dispatched concurrently via a thread pool — each thread runs its
+own MCTS.search with a RemoteEvaluator that routes NN forwards to the shared
+GPU server. Non-MCTS agents continue using batched action-head forward as before.
+
 Can be run standalone:
     python -m evaluation.evaluate --config config.json
 """
@@ -17,7 +23,9 @@ Can be run standalone:
 import os
 import json
 import random
+import threading
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -78,12 +86,180 @@ def _resolve_checkpoint_path(path):
     return None
 
 
+class _EvalInferenceServer:
+    """Manages an inference server process for MCTS agents during evaluation.
+
+    E.4.2: when MCTS agents are present, this spins up the same inference server
+    used by collect.py. MCTS decisions across tables run concurrently in a thread
+    pool, each with its own RemoteEvaluator routing NN forwards to the server.
+    The GIL is released during queue.get()/put(), so threads overlap effectively
+    on the I/O-bound server round-trips.
+
+    Lifecycle: start() -> create_mcts_for_agent() per agent -> shutdown().
+    """
+
+    def __init__(self, mcts_agents, config, device, log, n_tables):
+        """
+        Args:
+            mcts_agents: list of agent bundles that have use_mcts=True
+            config: full config dict
+            device: torch device string
+            log: logger callable
+            n_tables: number of parallel tables (determines thread pool size)
+        """
+        self.config = config
+        self.device = device
+        self.log = log
+        self.n_tables = n_tables
+        self.mcts_agents = mcts_agents
+        self._server_proc = None
+        self._req_q = None
+        self._resp_qs = {}    # thread_id -> mp.Queue
+        self._stop_event = None
+        self._ready_event = None
+        self._started = False
+        # Thread pool for concurrent MCTS searches. Pool size = n_tables
+        # (each active table can have at most one MCTS decision pending).
+        self._pool = None
+        # Lock protecting _resp_qs allocation (threads may request new queues
+        # concurrently on their first use).
+        self._resp_lock = threading.Lock()
+        # Counter for resp_q slot allocation (each thread gets a unique slot).
+        self._next_worker_id = 0
+        # thread-local storage mapping thread -> worker_id + resp_q
+        self._thread_local = threading.local()
+
+    def start(self):
+        """Start the inference server process."""
+        import torch.multiprocessing as tmp
+        from agent.mcts.inference_server import server_main
+
+        mcts_cfg = self.config.get("mcts", {})
+        eval_cfg = self.config.get("evaluation", {})
+        server_cfg = {
+            "device": self.device,
+            "server_max_batch": int(eval_cfg.get("server_max_batch",
+                                    mcts_cfg.get("server_max_batch", 256))),
+            "server_linger_ms": float(eval_cfg.get("server_linger_ms",
+                                      mcts_cfg.get("server_linger_ms", 2))),
+        }
+
+        # Build server spec from MCTS agents' state dicts.
+        spec = []
+        seen_names = set()
+        for bundle in self.mcts_agents:
+            name = bundle["name"]
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            agent = bundle["agent"]
+            sd = {k: v.detach().cpu()
+                  for k, v in agent.state_dict().items()}
+            spec.append({
+                "name": name,
+                "config": self.config,
+                "state_dict": sd,
+                "norm_stats": bundle.get("norm_stats"),
+            })
+
+        # Pre-allocate response queues: one per potential concurrent MCTS thread.
+        # n_tables is the max concurrency (at most one MCTS decision per table).
+        n_resp = self.n_tables
+        ctx = tmp.get_context("spawn")
+        self._req_q = ctx.Queue(maxsize=max(64, 8 * n_resp))
+        self._all_resp_qs = [ctx.Queue() for _ in range(n_resp)]
+        for q in self._all_resp_qs:
+            q._ignore_epipe = True
+        self._ready_event = ctx.Event()
+        self._stop_event = ctx.Event()
+
+        self._server_proc = ctx.Process(
+            target=server_main,
+            args=(spec, self._req_q, self._all_resp_qs,
+                  self._ready_event, self._stop_event, server_cfg),
+            daemon=True,
+        )
+        self._server_proc.start()
+        if not self._ready_event.wait(timeout=300):
+            self._stop_event.set()
+            self._server_proc.terminate()
+            raise RuntimeError(
+                "eval inference server failed to become ready in 300s")
+
+        self._pool = ThreadPoolExecutor(max_workers=n_resp)
+        self._started = True
+        self.log(f"E.4.2: inference server started on {self.device}, "
+                 f"{len(spec)} MCTS agent(s), {n_resp} response queues, "
+                 f"max_batch={server_cfg['server_max_batch']}")
+
+    def _get_thread_slot(self):
+        """Get (worker_id, resp_q) for the calling thread. Allocates on first
+        call per thread (thread-local)."""
+        tl = self._thread_local
+        wid = getattr(tl, "worker_id", None)
+        if wid is not None:
+            return wid, self._all_resp_qs[wid]
+        with self._resp_lock:
+            wid = self._next_worker_id
+            self._next_worker_id += 1
+        tl.worker_id = wid
+        return wid, self._all_resp_qs[wid]
+
+    def create_mcts(self, agent_name, mcts_cfg, n_actions):
+        """Create an MCTS instance with a RemoteEvaluator for use in a thread.
+
+        Must be called from within the thread that will use it (so the
+        thread-local worker_id is assigned correctly).
+
+        Opponent embedding is handled server-side (the server creates its own
+        per-(worker, agent) tables), so no opp_table is needed here.
+        """
+        from agent.mcts.mcts import MCTS
+        from agent.mcts.evaluator import RemoteEvaluator
+
+        wid, resp_q = self._get_thread_slot()
+        ev = RemoteEvaluator(wid, agent_name, self._req_q, resp_q, n_actions)
+        return MCTS(None, "cpu", mcts_cfg, evaluator=ev)
+
+    def submit_mcts_search(self, fn, *args, **kwargs):
+        """Submit an MCTS search function to the thread pool.
+
+        Returns a Future. The function `fn` will run in a worker thread
+        with access to a RemoteEvaluator via the thread-local slot.
+        """
+        return self._pool.submit(fn, *args, **kwargs)
+
+    def shutdown(self):
+        """Stop the inference server and thread pool."""
+        if not self._started:
+            return
+        self._started = False
+        # Shut down thread pool first (ongoing MCTS searches finish or cancel).
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=False)
+            self._pool = None
+        # Stop server.
+        self._stop_event.set()
+        try:
+            self._req_q.put(None)  # SENTINEL
+        except Exception:
+            pass
+        if self._server_proc is not None:
+            self._server_proc.join(timeout=30)
+            if self._server_proc.is_alive():
+                self._server_proc.terminate()
+            self._server_proc = None
+        self.log("E.4.2: inference server shut down")
+
+
 def _build_agent_bundle(name, ckpt_path, config, device, log,
                         fallback_temperature, entry_temperature_override=None,
                         use_opp_emb=False, use_mcts=False, mcts_cfg=None):
     """Build a single agent bundle from a checkpoint path.
 
-    Temperature precedence: checkpoint > entry override > fallback.
+    Temperature precedence: checkpoint > entry override > fallback. Inheriting
+    the checkpoint temperature at evaluation is intended (a feature) — it
+    reproduces the temperature the policy was trained/sampled with.
 
     Per-agent options:
       use_opp_emb: attach a fresh OpponentEmbeddingTable (only effective if
@@ -184,17 +360,20 @@ def _load_agents_from_list(agent_entries, config, device, log, fallback_temperat
         )
         agents.append(bundle)
         log(f"Loaded agent '{name}' from {ckpt_path} "
-            f"(temperature={bundle['temperature']}, "
-            f"opp_emb={bundle['use_opp_emb']}, mcts={bundle['use_mcts']})")
+            f"(policy={'MCTS' if bundle['use_mcts'] else 'action-head'}, "
+            f"temperature={bundle['temperature']}, opp_emb={bundle['use_opp_emb']})")
     return agents
 
 
 def _load_agents(agents_dir, config, device, log, fallback_temperature,
-                 use_opp_emb=False):
+                 use_opp_emb=False, use_mcts=False):
     """Load all agents from subdirectories (legacy dir-based path).
 
-    Applies the same global flag `use_opp_emb` to every agent loaded.
-    No MCTS in this path (dir-based config doesn't have per-agent flags).
+    Applies the same global flags `use_opp_emb` and `use_mcts` to every agent
+    loaded. The dir-based config has no per-agent granularity — use the explicit
+    `agents` list for per-agent flags. Этап-0 fix 0.3: `use_mcts=True` routes
+    every agent's decisions through MCTS.search so evaluation measures the
+    phase-6 MCTS-improved policy rather than the raw action head.
     """
     if not os.path.isdir(agents_dir):
         log(f"ERROR: agents_dir not found: {agents_dir}")
@@ -220,12 +399,13 @@ def _load_agents(agents_dir, config, device, log, fallback_temperature,
         bundle = _build_agent_bundle(
             name, ckpt_path, config, device, log, fallback_temperature,
             use_opp_emb=use_opp_emb,
-            use_mcts=False,
+            use_mcts=use_mcts,
             mcts_cfg=mcts_cfg,
         )
         agents.append(bundle)
         log(f"Loaded agent '{name}' from {ckpt_path} "
-            f"(temperature={bundle['temperature']}, opp_emb={bundle['use_opp_emb']})")
+            f"(policy={'MCTS' if bundle['use_mcts'] else 'action-head'}, "
+            f"temperature={bundle['temperature']}, opp_emb={bundle['use_opp_emb']})")
 
     return agents
 
@@ -265,6 +445,8 @@ def _rebuild_events(snapshots, deck, hero_pos, num_players, big_blind, small_bli
             "big_blind": float(big_blind),
             "small_blind": float(small_blind),
             "stack": float(snap["credits"][hero_pos]),
+            # B.6.2: per-position stacks vector (effective-stack signal).
+            "stacks": [float(c) for c in snap["credits"]],
             "table": table_cards,
             "pot": float(snap["pot"]),
             "bets": np.copy(snap["bets"]),
@@ -274,6 +456,61 @@ def _rebuild_events(snapshots, deck, hero_pos, num_players, big_blind, small_bli
             event["opponent_id"] = seated_names[snap["active_pos"]]
         events.append(event)
     return events
+
+
+def _rebuild_events_incremental(ts, hero_pos, num_players, big_blind,
+                                small_blind, n_actions, opp_keys):
+    """E.4.4: incremental version of _rebuild_events.
+
+    Uses per-(table, hero_pos) cache in ``ts["_events_cache"]`` to avoid
+    rebuilding the entire event sequence from scratch on every decision.
+    Only new snapshots (since the last call for this hero_pos) are converted
+    into event dicts and appended to the cache. Returns a shallow-copied list
+    of raw (un-normalized) event dicts suitable for in-place normalization
+    without corrupting the cache.
+    """
+    deck = ts["table"].deck
+    snapshots = ts["snapshots"]
+    up_to = len(snapshots) - 1
+    cache = ts.get("_events_cache")
+    if cache is None:
+        cache = {}
+        ts["_events_cache"] = cache
+
+    if hero_pos in cache:
+        cached_events, cached_up_to = cache[hero_pos]
+        start = cached_up_to + 1
+    else:
+        cached_events = []
+        start = 0
+
+    if start <= up_to:
+        hand = deck[5 + 2 * hero_pos: 7 + 2 * hero_pos].tolist()
+        for snap in snapshots[start:up_to + 1]:
+            table_cards = _get_table_display_from_turn(deck, snap["turn"])
+            action = snap["action"]
+            if action is None:
+                action = torch.zeros(n_actions, dtype=torch.float32)
+            event = {
+                "hand": hand,
+                "num_players": num_players,
+                "hero_pos": hero_pos,
+                "acting_pos": snap["active_pos"],
+                "big_blind": float(big_blind),
+                "small_blind": float(small_blind),
+                "stack": float(snap["credits"][hero_pos]),
+                "stacks": [float(c) for c in snap["credits"]],
+                "table": table_cards,
+                "pot": float(snap["pot"]),
+                "bets": np.copy(snap["bets"]),
+                "action": action,
+            }
+            if opp_keys is not None:
+                event["opponent_id"] = opp_keys[snap["active_pos"]]
+            cached_events.append(event)
+
+    cache[hero_pos] = (cached_events, up_to)
+    return [{**e} for e in cached_events]
 
 
 def _normalize_events_inplace(events, norm_stats):
@@ -292,11 +529,24 @@ def _normalize_events_inplace(events, norm_stats):
             event["bets"] = (event["bets"] - bets_m) / bets_s
         else:
             event["bets"] = [(b - bets_m) / bets_s for b in event["bets"]]
+        # B.6.2: normalize the per-position stacks vector on the hero-stack scale.
+        if "stacks" in event:
+            if isinstance(event["stacks"], np.ndarray):
+                event["stacks"] = (event["stacks"] - stack_m) / stack_s
+            else:
+                event["stacks"] = [(c - stack_m) / stack_s for c in event["stacks"]]
 
 
 def _init_table_state(agents, agent_queue, num_players, raise_sizes,
-                      big_blind, small_blind, n_actions, player_ids=None):
-    """Initialize a new hand at a table. Returns table state dict."""
+                      big_blind, small_blind, n_actions, player_ids=None,
+                      table_uid=None):
+    """Initialize a new hand at a table. Returns table state dict.
+
+    `table_uid` is a unique id for this hand/matchup; it is used to namespace
+    opponent-embedding keys (Этап-0 fix 0.5) so that the same agent seated at
+    different parallel tables — or in a later matchup at the same slot — keeps
+    independent embeddings and does not clobber state across tables in a batch.
+    """
     seated_indices = [agent_queue[i] for i in range(num_players)]
     seated = [agents[idx] for idx in seated_indices]
 
@@ -328,10 +578,15 @@ def _init_table_state(agents, agent_queue, num_players, raise_sizes,
         "seated": seated,
         "seated_names": seated_names,
         "player_ids": player_ids,
+        "table_uid": table_uid,
         "pre_credits": pre_credits,
         "snapshots": snapshots,
         "action_step": 0,
         "finished": False,
+        # E.4.4: per-hero raw event cache. Keyed by hero_pos, value is
+        # (raw_events_list, snapshot_up_to). On subsequent decisions for the
+        # same hero, only new snapshots are converted to events and appended.
+        "_events_cache": {},
     }
 
 
@@ -378,12 +633,16 @@ def run_evaluation(config, device, log, results_dir_override=None):
         agents = _load_agents_from_list(agent_entries, config, device, log,
                                         fallback_temperature)
     else:
-        # Legacy dir-based path: apply global use_opponent_emb to all agents
+        # Legacy dir-based path: apply global use_opponent_emb / use_mcts to all
+        # agents (no per-agent granularity here — use the `agents` list for that).
         global_use_opp_emb = bool(eval_cfg.get("use_opponent_emb", False))
-        log(f"Loading agents from {agents_dir} (global use_opponent_emb={global_use_opp_emb})")
+        global_use_mcts = bool(eval_cfg.get("use_mcts", False))
+        log(f"Loading agents from {agents_dir} "
+            f"(global use_opponent_emb={global_use_opp_emb}, use_mcts={global_use_mcts})")
         agents = _load_agents(agents_dir, config, device, log,
                               fallback_temperature,
-                              use_opp_emb=global_use_opp_emb)
+                              use_opp_emb=global_use_opp_emb,
+                              use_mcts=global_use_mcts)
     if not agents:
         log("No agents loaded. Aborting evaluation.")
         return
@@ -402,6 +661,34 @@ def run_evaluation(config, device, log, results_dir_override=None):
     n_mcts = sum(1 for a in agents if a.get("mcts") is not None)
     log(f"Per-agent opponent_embedding active for {n_opp_emb}/{len(agents)} agent(s)")
     log(f"Per-agent MCTS active for {n_mcts}/{len(agents)} agent(s)")
+
+    # E.4.2: when MCTS agents are present, spin up an inference server so
+    # MCTS decisions across tables run concurrently via a thread pool. The
+    # server holds GPU copies of the MCTS agents; the main process moves
+    # those agents' models to CPU to free GPU memory. Non-MCTS agents stay
+    # on the original device for batched action-head forward.
+    mcts_server = None
+    mcts_agents_list = [a for a in agents if a.get("mcts") is not None]
+    if n_mcts > 0 and n_tables > 1:
+        mcts_server = _EvalInferenceServer(
+            mcts_agents_list, config, device, log, n_tables)
+        try:
+            mcts_server.start()
+        except Exception as e:
+            log(f"WARNING: failed to start inference server ({e}), "
+                f"falling back to sequential MCTS")
+            mcts_server = None
+
+        if mcts_server is not None:
+            # Move MCTS agents' ASI models to CPU — the server has its own
+            # GPU copies. Non-MCTS agents stay on GPU for batched forward.
+            if str(device).startswith("cuda"):
+                for bundle in mcts_agents_list:
+                    bundle["agent"].cpu()
+                    bundle["agent"].device_ = "cpu"
+                torch.cuda.empty_cache()
+                log(f"E.4.2: moved {len(mcts_agents_list)} MCTS agent model(s) "
+                    f"to CPU (server holds GPU copies)")
 
     # Player identity pool + swap config (for opponent embedding tracking)
     opp_data_cfg = config.get("opponent_data", {})
@@ -434,14 +721,11 @@ def run_evaluation(config, device, log, results_dir_override=None):
     os.makedirs(results_dir, exist_ok=True)
     history_path = os.path.join(results_dir, f"{log.init_time}.pt")
 
-    # Tracking — two parallel sets of arrays:
-    #   * raw_*       — actual chip delta from Table.credits (the env may leak
-    #                   chips through showdown / multi-street accounting; sum
-    #                   across agents over many hands can drift negative).
-    #   * total_*     — leak-corrected: each hand's chip leak is split equally
-    #                   across seated agents so per-hand sum is exactly zero.
-    #                   This is what we use for BB/100 — the metric reflects
-    #                   pure win/loss between agents, not env artefacts.
+    # Tracking — two parallel sets of arrays kept for output-schema
+    # compatibility. After Этап-0 fixes 0.1 (engine conserves chips) and 0.2
+    # (no leak correction), both hold the SAME values: the actual per-hand chip
+    # delta from Table.credits, which now sums to exactly zero across seated
+    # agents every hand. BB/100 is computed from total_*.
     raw_profit = {a["name"]: 0.0 for a in agents}
     raw_per_hand_chips = {a["name"]: [] for a in agents}
     total_profit = {a["name"]: 0.0 for a in agents}
@@ -459,6 +743,10 @@ def run_evaluation(config, device, log, results_dir_override=None):
     hands_completed = 0
     hands_started = 0
     last_log_at = 0
+    # Monotonic counter handing out a unique table_uid per hand/matchup. Used to
+    # namespace opponent-embedding keys (Этап-0 0.5): a fresh uid each new hand
+    # means a new matchup never reuses the prior matchup's embedding keys.
+    next_table_uid = 0
 
     # Initialize all tables
     table_states = []
@@ -468,7 +756,8 @@ def run_evaluation(config, device, log, results_dir_override=None):
         init_pids = [random.choice(player_pool) for _ in range(num_players)]
         ts = _init_table_state(agents, agent_queue, num_players, raise_sizes,
                                big_blind, small_blind, n_actions,
-                               player_ids=init_pids)
+                               player_ids=init_pids, table_uid=next_table_uid)
+        next_table_uid += 1
         table_states.append(ts)
         hands_started += 1
 
@@ -517,19 +806,28 @@ def run_evaluation(config, device, log, results_dir_override=None):
             })
 
             agent_info = ts["seated"][active_pos]
-            events = _rebuild_events(
-                ts["snapshots"], table.deck, active_pos,
-                num_players, big_blind, small_blind, n_actions,
-                up_to=len(ts["snapshots"]) - 1,
-                seated_names=ts["player_ids"],
+            # Этап-0 fix 0.5: key opponent embeddings by a composite
+            # "{table_uid}:{agent_name}" id — agent name (consistent with
+            # training, which keys by agent name) namespaced per table/matchup
+            # so concurrent tables in a batch and successive matchups stay
+            # independent. (The legacy player_ids pool is no longer the key.)
+            opp_keys = [f"{ts['table_uid']}:{nm}" for nm in ts["seated_names"]]
+            # E.4.4: incremental event building — only new snapshots since the
+            # last decision by this hero are converted to event dicts. Returns
+            # shallow copies safe for in-place normalization.
+            events = _rebuild_events_incremental(
+                ts, active_pos, num_players, big_blind,
+                small_blind, n_actions, opp_keys,
             )
             decision_street = int(table.turn)
             pending.append((ti, agent_info, events, decision_street))
 
         # --- Phase 3: Decisions ---
-        # Split pending into MCTS (one-by-one) vs non-MCTS (batched by model).
-        # MCTS agents can't share batch with non-MCTS — MCTS.search runs its
-        # own internal forward passes and returns an action_idx directly.
+        # Split pending into MCTS vs non-MCTS (batched by model).
+        # E.4.2: when an inference server is active, MCTS decisions are
+        # dispatched concurrently via the thread pool — each thread creates
+        # its own MCTS + RemoteEvaluator and runs the search independently.
+        # When no server, falls back to sequential MCTS (original path).
         if pending:
             actions_out = [None] * len(pending)
 
@@ -542,21 +840,60 @@ def run_evaluation(config, device, log, results_dir_override=None):
                     batch_pending.append((pidx, ti, agent_info, events, street))
 
             with torch.no_grad():
-                # MCTS path — sequential per decision (each search has its own
-                # forward passes; cannot batch across tables).
                 if mcts_pending:
                     from agent.mcts.game_state import GameState  # lazy import
-                for pidx, ti, agent_info, events, street in mcts_pending:
-                    table = table_states[ti]["table"]
-                    active_pos = table.active_player
-                    _normalize_events_inplace(events, agent_info["norm_stats"])
-                    gs = GameState.from_table(table, active_pos)
-                    action_idx = int(agent_info["mcts"].search([events], gs))
-                    action = torch.zeros(n_actions, dtype=torch.float32)
-                    action[action_idx] = 1.0
-                    actions_out[pidx] = action
-                    action_hist[agent_info["name"]][action_idx] += 1
-                    action_hist_by_street[agent_info["name"]][street, action_idx] += 1
+
+                # E.4.2: dispatch MCTS searches to the thread pool FIRST, then
+                # run the batched action-head forward while MCTS threads work
+                # on the server. This overlaps GPU utilization: the server
+                # handles MCTS forwards while the main thread does non-MCTS
+                # batched forwards on the same GPU (they don't collide because
+                # MCTS agents' models were moved to CPU — the server has its
+                # own copies).
+                mcts_futures = None
+                if mcts_pending and mcts_server is not None:
+                    mcts_cfg_local = config.get("mcts", {})
+
+                    def _run_mcts_in_thread(pidx, ti, agent_info, events,
+                                            street, _server=mcts_server,
+                                            _mcts_cfg=mcts_cfg_local,
+                                            _n_actions=n_actions,
+                                            _table_states=table_states):
+                        """Run one MCTS search in a worker thread. Creates a
+                        fresh MCTS + RemoteEvaluator per call (thread-local
+                        worker_id assigned on first use)."""
+                        _normalize_events_inplace(events,
+                                                  agent_info["norm_stats"])
+                        table = _table_states[ti]["table"]
+                        active_pos = table.active_player
+                        gs = GameState.from_table(table, active_pos)
+                        mcts_inst = _server.create_mcts(
+                            agent_info["name"], _mcts_cfg, _n_actions)
+                        action_idx = int(mcts_inst.search([events], gs))
+                        return pidx, action_idx, agent_info["name"], street
+
+                    mcts_futures = []
+                    for pidx, ti, agent_info, events, street in mcts_pending:
+                        fut = mcts_server.submit_mcts_search(
+                            _run_mcts_in_thread, pidx, ti, agent_info,
+                            events, street)
+                        mcts_futures.append(fut)
+                    # Futures are now in flight — continue to batched path
+                    # while they run.
+
+                elif mcts_pending:
+                    # Fallback: sequential MCTS (no server, original path).
+                    for pidx, ti, agent_info, events, street in mcts_pending:
+                        table = table_states[ti]["table"]
+                        active_pos = table.active_player
+                        _normalize_events_inplace(events, agent_info["norm_stats"])
+                        gs = GameState.from_table(table, active_pos)
+                        action_idx = int(agent_info["mcts"].search([events], gs))
+                        action = torch.zeros(n_actions, dtype=torch.float32)
+                        action[action_idx] = 1.0
+                        actions_out[pidx] = action
+                        action_hist[agent_info["name"]][action_idx] += 1
+                        action_hist_by_street[agent_info["name"]][street, action_idx] += 1
 
                 # Batched action-head path — group by model_id for efficient
                 # forward; opp_table is per-agent so events from agents with
@@ -589,6 +926,7 @@ def run_evaluation(config, device, log, results_dir_override=None):
                             all_events, skip_memory=True,
                             skip_opponent_emb=(opp_table is None),
                             opponent_emb_table=opp_table,
+                            heads={"action"},
                         )
                     all_logits = out["action_logits"]
 
@@ -612,6 +950,18 @@ def run_evaluation(config, device, log, results_dir_override=None):
                         actions_out[pidx] = action
                         action_hist[agent_info["name"]][action_idx] += 1
                         action_hist_by_street[agent_info["name"]][street, action_idx] += 1
+
+                # E.4.2: collect results from concurrent MCTS searches (if any
+                # were dispatched). By this point the batched action-head
+                # forward is done, so we just wait for any remaining threads.
+                if mcts_futures is not None:
+                    for fut in as_completed(mcts_futures):
+                        pidx, action_idx, agent_name, street = fut.result()
+                        action = torch.zeros(n_actions, dtype=torch.float32)
+                        action[action_idx] = 1.0
+                        actions_out[pidx] = action
+                        action_hist[agent_name][action_idx] += 1
+                        action_hist_by_street[agent_name][street, action_idx] += 1
 
             # Step each table with its action
             for pidx, (ti, agent_info, events, _street) in enumerate(pending):
@@ -642,13 +992,12 @@ def run_evaluation(config, device, log, results_dir_override=None):
                 new_table_states.append(ts)
                 continue
 
-            # Profit accounting — two passes:
-            #   1) raw_profit: actual chip delta from Table.credits.
-            #   2) total_profit: leak-corrected (zero-sum per hand) — used
-            #      for BB/100. Any chip delta that vanished inside the env
-            #      (showdown / multi-street accounting bugs, max-stack caps,
-            #      etc.) is split equally across seated agents so the metric
-            #      reflects only actual win/loss transfers between players.
+            # Profit accounting — actual chip delta from Table.credits.
+            # Этап-0 fix 0.1 makes the engine conserve chips every hand, so the
+            # deltas sum to exactly zero; fix 0.2 drops the old equal-split
+            # "leak correction" (it masked all-in / showdown skill). The assert
+            # below is insurance against an engine regression re-introducing a
+            # leak — a non-zero sum should halt the run, not be silently spread.
             table = ts["table"]
             seated = ts["seated"]
             pre_credits = ts["pre_credits"]
@@ -660,19 +1009,19 @@ def run_evaluation(config, device, log, results_dir_override=None):
                 raw_deltas.append(new_stack - pre_credits[pos])
                 agent_info["stack"] = new_stack
 
-            leak = -sum(raw_deltas)  # > 0 if env lost chips this hand
-            per_player_correction = leak / num_players if num_players else 0.0
+            leak = sum(raw_deltas)
+            assert abs(leak) < 1e-6, (
+                f"chip leak {leak:+.6f} this hand — engine conservation broke "
+                f"(raw_deltas={raw_deltas})"
+            )
 
             for pos in range(num_players):
                 agent_info = seated[pos]
                 raw_d = float(raw_deltas[pos])
-                corrected_d = raw_d + per_player_correction
-                # Raw (uncorrected): for diagnostics
                 raw_profit[agent_info["name"]] += raw_d
                 raw_per_hand_chips[agent_info["name"]].append(raw_d)
-                # Corrected (zero-sum): primary metric for BB/100
-                total_profit[agent_info["name"]] += corrected_d
-                per_hand_chips[agent_info["name"]].append(float(corrected_d))
+                total_profit[agent_info["name"]] += raw_d
+                per_hand_chips[agent_info["name"]].append(raw_d)
                 hands_count[agent_info["name"]] += 1
 
             # Rebuy busted agents + cap oversize stacks
@@ -682,6 +1031,18 @@ def run_evaluation(config, device, log, results_dir_override=None):
                     agent_info["stack"] = float(random.randint(min_rebuy, max_rebuy))
                 elif agent_info["stack"] > max_stack_cap:
                     agent_info["stack"] = float(random.randint(min_rebuy, max_rebuy))
+
+            # Этап-0 fix 0.5: explicit reset at the matchup boundary — drop this
+            # table's namespaced opponent-embedding entries from every seated
+            # agent's table so state never carries into a later matchup and the
+            # per-agent tables don't grow without bound.
+            tuid_prefix = f"{ts['table_uid']}:"
+            for agent_info in seated:
+                opp_table = agent_info.get("opp_table")
+                if opp_table is not None:
+                    for key in [k for k in opp_table.embeddings
+                                if k.startswith(tuid_prefix)]:
+                        del opp_table.embeddings[key]
 
             hands_completed += 1
             pbar.update(1)
@@ -717,13 +1078,28 @@ def run_evaluation(config, device, log, results_dir_override=None):
                         prev_pids[pos] = random.choice(player_pool)
                 new_ts = _init_table_state(agents, agent_queue, num_players, raise_sizes,
                                            big_blind, small_blind, n_actions,
-                                           player_ids=prev_pids)
+                                           player_ids=prev_pids, table_uid=next_table_uid)
+                next_table_uid += 1
                 new_table_states.append(new_ts)
                 hands_started += 1
 
         table_states = new_table_states
 
     pbar.close()
+
+    # E.4.2: shut down inference server (if active) and restore MCTS agents
+    # to GPU before reporting results.
+    if mcts_server is not None:
+        mcts_server.shutdown()
+        mcts_server = None
+        # Restore MCTS agents to their original device so downstream code
+        # (if any) finds them where it expects.
+        if str(device).startswith("cuda"):
+            for bundle in mcts_agents_list:
+                try:
+                    bundle["agent"].set_device(device)
+                except Exception:
+                    pass
 
     # Final results
     hands_actually_played = sum(hands_count.values()) // num_players
@@ -752,8 +1128,8 @@ def run_evaluation(config, device, log, results_dir_override=None):
             float(chips_arr.std(ddof=1) / np.sqrt(len(chips_arr)) / big_blind * 100)
             if len(chips_arr) > 1 else 0.0
         )
-        # Raw (uncorrected) BB/100 — for diagnostics. Difference between
-        # this and the corrected one shows how much the env is leaking chips.
+        # Raw BB/100 — identical to the corrected metric now that the engine
+        # conserves chips (Этап-0 0.1/0.2); kept for output-schema compat.
         bb100_raw = ((raw_profit[name] / big_blind) / (n / 100)) if n > 0 else 0.0
         bundle = by_name.get(name, {})
         results[name] = {
@@ -787,8 +1163,8 @@ def run_evaluation(config, device, log, results_dir_override=None):
     history["bb100"].append((hands_actually_played, snapshot_bb100))
     history["profit"].append((hands_actually_played, dict(total_profit)))
     history["hands"].append((hands_actually_played, dict(hands_count)))
-    history["per_hand_chips"] = per_hand_chips           # leak-corrected
-    history["per_hand_chips_raw"] = raw_per_hand_chips   # uncorrected
+    history["per_hand_chips"] = per_hand_chips           # == raw (engine conserves)
+    history["per_hand_chips_raw"] = raw_per_hand_chips   # identical now
     history["raw_profit_total"] = dict(raw_profit)
     history["action_hist"] = {n: arr.tolist() for n, arr in action_hist.items()}
     history["action_hist_by_street"] = {

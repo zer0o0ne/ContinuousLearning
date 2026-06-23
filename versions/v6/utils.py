@@ -39,12 +39,21 @@ class Logger:
         logs_dir = os.path.join(base_dir, "logs")
         os.makedirs(logs_dir, exist_ok=True)
         self.filename = os.path.join(logs_dir, f"{self.init_time}.txt")
+        self._fh = open(self.filename, "a", encoding="utf-8")
 
     def __call__(self, obj):
         text = str(obj)
         print(text)
-        with open(self.filename, "a", encoding="utf-8") as f:
-            f.write(text + "\n")
+        self._fh.write(text + "\n")
+        self._fh.flush()
+
+    def close(self):
+        """Close the underlying log file handle."""
+        if self._fh and not self._fh.closed:
+            self._fh.close()
+
+    def __del__(self):
+        self.close()
 
     def run_dir(self, scenario_name):
         """Return a timestamped run directory for a training scenario.

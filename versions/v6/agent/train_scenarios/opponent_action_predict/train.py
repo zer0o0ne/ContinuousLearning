@@ -27,30 +27,37 @@ from agent.train_scenarios._checkpoint_io import (
     restore_optim_sched,
 )
 from agent.resume import atomic_torch_save
+from agent.train_scenarios._history import IncrementalHistory
 
 
 _PHASE = "opponent_action_predict"
 
 
 class LengthGroupedBatchSampler(Sampler):
-    """Groups samples by sequence length into batches, shuffles batch order."""
+    """Groups samples by sequence length into batches, shuffles batch order.
+
+    Batch composition is re-randomized every epoch: indices are shuffled
+    before stable-sorting by length, so same-length samples get different
+    neighbours each time (E.5.6).
+    """
 
     def __init__(self, dataset, batch_size):
         self.batch_size = batch_size
-        indices = list(range(len(dataset)))
-        lengths = [len(dataset[i][0]) for i in indices]
-        sorted_indices = sorted(indices, key=lambda i: lengths[i])
-        self.batches = [sorted_indices[i:i + batch_size]
-                        for i in range(0, len(sorted_indices), batch_size)]
+        self.n = len(dataset)
+        self.lengths = [len(dataset[i][0]) for i in range(self.n)]
 
     def __iter__(self):
-        order = list(range(len(self.batches)))
-        random.shuffle(order)
-        for idx in order:
-            yield self.batches[idx]
+        indices = list(range(self.n))
+        random.shuffle(indices)
+        indices.sort(key=lambda i: self.lengths[i])
+        batches = [indices[i:i + self.batch_size]
+                   for i in range(0, len(indices), self.batch_size)]
+        random.shuffle(batches)
+        for batch in batches:
+            yield batch
 
     def __len__(self):
-        return len(self.batches)
+        return (self.n + self.batch_size - 1) // self.batch_size
 
 
 def _compute_norm_stats(scenarios):
@@ -88,28 +95,44 @@ def _kl_loss(logits, target_probs):
 
 
 def _run_validation(agent, val_loader, device, amp_config=None,
-                    opponent_emb_table=None, gru_window=1):
+                    opponent_emb_table=None, gru_window=1,
+                    use_perception_cache=False):
     """Run validation. Returns (avg_loss, top1_accuracy)."""
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     skip_opp = (opponent_emb_table is None)
+    if opponent_emb_table is not None:
+        opponent_emb_table = opponent_emb_table.clone()
     agent.eval()
     loss_sum = 0.0
     correct = 0
     count = 0
     with torch.no_grad():
-        for event_sequences, target_probs in val_loader:
-            target_probs = target_probs.to(device)
-            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                out = agent.forward_batch(event_sequences, skip_memory=True,
-                                          heads={"opponent_action"},
-                                          skip_opponent_emb=skip_opp,
-                                          opponent_emb_table=opponent_emb_table,
-                                          gru_window=gru_window)
-                logits = out["opponent_action_logits"]
-                batch_loss = _kl_loss(logits, target_probs)
-            loss_sum += batch_loss.item() * len(event_sequences)
+        for batch in val_loader:
+            if use_perception_cache:
+                cached_p, cached_m, target_probs = batch
+                cached_p = cached_p.to(device)
+                cached_m = cached_m.to(device)
+                target_probs = target_probs.to(device)
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                    logits = agent.opponent_action_head(cached_p, mask=cached_m)
+                    batch_loss = _kl_loss(logits, target_probs)
+                n_samples = cached_p.shape[0]
+            else:
+                precomputed, target_probs = batch
+                target_probs = target_probs.to(device)
+                n_samples = precomputed["B"] if precomputed is not None else 0
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                    out = agent.forward_batch(None, skip_memory=True,
+                                              heads={"opponent_action"},
+                                              skip_opponent_emb=skip_opp,
+                                              opponent_emb_table=opponent_emb_table,
+                                              gru_window=gru_window,
+                                              precomputed=precomputed)
+                    logits = out["opponent_action_logits"]
+                    batch_loss = _kl_loss(logits, target_probs)
+            loss_sum += batch_loss.item() * n_samples
             correct += (logits.argmax(dim=-1) == target_probs.argmax(dim=-1)).sum().item()
-            count += len(event_sequences)
+            count += n_samples
     agent.train()
     n = max(count, 1)
     return loss_sum / n, correct / n
@@ -130,8 +153,9 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
     log(f"  New best model (val loss: {val_loss:.6f})")
 
 
-def _save_history(history, run_dir):
-    atomic_torch_save(history, os.path.join(run_dir, "history.pt"))
+def _save_history(hist):
+    """Save training history incrementally (E.5.3: append-only shards)."""
+    hist.save()
 
 
 def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
@@ -268,11 +292,86 @@ def train_opponent_action(agent, train_cfg, device, log,
         opp_table = OpponentEmbeddingTable(agent.perception.d_model)
         log("Opponent GRU embedding enabled")
 
-    train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                              collate_fn=batch_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            collate_fn=batch_collate)
+    _use_perception_cache = not use_opp_emb
+
+    if use_opp_emb:
+        # A.4.4: feed in hand_id (chronological) order so the opponent GRU table
+        # accumulates exactly as it would at inference — not length-shuffled.
+        from agent.train_scenarios.split import OrderedBatchSampler
+        base_ds = train_dataset.dataset       # OpponentActionDataset
+        expanded = base_ds.indices            # [(s_idx, hero_pos), ...]
+        scens = base_ds.scenarios
+        keyed = []
+        for pos, exp_idx in enumerate(train_dataset.indices):
+            s_idx = expanded[exp_idx][0]
+            hid = scens[s_idx].get("hand_id", s_idx)
+            keyed.append((hid, exp_idx, pos))
+        keyed.sort(key=lambda t: (t[0], t[1]))   # hand_id, then scenario order
+        order = [pos for _, _, pos in keyed]
+        train_sampler = OrderedBatchSampler(order, batch_size)
+        log("Opponent GRU active → chronological (hand_id) batch order")
+        from agent.train_scenarios.opponent_action_predict.dataset import make_tensor_collate
+        max_players = agent.perception.embedder.max_players
+        _tc = make_tensor_collate(max_players)
+        train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                  collate_fn=_tc, num_workers=2,
+                                  persistent_workers=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                collate_fn=_tc, num_workers=2,
+                                persistent_workers=True)
+    else:
+        # E.5.1: pre-compute frozen perception outputs (all perception params
+        # frozen when opp_emb disabled — outputs are deterministic)
+        log("Pre-computing frozen perception outputs...")
+        _p_outs = []
+        _p_masks = []
+        with torch.no_grad():
+            for start in range(0, len(dataset), batch_size):
+                end = min(start + batch_size, len(dataset))
+                batch_events = [dataset[j][0] for j in range(start, end)]
+                p_out, _, m = agent.perception.forward_batch(
+                    batch_events, device=device, skip_memory=True)
+                for k in range(p_out.shape[0]):
+                    L = int(m[k].sum().item())
+                    _p_outs.append(p_out[k, :L].detach().cpu())
+                    _p_masks.append(m[k, :L].detach().cpu())
+        log(f"Cached {len(_p_outs)} perception outputs")
+
+        class _CachedDataset(torch.utils.data.Dataset):
+            def __init__(self, indices, p_outs, p_masks, base_dataset):
+                self.indices = list(indices)
+                self.p_outs = p_outs
+                self.p_masks = p_masks
+                self.base = base_dataset
+            def __len__(self):
+                return len(self.indices)
+            def __getitem__(self, idx):
+                oidx = self.indices[idx]
+                return self.p_outs[oidx], self.p_masks[oidx], self.base[oidx][1]
+
+        def _cached_collate(batch):
+            p_outs_b, masks_b, targets_b = zip(*batch)
+            max_len = max(p.shape[0] for p in p_outs_b)
+            B = len(batch)
+            d = p_outs_b[0].shape[-1]
+            padded_p = torch.zeros(B, max_len, d)
+            padded_m = torch.zeros(B, max_len, dtype=masks_b[0].dtype)
+            for i, (p, m) in enumerate(zip(p_outs_b, masks_b)):
+                L = p.shape[0]
+                padded_p[i, :L] = p
+                padded_m[i, :L] = m
+            return padded_p, padded_m, torch.stack(targets_b)
+
+        cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
+        cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
+
+        train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
+        train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
+                                  collate_fn=_cached_collate, num_workers=2,
+                                  persistent_workers=True)
+        val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
+                                collate_fn=_cached_collate, num_workers=2,
+                                persistent_workers=True)
 
     log(f"Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
 
@@ -290,17 +389,11 @@ def train_opponent_action(agent, train_cfg, device, log,
     global_step = 0
     start_epoch = 0
 
-    history_path = os.path.join(run_dir, "history.pt")
-    if os.path.exists(history_path):
-        history = torch.load(history_path, weights_only=False)
-        for k in ("step_loss", "val_loss", "val_accuracy",
-                  "epoch_train_loss", "epoch_val_loss"):
-            history.setdefault(k, [])
-        log(f"Resumed history from {history_path} "
-            f"(step_loss n={len(history['step_loss'])})")
-    else:
-        history = {"step_loss": [], "val_loss": [], "val_accuracy": [],
-                   "epoch_train_loss": [], "epoch_val_loss": []}
+    hist = IncrementalHistory(run_dir,
+                              keys=["step_loss", "val_loss", "val_accuracy",
+                                    "epoch_train_loss", "epoch_val_loss"])
+    history = hist.data
+    log(f"Loaded history (step_loss n={len(history['step_loss'])})")
 
     if resume_state is not None:
         restore_optim_sched(
@@ -327,18 +420,31 @@ def train_opponent_action(agent, train_cfg, device, log,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_sequences, target_probs) in enumerate(train_loader):
-            target_probs = target_probs.to(device)
-
-            with torch.autocast(device_type=device_type, dtype=amp_dtype,
-                                enabled=amp_enabled):
-                out = agent.forward_batch(event_sequences, skip_memory=True,
-                                          heads={"opponent_action"},
-                                          skip_opponent_emb=(opp_table is None),
-                                          opponent_emb_table=opp_table,
-                                          gru_window=gru_window)
-                logits = out["opponent_action_logits"]
-                batch_loss = _kl_loss(logits, target_probs)
+        for batch_idx, batch in enumerate(train_loader):
+            if _use_perception_cache:
+                cached_p, cached_m, target_probs = batch
+                cached_p = cached_p.to(device)
+                cached_m = cached_m.to(device)
+                target_probs = target_probs.to(device)
+                with torch.autocast(device_type=device_type, dtype=amp_dtype,
+                                    enabled=amp_enabled):
+                    logits = agent.opponent_action_head(cached_p, mask=cached_m)
+                    batch_loss = _kl_loss(logits, target_probs)
+                n_samples = cached_p.shape[0]
+            else:
+                precomputed, target_probs = batch
+                target_probs = target_probs.to(device)
+                n_samples = precomputed["B"] if precomputed is not None else 0
+                with torch.autocast(device_type=device_type, dtype=amp_dtype,
+                                    enabled=amp_enabled):
+                    out = agent.forward_batch(None, skip_memory=True,
+                                              heads={"opponent_action"},
+                                              skip_opponent_emb=(opp_table is None),
+                                              opponent_emb_table=opp_table,
+                                              gru_window=gru_window,
+                                              precomputed=precomputed)
+                    logits = out["opponent_action_logits"]
+                    batch_loss = _kl_loss(logits, target_probs)
 
             optimizer.zero_grad()
             scaler.scale(batch_loss).backward()
@@ -354,8 +460,8 @@ def train_opponent_action(agent, train_cfg, device, log,
             history["step_loss"].append((global_step, step_loss))
             global_step += 1
 
-            train_loss_sum += step_loss * len(event_sequences)
-            train_count += len(event_sequences)
+            train_loss_sum += step_loss * n_samples
+            train_count += n_samples
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count
@@ -367,10 +473,11 @@ def train_opponent_action(agent, train_cfg, device, log,
             if val_every and (global_step % val_every == 0):
                 val_loss, val_acc = _run_validation(
                     agent, val_loader, device, amp_config=amp_cfg,
-                    opponent_emb_table=opp_table, gru_window=gru_window)
+                    opponent_emb_table=opp_table, gru_window=gru_window,
+                    use_perception_cache=_use_perception_cache)
                 history["val_loss"].append((global_step, val_loss))
                 history["val_accuracy"].append((global_step, val_acc))
-                _save_history(history, run_dir)
+                _save_history(hist)
                 log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}, "
                     f"Acc: {val_acc:.4f}")
 
@@ -396,12 +503,13 @@ def train_opponent_action(agent, train_cfg, device, log,
         # End-of-epoch validation
         val_loss, val_acc = _run_validation(
             agent, val_loader, device, amp_config=amp_cfg,
-            opponent_emb_table=opp_table, gru_window=gru_window)
+            opponent_emb_table=opp_table, gru_window=gru_window,
+            use_perception_cache=_use_perception_cache)
         history["val_loss"].append((global_step, val_loss))
         history["val_accuracy"].append((global_step, val_acc))
         history["epoch_train_loss"].append(train_loss_avg)
         history["epoch_val_loss"].append(val_loss)
-        _save_history(history, run_dir)
+        _save_history(hist)
 
         log(f"Epoch {epoch + 1}/{epochs} — Train: {train_loss_avg:.6f}, "
             f"Val: {val_loss:.6f}, Acc: {val_acc:.4f}")
@@ -440,6 +548,6 @@ def train_opponent_action(agent, train_cfg, device, log,
         param.requires_grad = True
 
     log(f"=== Opponent Action Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
-    _save_history(history, run_dir)
+    hist.compact()
 
     return history, run_dir

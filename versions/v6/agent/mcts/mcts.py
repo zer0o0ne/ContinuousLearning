@@ -48,9 +48,21 @@ class MCTS:
     """
 
     def __init__(self, agent, device, mcts_config=None, opponent_emb_table=None,
-                 strange_p=0.0, evaluator=None):
+                 strange_p=0.0, evaluator=None, search_scale=1.0):
         self.agent = agent
         self.device = device
+        # C.4: per-agent value scale (the cycle's `mcts_value_scale` snapshot,
+        # fallback BB on cycle 0) used to project deterministic fold-terminal
+        # chip values into the same axis as the value head's outputs. Must
+        # equal the `value_scales_by_position[hero_pos]` that
+        # `evaluate_all_terminals` divides equity terminal Q by, so search-time
+        # and post-hand terminal valuations live on one axis.
+        self.search_scale = float(search_scale) if search_scale else 1.0
+        # Root-state per-seat credits, captured at the start of each `search`.
+        # `_deterministic_terminal_value` derives hero_invested_from_root from
+        # this so fold terminals are valued without the NN (anti fold-spiral
+        # anchor). None until the first `search` call.
+        self._root_credits = None
         # Evaluator boundary: all neural-net access goes through `self.evaluator`
         # (see agent/mcts/evaluator.py). When none is supplied, wrap the live
         # agent in a LocalEvaluator — this preserves the exact in-process
@@ -69,8 +81,8 @@ class MCTS:
         # Probability per simulation of doing a "strange" traversal: at every
         # hero node along the descent we sample action with weight 1/(N+1)
         # (inverse visit count) instead of PUCT. Opp selection stays the same.
-        # Combined with hero max-backup (W = max child.W), bad strange paths
-        # do not poison hero ancestors' W. Set externally by `collect.py` as
+        # Combined with hero max-Q backup (Q = max child.Q), bad strange paths
+        # do not poison hero ancestors' value. Set externally by `collect.py` as
         # `C(cycle) * exp(-last_action_loss)` so search broadens when the
         # action head has already converged. Default 0 disables it.
         self.strange_p = float(strange_p)
@@ -119,7 +131,18 @@ class MCTS:
         """
         legal = game_state.get_legal_actions()
         if len(legal) == 1:
+            # C.7.2: set last_root before the early return — consumers read
+            # `mcts.last_root` after every search; leaving it stale (or unset
+            # on the first-ever call) silently feeds the previous decision's
+            # tree (or raises AttributeError). A forced single-legal-action
+            # decision carries no policy signal → None (no training example).
+            self.last_root = None
             return legal[0]
+
+        # C.4: capture the root per-seat credits so fold terminals reached
+        # during search can be valued deterministically (hero_invested_from_root
+        # = root_credits[hero] − terminal_credits[hero]).
+        self._root_credits = list(game_state.credits)
 
         # Evaluate root: full perception forward
         root_ctx, root_mask, value, act_logits, opp_logits, act_embs = \
@@ -133,78 +156,146 @@ class MCTS:
         # Pending queue: in-flight (path, gs, is_terminal_flag) waiting for
         # batched NN evaluation. Their nodes already carry virtual loss so
         # subsequent _select_to_leaf calls steer away from them.
-        #   is_terminal_flag=True → first visit to a terminal: needs ONE
-        #     value_head forward to cache V_pred, then sum-style backup.
-        #     gs is unused (terminal has no children to expand).
+        #   is_terminal_flag=True → first visit to a SHOWDOWN terminal: needs
+        #     ONE value_head forward to cache V_pred, then sum-style backup.
+        #     gs is unused (terminal has no children to expand). Fold terminals
+        #     never enter `pending` — they are valued deterministically below
+        #     (C.4) and backed up immediately.
         #   is_terminal_flag=False → regular non-terminal leaf: full
         #     expansion via _expand_node.
+        # C.7.1: `pending_ids` holds id() of every node already queued this
+        # batch so a re-selection of an in-flight leaf (possible under ties
+        # despite virtual loss) is NOT queued twice — we break and flush early
+        # instead, which expands/caches it and removes it from the leaf set.
         pending = []
+        pending_ids = set()
         sim = 0
         while sim < self.n_simulations:
             while len(pending) < self.batch_size and sim < self.n_simulations:
                 strange = (self.strange_p > 0.0
                            and random.random() < self.strange_p)
                 path, gs = self._select_to_leaf(root, game_state, strange=strange)
-                sim += 1
                 leaf = path[-1]
                 if leaf.is_terminal:
                     if leaf._term_value is None:
-                        # First terminal visit — queue for batched value_head.
+                        # First visit: fold terminals get a deterministic value
+                        # (no NN); showdown terminals are queued for value_head.
+                        # gs is None only on a repeat in-flight visit to a
+                        # showdown terminal already queued this batch (fold
+                        # terminals cache _term_value on the first visit, so
+                        # they never reach here with gs None).
+                        det_v = (self._deterministic_terminal_value(gs)
+                                 if gs is not None else None)
+                        if det_v is not None:
+                            leaf._term_value = float(det_v)
+                            sim += 1
+                            self._backup_cached_terminal(path, leaf._term_value)
+                            continue
+                        if id(leaf) in pending_ids:
+                            break  # already queued — flush to make progress
+                        sim += 1
                         self._apply_virtual_loss(path)
                         pending.append((path, None, True))
+                        pending_ids.add(id(leaf))
                     else:
                         # Repeat visit: sum-style backup with cached V_pred.
+                        sim += 1
                         self._backup_cached_terminal(path, leaf._term_value)
                     continue
+                if id(leaf) in pending_ids:
+                    break  # unexpanded leaf already queued — flush early
+                sim += 1
                 self._apply_virtual_loss(path)
                 pending.append((path, gs, False))
+                pending_ids.add(id(leaf))
 
             if pending:
                 self._flush_pending(pending, root_ctx, root_mask)
                 pending.clear()
+                pending_ids.clear()
 
         self.last_root = root
         return self._best_action(root)
 
+    def _deterministic_terminal_value(self, gs):
+        """Hero value for a terminal whose outcome is NN-independent, in
+        `search_scale` units; ``None`` when the value needs equity (showdown
+        with hero still live).
+
+        C.4 — restores the structural anchor against fold-spirals removed when
+        `_make_terminal_evaluator` was deleted. Mirrors the fold / hero-folded
+        branches of `terminal_eval.evaluate_all_terminals` exactly (so the
+        search-time estimate and the post-hand override agree on these
+        terminals):
+
+          - **Fold terminal** (``len(active) <= 1``): the lone survivor
+            collects the pot, everyone else loses what they invested. (The
+            plain ``−invested`` of the audit text is the hero-folds case; the
+            survivor case is included so betting that induces folds is not
+            mis-scored as a loss during search.)
+          - **Hero folded along this path** but ≥2 others reach showdown: hero
+            is locked at ``−invested`` regardless of the showdown — still
+            deterministic, no NN.
+          - **Showdown with hero live**: returns ``None`` → caller runs the
+            value head (its equity estimate is overridden post-hand by
+            `evaluate_all_terminals`).
+
+        The result is divided by `self.search_scale` so it sits on the same
+        axis as the value head's outputs and the equity terminal Q.
+        """
+        hero = gs.hero_pos
+        active = [i for i in range(gs.num_players) if gs.players_state[i] >= 0]
+        root_credits = self._root_credits
+        hero_invested = root_credits[hero] - gs.credits[hero]
+        if len(active) <= 1:
+            if len(active) == 1 and active[0] == hero:
+                q_chips = float(gs.pot) - hero_invested
+            elif len(active) == 1:
+                q_chips = -hero_invested
+            else:
+                # No survivors (shouldn't happen) — neutral.
+                q_chips = 0.0
+            return q_chips / self.search_scale
+        if hero not in active:
+            return (-hero_invested) / self.search_scale
+        return None  # showdown, hero live → value head
+
     def _backup_cached_terminal(self, path, V_pred):
         """Sum-style backup of a cached terminal V_pred (repeat visit).
 
-        No NN evaluation needed (`V_pred` was cached on first visit in
-        `_flush_pending`); no virtual loss applied (nothing is in flight).
-        Treats the terminal as a deterministic leaf with value V_pred:
-        each visit adds V_pred to W of every "sum-style" node along the
-        path (opp ancestors + the terminal itself), so W and N scale
-        together and hero max-backup compares apples to apples between
-        terminal and non-terminal children. Hero non-terminal ancestors
-        re-derive their W from `max(child.W)` in the bottom-up pass.
+        No NN evaluation needed (`V_pred` was cached on the first visit, in
+        `_flush_pending` for showdown terminals or in `search` for fold
+        terminals); no virtual loss applied (nothing is in flight).
+
+        C.1 — every node's `W` is a plain sum of the leaf values backed up
+        through it (uniform across hero / opp / terminal). The decision
+        statistic differs: opp/terminal `Q = W/N`; hero `Q = max(child.Q)`
+        (recomputed bottom-up in `_recompute_node_after_backup`). W stays the
+        accounting ledger that `re_backup_terminals` propagates deltas through.
         """
         for n in path:
             n.N += 1
-            if (not n.is_hero) or n.is_terminal:
-                n.W += V_pred
+            n.W += V_pred
         for n in reversed(path):
             self._recompute_node_after_backup(n, leaf_value=V_pred)
 
     def _apply_virtual_loss(self, path):
         """Tentatively mark a path as visited with a negative value bias.
 
-        Under **mixed backup** semantics:
-          - All nodes: `N += 1` (PUCT exploration term shrinks for this
-            child in concurrent sims).
-          - **Sum-style nodes** (opp ancestors + the terminal leaf, regardless
-            of its `is_hero` flag): `W -= vl`; Q = W/N drops sample-mean.
-          - **Hero non-terminal nodes**: W is NOT touched directly (it lives
-            in `max(child.W)`, which hasn't changed yet — no child's W moved
-            during this VL phase). Q = W/N still drops a bit thanks to N bump.
-            Opp pessimism is re-applied inline so any hero still further up
-            sees the right Q via children comparison in PUCT.
+        C.1 — uniform sum-W backup:
+          - All nodes: `N += 1` (PUCT exploration term shrinks for this child
+            in concurrent sims) and `W -= vl` (the ledger drops the tentative
+            loss; resolved with `+vl + leaf_value` in `_flush_pending`).
+          - Q is recomputed bottom-up: opp/terminal `Q = W/N` (so the
+            sample-mean drops), hero `Q = max(child.Q)`. For an opp the
+            pessimism blend is re-applied inline so any hero further up reads
+            the right Q in PUCT.
         """
         vl = self.virtual_loss
         for n in path:
             n.N += 1
-            if (not n.is_hero) or n.is_terminal:
-                n.W -= vl
-        # Bottom-up Q (and hero W) recompute so PUCT reads are consistent.
+            n.W -= vl
+        # Bottom-up Q recompute so PUCT reads are consistent.
         for n in reversed(path):
             self._recompute_node_after_backup(n)
 
@@ -267,32 +358,34 @@ class MCTS:
             else:
                 self._expand_node(leaf, gs,
                                   act_logits[i:i+1], opp_logits[i:i+1], act_embs[i:i+1])
-            # Bookkeeping pass: sum-style nodes (opp ancestors + the terminal
-            # leaf if `is_term`) get `+vl + leaf_value` → net `+leaf_value`.
-            # Hero non-terminal nodes are skipped here and have their W
-            # rederived from `max(child.W)` in the bottom-up pass below.
+            # C.1: resolve virtual loss uniformly — every node on the path
+            # gets `+vl + leaf_value` → net `+leaf_value` on the W ledger.
             for n in path:
-                if (not n.is_hero) or n.is_terminal:
-                    n.W += vl + leaf_value
-            # Bottom-up: hero W ← max(child.W) [or leaf_value at first visit],
-            # opp Q ← W/N (then pessimism if any), terminal Q ← W/N.
+                n.W += vl + leaf_value
+            # Bottom-up Q recompute: hero Q ← max(child.Q) [or W/N == leaf_value
+            # at a freshly-expanded leaf with no visited children], opp Q ← W/N
+            # (then pessimism if any), terminal Q ← W/N.
             for n in reversed(path):
                 self._recompute_node_after_backup(n, leaf_value=leaf_value)
 
     def _recompute_node_after_backup(self, n, leaf_value=None):
-        """Recompute `n.W` (hero only) and `n.Q` under mixed backup rules.
+        """Recompute `n.Q` under C.1 uniform-sum-W backup.
 
-        Called bottom-up after `N`/`W` bookkeeping along a path:
-          - **terminal** (`is_terminal=True`, regardless of `is_hero`): pure
-            sum-style. `W` was already updated additively in the caller; we
-            just refresh Q = W/N. `is_hero` at a terminal is semantically
-            void (no acting player at hand end) — max-backup doesn't apply.
-          - **hero non-terminal**: `W = max(c.W for c.N > 0)`. If no visited
-            children (only happens at a hero leaf that was just expanded),
-            fall back to `leaf_value` (value-head estimate is the only signal
-            available for this fresh node).
-          - **opp non-terminal**: `W` was already updated additively in the
-            caller; compute Q = W/N and apply opp pessimism if any.
+        Called bottom-up after `N`/`W` bookkeeping along a path. `W` is a plain
+        sum of leaf values for EVERY node (updated additively by the caller);
+        only the decision statistic `Q` differs:
+          - **terminal** (`is_terminal=True`, regardless of `is_hero`):
+            `Q = W/N`. `is_hero` at a terminal is semantically void (no acting
+            player at hand end).
+          - **hero non-terminal**: `Q = max(c.Q for c in children if c.N > 0)`
+            — the hero plays the best reply, so its node value is the max over
+            visited children's Q, NOT a visit-weighted average of W sums (the
+            old `max(child.W)` compared sums with different N, compressing
+            root.Q toward 0 and, with negative Q, picking the least-visited
+            child — C.1). With no visited children (a hero leaf just expanded)
+            fall back to `W/N` (== `leaf_value` at N=1, the value-head estimate
+            — the only signal available for the fresh node).
+          - **opp non-terminal**: `Q = W/N`, then opp pessimism if enabled.
         """
         if n.is_terminal:
             n.Q = n.W / n.N if n.N > 0 else 0.0
@@ -300,12 +393,9 @@ class MCTS:
         if n.is_hero:
             visited = [c for c in n.children.values() if c.N > 0]
             if visited:
-                n.W = max(c.W for c in visited)
-            elif leaf_value is not None:
-                n.W = float(leaf_value)
-            # else: keep W untouched (e.g. VL phase before eval — no children
-            # have changed, no fresh leaf_value to assign).
-            n.Q = n.W / n.N if n.N > 0 else 0.0
+                n.Q = max(c.Q for c in visited)
+            else:
+                n.Q = n.W / n.N if n.N > 0 else 0.0
         else:
             n.Q = n.W / n.N if n.N > 0 else 0.0
             if self.opp_pessimism_alpha < 1.0:
@@ -324,8 +414,8 @@ class MCTS:
         `strange`: when True, hero selection uses inverse-N sampling instead
         of PUCT (opp selection is unchanged). Triggered by `self.strange_p`
         in `search()` to broaden exploration once the action head has mostly
-        converged. Under hero max-W backup, a strange path that lands in a
-        worse leaf does not depress hero ancestors' W (max ignores it), so
+        converged. Under hero max-Q backup, a strange path that lands in a
+        worse leaf does not depress hero ancestors' Q (max ignores it), so
         these explorations cost only the budget, not the value estimate.
 
         Returns:
@@ -379,11 +469,10 @@ class MCTS:
                 self._evaluate_node(context, mask)
             self._expand_node(node, gs, act_logits, opp_logits, act_embs)
 
-        # BACKUP (mixed: hero non-terminal = max child.W, opp/terminal = sum).
+        # BACKUP (C.1 uniform sum-W; hero Q = max child.Q in recompute).
         for n in path:
             n.N += 1
-            if (not n.is_hero) or n.is_terminal:
-                n.W += leaf_value
+            n.W += leaf_value
         for n in reversed(path):
             self._recompute_node_after_backup(n, leaf_value=leaf_value)
 
@@ -418,20 +507,31 @@ class MCTS:
             return random.choices(actions, weights=priors, k=1)[0]
 
     def _build_context(self, root_ctx, root_mask, path):
-        """Build context tensor by appending action embeddings along path."""
-        if len(path) <= 1:
-            return root_ctx, root_mask
+        """Build context tensor by appending action embeddings along path.
 
-        # Collect embeddings from path (skip root which has no embedding)
+        When root_ctx is None (E.2.4 remote mode), returns only the action
+        embeddings — root_ctx lives on the inference server and is prepended
+        there.
+        """
         embeddings = []
         for node in path[1:]:
             if node.action_embedding is not None:
                 embeddings.append(node.action_embedding)
 
-        if not embeddings:
+        if root_ctx is None:
+            if not embeddings:
+                d = self.evaluator.n_actions  # approximate d_model; unused for empty
+                return (torch.zeros(1, 0, embeddings[0].shape[-1] if embeddings else 64,
+                                    device=self.device),
+                        torch.zeros(1, 0, device=self.device))
+            emb_stack = torch.stack(embeddings).unsqueeze(0)
+            extra_mask = torch.ones(1, len(embeddings), device=self.device)
+            return emb_stack, extra_mask
+
+        if len(path) <= 1 or not embeddings:
             return root_ctx, root_mask
 
-        emb_stack = torch.stack(embeddings).unsqueeze(0)  # (1, depth, d_model)
+        emb_stack = torch.stack(embeddings).unsqueeze(0)
         context = torch.cat([root_ctx, emb_stack], dim=1)
         extra_mask = torch.ones(1, len(embeddings), dtype=root_mask.dtype,
                                 device=self.device)
@@ -464,7 +564,13 @@ class MCTS:
         — critical when the opp's true policy (e.g. Slumbot) differs from
         the agent pool that trained `opponent_action_head`. Hero priors are
         untouched (they get root-only Dirichlet noise via `_add_dirichlet_noise`).
+
+        C.7.1: idempotent — if `node.children` is already populated (a possible
+        double-expansion under batched flush), return without rebuilding priors
+        or re-sampling the inner Dirichlet noise.
         """
+        if node.children:
+            return
         legal = game_state.get_legal_actions()
         logits = act_logits if node.is_hero else opp_logits
         logits = logits[0]  # (n_actions,)
@@ -593,24 +699,25 @@ def action_path_from_root(node):
 def re_backup_terminals(root):
     """Propagate equity-based terminal Q values up to ancestors after search.
 
-    `_backup_terminal` leaves `terminal.W == 0` during the search (only bumps
-    `N`), so this is the sole path by which terminal information enters
-    ancestors' `W` / `Q`. `evaluate_all_terminals` first writes the
-    equity-based value into `terminal.Q`; here we set
-    `terminal.W = terminal.Q * terminal.N` and propagate the change upward
-    respecting the **mixed backup semantics**:
+    During search each terminal already backs up a value (fold = deterministic,
+    showdown = value-head; C.4), so `terminal.W` is a non-zero sum on the
+    ledger. `evaluate_all_terminals` overrides every `terminal.Q` with the
+    equity-based value; here we set `terminal.W = terminal.Q * terminal.N`
+    (delta = new − old) and propagate the change upward under C.1 uniform-sum-W
+    semantics:
 
-      - **opp ancestor**: `W += delta` (additive sum continues across all
-        terminals sharing this ancestor — order-independent).
-      - **hero ancestor**: `W = max(child.W for c in n.children if c.N > 0)`.
-        The new max is computed from already-updated children below; if max
-        didn't change, propagation can stop early because no ancestor above
-        will see a different value through this branch (the change carried
-        by `delta` becomes 0).
+      - **W (every ancestor): `W += delta`.** Each of the terminal's `N` visits
+        also visited every ancestor on the path and backed the SAME per-visit
+        leaf value to each, so the total correction `delta = N·(equity − old
+        per-visit)` applies identically to every ancestor's sum. `delta` is
+        therefore constant along the whole walk to the root.
+      - **Q recompute**: opp ancestor `Q = W/N`; hero ancestor
+        `Q = max(child.Q for visited)` — read from children already updated
+        below in the bottom-up walk.
 
-    Multiple terminals are processed sequentially; opp accumulators handle
-    that natively, and hero `max(...)` recomputation is order-independent.
-    Idempotent: re-running on the same tree adds 0 everywhere.
+    Multiple terminals are processed sequentially; the per-node W sums and the
+    hero `max(child.Q)` recomputation are both order-independent. Idempotent:
+    a second run finds `delta == 0` at every terminal and changes nothing.
     """
     for terminal in _collect_terminals(root):
         if terminal.N == 0:
@@ -623,18 +730,14 @@ def re_backup_terminals(root):
             continue
         node = terminal.parent
         while node is not None:
+            node.W += delta  # uniform sum ledger
             if node.is_hero:
                 visited = [c for c in node.children.values() if c.N > 0]
-                if not visited:
-                    break
-                new_node_W = max(c.W for c in visited)
-                delta = new_node_W - node.W
-                node.W = new_node_W
-                node.Q = node.W / node.N if node.N > 0 else 0.0
-                if delta == 0.0:
-                    break  # max unchanged → no further upward change
+                if visited:
+                    node.Q = max(c.Q for c in visited)
+                else:
+                    node.Q = node.W / node.N if node.N > 0 else 0.0
             else:
-                node.W += delta
                 node.Q = node.W / node.N if node.N > 0 else 0.0
             node = node.parent
 

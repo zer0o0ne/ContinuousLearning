@@ -450,6 +450,11 @@ def compute_ev_v2(hero_cards, board_cards, opponent_range_hand_types,
     # Equity vs calling range
     call_range_equity = gpu_equity_v2(hero_cards, board_cards, calling_combos, n_iters, device)
 
+    # NOTE (Audit B.1): value-bet pot bug — should be
+    # `pot + raise_amount + (raise_amount - facing_bet)` (see gpu_solver_v3.py).
+    # NOT fixed here: v2's compute_ev_v2 is off the live path (config
+    # solver.type=v3; terminal_eval imports only gpu_equity_v2/range helpers
+    # from this module, not compute_ev_v2). Apply the v3 fix before selecting v2.
     new_pot = pot + facing_bet + raise_amount
     showdown_ev = call_range_equity * (new_pot - total_raise) + (1 - call_range_equity) * (-total_raise)
 

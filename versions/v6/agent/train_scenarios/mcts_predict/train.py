@@ -18,8 +18,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-from agent.train_scenarios.mcts_predict.dataset import MCTSDataset, batch_collate
+from agent.train_scenarios.mcts_predict.dataset import MCTSDataset, batch_collate, make_tensor_collate
 from agent.train_scenarios._checkpoint_io import make_checkpoint
+from agent.resume import atomic_torch_save
+from agent.train_scenarios._history import IncrementalHistory
 
 
 _PHASE = "mcts_predict"
@@ -28,24 +30,26 @@ _PHASE = "mcts_predict"
 class LengthGroupedBatchSampler(Sampler):
     def __init__(self, dataset, batch_size):
         self.batch_size = batch_size
-        lengths = [len(dataset[i][0]) for i in range(len(dataset))]
-        sorted_indices = sorted(range(len(dataset)), key=lambda i: lengths[i])
-        self.batches = [sorted_indices[i:i + batch_size]
-                        for i in range(0, len(sorted_indices), batch_size)]
+        self.n = len(dataset)
+        self.lengths = [len(dataset[i][0]) for i in range(self.n)]
 
     def __iter__(self):
-        order = list(range(len(self.batches)))
-        random.shuffle(order)
-        for idx in order:
-            yield self.batches[idx]
+        indices = list(range(self.n))
+        random.shuffle(indices)
+        indices.sort(key=lambda i: self.lengths[i])
+        batches = [indices[i:i + self.batch_size]
+                    for i in range(0, len(indices), self.batch_size)]
+        random.shuffle(batches)
+        for batch in batches:
+            yield batch
 
     def __len__(self):
-        return len(self.batches)
+        return (self.n + self.batch_size - 1) // self.batch_size
 
 
 def _mcts_forward(agent, event_sequences, chains, device,
                   opponent_emb_table=None, p_tf=0.0, stop_grad_old_embs=True,
-                  examples_per_batch_terminals=None):
+                  examples_per_batch_terminals=None, precomputed=None):
     """Forward pass: perception → root predictions → modelling chain.
 
     Chain semantics (matches `collect.py:MCTSTrainingExample`):
@@ -89,7 +93,8 @@ def _mcts_forward(agent, event_sequences, chains, device,
     # 1. Root perception (updates opp_table once)
     perception_out, _, mask = agent.perception.forward_batch(
         event_sequences, device=device, skip_memory=True,
-        skip_opponent_emb=skip_opp, opponent_emb_table=opponent_emb_table)
+        skip_opponent_emb=skip_opp, opponent_emb_table=opponent_emb_table,
+        precomputed=precomputed)
 
     # 2. Root predictions
     value_preds = agent.value_head(perception_out, mask=mask)
@@ -97,13 +102,16 @@ def _mcts_forward(agent, event_sequences, chains, device,
 
     B = perception_out.shape[0]
 
-    # 3. Collect chain events for ONE batched perception forward
+    # 3. Collect chain events for ONE batched perception forward.
+    # D.3: only hero-owned steps — opp-step events contain the opponent's
+    # private hand cards which are unavailable during search. Teacher
+    # forcing and recon on opp-steps would train on unreachable inputs.
     flat_step_events = []
     step_index = {}  # (b, i) -> index into flat_step_events / chain_pooled
     for b, chain in enumerate(chains):
         for i, step in enumerate(chain):
             evts = getattr(step, "events_at_step", None) or []
-            if evts:
+            if evts and step.is_hero:
                 step_index[(b, i)] = len(flat_step_events)
                 flat_step_events.append(evts)
 
@@ -144,97 +152,153 @@ def _mcts_forward(agent, event_sequences, chains, device,
         counts = m_float.sum(dim=1).clamp(min=1.0)             # (M, 1)
         chain_pooled_detached = (sums / counts).detach()       # (M, D)
 
-    # 4. Per-example chain loop
-    chain_action_preds = []
-    chain_action_targets = []
-    chain_is_hero = []
-    chain_value_preds = []
-    chain_value_targets = []
-    chain_recon_preds = []
-    chain_recon_targets = []
-    chain_recon_depths = []
+    # 4. E.1.5: depth-batched chain loop — process chain steps of the same
+    #    depth across examples in one padded forward instead of B=1 per step.
+    chain_action_preds = [[] for _ in range(B)]
+    chain_action_targets = [[] for _ in range(B)]
+    chain_is_hero = [[] for _ in range(B)]
+    chain_value_preds = [[] for _ in range(B)]
+    chain_value_targets = [[] for _ in range(B)]
+    chain_recon_preds = [[] for _ in range(B)]
+    chain_recon_targets = [[] for _ in range(B)]
+    chain_recon_depths = [[] for _ in range(B)]
 
+    # A.5.1: trim each example to its true length
+    per_ex_ctx = [None] * B
+    per_ex_mask = [None] * B
     for b in range(B):
-        chain = chains[b]
-        if not chain:
-            for L in (chain_action_preds, chain_action_targets, chain_is_hero,
-                      chain_value_preds, chain_value_targets,
-                      chain_recon_preds, chain_recon_targets,
-                      chain_recon_depths):
-                L.append([])
+        if chains[b]:
+            L_b = int(mask[b].sum().item())
+            per_ex_ctx[b] = perception_out[b:b+1, :L_b]
+            per_ex_mask[b] = mask[b:b+1, :L_b]
+
+    max_depth = max((len(chains[b]) for b in range(B) if chains[b]), default=0)
+    D_model = perception_out.shape[2]
+
+    for d in range(max_depth):
+        active_bs = [b for b in range(B) if chains[b] and d < len(chains[b])]
+        if not active_bs:
             continue
+        N_act = len(active_bs)
 
-        ctx_rolled = perception_out[b:b+1]
-        ctx_mask = mask[b:b+1]
+        # --- Modelling head: batched across active examples ---
+        ctxs = [per_ex_ctx[b] for b in active_bs]
+        ctx_masks = [per_ex_mask[b] for b in active_bs]
+        max_ctx_len = max(c.size(1) for c in ctxs)
 
-        b_action_preds = []
-        b_action_tgts = []
-        b_is_hero = []
-        b_value_preds = []
-        b_value_tgts = []
-        b_recon_preds = []
-        b_recon_tgts = []
-        b_recon_depths = []
+        padded_c = torch.zeros(N_act, max_ctx_len, D_model,
+                               dtype=ctxs[0].dtype, device=device)
+        padded_m = torch.zeros(N_act, max_ctx_len,
+                               dtype=ctx_masks[0].dtype, device=device)
+        for idx, (c, m) in enumerate(zip(ctxs, ctx_masks)):
+            Lc = c.size(1)
+            padded_c[idx, :Lc] = c[0]
+            padded_m[idx, :Lc] = m[0]
 
-        for i, step in enumerate(chain):
-            action_embs = agent.modelling_head(ctx_rolled, mask=ctx_mask)
-            emb = action_embs[:, step.action_taken, :]  # (1, D)
-            new_emb_token = emb.unsqueeze(1)            # (1, 1, D)
-            ones_mask = torch.ones(1, 1, dtype=ctx_mask.dtype, device=device)
-            ctx_with_new_emb = torch.cat([ctx_rolled, new_emb_token], dim=1)
-            ctx_with_new_emb_mask = torch.cat([ctx_mask, ones_mask], dim=1)
+        batch_embs = agent.modelling_head(padded_c, mask=padded_m)
 
-            tf_idx = step_index.get((b, i))
-            use_tf = (tf_idx is not None and p_tf > 0.0
+        # Extract per-example embedding, build prediction contexts
+        steps_d = []
+        new_emb_tokens = []
+        pred_ctxs = []
+        pred_masks = []
+
+        for idx, b in enumerate(active_bs):
+            step = chains[b][d]
+            steps_d.append(step)
+            emb = batch_embs[idx:idx+1, step.action_taken, :]
+            new_tok = emb.unsqueeze(1)
+            new_emb_tokens.append(new_tok)
+
+            ones = torch.ones(1, 1, dtype=per_ex_mask[b].dtype, device=device)
+            ctx_with_new = torch.cat([per_ex_ctx[b], new_tok], dim=1)
+            mask_with_new = torch.cat([per_ex_mask[b], ones], dim=1)
+
+            tf_idx_val = step_index.get((b, d))
+            use_tf = (tf_idx_val is not None and p_tf > 0.0
+                      and step.is_hero
                       and chain_perception_out is not None
                       and random.random() < p_tf)
             if use_tf:
-                ctx_for_pred = chain_perception_out[tf_idx:tf_idx+1]
-                ctx_for_pred_mask = chain_perception_mask[tf_idx:tf_idx+1]
+                pred_ctxs.append(chain_perception_out[tf_idx_val:tf_idx_val+1])
+                pred_masks.append(chain_perception_mask[tf_idx_val:tf_idx_val+1])
             else:
-                ctx_for_pred = ctx_with_new_emb
-                ctx_for_pred_mask = ctx_with_new_emb_mask
+                pred_ctxs.append(ctx_with_new)
+                pred_masks.append(mask_with_new)
 
+        # --- Prediction heads: batched ---
+        max_pred_len = max(pc.size(1) for pc in pred_ctxs)
+        all_pred = torch.zeros(N_act, max_pred_len, D_model,
+                               dtype=pred_ctxs[0].dtype, device=device)
+        all_pred_m = torch.zeros(N_act, max_pred_len,
+                                 dtype=pred_masks[0].dtype, device=device)
+        for idx, (pc, pm) in enumerate(zip(pred_ctxs, pred_masks)):
+            Lp = pc.size(1)
+            all_pred[idx, :Lp] = pc[0]
+            all_pred_m[idx, :Lp] = pm[0]
+
+        batch_values = agent.value_head(all_pred, mask=all_pred_m)
+
+        hero_idxs = [idx for idx, s in enumerate(steps_d) if s.is_hero]
+        opp_idxs = [idx for idx, s in enumerate(steps_d) if not s.is_hero]
+
+        batch_hero_preds = None
+        if hero_idxs:
+            h_idx = torch.tensor(hero_idxs, dtype=torch.long)
+            batch_hero_preds = agent.action_head(
+                all_pred[h_idx], mask=all_pred_m[h_idx])
+
+        batch_opp_preds = None
+        if opp_idxs:
+            o_idx = torch.tensor(opp_idxs, dtype=torch.long)
+            batch_opp_preds = agent.opponent_action_head(
+                all_pred[o_idx], mask=all_pred_m[o_idx])
+
+        # --- Scatter results back ---
+        hero_ctr = 0
+        opp_ctr = 0
+        for idx, b in enumerate(active_bs):
+            step = steps_d[idx]
             if step.is_hero:
-                pred = agent.action_head(ctx_for_pred, mask=ctx_for_pred_mask)
+                act_pred = batch_hero_preds[hero_ctr:hero_ctr+1]
+                hero_ctr += 1
             else:
-                pred = agent.opponent_action_head(ctx_for_pred,
-                                                   mask=ctx_for_pred_mask)
-            value_pred = agent.value_head(ctx_for_pred, mask=ctx_for_pred_mask)
+                act_pred = batch_opp_preds[opp_ctr:opp_ctr+1]
+                opp_ctr += 1
 
-            b_action_preds.append(pred.squeeze(0))
-            b_action_tgts.append(torch.tensor(
+            chain_action_preds[b].append(act_pred.squeeze(0))
+            chain_action_targets[b].append(torch.tensor(
                 step.target_distribution, dtype=torch.float32, device=device))
-            b_is_hero.append(bool(step.is_hero))
-            b_value_preds.append(value_pred.reshape(()))
-            b_value_tgts.append(torch.tensor(
+            chain_is_hero[b].append(bool(step.is_hero))
+            chain_value_preds[b].append(batch_values[idx].reshape(()))
+            chain_value_targets[b].append(torch.tensor(
                 float(getattr(step, "value_target", 0.0)),
                 dtype=torch.float32, device=device))
 
-            if tf_idx is not None and chain_pooled_detached is not None:
-                m_float = ctx_with_new_emb_mask.float().unsqueeze(-1)
-                sums_e = (ctx_with_new_emb * m_float).sum(dim=1)  # (1, D)
-                counts_e = m_float.sum(dim=1).clamp(min=1.0)      # (1, 1)
-                recon_pred = (sums_e / counts_e).squeeze(0)       # (D,)
-                b_recon_preds.append(recon_pred)
-                b_recon_tgts.append(chain_pooled_detached[tf_idx])
-                b_recon_depths.append(i)
+            # D.3: recon only for hero-owned steps
+            tf_idx_val = step_index.get((b, d))
+            if (tf_idx_val is not None and chain_pooled_detached is not None
+                    and step.is_hero):
+                ones = torch.ones(1, 1, dtype=per_ex_mask[b].dtype,
+                                  device=device)
+                ctx_wn = torch.cat([per_ex_ctx[b], new_emb_tokens[idx]],
+                                   dim=1)
+                msk_wn = torch.cat([per_ex_mask[b], ones], dim=1)
+                m_fl = msk_wn.float().unsqueeze(-1)
+                sums_e = (ctx_wn * m_fl).sum(dim=1)
+                counts_e = m_fl.sum(dim=1).clamp(min=1.0)
+                recon_pred = (sums_e / counts_e).squeeze(0)
+                chain_recon_preds[b].append(recon_pred)
+                chain_recon_targets[b].append(chain_pooled_detached[tf_idx_val])
+                chain_recon_depths[b].append(d)
 
-            if stop_grad_old_embs:
-                ctx_rolled = torch.cat([ctx_rolled, new_emb_token.detach()],
-                                        dim=1)
-            else:
-                ctx_rolled = torch.cat([ctx_rolled, new_emb_token], dim=1)
-            ctx_mask = ctx_with_new_emb_mask
-
-        chain_action_preds.append(b_action_preds)
-        chain_action_targets.append(b_action_tgts)
-        chain_is_hero.append(b_is_hero)
-        chain_value_preds.append(b_value_preds)
-        chain_value_targets.append(b_value_tgts)
-        chain_recon_preds.append(b_recon_preds)
-        chain_recon_targets.append(b_recon_tgts)
-        chain_recon_depths.append(b_recon_depths)
+        # --- Update contexts for next depth ---
+        for idx, b in enumerate(active_bs):
+            ones = torch.ones(1, 1, dtype=per_ex_mask[b].dtype, device=device)
+            tok = new_emb_tokens[idx].detach() if stop_grad_old_embs \
+                else new_emb_tokens[idx]
+            per_ex_ctx[b] = torch.cat([per_ex_ctx[b], tok], dim=1)
+            per_ex_mask[b] = torch.cat([per_ex_mask[b], ones], dim=1)
 
     # 5. Terminal value supervision: for each example, roll out the modelling
     #    chain along each terminal's action_path_from_root and predict
@@ -450,23 +514,28 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
     schedule.
     """
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
+    # A.4.3: validation forwards mutate the table — work on a clone so the live
+    # training table is not advanced by the val set.
+    if opponent_emb_table is not None:
+        opponent_emb_table = opponent_emb_table.clone()
     agent.eval()
     sums = {k: 0.0 for k in _LOSS_KEYS}
     count = 0
     with torch.no_grad():
-        for event_seqs, val_targets, act_targets, chains, term_tgts in val_loader:
+        for precomputed, val_targets, act_targets, chains, term_tgts in val_loader:
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 forward_out = _mcts_forward(
-                    agent, event_seqs, chains, device,
+                    agent, None, chains, device,
                     opponent_emb_table=opponent_emb_table,
                     p_tf=0.0,
                     stop_grad_old_embs=stop_grad_old_embs,
-                    examples_per_batch_terminals=term_tgts)
+                    examples_per_batch_terminals=term_tgts,
+                    precomputed=precomputed)
                 _, ldict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
-            n = len(event_seqs)
+            n = precomputed["B"] if precomputed is not None else 0
             for k in _LOSS_KEYS:
                 sums[k] += ldict[k] * n
             count += n
@@ -586,24 +655,43 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         opp_table = OpponentEmbeddingTable(agent.perception.d_model)
         log("Opponent GRU embedding enabled")
 
-    # Dataset
+    # Dataset — D.2: hand-aware split prevents chain leakage (chain of
+    # example t contains roots of examples t+1..t+5 from the same hand;
+    # random split = direct train↔val leak).
     dataset = MCTSDataset(examples)
-    n_val = max(1, int(len(dataset) * val_split))
-    n_train = len(dataset) - n_val
-    indices = list(range(len(dataset)))
-    random.seed(42)
-    random.shuffle(indices)
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
+    from agent.train_scenarios.split import hand_aware_split
+    scenarios_for_split = [
+        {"events": ex.events,
+         "num_players": ex.events[0]["num_players"] if ex.events else 2}
+        for ex in examples
+    ]
+    train_dataset, val_dataset = hand_aware_split(
+        dataset, scenarios_for_split, val_split, seed=42)
+    n_train = len(train_dataset)
+    n_val = len(val_dataset)
+    train_indices = train_dataset.indices
+    val_indices = val_dataset.indices
 
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(dataset, val_indices)
-
-    train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
+    if opp_table is not None:
+        # A.4.4: feed in collection (chronological) order so the opponent GRU
+        # table accumulates as at inference. Examples are appended per decision
+        # in hand order, so the original example index is a chronological proxy;
+        # sort subset positions by it (the random split scrambles which examples
+        # land in train, but their relative order is restored here).
+        from agent.train_scenarios.split import OrderedBatchSampler
+        order = sorted(range(len(train_indices)), key=lambda pos: train_indices[pos])
+        train_sampler = OrderedBatchSampler(order, batch_size)
+        log("Opponent GRU active → chronological (collection-order) batch order")
+    else:
+        train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
+    max_players = agent.perception.embedder.max_players
+    _tensor_collate = make_tensor_collate(max_players)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                              collate_fn=batch_collate)
+                              collate_fn=_tensor_collate, num_workers=2,
+                              persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            collate_fn=batch_collate)
+                            collate_fn=_tensor_collate, num_workers=2,
+                            persistent_workers=True)
 
     log(f"Train: {n_train}, Val: {n_val}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     log(f"Weights: value={value_weight}, action={action_weight}, "
@@ -630,14 +718,12 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     # Cross-cycle history: load existing if present, else fresh
     if history_path is None:
         history_path = os.path.join(run_dir, "history.pt")
-    if os.path.exists(history_path):
-        history = torch.load(history_path, weights_only=False)
-        for k in ("step_loss", "val_loss", "epoch_train_loss",
-                  "epoch_val_loss", "cycles"):
-            history.setdefault(k, [])
-    else:
-        history = {"step_loss": [], "val_loss": [], "epoch_train_loss": [],
-                   "epoch_val_loss": [], "cycles": []}
+    history_dir = os.path.dirname(history_path)
+    hist = IncrementalHistory(history_dir,
+                              keys=["step_loss", "val_loss",
+                                    "epoch_train_loss", "epoch_val_loss",
+                                    "cycles"])
+    history = hist.data
 
     best_val_loss = float("inf")
     fails_since_best = 0
@@ -663,17 +749,19 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_seqs, val_targets, act_targets, chains, term_tgts) in enumerate(train_loader):
+        for batch_idx, (precomputed, val_targets, act_targets, chains, term_tgts) in enumerate(train_loader):
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
+            n_samples = precomputed["B"] if precomputed is not None else 0
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 forward_out = _mcts_forward(
-                    agent, event_seqs, chains, device,
+                    agent, None, chains, device,
                     opponent_emb_table=opp_table,
                     p_tf=p_tf,
                     stop_grad_old_embs=stop_grad_old_embs,
-                    examples_per_batch_terminals=term_tgts)
+                    examples_per_batch_terminals=term_tgts,
+                    precomputed=precomputed)
                 loss, loss_dict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
 
@@ -702,11 +790,11 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 "action_entropy": loss_dict["action_entropy"],
                 "p_tf": p_tf,
                 "lr": current_lr,
-                "batch_size": len(event_seqs),
+                "batch_size": n_samples,
             })
             global_step += 1
-            train_loss_sum += step_loss * len(event_seqs)
-            train_count += len(event_seqs)
+            train_loss_sum += step_loss * n_samples
+            train_count += n_samples
             cycle_action_sum += loss_dict["action"] * len(event_seqs)
             cycle_action_count += len(event_seqs)
 
@@ -792,9 +880,16 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 log(f"  Early stopping: {fails_since_best} failed validations")
                 break
 
-    # best.pt is always rolled forward (latest-after-cycle), but the
-    # permanent per-cycle snapshot under cycles/ is gated by
-    # save_every_cycles via save_checkpoint.
+    # D.5.4: best.pt is **latest by design** — always rolled forward
+    # (overwritten at cycle end). Within a single cycle the val-gated save
+    # (above) is also written when val improves, but the cycle_end save
+    # overwrites it unconditionally. Rationale: each MCTS cycle collects
+    # NEW self-play data from the updated agent, so intra-cycle val is a
+    # noisy proxy; the latest weights are the most meaningful input for the
+    # next collection. With D.2 (hand-aware split) the val signal is now
+    # reliable enough that intra-cycle val-gating could be reconsidered in
+    # a future enhancement. Permanent per-cycle snapshots under cycles/
+    # are gated by save_every_cycles via save_checkpoint.
     final_val = float(val_avg) if 'val_avg' in locals() else float(best_val_loss)
     final_epoch = epoch if 'epoch' in locals() else 0
 
@@ -829,11 +924,37 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         "epochs_run": epochs,
     })
 
-    torch.save(history, history_path)
+    hist.save()
     log(f"=== MCTS Cycle {cycle_id} Complete. "
         f"Best val: {best_val_loss:.6f}, saved=cycle_end ===")
     agent.set_gradient_checkpointing(False)
     return history, run_dir, global_step
+
+
+def _cleanup_old_snapshots(snapshots_dir, keep_last=3, keep_every=10, log=None):
+    """Remove old cycle snapshots, keeping the last `keep_last` plus every
+    `keep_every`-th (e.g. cycle 0, 10, 20, ...). Prevents unbounded disk growth.
+    """
+    if not os.path.isdir(snapshots_dir):
+        return
+    files = sorted(f for f in os.listdir(snapshots_dir) if f.startswith("cycle_") and f.endswith(".pt"))
+    if len(files) <= keep_last:
+        return
+    keep_set = set(files[-keep_last:])
+    for f in files:
+        try:
+            cid = int(f.replace("cycle_", "").replace(".pt", ""))
+        except ValueError:
+            continue
+        if cid % keep_every == 0:
+            keep_set.add(f)
+    removed = 0
+    for f in files:
+        if f not in keep_set:
+            os.remove(os.path.join(snapshots_dir, f))
+            removed += 1
+    if removed and log:
+        log(f"  Cleaned up {removed} old cycle snapshot(s), kept {len(files) - removed}")
 
 
 def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
@@ -859,15 +980,18 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
     )
 
     best_path = os.path.join(ckpt_dir, "best.pt")
-    torch.save(ckpt, best_path)
+    atomic_torch_save(ckpt, best_path)
 
     snapshot_written = False
     if cycle_id is not None and write_snapshot:
         snapshots_dir = os.path.join(ckpt_dir, "cycles")
         os.makedirs(snapshots_dir, exist_ok=True)
         snapshot_path = os.path.join(snapshots_dir, f"cycle_{cycle_id:04d}.pt")
-        torch.save(ckpt, snapshot_path)
+        atomic_torch_save(ckpt, snapshot_path)
         snapshot_written = True
+
+    if snapshot_written:
+        _cleanup_old_snapshots(snapshots_dir, keep_last=3, keep_every=10, log=log)
 
     snap_str = " + snapshot" if snapshot_written else ""
     log(f"  Saved best.pt{snap_str} ({reason}, val={val_loss:.6f}, "

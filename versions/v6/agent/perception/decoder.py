@@ -4,6 +4,8 @@ import torch.utils.checkpoint as ckpt
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm
 
+from agent.attn_utils import build_causal_padding_mask
+
 
 class Decoder(nn.Module):
     """
@@ -13,10 +15,13 @@ class Decoder(nn.Module):
 
     def __init__(self, d_model, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len):
         super().__init__()
+        assert d_model % n_heads == 0, (
+            f"d_model {d_model} must be divisible by n_heads {n_heads}")
         self.config = Qwen3Config(
             hidden_size=d_model,
             num_attention_heads=n_heads,
             num_key_value_heads=n_kv_heads,
+            head_dim=d_model // n_heads,
             intermediate_size=d_ff,
             num_hidden_layers=n_layers,
             max_position_embeddings=max_seq_len,
@@ -41,9 +46,9 @@ class Decoder(nn.Module):
         position_ids = torch.arange(seq_len, device=sequence.device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.rope(sequence, position_ids)
 
-        attn_mask = None
-        if mask is not None:
-            attn_mask = (1.0 - mask[:, None, None, :]) * torch.finfo(sequence.dtype).min
+        # A.1: explicit combined causal + padding mask. An explicit mask
+        # disables Qwen3's built-in is_causal, so causality is encoded here.
+        attn_mask = build_causal_padding_mask(mask, seq_len, sequence.dtype, sequence.device)
 
         x = sequence
         use_ckpt = (self.gradient_checkpointing and self.training

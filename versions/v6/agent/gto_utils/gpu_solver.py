@@ -427,6 +427,12 @@ def compute_ev(equity, pot, facing_bet, stack, hero_invested, raise_frac=1.0):
     # opponent needs to call the raise difference.
     # Simplified: assume opponent calls → new_pot = pot + raise_amount + (raise_amount - facing_bet)
     # But this is complex. Use simpler model: pot + facing_bet + raise_amount
+    # NOTE (Audit B.1): the "simpler model" below is the value-bet bug — it
+    # double-counts facing_bet and omits the opponent's call, so value bets
+    # never pay (EV(raise)-EV(check) = -(1-eq)*b < 0 at facing_bet=0). The
+    # correct formula is the commented one two lines up. NOT fixed here because
+    # v1 is off the live generation path (config solver.type=v3, which is
+    # fixed). If you select solver.type="v1", apply the v3 fix first.
     new_pot = pot + facing_bet + raise_amount
     raise_ev = equity * (new_pot - total_raise) + (1 - equity) * (-total_raise)
     # Simplifies to: equity * new_pot - total_raise

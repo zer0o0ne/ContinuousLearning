@@ -16,6 +16,8 @@ source venv/bin/activate
 ```
 
 Device auto-detected: CUDA → MPS → CPU. All Python commands must use the venv.
+
+**Linux CUDA requirement**: `vm.max_map_count` must be ≥ 1048576 (default 65530 is too low for `expandable_segments:True`). Check: `sysctl vm.max_map_count`. Fix: `sudo sysctl -w vm.max_map_count=1048576` (or persist in `/etc/sysctl.conf`). Without this, the inference server may crash with ENOMEM.
 ALL CODE EDITS MUST MODIFY ONLY DIRECTORY /versoins/<version>!
 ALL DATA MUST STORE OUTSIDE THE /versions DIRECTORY INTO /data DIRECTORY!
 
@@ -51,10 +53,10 @@ Event sequence (N events)
 
 Each event produces **7 vectors** (CARDS_PER_EVENT=7), one per card slot: `[table_0..4, hand_0, hand_1]`. Each vector combines:
 - **Card embedding**: `Embedding(53, d_model)` — indices 0-51 = cards, 52 = no-card. Clamped to [0, 52].
-- **6 context embeddings** (shared across all 7 cards): hero_pos, acting_pos, num_players (Embedding lookups), pot+stack (Linear(2→d)), bets (Linear(max_players→d)), action (Linear(n_actions→d))
-- Combined: `cat(card_emb, 6 context embs)` → `Linear(7d → d)` → `+ source_embed` → `LayerNorm(d)`
+- **7 context embeddings** (shared across all 7 cards): hero_pos, acting_pos, num_players (Embedding lookups), pot+hero-stack (Linear(2→d)), bets (Linear(max_players→d)), action (Linear(n_actions→d)), **per-position stacks vector** (Linear(max_players→d) — B.6.2; a per-seat effective-stack signal, without which stack-aware play is unlearnable). Events must carry a `stacks` list; missing → treated as zeros.
+- Combined: `cat(card_emb, 7 context embs)` → `Linear(8d → d)` → `+ source_embed` → `LayerNorm(d)`
 
-**Opponent embedding** (optional, `architecture.opponent_embedding.enabled`): for hand card positions (5, 6), adds a per-opponent GRU-updated embedding. `OpponentEmbeddingTable` stores embeddings by opponent_id; `opponent_gru` updates them from encoder output after each forward. Embeddings do NOT require grad — updated only by GRU output replacement.
+**Opponent embedding** (optional, `architecture.opponent_embedding.enabled`): for hand card positions (5, 6), adds a per-opponent GRU-updated embedding. `OpponentEmbeddingTable` stores embeddings by opponent_id; `opponent_gru` advances them from **pre-encoder embedder features** (mean over the table-card slots 0–4 only — A.4.1), processed causally per event in flat sample/event order: each event injects the running state as of that event (no future leak, no cross-sample interleaving). The stored tensor stays in the autograd graph within a forward (truncated BPTT, depth = `gru_window`) and is detached between steps via `detach_all()`; it is never an optimizer parameter.
 
 ### Encoder (`perception/encoder.py`)
 
@@ -119,6 +121,8 @@ Beam-search clustering memory. Currently disabled (`skip_memory=True` everywhere
 
 Agent-vs-agent evaluation. Loads agents from subdirectories, seats them at tables, plays N hands, reports BB/100. Multi-table batching for GPU efficiency. Agent rotation when pool > table size. Can run standalone: `python -m evaluation.evaluate --config config.json`.
 
+**E.4.2: parallel MCTS in eval** — when MCTS agents are present and `n_tables > 1`, an inference server (`_EvalInferenceServer`) is spun up reusing `agent/mcts/inference_server.py`. MCTS decisions across tables are dispatched concurrently via a `ThreadPoolExecutor`; each thread creates a fresh `MCTS` + `RemoteEvaluator` routing NN forwards to the server. Non-MCTS agents continue using batched action-head forward in the main thread. MCTS agents' models are moved to CPU during eval (the server holds its own GPU copies). The thread pool overlaps MCTS searches with the batched action-head path, improving GPU utilization at high `n_tables`. Config: `evaluation.server_max_batch` (default: `mcts.server_max_batch` or 256), `evaluation.server_linger_ms` (default: `mcts.server_linger_ms` or 2). Falls back to sequential MCTS if the server fails to start or `n_tables <= 1`.
+
 ## Config (`versions/<version>/config.json`)
 
 | Section | Purpose |
@@ -133,11 +137,11 @@ Agent-vs-agent evaluation. Loads agents from subdirectories, seats them at table
 | `gto_probs_train` | Phase 2 hyperparams |
 | `gto_train` | Phase 3 hyperparams + `action_loss_weight` |
 | `modelling_train` | Phase 4 hyperparams + `recon_weight` |
-| `opponent_data` | Opponent data generation: `agents_dir`, `n_hands`, `action_temperature`, `range_threshold` |
+| `opponent_data` | Opponent data generation: `agents_dir`, `n_hands`, `action_temperature` (dead `range_threshold` removed — B.7.3) |
 | `opponent_action_train` | Phase 5 hyperparams |
 | `mcts` | MCTS search params: `n_simulations`, `c_puct`, `dirichlet_alpha/epsilon`, `temperature` |
 | `mcts_train` | Phase 6: `n_cycles`, `n_hands_per_cycle`, `value/action/chain_weight` |
-| `evaluation` | `agents_dir`, `n_hands`, `n_tables`, `use_opponent_emb` |
+| `evaluation` | `agents_dir`, `n_hands`, `n_tables`, `use_opponent_emb`, `server_max_batch`, `server_linger_ms` |
 | `pipeline` | Flags: `run_gto_ev`, `run_gto_probs`, `run_gto_training`, `run_modelling`, `run_opponent_data`, `run_opponent_action_train`, `run_mcts_train`, `run_evaluation` |
 | `multi_agent` | Agent pool with per-agent modifiers (see below) |
 
@@ -167,11 +171,15 @@ Explicit: `[0, 1, 52]`. Slice: `"15:35"`, `"2:52:2"`.
 
 ### GTO Data (`generation/generate.py`)
 
-Simulates poker hands with GTO-sampled actions. Each sample: `events` (variable-length event dicts), `ev_target`, `action_evs`, `action_probs`, metadata (`equity`, `pot`, `facing_bet`, `stack`, etc.). Saved **raw** (unnormalized).
+Simulates poker hands with GTO-sampled actions. Each sample: `events` (variable-length event dicts, each with a per-position `stacks` vector — B.6.2), `ev_target`, `action_evs`, `action_probs`, metadata (`equity`, `pot`, `facing_bet`, `stack`, etc.). Saved **raw** (unnormalized).
+
+Audit-B fixes baked in here: per-seat independent starting stacks (B.6.1); event `acting_pos` uses the next-player convention, consistent with collect/eval (B.2); `action_probs`/sampling mask illegal+dominated actions via the same `GameState.get_legal_action_mask` the MCTS/eval paths use — fold is dropped when checking is free and capped raise bins collapse into the single all-in (B.5.2/B.5.3); preflop raises are classified open vs 3bet+ by raises-this-street (B.5.6); raise-size→solver-frac conversion divides by `pot+facing_bet` (B.5.1); `max_actions = 6*num_players+8`, truncations warned not silently dropped (B.6.3). The v3 solver's value-bet pot is `pot + raise_amount + (raise_amount − facing_bet)` (B.1) and raise EV is multiway-aware (`Π p_fold` to win uncontested, else showdown vs callers — B.5.4).
 
 ### Opponent Data (`generation/generate_opponent.py`)
 
-Simulates hands with trained agents, tracking per-player hand ranges. At each decision: runs inference for every hand in acting player's range → averages action distributions → training target. Range narrowing: removes hands where P(chosen)/P(best) < threshold. Shared event format (all hands unmasked); data loader converts to per-observer masking.
+Simulates hands with trained agents, tracking per-player hand ranges via a soft-Bayes belief (`opponent_data.bayes`). At each decision: runs inference over the ESS-truncated forward subset of the acting player's range → belief-weighted average action distribution → training target. Shared event format (all hands unmasked, with a per-position `stacks` vector); data loader converts to per-observer masking.
+
+Audit-B fixes: fixed hands are physically consistent — disjoint from the revealed board and from other players' fixed hands; an acting hand that collides with a later board card is re-sampled, and observers whose fixed hand lands on the board are dropped from `hero_positions` (B.4). Un-observed (non-forward) combos in the Bayes update get the **likelihood floor** (min observed tempered likelihood), not an implicit 1.0, so the excluded tail does not inflate (B.7.1). Each scenario persists the per-combo distributions + weights + combo card-pairs; the loader **re-averages the target per observer**, excluding combos blocked by that observer's own cards (B.7.2).
 
 **Parallel generation** (`opponent_data.n_workers > 1`): reuses the same GPU inference server as MCTS (`agent/mcts/inference_server.py`). CPU actor processes play hands + range bookkeeping; the only model forward — the action-head combo inference in `_compute_range_probs` — is routed to the server via `EvalProxy` (`FORWARD_BATCH`). No opponent embedding here (`skip_opponent_emb=True`), so no server-side state. Hands split across actors with contiguous `hand_id` offsets; parent merges scenarios and saves once (no per-`save_every_hands` incremental save in parallel mode). Config: `opponent_data.n_workers` (default 1 = sequential, unchanged), `server_max_batch` (256), `server_linger_ms` (2).
 
@@ -180,7 +188,7 @@ Simulates hands with trained agents, tracking per-player hand ranges. At each de
 Computed per-agent at training time. Norm stats saved in `best.pt` as `_checkpoint_norm_stats`. Downstream phases (modelling, opponent_action) reuse checkpoint norm stats to avoid distribution mismatch with frozen perception.
 
 **EV**: `ev_target / max(pot + facing_bet, big_blind)` → z-score.
-**Events**: pot, stack, bets → z-score. Blinds → z-score.
+**Events**: pot, stack, bets → z-score. The per-position `stacks` vector (B.6.2) reuses the hero-`stack` mean/std (same units). Blinds → z-score.
 **Action EVs** (modelling only): same scale as EV target, normalized separately via `_normalize_action_evs()`.
 
 ## Pipeline Flow (`pipeline.py`)

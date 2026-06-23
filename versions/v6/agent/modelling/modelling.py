@@ -4,7 +4,6 @@ import torch.utils.checkpoint as ckpt
 from transformers import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm, repeat_kv,
-    apply_rotary_pos_emb,
 )
 
 
@@ -32,15 +31,16 @@ class Qwen3CrossAttention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, query, key_value, mask=None, q_position_embeddings=None, kv_position_embeddings=None):
+    def forward(self, query, key_value, mask=None):
         """
         Args:
             query:     (B, Nq, d_model) — action embeddings
             key_value: (B, Nkv, d_model) — decoder output (context)
             mask:      (B, Nkv) float — 1 for real, 0 for padding
-            q_position_embeddings: (cos, sin) tuple for RoPE on queries
-            kv_position_embeddings: (cos, sin) tuple for RoPE on keys
         Returns: (B, Nq, d_model)
+
+        A.2: No RoPE here by design — action queries are orderless and the
+        context keys already carry positional information from the decoder.
         """
         B, Nq, _ = query.shape
         Nkv = key_value.shape[1]
@@ -48,16 +48,6 @@ class Qwen3CrossAttention(nn.Module):
         q = self.q_norm(self.q_proj(query).view(B, Nq, self.n_heads, self.head_dim)).transpose(1, 2)
         k = self.k_norm(self.k_proj(key_value).view(B, Nkv, self.n_kv_heads, self.head_dim)).transpose(1, 2)
         v = self.v_proj(key_value).view(B, Nkv, self.n_kv_heads, self.head_dim).transpose(1, 2)
-
-        # RoPE on queries — gives each action a distinct positional signature
-        if q_position_embeddings is not None:
-            cos, sin = q_position_embeddings
-            q, _ = apply_rotary_pos_emb(q, q, cos, sin)
-
-        # RoPE on keys — positional encoding for context tokens
-        if kv_position_embeddings is not None:
-            cos, sin = kv_position_embeddings
-            _, k = apply_rotary_pos_emb(k, k, cos, sin)
 
         # GQA: repeat K, V heads to match Q heads
         k = repeat_kv(k, self.n_kv_groups)
@@ -89,6 +79,8 @@ class ModellingHead(nn.Module):
 
     def __init__(self, d_model, n_actions, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len, dropout=0.1):
         super().__init__()
+        assert d_model % n_heads == 0, (
+            f"d_model {d_model} must be divisible by n_heads {n_heads}")
         self.n_actions = n_actions
         self.d_model = d_model
 
@@ -99,6 +91,7 @@ class ModellingHead(nn.Module):
             hidden_size=d_model,
             num_attention_heads=n_heads,
             num_key_value_heads=n_kv_heads,
+            head_dim=d_model // n_heads,
             intermediate_size=d_ff,
             num_hidden_layers=n_layers,
             max_position_embeddings=max_seq_len,
@@ -127,19 +120,26 @@ class ModellingHead(nn.Module):
             mask: (batch, seq_len) float — 1 for real, 0 for padding
         Returns: (batch, n_actions, d_model) — action embedding vectors
         """
-        batch_size, seq_len = context.shape[0], context.shape[1]
+        batch_size = context.shape[0]
 
         # Initialize action queries from learnable embeddings
         action_ids = torch.arange(self.n_actions, device=context.device)
         x = self.action_embeddings(action_ids).unsqueeze(0).expand(batch_size, -1, -1)
 
-        # RoPE for action queries (self-attention + cross-attention Q)
+        # RoPE for action queries — used by the self-attention refinement only.
+        # (A.2: cross-attention is RoPE-free; the context already carries
+        # positional information from the decoder.)
         position_ids = torch.arange(self.n_actions, device=context.device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.rope(x, position_ids)
 
-        # RoPE for context keys (cross-attention K)
-        kv_position_ids = torch.arange(seq_len, device=context.device).unsqueeze(0).expand(batch_size, -1)
-        kv_position_embeddings = self.rope(context, kv_position_ids)
+        # A.2: all-visible (zeros) mask so action queries attend to each other
+        # symmetrically in self-attention. An explicit mask disables Qwen3's
+        # is_causal, which otherwise imposed a spurious fold..allin ordering on
+        # the orderless action set.
+        self_attn_mask = torch.zeros(
+            batch_size, 1, self.n_actions, self.n_actions,
+            dtype=x.dtype, device=context.device,
+        )
 
         use_ckpt = (self.gradient_checkpointing and self.training
                     and torch.is_grad_enabled())
@@ -147,11 +147,10 @@ class ModellingHead(nn.Module):
         def _block(x, cross_norm, cross_attn, self_attn, context, mask):
             residual = x
             x = residual + self.resid_dropout(cross_attn(
-                cross_norm(x), context, mask=mask,
-                q_position_embeddings=position_embeddings,
-                kv_position_embeddings=kv_position_embeddings))
+                cross_norm(x), context, mask=mask))
             layer_out = self_attn(x, position_ids=position_ids,
-                                  position_embeddings=position_embeddings)
+                                  position_embeddings=position_embeddings,
+                                  attention_mask=self_attn_mask)
             return layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         for cross_norm, cross_attn, self_attn in zip(

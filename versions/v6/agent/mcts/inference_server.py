@@ -1,3 +1,6 @@
+import os as _os
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 """
 GPU inference server for parallel MCTS collection.
 
@@ -114,8 +117,52 @@ def _run_root(agent, worker_id, agent_name, event_sequences, device, get_table,
     # `.detach()` ensures we don't hold autograd state — torch.set_grad_enabled
     # is already False at server start, but explicit is safer.
     root_cache[(worker_id, agent_name)] = (p_out.detach(), mask.detach())
-    return (p_out.cpu(), mask.cpu(), value.cpu(),
-            act_logits.cpu(), opp_logits.cpu(), act_embs.cpu())
+    root_len = int(p_out.shape[1])
+    return (root_len, value.half().cpu(),
+            act_logits.half().cpu(), opp_logits.half().cpu(),
+            act_embs.half().cpu())
+
+
+def _run_root_batch(agent, reqs, device, get_table, root_cache, resp_qs):
+    """Batched ROOT: perception + 4 heads on N event sequences at once.
+
+    Opponent-embedding must be handled per-worker (each worker mutates its own
+    GRU table). When opp_emb is enabled, we fall back to serial execution;
+    when disabled, we batch all event sequences into one forward.
+    """
+    if agent.perception.opp_emb_enabled:
+        for (rid, wid, name, _rtype, payload) in reqs:
+            res = _run_root(agent, wid, name, payload, device, get_table,
+                            root_cache)
+            resp_qs[wid].put((rid, "OK", res))
+        return
+
+    all_events = []
+    for (_rid, _wid, _name, _rtype, payload) in reqs:
+        all_events.extend(payload)
+
+    p_out, encoded, mask = agent.perception.forward_batch(
+        all_events, device=device, skip_memory=True,
+        skip_opponent_emb=True, opponent_emb_table=None)
+    values = agent.value_head(p_out, mask=mask)
+    act_logits = agent.action_head(p_out, mask=mask)
+    opp_logits = agent.opponent_action_head(p_out, mask=mask)
+    act_embs = agent.modelling_head(p_out, mask=mask)
+
+    off = 0
+    for (rid, wid, name, _rtype, payload) in reqs:
+        n = len(payload)
+        po = p_out[off:off + n]
+        mk = mask[off:off + n]
+        root_cache[(wid, name)] = (po.detach(), mk.detach())
+        root_len = int(po.shape[1])
+        res = (root_len,
+               values[off:off + n].half().cpu(),
+               act_logits[off:off + n].half().cpu(),
+               opp_logits[off:off + n].half().cpu(),
+               act_embs[off:off + n].half().cpu())
+        resp_qs[wid].put((rid, "OK", res))
+        off += n
 
 
 def _run_leaf_batch(agent, reqs, device):
@@ -146,10 +193,11 @@ def _run_leaf_batch(agent, reqs, device):
     out = []
     off = 0
     for i, n in enumerate(sizes):
-        v = values[off:off + n].cpu()
+        v = values[off:off + n].half().cpu()
         if needs[i]:
-            out.append((v, act[off:off + n].cpu(),
-                        opp[off:off + n].cpu(), embs[off:off + n].cpu()))
+            out.append((v, act[off:off + n].half().cpu(),
+                        opp[off:off + n].half().cpu(),
+                        embs[off:off + n].half().cpu()))
         else:
             out.append((v, None, None, None))
         off += n
@@ -217,10 +265,11 @@ def _run_leaf_cached_batch(agent, reqs, device, root_cache):
     out = []
     off = 0
     for i, n in enumerate(sizes):
-        v = values[off:off + n].cpu()
+        v = values[off:off + n].half().cpu()
         if needs[i]:
-            out.append((v, act[off:off + n].cpu(),
-                        opp[off:off + n].cpu(), embs[off:off + n].cpu()))
+            out.append((v, act[off:off + n].half().cpu(),
+                        opp[off:off + n].half().cpu(),
+                        embs[off:off + n].half().cpu()))
         else:
             out.append((v, None, None, None))
         off += n
@@ -301,10 +350,7 @@ def _run_group(agent, rtype, reqs, device, get_table, resp_qs, root_cache):
     with _timing.span("server_run_group", rtype=rtype, n_reqs=len(reqs),
                       n_items=n_leaves):
         if rtype == REQ_ROOT:
-            for (rid, wid, name, _rtype, payload) in reqs:
-                res = _run_root(agent, wid, name, payload, device, get_table,
-                                root_cache)
-                resp_qs[wid].put((rid, "OK", res))
+            _run_root_batch(agent, reqs, device, get_table, root_cache, resp_qs)
         elif rtype == REQ_LEAF:
             results = _run_leaf_batch(agent, reqs, device)
             for req, res in zip(reqs, results):
@@ -340,9 +386,18 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
     torch.set_grad_enabled(False)
     device = server_cfg.get("device", "cuda")
     max_batch = int(server_cfg.get("server_max_batch", 256))
-    linger = float(server_cfg.get("server_linger_ms", 2)) / 1000.0
+    n_workers = int(server_cfg.get("n_workers", 1))
+    base_linger = float(server_cfg.get("server_linger_ms", 2))
+    # E.2.3: with few workers, linger longer to accumulate a batch; with many,
+    # the queue fills fast so linger can be shorter. Scale inversely so the
+    # effective batch size stays ~constant regardless of worker count.
+    if n_workers >= 4:
+        linger = base_linger * max(0.25, 2.0 / n_workers) / 1000.0
+    else:
+        linger = base_linger / 1000.0
 
-    sys.stderr.write(f"[server] starting on device={device} max_batch={max_batch}\n")
+    sys.stderr.write(f"[server] starting on device={device} max_batch={max_batch} "
+                     f"n_workers={n_workers} linger={linger*1000:.1f}ms\n")
     sys.stderr.flush()
 
     opp_tables = {}
@@ -411,17 +466,15 @@ def server_main(spec, req_q, resp_qs, ready_event, stop_event, server_cfg):
                         hit_max=(len(bucket) >= max_batch),
                     )
 
-                # Group by (req_type, agent, worker_for_ROOT). ROOT is keyed
-                # by worker too because each worker has its own opp-emb table.
-                # LEAF_CACHED is NOT keyed by worker — `_run_leaf_cached_batch`
-                # looks up each request's own (worker, agent) cache entry while
-                # building context, so cross-worker batching for the same agent
-                # is still safe and desirable.
+                # Group by (req_type, agent). ROOT requests are batched across
+                # workers when opp_emb is disabled; _run_root_batch falls back
+                # to serial when opp_emb is on (each worker mutates its own
+                # GRU table). LEAF_CACHED looks up per-(worker, agent) cache
+                # entries internally, so cross-worker batching is safe.
                 groups = defaultdict(list)
                 for req in bucket:
                     _rid, wid, name, rtype, _payload = req
-                    key = (rtype, name, wid if rtype == REQ_ROOT else None)
-                    groups[key].append(req)
+                    groups[(rtype, name, None)].append(req)
 
                 for (rtype, name, _wid), reqs in groups.items():
                     try:

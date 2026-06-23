@@ -156,28 +156,25 @@ class RemoteEvaluator(_RemoteBase):
         self._root_len = 0
 
     def evaluate_root(self, event_sequences):
-        # event_sequences are plain dicts (np bets serialize fine via pickle).
         result = self._rpc(self.agent_name, REQ_ROOT, event_sequences)
-        # Cache the root prefix length locally so subsequent LEAF flushes can
-        # strip it off before sending. Server-side cache is keyed by the same
-        # (worker_id, agent_name) and is populated by `_run_root`.
-        # result = (p_out, mask, value, act_logits, opp_logits, act_embs)
-        p_out = result[0]
-        self._root_len = int(p_out.shape[1])
-        return result
+        # E.2.4: server sends (root_len, value, act_logits, opp_logits,
+        # act_embs) — no p_out/mask tensors, saving ~root_len × d_model × 2
+        # bytes of IPC per decision. The server keeps the GPU-resident
+        # root_ctx cached; LEAF_CACHED rebuilds full context server-side.
+        root_len = result[0]
+        self._root_len = int(root_len)
+        value, act_logits, opp_logits, act_embs = result[1], result[2], result[3], result[4]
+        return None, None, value, act_logits, opp_logits, act_embs
 
     def evaluate_leaves(self, batch_ctx, batch_mask, needs_expansion):
-        if PARALLEL_OPT_ENABLED and self._root_len > 0:
-            # Strip the cached root prefix and ship only the deltas. The server
-            # rebuilds full context by concatenating its cached root_ctx.
-            r = self._root_len
-            # If a path has no delta (depth 0 → leaf is root, only possible for
-            # degenerate trees), batch_ctx.shape[1] == r and delta is empty.
-            delta_ctx = batch_ctx[:, r:, :].detach().to(torch.float16).cpu()
-            delta_mask = batch_mask[:, r:].detach().cpu()
+        if PARALLEL_OPT_ENABLED:
+            # E.2.4: root_ctx was never prepended to batch_ctx (it lives on the
+            # server), so the entire batch_ctx IS the delta. The server rebuilds
+            # full context by concatenating its cached root_ctx.
+            delta_ctx = batch_ctx.detach().to(torch.float16).cpu()
+            delta_mask = batch_mask.detach().cpu()
             payload = (delta_ctx, delta_mask, bool(needs_expansion))
             return self._rpc(self.agent_name, REQ_LEAF_CACHED, payload)
-        # Legacy path: full batch_ctx over the wire.
         payload = (
             batch_ctx.detach().to(torch.float16).cpu(),
             batch_mask.detach().cpu(),

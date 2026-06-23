@@ -97,12 +97,13 @@ def apply_modifiers(scenarios, modifiers, n_actions, big_blind, temperature):
         temperature: base GTO temperature
 
     Returns:
-        list of modified scenario dicts (deepcopy)
+        list of modified scenario dicts (shallow copy; only action_evs/action_probs/ev_target are mutated)
     """
-    scenarios = copy.deepcopy(scenarios)
-
     if not modifiers:
         return scenarios
+
+    scenarios = [{**s, "action_evs": list(s["action_evs"]),
+                  "action_probs": list(s["action_probs"])} for s in scenarios]
 
     # Separate temperature modifier (applied at the end)
     temp = temperature
@@ -126,9 +127,16 @@ def apply_modifiers(scenarios, modifiers, n_actions, big_blind, temperature):
             entry["cond"] = (field, op, thresh)
         parsed_mods.append(entry)
 
-    normalizer = big_blind * temp
-
     for s in scenarios:
+        # Audit B.3: use the SAME per-scenario normalizer as generation
+        # (generate.py:834/913), not `big_blind * temp`. Generation softmaxes
+        # action_evs by `max(pot + facing_bet, big_blind) * temperature`; using
+        # only `big_blind * temp` here recomputed action_probs on a different
+        # (much sharper) scale than the base dataset, so an identity-temperature
+        # modifier would NOT reproduce the base targets. GTO scenarios carry
+        # top-level `pot`/`facing_bet` (generate.py:922-923).
+        normalizer = max(s["pot"] + s["facing_bet"], big_blind) * temp
+
         evs = s["action_evs"]
         if isinstance(evs, list):
             evs = [float(e) for e in evs]

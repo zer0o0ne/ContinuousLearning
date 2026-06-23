@@ -9,17 +9,24 @@ class Table:
         self.num_players = num_players
         self.big_blind = big_blind
         self.small_blind = small_blind
-        self.start_credits = start_credits
-        self.credits = [start_credits] * num_players
+        # B.6.1: per-seat starting stacks. Accept a scalar (same stack for all
+        # seats) OR a per-seat sequence. Stored as a float array so downstream
+        # `hero_invested = start_credits[pos] - credits[pos]` works for the
+        # asymmetric (per-seat) stacks the data generators now sample.
+        if np.ndim(start_credits) == 0:
+            self.start_credits = np.full(num_players, float(start_credits))
+        else:
+            self.start_credits = np.asarray(start_credits, dtype=float)
+        self.credits = list(self.start_credits)
         self.raise_sizes = raise_sizes  # list of 4 lists (one per street)
         self.n_raise_bins = len(raise_sizes[0])
         self.judger = Judger()
 
     def reset(self, position = None):
         if position is None:
-            self.credits = [self.start_credits] * self.num_players
+            self.credits = list(self.start_credits)
         else:
-            self.credits[position] = self.start_credits
+            self.credits[position] = self.start_credits[position]
 
     def get_hand(self):
         pos = self.active_player
@@ -45,7 +52,15 @@ class Table:
         self.high_bet = self.big_blind
         self.bets = np.zeros((self.num_players,))
         self.bets[0], self.bets[1] = sb, bb
+        # Per-hand cumulative contributions per player. Unlike self.bets (which
+        # next_turn resets to zero on each street change), this accumulates over
+        # the whole hand. Seeded with the blinds here; step() adds each action's
+        # chips. Used at showdown so chips from earlier streets are not lost.
+        self.cumulative_bets = np.copy(self.bets)
         self.turn = 0
+        # C.7.5: NLHE min-raise tracking. The big blind is the initial "raise".
+        self.last_raise_size = float(self.big_blind)
+        self._last_full_raise_level = float(self.big_blind)
 
     def step(self, action):
         bet = 0
@@ -55,7 +70,7 @@ class Table:
                 self.players_state[self.active_player] = -1
 
             if action == 1:
-                bet = min(self.high_bet - self.bets[self.active_player], self.credits[self.active_player]) 
+                bet = min(self.high_bet - self.bets[self.active_player], self.credits[self.active_player])
                 self.pot += bet
                 self.credits[self.active_player] -= bet
                 self.bets[self.active_player] += bet
@@ -63,6 +78,7 @@ class Table:
                 if self.credits[self.active_player] == 0: self.players_state[self.active_player] = 2
 
             if action > 1 and action < self.n_raise_bins + 2:
+                old_high = self.high_bet
                 raise_pct = self.raise_sizes[self.turn][action - 2]
                 effective_pot = self.pot - self.bets[self.active_player]
                 call_amount = self.high_bet - self.bets[self.active_player]
@@ -71,17 +87,29 @@ class Table:
                 self.credits[self.active_player] -= bet
                 self.bets[self.active_player] += bet
                 self.high_bet = max(self.high_bet, self.bets[self.active_player])
+                # C.7.5: track raise increment for min-raise logic
+                raise_inc = self.high_bet - old_high
+                if raise_inc > 0 and raise_inc >= self.last_raise_size:
+                    self.last_raise_size = float(raise_inc)
+                    self._last_full_raise_level = float(self.high_bet)
                 self.players_state[self.active_player] = 0
                 if self.credits[self.active_player] == 0: self.players_state[self.active_player] = 2
 
             if action == self.n_raise_bins + 2:
+                old_high = self.high_bet
                 bet = self.credits[self.active_player]
                 self.pot += bet
                 self.credits[self.active_player] -= bet
                 self.bets[self.active_player] += bet
                 self.high_bet = max(self.high_bet, self.bets[self.active_player])
+                # C.7.5: only update on full raise
+                raise_inc = self.high_bet - old_high
+                if raise_inc > 0 and raise_inc >= self.last_raise_size:
+                    self.last_raise_size = float(raise_inc)
+                    self._last_full_raise_level = float(self.high_bet)
                 self.players_state[self.active_player] = 2
 
+        self.cumulative_bets[self.active_player] += bet
         end = self.next_turn()
         return end, self.several_all_in, self.get_state(), bet
 
@@ -99,14 +127,17 @@ class Table:
         moving_players = self.players_state == 1
         if moving_players.sum() == 0:
             if self.turn == 3:
-                rewards = self.judger.get_reward(self.deck, self.players_state, self.bets)
-                for i in range(self.num_players): 
-                    self.credits[i] += rewards[i] + self.bets[i]
+                rewards = self.judger.get_reward(self.deck, self.players_state, self.cumulative_bets)
+                for i in range(self.num_players):
+                    self.credits[i] += rewards[i] + self.cumulative_bets[i]
                 return True
             else:
                 self.turn += 1
                 self.bets = np.zeros((self.num_players,))
                 self.high_bet = 0
+                # C.7.5: reset min-raise to big blind on new street
+                self.last_raise_size = float(self.big_blind)
+                self._last_full_raise_level = 0.0
                 self.players_state[waiting_players] = 1
                 start_pos = 1 if self.num_players == 2 else 0
                 for offset in range(self.num_players):

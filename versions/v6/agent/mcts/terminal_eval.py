@@ -24,7 +24,8 @@ from agent.gto_utils.gpu_solver_v2 import (
 
 def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                            value_scales_by_position=None,
-                           proxy=None, agent_name_by_pos=None, equity_device=None):
+                           proxy=None, agent_name_by_pos=None, equity_device=None,
+                           combo_probs_cache=None):
     """Evaluate terminal nodes across all MCTS trees from one completed hand.
 
     For fold terminals: deterministic Q (pot distribution).
@@ -52,13 +53,18 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
             head's outputs at non-terminal leaves; ``re_backup_terminals``
             then propagates them up consistently. When omitted, terminal Q
             is left in raw chips (legacy / debugging behaviour).
+        combo_probs_cache: optional pre-computed cache from
+            ``_precompute_combo_probs``. When provided, skips the expensive
+            per-combo action-head inference (E.1.1 dedup).
+
+    Returns:
+        combo_probs_cache — the cache (computed or passed through), so the
+        caller can forward it to ``compute_equity_outcome``.
     """
     cfg = config or {}
     n_equity_iters = cfg.get("n_equity_iters", 3000)
     max_batch = cfg.get("max_batch", 128)
     prob_floor = float(cfg.get("terminal_eval_prob_floor", 0.05))
-    # Device for the pure-card equity MC. In parallel actors this is forced to
-    # "cpu" (actors must not init CUDA); sequential keeps the passed device.
     eq_dev = equity_device if equity_device is not None else device
 
     decisions = hand_record["decisions"]
@@ -66,21 +72,18 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
     hero_hands = hand_record["hero_hands"]
     num_players = hand_record["num_players"]
 
-    # Pre-compute per-combo action probs for each decision (for range narrowing)
-    # combo_probs[decision_idx] = {pos: (combos, per_combo_probs)} or None
-    combo_probs_cache = _precompute_combo_probs(
-        decisions, hero_hands, agents_by_position, num_players, device, max_batch,
-        proxy=proxy, agent_name_by_pos=agent_name_by_pos)
+    if combo_probs_cache is None:
+        combo_probs_cache = _precompute_combo_probs(
+            decisions, hero_hands, agents_by_position, num_players, device,
+            max_batch, proxy=proxy, agent_name_by_pos=agent_name_by_pos)
+
+    narrow_cache = {}
 
     # Process each tree
+    equity_cache = {}
     for dec_idx, decision in enumerate(decisions):
         root = decision["mcts_root"]
         if root is None:
-            # Past-opponent decision: no MCTS tree, nothing to evaluate.
-            # (Range-narrowing through `_precompute_combo_probs` still uses
-            # the past agent's action_head when other heroes' equity is
-            # computed — see `_precompute_combo_probs` which does not depend
-            # on `mcts_root`.)
             continue
         hero_pos = decision["player_pos"]
         root_gs = decision["game_state_at_root"]
@@ -89,9 +92,6 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
         board_cards = _board_at_turn(deck, root_turn)
         initial_stacks = list(root_gs.credits)
 
-        # Scale into which terminal Q must be projected so it matches the
-        # value-head outputs already living in ancestors' W (the cycle's
-        # `mcts_value_scale`). 1.0 keeps raw chips (legacy / debug).
         if value_scales_by_position is not None:
             scale = float(value_scales_by_position.get(hero_pos, 1.0))
         else:
@@ -101,7 +101,6 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
 
         terminals = _collect_terminals(root)
         for terminal in terminals:
-            # Replay game state to terminal
             path = _path_to_root(terminal)
             gs = root_gs.clone()
             for node in path[1:]:
@@ -110,9 +109,10 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
 
             active = [i for i in range(num_players) if gs.players_state[i] >= 0]
             hero_invested = initial_stacks[hero_pos] - gs.credits[hero_pos]
+            contributions = [initial_stacks[p] - gs.credits[p]
+                             for p in range(num_players)]
 
             if len(active) <= 1:
-                # FOLD terminal: one player wins the pot, others lose invested
                 if len(active) == 1:
                     winner = active[0]
                     if winner == hero_pos:
@@ -122,16 +122,13 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                 else:
                     q_chips = 0.0
             elif hero_pos not in active:
-                # Hero already folded along this path: locked at -invested.
                 q_chips = -hero_invested
             else:
-                # SHOWDOWN terminal with hero still in: MC equity needed
                 q_chips = _equity_terminal_chips(
                     hero_pos=hero_pos,
                     hero_hand=hero_hand,
                     board_cards=board_cards,
-                    pot=float(gs.pot),
-                    hero_invested=hero_invested,
+                    contributions=contributions,
                     active_players=active,
                     num_players=num_players,
                     dec_idx=dec_idx,
@@ -142,16 +139,21 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                     n_equity_iters=n_equity_iters,
                     device=eq_dev,
                     prob_floor=prob_floor,
+                    narrow_cache=narrow_cache,
+                    equity_cache=equity_cache,
                 )
 
             terminal.Q = q_chips / scale
 
         re_backup_terminals(root)
 
+    return combo_probs_cache
+
 
 def compute_equity_outcome(hand_record, agents_by_position, device,
                            ref_credits_by_decision, config=None,
-                           proxy=None, agent_name_by_pos=None, equity_device=None):
+                           proxy=None, agent_name_by_pos=None, equity_device=None,
+                           combo_probs_cache=None):
     """Equity-based realized outcome at the played-out final state of the hand.
 
     Replaces the noisy single-sample chip delta `final_credits[hero] −
@@ -219,6 +221,15 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
     final_pot = float(hand_record["final_pot"])
     final_active = list(hand_record["final_active_positions"])
     credits_pre_dist = list(hand_record["credits_pre_distribution"])
+    initial_credits = hand_record.get("initial_credits")
+
+    # C.5: per-player total contributions for the whole hand (for side-pot cap).
+    # contributions[p] = chips player p put in across all streets.
+    if initial_credits is not None:
+        contributions = [float(initial_credits[p]) - float(credits_pre_dist[p])
+                         for p in range(num_players)]
+    else:
+        contributions = None
 
     def _invested(dec_idx, hero_pos):
         return (float(ref_credits_by_decision[dec_idx][hero_pos])
@@ -226,6 +237,9 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
 
     realized_by_decision = {}
     equity_by_hero = {}
+    # C.5: cache side-pot-capped hero base (excess + equity * hero_share_pot)
+    # per hero so each decision only recomputes invested_from_t.
+    _hero_base_cache = {}
 
     base = {
         "final_pot": final_pot,
@@ -242,7 +256,6 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
                 realized_by_decision[dec_idx] = final_pot - invested
             else:
                 realized_by_decision[dec_idx] = -invested
-            # No showdown reached → equity is undefined.
             equity_by_hero.setdefault(hero_pos, None)
         return {
             "realized_by_decision": realized_by_decision,
@@ -254,9 +267,10 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
     # decisions made by that hero in this hand (cards & narrowing identical).
     board_cards = torch.tensor(deck[:5].tolist(), dtype=torch.long)
 
-    combo_probs_cache = _precompute_combo_probs(
-        decisions, hero_hands, agents_by_position, num_players, device, max_batch,
-        proxy=proxy, agent_name_by_pos=agent_name_by_pos)
+    if combo_probs_cache is None:
+        combo_probs_cache = _precompute_combo_probs(
+            decisions, hero_hands, agents_by_position, num_players, device,
+            max_batch, proxy=proxy, agent_name_by_pos=agent_name_by_pos)
 
     for dec_idx, decision in enumerate(decisions):
         hero_pos = decision["player_pos"]
@@ -283,7 +297,25 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
             )
 
         equity = equity_by_hero[hero_pos]
-        realized_by_decision[dec_idx] = equity * final_pot - invested
+
+        # C.5: side-pot-correct chip delta. hero_base = excess + equity *
+        # hero_share_pot (same for all decisions by this hero); only
+        # invested_from_t varies per decision.
+        if contributions is not None and hero_pos not in _hero_base_cache:
+            invested_hero_total = float(contributions[hero_pos])
+            opp_contribs = [float(contributions[p]) for p in final_active
+                            if p != hero_pos]
+            max_opp = max(opp_contribs) if opp_contribs else 0.0
+            effective_hero = min(invested_hero_total, max_opp)
+            excess = invested_hero_total - effective_hero
+            hero_share_pot = sum(min(float(c), effective_hero)
+                                 for c in contributions)
+            _hero_base_cache[hero_pos] = excess + equity * hero_share_pot
+
+        if contributions is not None:
+            realized_by_decision[dec_idx] = _hero_base_cache[hero_pos] - invested
+        else:
+            realized_by_decision[dec_idx] = equity * final_pot - invested
 
     return {
         "realized_by_decision": realized_by_decision,
@@ -304,30 +336,69 @@ def _board_at_turn(deck, turn):
         return torch.tensor(deck[:5].tolist(), dtype=torch.long)
 
 
-def _equity_terminal_chips(hero_pos, hero_hand, board_cards, pot, hero_invested,
+def _capped_showdown_chips(equity, contributions, hero_pos, active_players):
+    """Side-pot-correct hero chip delta at a showdown (C.5).
+
+    `contributions[p]` = chips player `p` put in the pot this hand (from the
+    root; folded players' dead money included). `active_players` = players
+    still live at this showdown, hero included. Replaces the naive
+    ``equity * full_pot − hero_invested``, which credited hero with chips no
+    opponent covered and never returned hero's uncalled excess:
+
+      - hero can win from each contributor only up to hero's own at-risk
+        amount → ``hero_share_pot = Σ_p min(contribution_p, effective_hero)``
+        with ``effective_hero = min(invested_hero, max active-opponent
+        contribution)``;
+      - hero's uncalled excess ``invested_hero − effective_hero`` is returned
+        unconditionally (no live opponent matched it).
+
+    Net = ``excess + equity · hero_share_pot − invested_hero``.
+    """
+    invested_hero = float(contributions[hero_pos])
+    opp_contribs = [float(contributions[p]) for p in active_players
+                    if p != hero_pos]
+    max_opp = max(opp_contribs) if opp_contribs else 0.0
+    effective_hero = min(invested_hero, max_opp)
+    excess = invested_hero - effective_hero
+    hero_share_pot = sum(min(float(c), effective_hero) for c in contributions)
+    return excess + equity * hero_share_pot - invested_hero
+
+
+def _equity_terminal_chips(hero_pos, hero_hand, board_cards, contributions,
                            active_players, num_players, dec_idx, decisions,
                            combo_probs_cache, path, root_gs, n_equity_iters,
-                           device, prob_floor=0.05):
+                           device, prob_floor=0.05,
+                           narrow_cache=None, equity_cache=None):
     """Compute hero's chip-units terminal Q via equity vs narrowed ranges.
 
     Used inside :func:`evaluate_all_terminals` for showdown terminals. Shared
     with :func:`_hero_equity_at_showdown` via the helpers below — only the
-    "what counts as active" and "where to apply path-narrowing" differ.
+    "what counts as active" and "where to apply path-narrowing" differ. The
+    equity is converted to chips with the side-pot-correct
+    :func:`_capped_showdown_chips` (C.5).
     """
     hero_cards_t = torch.tensor(hero_hand, dtype=torch.long)
     dead_cards = set(hero_hand)
     dead_cards.update(board_cards.tolist())
 
     opponent_combos = []
+    range_key_parts = []
     for opp_pos in active_players:
         if opp_pos == hero_pos:
             continue
         range_types = get_position_range(opp_pos, num_players)
-        range_types = _narrow_by_real_actions(
-            range_types, opp_pos, dec_idx, decisions, combo_probs_cache,
-            prob_floor=prob_floor)
+        narrow_key = (opp_pos, dec_idx, frozenset(dead_cards))
+        if narrow_cache is not None and narrow_key in narrow_cache:
+            range_types = narrow_cache[narrow_key]
+        else:
+            range_types = _narrow_by_real_actions(
+                range_types, opp_pos, dec_idx, decisions, combo_probs_cache,
+                prob_floor=prob_floor, dead_cards=dead_cards)
+            if narrow_cache is not None:
+                narrow_cache[narrow_key] = range_types
         range_types = _narrow_by_simulated_actions(
             range_types, opp_pos, hero_pos, path, root_gs)
+        range_key_parts.append((opp_pos, tuple(range_types)))
         combos = expand_range(range_types, dead_cards)
         if len(combos) == 0:
             combos = expand_range(
@@ -335,12 +406,20 @@ def _equity_terminal_chips(hero_pos, hero_hand, board_cards, pot, hero_invested,
         opponent_combos.append(combos)
 
     if not opponent_combos:
-        return pot - hero_invested
+        return _capped_showdown_chips(1.0, contributions, hero_pos,
+                                      active_players)
 
-    equity = gpu_equity_v2(
-        hero_cards_t, board_cards, opponent_combos,
-        n_iters=n_equity_iters, device=device)
-    return equity * pot - hero_invested
+    eq_key = (hero_pos, frozenset(active_players), tuple(range_key_parts))
+    if equity_cache is not None and eq_key in equity_cache:
+        equity = equity_cache[eq_key]
+    else:
+        equity = gpu_equity_v2(
+            hero_cards_t, board_cards, opponent_combos,
+            n_iters=n_equity_iters, device=device)
+        if equity_cache is not None:
+            equity_cache[eq_key] = equity
+    return _capped_showdown_chips(equity, contributions, hero_pos,
+                                  active_players)
 
 
 def _hero_equity_at_showdown(hero_pos, hero_hand, board_cards, final_active,
@@ -360,10 +439,12 @@ def _hero_equity_at_showdown(hero_pos, hero_hand, board_cards, final_active,
             continue
         range_types = get_position_range(opp_pos, num_players)
         # Use the entire decision sequence to narrow this opponent's range.
+        # C.7.3: pass hero's dead cards so impossible combos don't distort
+        # hand-type aggregation inside the Bayesian narrowing.
         range_types = _narrow_by_real_actions(
             range_types, opp_pos, current_dec_idx=len(decisions),
             decisions=decisions, combo_probs_cache=combo_probs_cache,
-            prob_floor=prob_floor)
+            prob_floor=prob_floor, dead_cards=dead_cards)
         combos = expand_range(range_types, dead_cards)
         if len(combos) == 0:
             combos = expand_range(
@@ -435,18 +516,19 @@ def _precompute_combo_probs(decisions, hero_hands, agents_by_position, num_playe
         all_probs = []
         for start in range(0, len(combos), max_batch):
             batch_combos = combos[start:start + max_batch]
-            batch_events = []
-            for c1, c2 in batch_combos.tolist():
-                events_copy = [dict(e) for e in events_template]
-                for e in events_copy:
-                    e["hand"] = [c1, c2]
-                batch_events.append(events_copy)
 
             if proxy is not None:
-                logits = proxy.forward_batch(
-                    agent_name_by_pos[acting_pos], batch_events, heads=("action",))
+                logits = proxy.forward_batch_templated(
+                    agent_name_by_pos[acting_pos], events_template,
+                    batch_combos.tolist(), heads=("action",))
                 probs = F.softmax(logits, dim=-1)
             else:
+                batch_events = []
+                for c1, c2 in batch_combos.tolist():
+                    events_copy = [dict(e) for e in events_template]
+                    for e in events_copy:
+                        e["hand"] = [c1, c2]
+                    batch_events.append(events_copy)
                 with torch.no_grad():
                     out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})
                     logits = out["action_logits"]
@@ -484,7 +566,7 @@ def _combo_to_hand_type(c1, c2):
 
 
 def _narrow_by_real_actions(range_types, opp_pos, current_dec_idx, decisions,
-                            combo_probs_cache, prob_floor=0.05):
+                            combo_probs_cache, prob_floor=0.05, dead_cards=None):
     """Narrow an opponent's range using their per-combo action probs from
     real decisions, with two robustness improvements over the legacy logic:
 
@@ -577,6 +659,11 @@ def _narrow_by_real_actions(range_types, opp_pos, current_dec_idx, decisions,
     for i in range(n_combos):
         c1 = int(ref_combos[i, 0])
         c2 = int(ref_combos[i, 1])
+        # C.7.3: skip combos containing observer's dead cards (hero hand +
+        # board) — impossible for the opponent, they distort which hand types
+        # survive before the final expand_range filters them out.
+        if dead_cards and (c1 in dead_cards or c2 in dead_cards):
+            continue
         ht = _combo_to_hand_type(c1, c2)
         type_mass[ht] = type_mass.get(ht, 0.0) + float(weights[i])
 

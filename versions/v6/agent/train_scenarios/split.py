@@ -7,7 +7,27 @@ preventing data leakage between train and validation sets.
 
 import random
 from collections import defaultdict
-from torch.utils.data import Subset
+from torch.utils.data import Subset, Sampler
+
+
+class OrderedBatchSampler(Sampler):
+    """Yield fixed batches in a caller-provided order (NO shuffle).
+
+    A.4.4: when the opponent GRU is active, examples must be fed chronologically
+    so the embedding table accumulates in the same order as at inference. The
+    caller passes `order` — a list of dataset positions already sorted into the
+    desired (chronological) sequence — and this batches them consecutively.
+    """
+
+    def __init__(self, order, batch_size):
+        self.batches = [list(order[i:i + batch_size])
+                        for i in range(0, len(order), batch_size)]
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
 
 
 def _infer_hand_ids(scenarios):

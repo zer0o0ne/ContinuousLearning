@@ -321,7 +321,7 @@ def _solver_choose_action(bundle, state, hero_user_pos, hole_cards_int,
         return 1
 
     gs = _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins,
-                           chip_scale)
+                           chip_scale, big_blind_internal=big_blind_internal)
     legal_mask = torch.tensor(
         gs.get_legal_action_mask(n_actions), dtype=torch.bool,
     )
@@ -617,6 +617,11 @@ def _build_events(snapshots, hole_cards_int, board_ints, hero_user_pos,
             user_pos = 1 - slumbot_pos
             bets_user[user_pos] = float(snap["bets"][slumbot_pos]) * inv_scale
         stack_user_hero = float(snap["credits"][1 - hero_user_pos]) * inv_scale
+        # B.6.2: per-position stacks vector in user frame (mirrors bets_user).
+        stacks_user = np.zeros(num_players, dtype=np.float32)
+        for slumbot_pos in range(2):
+            user_pos = 1 - slumbot_pos
+            stacks_user[user_pos] = float(snap["credits"][slumbot_pos]) * inv_scale
         events.append({
             "hand": list(hole_cards_int),
             "num_players": num_players,
@@ -625,6 +630,7 @@ def _build_events(snapshots, hole_cards_int, board_ints, hero_user_pos,
             "big_blind": float(big_blind_internal),
             "small_blind": float(small_blind_internal),
             "stack": stack_user_hero,
+            "stacks": stacks_user,
             "table": table,
             "pot": float(snap["pot"]) * inv_scale,
             "bets": bets_user,
@@ -634,7 +640,8 @@ def _build_events(snapshots, hole_cards_int, board_ints, hero_user_pos,
     return events
 
 
-def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scale):
+def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scale,
+                      big_blind_internal=None):
     """Construct a GameState (in training chip units) from SlumbotState for MCTS."""
     inv_scale = 1.0 / chip_scale
     # Reorder to user frame
@@ -661,6 +668,7 @@ def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scal
         n_raise_bins=n_raise_bins,
         is_terminal=False,
         several_all_in=False,
+        big_blind=float(big_blind_internal) * inv_scale if big_blind_internal is not None else float(state.get("high_bet", 10.0)) * inv_scale,
     )
 
 
@@ -896,7 +904,8 @@ def _choose_action(bundle, events, state, hero_user_pos, hole_cards_int,
     # Normalize a copy in place (events are local to this hand)
     _normalize_events_inplace(events, norm_stats)
 
-    gs = _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scale)
+    gs = _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scale,
+                           big_blind_internal=big_blind_internal)
 
     if bundle["mcts"] is not None:
         return int(bundle["mcts"].search([events], gs))
@@ -909,6 +918,7 @@ def _choose_action(bundle, events, state, hero_user_pos, hole_cards_int,
                 [events], skip_memory=True,
                 skip_opponent_emb=skip_opp,
                 opponent_emb_table=opp_table,
+                heads={"action"},
             )
     logits = out["action_logits"][0]
     legal_mask = torch.tensor(
@@ -1044,11 +1054,35 @@ def _stderr_bb_per_100(per_hand_chips):
     return float(arr.std(ddof=1) / np.sqrt(len(arr)) * 100.0)
 
 
+def _stderr_bb_per_100_online(welford_n, welford_M2):
+    """O(1) stderr of BB/100 from Welford's online variance state.
+
+    welford_n:  number of samples incorporated so far
+    welford_M2: running sum of squared deviations (already in BB units)
+    Returns the same value as _stderr_bb_per_100 but without iterating the list.
+    """
+    if welford_n < 2:
+        return 0.0
+    variance = welford_M2 / (welford_n - 1)  # sample variance (ddof=1)
+    return float(np.sqrt(variance / welford_n) * 100.0)
+
+
 def _make_session_buffers(n_actions):
     """Fresh accumulators for one agent session."""
     return {
         "per_hand_chips": [],
         "per_hand_baseline": [],
+        "sum_chips": 0.0,
+        "sum_baseline": 0.0,
+        # Welford's online variance accumulators (values in BB units).
+        # chips:
+        "welford_chips_n": 0,
+        "welford_chips_mean": 0.0,
+        "welford_chips_M2": 0.0,
+        # baseline:
+        "welford_baseline_n": 0,
+        "welford_baseline_mean": 0.0,
+        "welford_baseline_M2": 0.0,
         "clamp_counters": defaultdict(int),
         "action_hist": np.zeros(n_actions, dtype=np.int64),
         "action_hist_by_street": np.zeros((4, n_actions), dtype=np.int64),
@@ -1065,20 +1099,45 @@ def _update_progress(buffers, name, n_hands, log_every, pbar, log,
     per_hand_chips = buffers["per_hand_chips"]
     per_hand_baseline = buffers["per_hand_baseline"]
     done = len(per_hand_chips)
-    running_bcorr = _bb_per_100(sum(per_hand_baseline), done)
+    if done > 0:
+        latest_chips = per_hand_chips[-1]
+        latest_baseline = per_hand_baseline[-1]
+        buffers["sum_chips"] += latest_chips
+        buffers["sum_baseline"] += latest_baseline
+
+        # Welford online update (in BB units) — O(1) per hand.
+        x_chips = latest_chips / SLUMBOT_BIG_BLIND
+        n = buffers["welford_chips_n"] + 1
+        delta = x_chips - buffers["welford_chips_mean"]
+        new_mean = buffers["welford_chips_mean"] + delta / n
+        delta2 = x_chips - new_mean
+        buffers["welford_chips_n"] = n
+        buffers["welford_chips_mean"] = new_mean
+        buffers["welford_chips_M2"] += delta * delta2
+
+        x_baseline = latest_baseline / SLUMBOT_BIG_BLIND
+        n_b = buffers["welford_baseline_n"] + 1
+        delta_b = x_baseline - buffers["welford_baseline_mean"]
+        new_mean_b = buffers["welford_baseline_mean"] + delta_b / n_b
+        delta2_b = x_baseline - new_mean_b
+        buffers["welford_baseline_n"] = n_b
+        buffers["welford_baseline_mean"] = new_mean_b
+        buffers["welford_baseline_M2"] += delta_b * delta2_b
+
+    running_bcorr = _bb_per_100(buffers["sum_baseline"], done)
     running_residual = _bb_per_100(
-        sum(w_i - b_i for w_i, b_i in zip(per_hand_chips, per_hand_baseline)),
-        done,
-    )
+        buffers["sum_chips"] - buffers["sum_baseline"], done)
     pbar.set_postfix({
         "BB/100 base": f"{running_bcorr:+.1f}",
         "failed": buffers["hands_failed"],
     }, refresh=False)
     pbar.update(1)
     if post_log and done > 0 and done % log_every == 0:
-        raw = _bb_per_100(sum(per_hand_chips), done)
-        stderr_raw = _stderr_bb_per_100(per_hand_chips)
-        stderr_bcorr = _stderr_bb_per_100(per_hand_baseline)
+        raw = _bb_per_100(buffers["sum_chips"], done)
+        stderr_raw = _stderr_bb_per_100_online(
+            buffers["welford_chips_n"], buffers["welford_chips_M2"])
+        stderr_bcorr = _stderr_bb_per_100_online(
+            buffers["welford_baseline_n"], buffers["welford_baseline_M2"])
         buffers["history"]["bb100_raw"].append((done, raw))
         buffers["history"]["bb100_baseline"].append((done, running_bcorr))
         log(f"  [{name}] {done}/{n_hands}: "
@@ -1876,8 +1935,10 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
         bb100_raw = _bb_per_100(total_chips, n_played)
         bb100_bcorr = _bb_per_100(total_baseline, n_played)
         bb100_residual = _bb_per_100(total_chips - total_baseline, n_played)
-        stderr_bb100 = _stderr_bb_per_100(per_hand_chips)
-        stderr_bb100_bcorr = _stderr_bb_per_100(per_hand_baseline)
+        stderr_bb100 = _stderr_bb_per_100_online(
+            buffers["welford_chips_n"], buffers["welford_chips_M2"])
+        stderr_bb100_bcorr = _stderr_bb_per_100_online(
+            buffers["welford_baseline_n"], buffers["welford_baseline_M2"])
         mbb_per_hand_raw = bb100_raw * 10.0  # 1000 mbb / 100 hands
 
         # Action distribution analytics

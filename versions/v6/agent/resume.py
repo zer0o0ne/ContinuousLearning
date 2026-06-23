@@ -61,15 +61,17 @@ def atomic_json_dump(obj, path):
 
 
 def compute_config_hash(config):
-    """SHA256 over `game.*` + `solver.*` only.
+    """SHA256 over `game.*` + `solver.*` + `multi_agent.agents`.
 
-    Datasets become stale on any change to these — the simulator and solver
-    determine the data distribution. Everything else (architecture, training
-    hyperparams, mcts knobs) is orthogonal.
+    Datasets become stale on game/solver changes. Training phases become
+    stale on modifier changes (multi_agent.agents). Including all three
+    in a single hash means a modifier change also triggers dataset
+    regeneration (safe, slightly wasteful) — D.5.3.
     """
     payload = {
         "game":   config.get("game", {}),
         "solver": config.get("solver", {}),
+        "multi_agent_agents": config.get("multi_agent", {}).get("agents", []),
     }
     blob = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()

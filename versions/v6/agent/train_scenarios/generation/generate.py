@@ -20,6 +20,7 @@ import sys
 import json
 import copy
 import random
+import warnings
 import argparse
 import multiprocessing as mp
 from datetime import datetime
@@ -31,6 +32,12 @@ from tqdm.auto import tqdm
 
 from env.table import Table
 from agent.resume import atomic_torch_save, atomic_json_dump
+from agent.mcts.game_state import GameState
+
+# B.6.3: per-process tally of betting loops that hit max_actions without the
+# hand terminating (truncated raise-wars). Logged via a warning so truncation
+# is never silent.
+_truncation_stats = {"hands": 0, "truncated": 0}
 
 # Add gto_utils to path for direct import
 _gto_utils_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "gto_utils")
@@ -203,6 +210,8 @@ def _build_event(table, hero_pos, acting_pos, action, num_players, big_blind, sm
         "big_blind": float(big_blind),
         "small_blind": float(small_blind),
         "stack": hero_stack,
+        # B.6.2: per-position stacks vector (effective-stack signal).
+        "stacks": [float(c) for c in table.credits],
         "table": table_cards,
         "pot": float(table.pot),
         "bets": bets,
@@ -256,7 +265,7 @@ def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
     hero_t = torch.tensor(hand.tolist(), dtype=torch.long)
     board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
 
-    hero_invested = table.start_credits - table.credits[player_pos]
+    hero_invested = table.start_credits[player_pos] - table.credits[player_pos]
     facing_bet = max(0, table.high_bet - table.bets[player_pos])
     stack = table.credits[player_pos]
     pot = table.pot
@@ -404,7 +413,7 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
     hero_t = torch.tensor(hand.tolist(), dtype=torch.long)
     board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
 
-    hero_invested = table.start_credits - table.credits[player_pos]
+    hero_invested = table.start_credits[player_pos] - table.credits[player_pos]
     facing_bet = max(0, table.high_bet - table.bets[player_pos])
     stack = table.credits[player_pos]
     pot = table.pot
@@ -417,14 +426,32 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
     hero_bets = table.bets[player_pos]
     effective_pot = max(pot - hero_bets, 1e-6)
 
+    # B.5.2/B.5.3: playable-action mask, identical to the one the MCTS / eval /
+    # opponent-data inference paths build via GameState. Used to mask the
+    # policy softmax (below) so the training target and the sampled action both
+    # respect the same action set the policy is sampled from at play time:
+    #   - fold is illegal when checking is free (facing_bet == 0);
+    #   - raise bins that collapse to a call or duplicate the all-in are dropped
+    #     (otherwise k capped bins each carry the all-in EV and multiply its
+    #     softmax mass by k).
+    legal_mask = GameState.from_table(table, player_pos).get_legal_action_mask(n_actions)
+
     evs = torch.zeros(n_actions, dtype=torch.float)
 
     # Fold EV
     evs[0] = -hero_invested
 
     def _raise_to_solver_frac(raise_pct):
-        """Convert per-street raise_pct (fraction of effective pot) to solver raise_frac."""
-        return raise_pct * effective_pot / max(pot, 1e-6)
+        """Convert per-street raise_pct (fraction of effective pot) to solver raise_frac.
+
+        B.5.1: the solver's raise increment above the call is
+        `raise_frac * (pot + facing_bet)` (gpu_solver_v3), whereas the table
+        executes `raise_pct * effective_pot` on top of the call (table.py:69).
+        Equating the two → the denominator must be `pot + facing_bet`, not
+        `pot`. With `/pot` the EV labels were computed for a raise up to ~2x
+        larger than the action the table actually plays when facing a pot bet.
+        """
+        return raise_pct * effective_pot / max(pot + facing_bet, 1e-6)
 
     if solver_name == "v1":
         try:
@@ -458,7 +485,8 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
             for b in range(2, n_actions):
                 evs[b] = pot - hero_invested
             meta = {"equity": 1.0, "hero_invested": hero_invested,
-                    "facing_bet": facing_bet, "stack": stack, "pot": pot}
+                    "facing_bet": facing_bet, "stack": stack, "pot": pot,
+                    "legal_mask": legal_mask}
             return evs, meta
 
         if solver_name == "v3":
@@ -584,6 +612,7 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
         "facing_bet": facing_bet,
         "stack": stack,
         "pot": pot,
+        "legal_mask": legal_mask,
     }
     return evs, meta
 
@@ -636,6 +665,8 @@ def _rebuild_events(snapshots, deck, hero_pos, num_players, big_blind, small_bli
             "big_blind": float(big_blind),
             "small_blind": float(small_blind),
             "stack": float(snap["credits"][hero_pos]),
+            # B.6.2: per-position stacks vector (effective-stack signal).
+            "stacks": [float(c) for c in snap["credits"]],
             "table": table_cards,
             "pot": float(snap["pot"]),
             "bets": np.copy(snap["bets"]),
@@ -671,12 +702,15 @@ def generate_scenario(config, device="mps"):
     reraise_cap = config.get("reraise_cap", 0.10)
 
     num_players = random.randint(2, max_players)
-    start_credits = random.randint(big_blind * 2, max_stack)
+    # B.6.1: independent per-seat starting stacks (U[min,max] per seat) so the
+    # model sees asymmetric effective stacks. Table stores them per-seat, so
+    # hero_invested = start_credits[pos] - credits[pos] stays correct.
+    start_stacks = [random.randint(big_blind * 2, max_stack) for _ in range(num_players)]
 
     table = Table(
         num_players=num_players,
         raise_sizes=raise_sizes,
-        start_credits=start_credits,
+        start_credits=start_stacks,
         big_blind=big_blind,
         small_blind=small_blind,
     )
@@ -696,8 +730,16 @@ def generate_scenario(config, device="mps"):
         "action": None,
     })
 
-    max_actions = 4 * num_players
+    # B.6.3: cap high enough not to clip realistic raise-wars (was 4*N, which
+    # truncated multi-raise multiway pots). Truncations are logged below.
+    max_actions = 6 * num_players + 8
     action_history = []
+
+    # B.5.6: number of raises made so far on the CURRENT street, used to
+    # classify a preflop raise as an open (first raise) vs a 3bet+ (raise over
+    # a raise). Reset whenever the street advances.
+    street_raise_count = 0
+    cur_street = table.turn
 
     # V3/V4 solver params
     eqr_enabled = config.get("eqr_enabled", True)
@@ -747,11 +789,17 @@ def generate_scenario(config, device="mps"):
             weights = torch.ones(n_combos, dtype=torch.float32) / max(n_combos, 1)
             bayesian_state[pos] = {"hand_types": ht, "combos": combos, "weights": weights}
 
+    _truncation_stats["hands"] += 1
     for _ in range(max_actions):
         active_pos = table.active_player
 
         if table.players_state[active_pos] != 1:
             break
+
+        # B.5.6: reset the per-street raise counter when the street advances.
+        if table.turn != cur_street:
+            cur_street = table.turn
+            street_raise_count = 0
 
         # Compute ALL action EVs for the active player
         all_evs, meta = _compute_all_action_evs(
@@ -792,7 +840,7 @@ def generate_scenario(config, device="mps"):
                         table, active_pos, action_history, solver_mods
                     )
 
-                    hero_invested = table.start_credits - table.credits[active_pos]
+                    hero_invested = table.start_credits[active_pos] - table.credits[active_pos]
                     facing_bet = max(0, table.high_bet - table.bets[active_pos])
                     act_stack = table.credits[active_pos]
                     act_pot = table.pot
@@ -829,26 +877,42 @@ def generate_scenario(config, device="mps"):
             except Exception:
                 pass  # marginalization failed, continue with normal generation
 
-        # Sample action from full EVs
-        # Fix 5: normalize by pot size, not just big blind
+        # Sample action from full EVs.
+        # Fix 5: normalize by pot size, not just big blind.
+        # B.5.2/B.5.3: mask illegal/dominated actions before the softmax so the
+        # sampled (played) action respects the same playable set as inference.
         normalizer = max(meta["pot"] + meta["facing_bet"], big_blind) * temperature
-        probs = F.softmax(all_evs / normalizer, dim=0)
+        legal_mask_t = torch.tensor(meta["legal_mask"], dtype=torch.bool)
+        masked_evs = all_evs.masked_fill(~legal_mask_t, float("-inf"))
+        probs = F.softmax(masked_evs / normalizer, dim=0)
         choice_idx = torch.multinomial(probs, 1).item()
         action = torch.zeros(n_actions, dtype=torch.float32)
         action[choice_idx] = 1.0
 
-        # Classify action for range narrowing
+        # Classify action for range narrowing.
+        # B.5.6: classify preflop raises by the number of raises ALREADY made
+        # this street, not by all-in-vs-sized. The first voluntary preflop
+        # raise is an "open"; any raise over a raise is a "3bet" (narrows the
+        # opponent range to the very top — ACTION_NARROWING["3bet"]). The old
+        # code labeled every non-all-in preflop raise "open" (slice (0,1) → no
+        # narrowing), so 3bet/4bet ranges were never tightened.
         if choice_idx == 0:
             act_type = None
         elif choice_idx == 1:
             act_type = "call" if table.turn == 0 else "call_postflop"
-        elif choice_idx == n_raise_bins + 2:
-            act_type = "3bet" if table.turn == 0 else "bet_postflop"
         else:
-            act_type = "open" if table.turn == 0 else "bet_postflop"
+            # Any raise (sized bin or all-in).
+            if table.turn == 0:
+                act_type = "3bet" if street_raise_count >= 1 else "open"
+            else:
+                act_type = "bet_postflop"
 
         if act_type is not None:
             action_history.append((active_pos, act_type))
+
+        # Count this raise toward the current street's raise tally (B.5.6).
+        if choice_idx >= 2:
+            street_raise_count += 1
 
         # V4: Bayesian range update after observing action
         if solver_name == "v4" and v4_per_combo_probs is not None:
@@ -880,17 +944,33 @@ def generate_scenario(config, device="mps"):
         end, several_all_in, state, bet = table.step(action)
 
         # Save post-action snapshot
+        # Audit B.2: `acting_pos` in a post-action event uses the NEXT-player
+        # convention (who acts after this action) — consistent with collect.py,
+        # evaluate.py and generate_opponent.py. The decision snapshot above
+        # stores the actor (correct: that's who is on turn at the decision).
+        # Previously this stored `active_pos` (the actor who just moved),
+        # creating a train/inference event-schema mismatch.
         snapshots.append({
             "pot": table.pot,
             "bets": np.copy(table.bets),
             "credits": list(table.credits),
             "turn": table.turn,
-            "active_pos": active_pos,
+            "active_pos": table.active_player,
             "action": action,
         })
 
         if end or several_all_in:
             break
+    else:
+        # B.6.3: betting loop exhausted max_actions without terminating — a
+        # truncated raise-war. Not silent: warn with the running fraction.
+        _truncation_stats["truncated"] += 1
+        warnings.warn(
+            f"generate_scenario: hand truncated at max_actions={max_actions} "
+            f"({_truncation_stats['truncated']}/{_truncation_stats['hands']} hands "
+            f"truncated this process)",
+            stacklevel=2,
+        )
 
     if not decisions:
         return None
@@ -909,9 +989,14 @@ def generate_scenario(config, device="mps"):
             continue
 
         best_ev = float(all_evs.max().item())
-        # Fix 5: normalize by pot size, not just big blind
+        # Fix 5: normalize by pot size, not just big blind.
+        # B.5.2/B.5.3: mask illegal/dominated actions so the saved policy target
+        # matches the playable set (and the sampled action) — no train/inference
+        # gap, and the all-in mass is not multiplied by k capped raise bins.
         normalizer = max(meta["pot"] + meta["facing_bet"], big_blind) * temperature
-        action_probs = F.softmax(all_evs / normalizer, dim=0)
+        legal_mask_t = torch.tensor(meta["legal_mask"], dtype=torch.bool)
+        masked_evs = all_evs.masked_fill(~legal_mask_t, float("-inf"))
+        action_probs = F.softmax(masked_evs / normalizer, dim=0)
 
         results.append({
             "events": events,
@@ -1001,6 +1086,20 @@ def _compute_norm_stats(scenarios):
     }
 
 
+def _shallow_copy_scenarios(scenarios):
+    """Shallow-copy scenarios for normalization: copies only the mutable fields
+    (ev_target, events, action_evs, action_probs) without a full deepcopy."""
+    out = []
+    for s in scenarios:
+        copy = {**s, "events": [{**e} for e in s["events"]]}
+        if "action_evs" in copy:
+            copy["action_evs"] = list(copy["action_evs"])
+        if "action_probs" in copy:
+            copy["action_probs"] = list(copy["action_probs"])
+        out.append(copy)
+    return out
+
+
 def _normalize_scenarios(scenarios, norm_stats):
     """Normalize ev_target and event scalar inputs in-place.
 
@@ -1025,6 +1124,13 @@ def _normalize_scenarios(scenarios, norm_stats):
                 event["bets"] = (event["bets"] - bets_m) / bets_s
             else:
                 event["bets"] = [(b - bets_m) / bets_s for b in event["bets"]]
+            # B.6.2: normalize the per-position stacks vector on the same scale
+            # as the hero "stack" scalar (same units → reuse stack_mean/std).
+            if "stacks" in event:
+                if isinstance(event["stacks"], np.ndarray):
+                    event["stacks"] = (event["stacks"] - stack_m) / stack_s
+                else:
+                    event["stacks"] = [(c - stack_m) / stack_s for c in event["stacks"]]
 
 
 def _meta_path(dataset_dir):
@@ -1104,12 +1210,16 @@ def _get_generation_device(config_device=None):
 
 
 _shared_counter = None
+_worker_config = None
+_worker_device = None
 
 
-def _init_worker(counter):
-    """Initializer for pool workers — stores shared counter."""
-    global _shared_counter
+def _init_worker(counter, config=None, device=None):
+    """Initializer for pool workers — stores shared counter and config."""
+    global _shared_counter, _worker_config, _worker_device
     _shared_counter = counter
+    _worker_config = config
+    _worker_device = device
     torch.set_num_threads(1)
 
 
@@ -1117,12 +1227,15 @@ def _generate_worker(args):
     """Worker function for multiprocessing dataset generation.
 
     Args:
-        args: tuple of (config, device, n_hands, worker_id)
+        args: tuple of (n_hands, worker_id). Config and device are passed
+              via initargs to avoid pickling them per task.
 
     Returns:
         list of scenario dicts (flat)
     """
-    config, device, n_hands, worker_id = args
+    n_hands, worker_id = args
+    config = _worker_config
+    device = _worker_device
     scenarios = []
     failed = 0
     for _ in range(n_hands):
@@ -1177,6 +1290,18 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
         n_workers = min(os.cpu_count() or 1, 8)
 
     device = _get_generation_device(config.get("device"))
+    # E.3.5: cap CUDA workers to avoid OOM from multiple CUDA contexts. Each
+    # spawn'd worker creates its own CUDA context (~300-500 MB overhead) plus
+    # solver tensors. With the solver on GPU, limit to 2 workers (one active +
+    # one queuing) and let per-hand GPU work fill the device. CPU workers are
+    # uncapped (they use the GPU only via the solver's device arg).
+    if n_workers > 1 and str(device).startswith("cuda"):
+        max_cuda_workers = int(config.get("max_cuda_workers", 2))
+        if n_workers > max_cuda_workers:
+            if log:
+                log(f"Capping n_workers {n_workers} → {max_cuda_workers} "
+                    f"(CUDA device {device}, max_cuda_workers={max_cuda_workers})")
+            n_workers = max_cuda_workers
     dataset_path = os.path.join(save_dir, "dataset.pt")
     os.makedirs(save_dir, exist_ok=True)
     save_every_hands = config.get("save_every_hands", 1000)
@@ -1229,6 +1354,21 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                 # `save_every_hands` (anything between the last incremental
                 # _persist and the kill is regenerated).
                 scenarios = torch.load(dataset_path, weights_only=False)
+                # E.3.4: replay any un-compacted shards on top of dataset.pt
+                _shard_resume_dir = os.path.join(save_dir, "dataset_shards")
+                if os.path.isdir(_shard_resume_dir):
+                    import glob as _glob
+                    shard_files = sorted(_glob.glob(
+                        os.path.join(_shard_resume_dir, "shard_*.pt")))
+                    for sf in shard_files:
+                        try:
+                            delta = torch.load(sf, weights_only=False)
+                            scenarios.extend(delta)
+                        except Exception:
+                            pass
+                    if shard_files and log:
+                        log(f"  Replayed {len(shard_files)} shard(s) "
+                            f"→ {len(scenarios)} total samples")
                 start_attempts = int(meta.get("completed_attempts", 0))
                 start_hand_id = int(meta.get("completed_hands", 0))
                 initial_failed = max(0, start_attempts - start_hand_id)
@@ -1245,8 +1385,41 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
         if existing is not None:
             return existing
 
+    # E.3.4: shard-based incremental saving. Mid-generation saves write only
+    # new scenarios to numbered shard files instead of rewriting the entire
+    # list (which is O(N) per save → O(N²/k) total serialization). The final
+    # save compacts everything into dataset.pt.
+    shard_dir = os.path.join(save_dir, "dataset_shards")
+    _persisted_count = len(scenarios)  # scenarios loaded from prior run
+    _shard_idx = 0
+
     def _persist(meta_done):
-        atomic_torch_save(scenarios, dataset_path)
+        nonlocal _persisted_count, _shard_idx
+        if meta_done:
+            # Final save: compact everything into dataset.pt
+            atomic_torch_save(scenarios, dataset_path)
+            # Remove shard files
+            if os.path.isdir(shard_dir):
+                import glob
+                for sf in glob.glob(os.path.join(shard_dir, "shard_*.pt")):
+                    try:
+                        os.unlink(sf)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(shard_dir)
+                except OSError:
+                    pass
+        else:
+            # Incremental: save only new scenarios as a shard
+            new_count = len(scenarios)
+            if new_count > _persisted_count:
+                os.makedirs(shard_dir, exist_ok=True)
+                delta = scenarios[_persisted_count:]
+                shard_path = os.path.join(shard_dir, f"shard_{_shard_idx:06d}.pt")
+                atomic_torch_save(delta, shard_path)
+                _shard_idx += 1
+                _persisted_count = new_count
         if config_hash is not None or resume:
             _write_meta(save_dir, {
                 "version":            1,
@@ -1277,17 +1450,15 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                 log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
             log(f"Incremental save every {save_every_hands} hands")
 
-        chunk_size = 1
+        chunk_size = max(1, min(50, (n_scenarios - start_attempts) // max(1, n_workers * 4)))
         worker_args = []
         worker_id = start_attempts
         while worker_id < n_scenarios:
             n_hands = min(chunk_size, n_scenarios - worker_id)
-            worker_args.append((config, worker_device, n_hands, worker_id))
+            worker_args.append((n_hands, worker_id))
             worker_id += n_hands
 
         ctx = mp.get_context("spawn")
-        # Shared counter starts at start_attempts so meta's `completed_attempts`
-        # and the progress bar reflect cumulative work across all runs.
         counter = ctx.Value("i", start_attempts)
         total_ok = start_hand_id
         total_failed = initial_failed
@@ -1299,8 +1470,10 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                     initial=start_attempts)
 
         if worker_args:
-            with ctx.Pool(n_workers, initializer=_init_worker, initargs=(counter,)) as pool:
-                for worker_scenarios, ok, failed in pool.imap_unordered(_generate_worker, worker_args):
+            with ctx.Pool(n_workers, initializer=_init_worker,
+                          initargs=(counter, config, worker_device)) as pool:
+                for worker_scenarios, ok, failed in pool.imap_unordered(
+                        _generate_worker, worker_args, chunksize=1):
                     scenarios.extend(worker_scenarios)
                     total_ok += ok
                     total_failed += failed

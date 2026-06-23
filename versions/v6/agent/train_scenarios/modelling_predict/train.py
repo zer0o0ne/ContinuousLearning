@@ -10,7 +10,6 @@ Gradients flow through value_head (params frozen, graph intact) back to modellin
 
 import os
 import random
-import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,13 +18,14 @@ from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
-    _compute_norm_stats, _normalize_scenarios
+    _compute_norm_stats, _normalize_scenarios, _shallow_copy_scenarios
 from agent.train_scenarios.modelling_predict.dataset import GTOModellingDataset, batch_collate
 from agent.train_scenarios._checkpoint_io import (
     make_checkpoint,
     restore_optim_sched,
 )
 from agent.resume import atomic_torch_save
+from agent.train_scenarios._history import IncrementalHistory
 
 
 _PHASE = "modelling_predict"
@@ -34,28 +34,28 @@ _PHASE = "modelling_predict"
 class LengthGroupedBatchSampler(Sampler):
     """Sampler that groups samples by sequence length into batches.
 
-    Sorts by n_events, chunks into batches, shuffles batch order each epoch.
+    Batch composition is re-randomized every epoch: indices are shuffled
+    before stable-sorting by length, so same-length samples get different
+    neighbours each time (E.5.6).
     """
 
     def __init__(self, dataset, batch_size):
         self.batch_size = batch_size
-        indices = list(range(len(dataset)))
-        lengths = []
-        for i in indices:
-            sample = dataset[i]
-            lengths.append(len(sample[0]))
-        sorted_indices = sorted(indices, key=lambda i: lengths[i])
-        self.batches = [sorted_indices[i:i + batch_size]
-                        for i in range(0, len(sorted_indices), batch_size)]
+        self.n = len(dataset)
+        self.lengths = [len(dataset[i][0]) for i in range(self.n)]
 
     def __iter__(self):
-        batch_order = list(range(len(self.batches)))
-        random.shuffle(batch_order)
-        for idx in batch_order:
-            yield self.batches[idx]
+        indices = list(range(self.n))
+        random.shuffle(indices)
+        indices.sort(key=lambda i: self.lengths[i])
+        batches = [indices[i:i + self.batch_size]
+                   for i in range(0, len(indices), self.batch_size)]
+        random.shuffle(batches)
+        for batch in batches:
+            yield batch
 
     def __len__(self):
-        return len(self.batches)
+        return (self.n + self.batch_size - 1) // self.batch_size
 
 
 def _compress_targets(targets):
@@ -63,20 +63,26 @@ def _compress_targets(targets):
     return torch.where(targets >= -1, targets, -1 + (targets + 1) * 0.03)
 
 
-def _modelling_forward(agent, event_sequences, device):
+def _modelling_forward(agent, event_sequences, device, cached_perception=None):
     """Run the modelling forward pass: perception → modelling_head → value_head.
+
+    Args:
+        cached_perception: optional (perception_out, mask) tuple from E.5.1
+            cache. When provided, skips the perception forward entirely.
 
     Returns:
         predicted_evs: (B, K) — predicted EV for each action
         action_embs: (B, K, D) — per-action embeddings from modelling head
         perception_out: (B, N, D) — detached perception output
     """
-    # Perception is frozen — no_grad + detach
-    with torch.no_grad():
-        perception_out, encoded, mask = agent.perception.forward_batch(
-            event_sequences, device=device, skip_memory=True
-        )
-    perception_out = perception_out.detach()
+    if cached_perception is not None:
+        perception_out, mask = cached_perception
+    else:
+        with torch.no_grad():
+            perception_out, encoded, mask = agent.perception.forward_batch(
+                event_sequences, device=device, skip_memory=True
+            )
+        perception_out = perception_out.detach()
 
     # Modelling head — TRAINABLE, produces per-action embeddings
     action_embs = agent.modelling_head(perception_out, mask=mask)  # (B, K, D)
@@ -84,19 +90,28 @@ def _modelling_forward(agent, event_sequences, device):
     B, N, D = perception_out.shape
     K = agent.n_actions
 
-    # Expand perception_out: (B, N, D) → (B*K, N, D)
+    # Expand perception_out: (B, N, D) → (B*K, N, D), plus one slot for the
+    # appended action token.
     p_expanded = perception_out.unsqueeze(1).expand(B, K, N, D).reshape(B * K, N, D)
+    combined = torch.cat(
+        [p_expanded,
+         torch.zeros(B * K, 1, D, dtype=p_expanded.dtype, device=device)],
+        dim=1)                                                  # (B*K, N+1, D)
 
-    # Reshape action embeddings: (B, K, D) → (B*K, 1, D)
-    a_flat = action_embs.reshape(B * K, 1, D)
-
-    # Concat: (B*K, N+1, D)
-    combined = torch.cat([p_expanded, a_flat], dim=1)
-
-    # Extend mask: (B, N) → (B*K, N+1) with 1 appended for the action token
     mask_expanded = mask.unsqueeze(1).expand(B, K, N).reshape(B * K, N)
-    mask_combined = torch.cat([mask_expanded,
-                               torch.ones(B * K, 1, device=device)], dim=1)
+    mask_combined = torch.cat(
+        [mask_expanded,
+         torch.zeros(B * K, 1, dtype=mask_expanded.dtype, device=device)],
+        dim=1)                                                  # (B*K, N+1)
+
+    # A.5.1: place each sample's action token at its TRUE length position (right
+    # after its real events) so the token's RoPE index matches MCTS, which
+    # appends to the unpadded context — not at the fixed batch-padded length N.
+    lengths = mask.sum(dim=1).long()                            # (B,) true lengths
+    pos = lengths.unsqueeze(1).expand(B, K).reshape(B * K)      # (B*K,)
+    rows = torch.arange(B * K, device=device)
+    combined[rows, pos] = action_embs.reshape(B * K, D)
+    mask_combined[rows, pos] = 1.0
 
     # Value head — frozen params, but gradients flow through to action_embs
     values = agent.value_head(combined, mask=mask_combined)  # (B*K, 1)
@@ -160,23 +175,30 @@ def _reconstruction_loss(action_embs, perception_out, event_sequences):
 
 def _run_validation(agent, val_loader, loss_fn, device, recon_weight=0.0,
                     amp_config=None):
-    """Run validation and return average loss."""
+    """Run validation and return average loss.
+
+    E.5.1: val_loader yields (cached_p, cached_m, event_sequences, action_evs)
+    when perception caching is active.
+    """
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     agent.eval()
     val_loss_sum = 0.0
     val_count = 0
     with torch.no_grad():
-        for event_sequences, action_evs in val_loader:
+        for cached_p, cached_m, event_sequences, action_evs in val_loader:
+            cached_p = cached_p.to(device)
+            cached_m = cached_m.to(device)
             action_evs = _compress_targets(action_evs.to(device))
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 predicted_evs, action_embs, perception_out = _modelling_forward(
-                    agent, event_sequences, device)
+                    agent, event_sequences, device,
+                    cached_perception=(cached_p, cached_m))
                 batch_loss = loss_fn(predicted_evs, action_evs)
                 if recon_weight > 0:
                     batch_loss = batch_loss + recon_weight * _reconstruction_loss(
                         action_embs, perception_out, event_sequences)
-            val_loss_sum += batch_loss.item() * len(event_sequences)
-            val_count += len(event_sequences)
+            val_loss_sum += batch_loss.item() * cached_p.shape[0]
+            val_count += cached_p.shape[0]
     agent.train()
     return val_loss_sum / max(val_count, 1)
 
@@ -196,9 +218,9 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
     log(f"  New best model (val loss: {val_loss:.6f})")
 
 
-def _save_history(history, run_dir):
-    """Save training history incrementally for real-time monitoring."""
-    atomic_torch_save(history, os.path.join(run_dir, "history.pt"))
+def _save_history(hist):
+    """Save training history incrementally (E.5.3: append-only shards)."""
+    hist.save()
 
 
 def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
@@ -320,7 +342,7 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
     # Use norm stats from checkpoint (same distribution perception was trained on)
     # to avoid distribution mismatch with frozen perception. On resume, the
     # pipeline has already restored `_checkpoint_norm_stats` from `latest.pt`.
-    scenarios = copy.deepcopy(scenarios)
+    scenarios = _shallow_copy_scenarios(scenarios)
     if resume_state is not None and resume_state.get("norm_stats"):
         norm_stats = resume_state["norm_stats"]
         log("Using norm stats from resume_state")
@@ -341,9 +363,58 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
     dataset = GTOModellingDataset(scenarios)
     train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
 
-    train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=batch_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=batch_collate)
+    # E.5.1: pre-compute frozen perception outputs once
+    log("Pre-computing frozen perception outputs...")
+    _p_outs = []
+    _p_masks = []
+    with torch.no_grad():
+        for start in range(0, len(dataset), batch_size):
+            end = min(start + batch_size, len(dataset))
+            batch_events = [dataset[j][0] for j in range(start, end)]
+            p_out, _, m = agent.perception.forward_batch(
+                batch_events, device=device, skip_memory=True)
+            for k in range(p_out.shape[0]):
+                L = int(m[k].sum().item())
+                _p_outs.append(p_out[k, :L].detach().cpu())
+                _p_masks.append(m[k, :L].detach().cpu())
+    log(f"Cached {len(_p_outs)} perception outputs")
+
+    class _CachedDataset(torch.utils.data.Dataset):
+        def __init__(self, indices, p_outs, p_masks, base_dataset):
+            self.indices = list(indices)
+            self.p_outs = p_outs
+            self.p_masks = p_masks
+            self.base = base_dataset
+        def __len__(self):
+            return len(self.indices)
+        def __getitem__(self, idx):
+            oidx = self.indices[idx]
+            events, target = self.base[oidx]
+            return self.p_outs[oidx], self.p_masks[oidx], events, target
+
+    def _cached_collate(batch):
+        p_outs_b, masks_b, events_b, targets_b = zip(*batch)
+        max_len = max(p.shape[0] for p in p_outs_b)
+        B = len(batch)
+        d = p_outs_b[0].shape[-1]
+        padded_p = torch.zeros(B, max_len, d)
+        padded_m = torch.zeros(B, max_len, dtype=masks_b[0].dtype)
+        for i, (p, m) in enumerate(zip(p_outs_b, masks_b)):
+            L = p.shape[0]
+            padded_p[i, :L] = p
+            padded_m[i, :L] = m
+        return padded_p, padded_m, list(events_b), torch.stack(targets_b)
+
+    cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
+    cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
+
+    train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
+    train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
+                              collate_fn=_cached_collate, num_workers=2,
+                              persistent_workers=True)
+    val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
+                            collate_fn=_cached_collate, num_workers=2,
+                            persistent_workers=True)
 
     log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:
@@ -366,16 +437,11 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
     global_step = 0
     start_epoch = 0
 
-    history_path = os.path.join(run_dir, "history.pt")
-    if os.path.exists(history_path):
-        history = torch.load(history_path, weights_only=False)
-        for k in ("step_loss", "val_loss", "epoch_train_loss", "epoch_val_loss"):
-            history.setdefault(k, [])
-        log(f"Resumed history from {history_path} "
-            f"(step_loss n={len(history['step_loss'])})")
-    else:
-        history = {"step_loss": [], "val_loss": [],
-                   "epoch_train_loss": [], "epoch_val_loss": []}
+    hist = IncrementalHistory(run_dir,
+                              keys=["step_loss", "val_loss",
+                                    "epoch_train_loss", "epoch_val_loss"])
+    history = hist.data
+    log(f"Loaded history (step_loss n={len(history['step_loss'])})")
 
     if resume_state is not None:
         restore_optim_sched(
@@ -402,12 +468,15 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_sequences, action_evs) in enumerate(train_loader):
+        for batch_idx, (cached_p, cached_m, event_sequences, action_evs) in enumerate(train_loader):
+            cached_p = cached_p.to(device)
+            cached_m = cached_m.to(device)
             action_evs = _compress_targets(action_evs.to(device))
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 predicted_evs, action_embs, perception_out = _modelling_forward(
-                    agent, event_sequences, device)
+                    agent, event_sequences, device,
+                    cached_perception=(cached_p, cached_m))
                 batch_loss = loss_fn(predicted_evs, action_evs)
                 if recon_weight > 0:
                     batch_loss = batch_loss + recon_weight * _reconstruction_loss(
@@ -425,8 +494,8 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
             history["step_loss"].append((global_step, step_loss))
             global_step += 1
 
-            train_loss_sum += step_loss * len(event_sequences)
-            train_count += len(event_sequences)
+            train_loss_sum += step_loss * cached_p.shape[0]
+            train_count += cached_p.shape[0]
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count
@@ -439,7 +508,7 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                 val_loss = _run_validation(agent, val_loader, loss_fn, device,
                                            recon_weight=recon_weight, amp_config=amp_cfg)
                 history["val_loss"].append((global_step, val_loss))
-                _save_history(history, run_dir)
+                _save_history(hist)
                 log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}")
 
                 prev_best = best_val_loss
@@ -467,7 +536,7 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         history["epoch_train_loss"].append(train_loss_avg)
         history["epoch_val_loss"].append(val_loss_avg)
 
-        _save_history(history, run_dir)
+        _save_history(hist)
         log(f"Epoch {epoch+1}/{epochs} — Train Loss: {train_loss_avg:.6f}, Val Loss: {val_loss_avg:.6f}")
 
         prev_best = best_val_loss
@@ -496,6 +565,6 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         param.requires_grad = True
 
     log(f"=== Modelling Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
-    _save_history(history, run_dir)
+    hist.compact()
 
     return history, run_dir

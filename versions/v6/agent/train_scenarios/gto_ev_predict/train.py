@@ -14,13 +14,14 @@ from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
-    _compute_norm_stats, _normalize_scenarios
-from agent.train_scenarios.gto_ev_predict.dataset import GTOEVDataset, batch_collate
+    _compute_norm_stats, _normalize_scenarios, _shallow_copy_scenarios
+from agent.train_scenarios.gto_ev_predict.dataset import GTOEVDataset, batch_collate, make_tensor_collate
 from agent.train_scenarios._checkpoint_io import (
     make_checkpoint,
     restore_optim_sched,
 )
 from agent.resume import atomic_torch_save
+from agent.train_scenarios._history import IncrementalHistory
 
 
 _PHASE = "gto_ev_predict"
@@ -30,30 +31,28 @@ class LengthGroupedBatchSampler(Sampler):
     """Sampler that groups samples by sequence length into batches.
 
     Sorts by n_events, chunks into batches, shuffles batch order each epoch.
+    Batch composition is re-randomized every epoch: indices are shuffled
+    before stable-sorting by length, so same-length samples get different
+    neighbours each time (E.5.6).
     """
 
     def __init__(self, dataset, batch_size):
         self.batch_size = batch_size
-        # Get seq lengths — dataset may be a Subset (random_split)
-        indices = list(range(len(dataset)))
-        lengths = []
-        for i in indices:
-            sample = dataset[i]
-            lengths.append(len(sample[0]))  # sample[0] is event_sequences list
-        # Sort indices by length
-        sorted_indices = sorted(indices, key=lambda i: lengths[i])
-        # Chunk into batches
-        self.batches = [sorted_indices[i:i + batch_size]
-                        for i in range(0, len(sorted_indices), batch_size)]
+        self.n = len(dataset)
+        self.lengths = [len(dataset[i][0]) for i in range(self.n)]
 
     def __iter__(self):
-        batch_order = list(range(len(self.batches)))
-        random.shuffle(batch_order)
-        for idx in batch_order:
-            yield self.batches[idx]
+        indices = list(range(self.n))
+        random.shuffle(indices)
+        indices.sort(key=lambda i: self.lengths[i])
+        batches = [indices[i:i + self.batch_size]
+                   for i in range(0, len(indices), self.batch_size)]
+        random.shuffle(batches)
+        for batch in batches:
+            yield batch
 
     def __len__(self):
-        return len(self.batches)
+        return (self.n + self.batch_size - 1) // self.batch_size
 
 
 def _run_validation(agent, val_loader, loss_fn, device, amp_config=None):
@@ -63,14 +62,17 @@ def _run_validation(agent, val_loader, loss_fn, device, amp_config=None):
     val_loss_sum = 0.0
     val_count = 0
     with torch.no_grad():
-        for event_sequences, ev_targets in val_loader:
+        for precomputed, ev_targets in val_loader:
             ev_targets = ev_targets.to(device)
+            n_samples = precomputed["B"] if precomputed is not None else 0
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                result = agent.forward_batch(event_sequences, skip_memory=True)
+                result = agent.forward_batch(None, skip_memory=True,
+                                             heads={"value"},
+                                             precomputed=precomputed)
                 predicted_ev = result["value"].squeeze(-1)
                 batch_loss = loss_fn(predicted_ev, ev_targets)
-            val_loss_sum += batch_loss.item() * len(event_sequences)
-            val_count += len(event_sequences)
+            val_loss_sum += batch_loss.item() * n_samples
+            val_count += n_samples
     agent.train()
     return val_loss_sum / max(val_count, 1)
 
@@ -90,9 +92,9 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
     log(f"  New best model (val loss: {val_loss:.6f})")
 
 
-def _save_history(history, run_dir):
-    """Save training history incrementally for real-time monitoring."""
-    atomic_torch_save(history, os.path.join(run_dir, "history.pt"))
+def _save_history(hist):
+    """Save training history incrementally (E.5.3: append-only shards)."""
+    hist.save()
 
 
 def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
@@ -161,11 +163,15 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
     log("=== GTO EV Prediction Training (Step 1) ===")
     log("Memory: DISABLED (skip_memory=True)")
 
-    # Freeze action head — only train perception + value
+    # D.4: freeze action, modelling, opponent_action — only train perception + value
     for param in agent.action_head.parameters():
         param.requires_grad = False
+    for param in agent.modelling_head.parameters():
+        param.requires_grad = False
+    for param in agent.opponent_action_head.parameters():
+        param.requires_grad = False
 
-    # Optimizer over trainable parameters only
+    # Optimizer over trainable parameters only (perception + value)
     trainable_params = [p for p in agent.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=lr)
     loss_fn = nn.SmoothL1Loss(beta=1.0)
@@ -201,8 +207,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
     # norm_stats from the prior run — recomputing them mid-training would
     # silently change every sample's target distribution and invalidate
     # the optimizer's running estimates.
-    import copy
-    scenarios = copy.deepcopy(scenarios)
+    scenarios = _shallow_copy_scenarios(scenarios)
     if resume_state is not None and resume_state.get("norm_stats"):
         norm_stats = resume_state["norm_stats"]
         log(f"Norm stats (resumed): " + ", ".join(
@@ -218,9 +223,15 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
     dataset = GTOEVDataset(scenarios)
     train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
 
+    max_players = agent.perception.embedder.max_players
+    _tensor_collate = make_tensor_collate(max_players)
     train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=batch_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=batch_collate)
+    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                              collate_fn=_tensor_collate, num_workers=2,
+                              persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            collate_fn=_tensor_collate, num_workers=2,
+                            persistent_workers=True)
 
     log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:
@@ -244,16 +255,11 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
     global_step = 0
     start_epoch = 0
 
-    history_path = os.path.join(run_dir, "history.pt")
-    if os.path.exists(history_path):
-        history = torch.load(history_path, weights_only=False)
-        for k in ("step_loss", "val_loss", "epoch_train_loss", "epoch_val_loss"):
-            history.setdefault(k, [])
-        log(f"Resumed history from {history_path} "
-            f"(step_loss n={len(history['step_loss'])})")
-    else:
-        history = {"step_loss": [], "val_loss": [],
-                   "epoch_train_loss": [], "epoch_val_loss": []}
+    hist = IncrementalHistory(run_dir,
+                              keys=["step_loss", "val_loss",
+                                    "epoch_train_loss", "epoch_val_loss"])
+    history = hist.data
+    log(f"Loaded history (step_loss n={len(history['step_loss'])})")
 
     if resume_state is not None:
         restore_optim_sched(
@@ -281,11 +287,14 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_sequences, ev_targets) in enumerate(train_loader):
+        for batch_idx, (precomputed, ev_targets) in enumerate(train_loader):
             ev_targets = ev_targets.to(device)
+            n_samples = precomputed["B"] if precomputed is not None else 0
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                result = agent.forward_batch(event_sequences, skip_memory=True)
+                result = agent.forward_batch(None, skip_memory=True,
+                                             heads={"value"},
+                                             precomputed=precomputed)
                 predicted_ev = result["value"].squeeze(-1)  # (B,)
                 batch_loss = loss_fn(predicted_ev, ev_targets)
 
@@ -301,8 +310,8 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
             history["step_loss"].append((global_step, step_loss))
             global_step += 1
 
-            train_loss_sum += step_loss * len(event_sequences)
-            train_count += len(event_sequences)
+            train_loss_sum += step_loss * n_samples
+            train_count += n_samples
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count
@@ -314,7 +323,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
             if val_every and (global_step % val_every == 0):
                 val_loss = _run_validation(agent, val_loader, loss_fn, device, amp_config=amp_cfg)
                 history["val_loss"].append((global_step, val_loss))
-                _save_history(history, run_dir)
+                _save_history(hist)
                 log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}")
 
                 prev_best = best_val_loss
@@ -341,7 +350,7 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
         history["epoch_train_loss"].append(train_loss_avg)
         history["epoch_val_loss"].append(val_loss_avg)
 
-        _save_history(history, run_dir)
+        _save_history(hist)
         log(f"Epoch {epoch+1}/{epochs} — Train Loss: {train_loss_avg:.6f}, Val Loss: {val_loss_avg:.6f}")
 
         prev_best = best_val_loss
@@ -363,11 +372,15 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
         if should_stop:
             break
 
-    # Unfreeze action head after training
+    # Unfreeze all heads after training
     for param in agent.action_head.parameters():
+        param.requires_grad = True
+    for param in agent.modelling_head.parameters():
+        param.requires_grad = True
+    for param in agent.opponent_action_head.parameters():
         param.requires_grad = True
 
     log(f"=== GTO EV Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
-    _save_history(history, run_dir)
+    hist.compact()
 
     return history, run_dir

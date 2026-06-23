@@ -18,6 +18,7 @@ Can be run standalone:
 import os
 import copy
 import random
+import warnings
 import argparse
 from datetime import datetime
 
@@ -35,6 +36,10 @@ from agent.agent import ASI
 from agent.mcts.game_state import GameState
 from agent.resume import atomic_torch_save
 from utils import get_amp_config
+
+# B.6.3: per-process tally of opponent-data hands whose betting loop hit
+# max_actions without terminating. Logged via a warning (never silent).
+_opp_truncation_stats = {"hands": 0, "truncated": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +312,8 @@ def _shared_to_standard(shared_events, hero_pos, hero_hand):
             "big_blind": e["big_blind"],
             "small_blind": e["small_blind"],
             "stack": float(e["stacks"][hero_pos]),
+            # B.6.2: carry the full per-position stacks vector through.
+            "stacks": list(e["stacks"]),
             "table": list(e["table"]),
             "pot": e["pot"],
             "bets": np.copy(e["bets"]),
@@ -449,7 +456,10 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
 
     min_stack = config.get("min_stack", big_blind * 10)
     num_players = random.randint(2, max_players)
-    start_credits = random.randint(min_stack, max_stack)
+    # B.6.1: independent per-seat starting stacks (U[min,max] per seat). Stored
+    # into the event stream via snap["credits"], so the model sees asymmetric
+    # effective stacks. (Opponent-data never uses table.start_credits.)
+    start_stacks = [random.randint(min_stack, max_stack) for _ in range(num_players)]
 
     # Build opponent_ids mapping for this hand
     if player_ids is not None:
@@ -460,7 +470,7 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
     table = Table(
         num_players=num_players,
         raise_sizes=raise_sizes,
-        start_credits=start_credits,
+        start_credits=start_stacks,
         big_blind=big_blind,
         small_blind=small_blind,
     )
@@ -489,8 +499,10 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
     }]
 
     scenarios = []
-    max_actions = 4 * num_players
+    # B.6.3: cap high enough not to clip realistic raise-wars (was 4*N).
+    max_actions = 6 * num_players + 8
 
+    _opp_truncation_stats["hands"] += 1
     for _ in range(max_actions):
         active_pos = table.active_player
 
@@ -617,18 +629,54 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         target = target / target.sum().clamp(min=1e-9)  # safety renorm
         avg_probs = target  # name kept for downstream scenario field
 
-        # ----- Fix hand at first action of this player ------------------
-        if fixed_hands[active_pos] is None:
-            chosen_idx = int(np.random.choice(top_k, p=forward_weights))
-            fixed_hands[active_pos] = forward_combos[chosen_idx]
+        # ----- Fix / re-fix hand at this player's action ----------------
+        # Audit B.4. `forward_combos` already excludes the REVEALED board (it
+        # is derived from `w_live`, masked by `dead = _get_board_dead(table)`).
+        # Two further physical constraints, both handled here:
+        #
+        #  B.4.1: a freshly fixed hand must also avoid cards already committed
+        #         to OTHER players' fixed hands (sequential fixing → each new
+        #         hand is disjoint from every prior one).
+        #  B.4.2: a hand fixed on an EARLIER street can collide with a board
+        #         card revealed since then (the deck board is fixed but
+        #         revealed incrementally). When the acting player's fixed hand
+        #         now intersects the revealed board (or another player's fixed
+        #         hand), re-sample it from the current collision-free forward
+        #         subset instead of aborting the hand.
+        other_fixed = set()
+        for opos, oh in fixed_hands.items():
+            if opos != active_pos and oh is not None:
+                other_fixed.update(int(c) for c in oh)
+
+        cur = fixed_hands[active_pos]
+        collides = cur is not None and (
+            cur[0] in dead or cur[1] in dead
+            or cur[0] in other_fixed or cur[1] in other_fixed
+        )
+        if cur is None or collides:
+            valid = [
+                i for i in range(top_k)
+                if forward_combos[i][0] not in other_fixed
+                and forward_combos[i][1] not in other_fixed
+            ]
+            if not valid:
+                # No board/other-hand-free combo remains in the forward subset.
+                break
+            vw = forward_weights[valid].astype(np.float64)
+            vw_sum = vw.sum()
+            if vw_sum < 1e-12:
+                break
+            vw /= vw_sum
+            pick = int(np.random.choice(len(valid), p=vw))
+            fixed_hands[active_pos] = forward_combos[valid[pick]]
 
         fixed = fixed_hands[active_pos]
         try:
             fixed_idx_in_forward = forward_combos.index(fixed)
         except ValueError:
-            # Fixed hand was sampled before but dropped out of the forward
-            # subset (its weight collapsed below the ESS truncation mass).
-            # Cannot honestly sample an action for the fixed hand → stop.
+            # Fixed hand is board/other-hand free but dropped out of the top-K
+            # forward subset (its belief weight collapsed below the ESS
+            # truncation mass). Cannot honestly sample an action → stop.
             break
 
         fixed_probs = per_combo_probs[fixed_idx_in_forward]
@@ -638,10 +686,19 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         action = torch.zeros(n_actions, dtype=torch.float32)
         action[chosen_action] = 1.0
 
-        # Active observers (non-folded, non-acting)
+        # Active observers (non-folded, non-acting).
+        # B.4.3: an observer whose hand was fixed on an earlier street may now
+        # hold a card that has since appeared on the board → that per-observer
+        # view is physically impossible. Exclude such observers. (Observers
+        # with no fixed hand are kept: the dataset loader assigns them a
+        # collision-free random hand, excluding board + all fixed hands.)
         hero_positions = [
             pos for pos in range(num_players)
             if pos != active_pos and table.players_state[pos] >= 0
+            and not (
+                fixed_hands[pos] is not None
+                and (fixed_hands[pos][0] in dead or fixed_hands[pos][1] in dead)
+            )
         ]
 
         facing_bet = max(0, table.high_bet - table.bets[active_pos])
@@ -656,10 +713,19 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         max_w = float(w_eff.max())
         top_mass_size = int((w_eff >= 0.99 * max_w).sum()) if max_w > 0 else 0
 
-        # Record scenario
+        # Record scenario.
+        # B.7 (observer blockers): persist the per-combo action distributions,
+        # their weights and the combo card pairs so the dataset loader can
+        # RE-AVERAGE the target per observer, excluding combos blocked by that
+        # observer's own cards. `opponent_action_probs` is the un-blocked
+        # average (fallback / acting-player view); re-averaging over all combos
+        # reproduces it exactly.
         scenarios.append({
             "events": copy.deepcopy(shared_events),
             "opponent_action_probs": avg_probs.tolist(),
+            "forward_combos": [[int(c1), int(c2)] for (c1, c2) in forward_combos],
+            "per_combo_probs": per_combo_probs.cpu().tolist(),
+            "forward_weights": forward_weights_t.cpu().tolist(),
             "acting_pos": active_pos,
             "hero_positions": hero_positions,
             "num_players": num_players,
@@ -698,7 +764,14 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         non_forward_live_mask = np.ones(n_combos, dtype=bool)
         non_forward_live_mask[forward_indices] = False
         non_forward_live_mask &= ~dead_mask
-        new_w_full[non_forward_live_mask] = w_live[non_forward_live_mask]
+        # B.7: un-observed (non-forward) combos get the LIKELIHOOD FLOOR — the
+        # minimum tempered likelihood among the observed forward combos — rather
+        # than an implicit 1.0. With an implicit 1.0 the excluded tail is
+        # relatively boosted against forward combos that just observed a
+        # low-probability action, so the tail inflates with every action.
+        likelihood_floor = float(tempered.min())
+        new_w_full[non_forward_live_mask] = (
+            w_live[non_forward_live_mask] * likelihood_floor)
 
         total = float(new_w_full.sum())
         if total < 1e-12:
@@ -713,6 +786,15 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
 
         if end or several_all_in:
             break
+    else:
+        # B.6.3: betting loop exhausted max_actions without terminating.
+        _opp_truncation_stats["truncated"] += 1
+        warnings.warn(
+            f"generate_opponent_hand: hand truncated at max_actions={max_actions} "
+            f"({_opp_truncation_stats['truncated']}/{_opp_truncation_stats['hands']} "
+            f"hands truncated this process)",
+            stacklevel=2,
+        )
 
     return scenarios if scenarios else None
 
@@ -1040,6 +1122,7 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
         "device": device,
         "server_max_batch": int(opp_cfg.get("server_max_batch", 256)),
         "server_linger_ms": float(opp_cfg.get("server_linger_ms", 2)),
+        "n_workers": n_workers_cfg,
     }
 
     spec = []

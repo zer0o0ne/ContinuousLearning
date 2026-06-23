@@ -12,7 +12,7 @@
         "n_action_layers": 6,
         "n_opponent_action_layers": 8,
         "n_modelling_layers": 4,
-        "max_seq_len": 1024,
+        "max_seq_len": 1536,
         "max_players": 9,
         "memory": {
             "n_levels": 2,
@@ -160,7 +160,6 @@
         "server_max_batch": 256,
         "server_linger_ms": 2,
         "action_temperature": 0.3,
-        "range_threshold": 0.75,
         "max_batch_combos": 256,
         "save_dir": "",
         "save_every_hands": 1000,

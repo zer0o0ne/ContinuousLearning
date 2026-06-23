@@ -207,6 +207,11 @@ def decide_bets(eq, pot, bet, stack, pref="1"):
     call_ev = eq * (pot + bet) - (1 - eq) * bet
     fold_ev = 0.0
     raise_total = stack if pref == "shove" or stack <= bet else min(bet + (pot + 2 * bet) * RAISE_SIZES[pref], stack)
+    # NOTE (Audit B.1): same value-bet pot bug class as the solvers — the
+    # opponent's call of the raise is undercounted (final pot should reflect the
+    # opponent matching `raise_total`, not just `bet`). NOT fixed: decide_bets is
+    # a reference advisor, imported in gto_utils/__init__ but never called on the
+    # data-generation path. See gpu_solver_v3.py for the corrected model.
     raise_ev = eq * (pot + bet + raise_total) - (1 - eq) * raise_total
     best = max(fold_ev, call_ev, raise_ev)
     if best == raise_ev and raise_total > bet:

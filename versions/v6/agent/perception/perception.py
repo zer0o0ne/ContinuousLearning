@@ -254,7 +254,7 @@ class EventSequenceEmbedder(nn.Module):
                 scalar_emb, bet_emb, action_emb (each T,D)
         """
         if precomputed is not None:
-            if precomputed.get("T", 0) == 0:
+            if len(precomputed.get("card_ids", [])) == 0:
                 return None
             card_ids = precomputed["card_ids"].to(device)
             if mask_hand:
@@ -375,9 +375,14 @@ class EventSequenceEmbedder(nn.Module):
         """
         bt = self._build_batch_tensors(event_sequences, device=device, mask_hand=False,
                                        precomputed=precomputed)
-        B = len(event_sequences)
-        seq_lengths = [len(seq) for seq in event_sequences]
-        max_events = max(seq_lengths) if seq_lengths else 0
+        if precomputed is not None:
+            B = precomputed["B"]
+            seq_lengths = precomputed["seq_lengths"]
+            max_events = precomputed["max_events"]
+        else:
+            B = len(event_sequences)
+            seq_lengths = [len(seq) for seq in event_sequences]
+            max_events = max(seq_lengths) if seq_lengths else 0
 
         meta = {
             "B": B, "max_events": max_events, "seq_lengths": seq_lengths,

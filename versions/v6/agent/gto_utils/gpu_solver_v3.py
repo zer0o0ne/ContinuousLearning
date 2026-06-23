@@ -668,7 +668,7 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
     #   EV(raise|call) - EV(check) = b*(2*eq - 1)  (> 0 for eq > 0.5).
     new_pot = pot + raise_amount + (raise_amount - facing_bet)
 
-    call_cost = raise_amount
+    call_cost = raise_amount - facing_bet
     pot_after_raise = new_pot
     raw_fold_threshold = call_cost / pot_after_raise if pot_after_raise > 0 else 0.5
     fold_threshold = raw_fold_threshold ** 0.85

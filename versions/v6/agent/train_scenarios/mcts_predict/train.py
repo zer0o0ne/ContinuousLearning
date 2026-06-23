@@ -795,8 +795,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
             global_step += 1
             train_loss_sum += step_loss * n_samples
             train_count += n_samples
-            cycle_action_sum += loss_dict["action"] * len(event_seqs)
-            cycle_action_count += len(event_seqs)
+            cycle_action_sum += loss_dict["action"] * n_samples
+            cycle_action_count += n_samples
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count

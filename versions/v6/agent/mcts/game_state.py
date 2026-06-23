@@ -266,7 +266,7 @@ class GameState:
                     continue
                 actions.append(i + 2)
             actions.append(self.n_raise_bins + 2)  # all-in
-        elif (credits_pos > 0
+        elif (credits_pos > 0 and credits_pos > call_amount
               and not all_others_allin
               and not short_allin_restricted):
             # Can only go all-in (not enough to raise, but has chips). Suppressed

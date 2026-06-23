@@ -1122,7 +1122,7 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
         "device": device,
         "server_max_batch": int(opp_cfg.get("server_max_batch", 256)),
         "server_linger_ms": float(opp_cfg.get("server_linger_ms", 2)),
-        "n_workers": n_workers_cfg,
+        "n_workers": n_workers,
     }
 
     spec = []

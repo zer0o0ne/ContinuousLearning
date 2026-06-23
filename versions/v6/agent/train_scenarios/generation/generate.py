@@ -1238,11 +1238,11 @@ def _generate_worker(args):
     device = _worker_device
     scenarios = []
     failed = 0
-    for _ in range(n_hands):
+    for h in range(n_hands):
         result = generate_scenario(config, device=device)
         if result is not None:
             for s in result:
-                s["hand_id"] = worker_id
+                s["hand_id"] = worker_id + h
             scenarios.extend(result)
         else:
             failed += 1

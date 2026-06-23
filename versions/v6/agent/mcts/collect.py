@@ -956,6 +956,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             "final_active_positions": final_active,
             "credits_pre_distribution": credits_pre_dist,
             "initial_credits": initial_credits,
+            "start_stacks": start_stacks,
         }
 
         # 1) Backfill equity-based Q on EVERY terminal across every tree in
@@ -989,7 +990,8 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         equity_by_hero = equity_pkt["equity_by_hero"]
 
         # C.5: per-player total contributions for side-pot cap.
-        contributions = [float(initial_credits[p]) - float(credits_pre_dist[p])
+        # Use start_stacks (pre-blind) so blinds are included in contributions.
+        contributions = [float(start_stacks[p]) - float(credits_pre_dist[p])
                          for p in range(num_players)]
         # Cache side-pot-capped hero_base per hero (same across all
         # decisions by that hero — only invested_from_t varies).

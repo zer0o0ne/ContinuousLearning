@@ -91,6 +91,7 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
         hero_hand = hero_hands[hero_pos]
         board_cards = _board_at_turn(deck, root_turn)
         initial_stacks = list(root_gs.credits)
+        root_pot = float(root_gs.pot)
 
         if value_scales_by_position is not None:
             scale = float(value_scales_by_position.get(hero_pos, 1.0))
@@ -141,6 +142,7 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                     prob_floor=prob_floor,
                     narrow_cache=narrow_cache,
                     equity_cache=equity_cache,
+                    dead_money=root_pot,
                 )
 
             terminal.Q = q_chips / scale
@@ -224,8 +226,14 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
     initial_credits = hand_record.get("initial_credits")
 
     # C.5: per-player total contributions for the whole hand (for side-pot cap).
-    # contributions[p] = chips player p put in across all streets.
-    if initial_credits is not None:
+    # contributions[p] = chips player p put in across all streets INCLUDING blinds.
+    # Use start_stacks (pre-blind) when available so blind money is counted;
+    # fall back to initial_credits (post-blind) for backward compat.
+    start_stacks = hand_record.get("start_stacks")
+    if start_stacks is not None:
+        contributions = [float(start_stacks[p]) - float(credits_pre_dist[p])
+                         for p in range(num_players)]
+    elif initial_credits is not None:
         contributions = [float(initial_credits[p]) - float(credits_pre_dist[p])
                          for p in range(num_players)]
     else:
@@ -336,23 +344,16 @@ def _board_at_turn(deck, turn):
         return torch.tensor(deck[:5].tolist(), dtype=torch.long)
 
 
-def _capped_showdown_chips(equity, contributions, hero_pos, active_players):
+def _capped_showdown_chips(equity, contributions, hero_pos, active_players,
+                           dead_money=0.0):
     """Side-pot-correct hero chip delta at a showdown (C.5).
 
-    `contributions[p]` = chips player `p` put in the pot this hand (from the
-    root; folded players' dead money included). `active_players` = players
-    still live at this showdown, hero included. Replaces the naive
-    ``equity * full_pot − hero_invested``, which credited hero with chips no
-    opponent covered and never returned hero's uncalled excess:
+    `contributions[p]` = chips player `p` put in the pot from the reference
+    point onward. `dead_money` = pot that existed before the reference point
+    (e.g. blinds, or the pot at the MCTS root) — contested by all active
+    players at equal equity but not subject to side-pot caps.
 
-      - hero can win from each contributor only up to hero's own at-risk
-        amount → ``hero_share_pot = Σ_p min(contribution_p, effective_hero)``
-        with ``effective_hero = min(invested_hero, max active-opponent
-        contribution)``;
-      - hero's uncalled excess ``invested_hero − effective_hero`` is returned
-        unconditionally (no live opponent matched it).
-
-    Net = ``excess + equity · hero_share_pot − invested_hero``.
+    Net = ``excess + equity · (hero_share_pot + dead_money) − invested_hero``.
     """
     invested_hero = float(contributions[hero_pos])
     opp_contribs = [float(contributions[p]) for p in active_players
@@ -361,14 +362,15 @@ def _capped_showdown_chips(equity, contributions, hero_pos, active_players):
     effective_hero = min(invested_hero, max_opp)
     excess = invested_hero - effective_hero
     hero_share_pot = sum(min(float(c), effective_hero) for c in contributions)
-    return excess + equity * hero_share_pot - invested_hero
+    return excess + equity * (hero_share_pot + dead_money) - invested_hero
 
 
 def _equity_terminal_chips(hero_pos, hero_hand, board_cards, contributions,
                            active_players, num_players, dec_idx, decisions,
                            combo_probs_cache, path, root_gs, n_equity_iters,
                            device, prob_floor=0.05,
-                           narrow_cache=None, equity_cache=None):
+                           narrow_cache=None, equity_cache=None,
+                           dead_money=0.0):
     """Compute hero's chip-units terminal Q via equity vs narrowed ranges.
 
     Used inside :func:`evaluate_all_terminals` for showdown terminals. Shared
@@ -407,7 +409,7 @@ def _equity_terminal_chips(hero_pos, hero_hand, board_cards, contributions,
 
     if not opponent_combos:
         return _capped_showdown_chips(1.0, contributions, hero_pos,
-                                      active_players)
+                                      active_players, dead_money=dead_money)
 
     eq_key = (hero_pos, frozenset(active_players), tuple(range_key_parts))
     if equity_cache is not None and eq_key in equity_cache:
@@ -419,7 +421,7 @@ def _equity_terminal_chips(hero_pos, hero_hand, board_cards, contributions,
         if equity_cache is not None:
             equity_cache[eq_key] = equity
     return _capped_showdown_chips(equity, contributions, hero_pos,
-                                  active_players)
+                                  active_players, dead_money=dead_money)
 
 
 def _hero_equity_at_showdown(hero_pos, hero_hand, board_cards, final_active,

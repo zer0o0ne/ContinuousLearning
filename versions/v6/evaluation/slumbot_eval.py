@@ -267,6 +267,12 @@ def _make_solver_table_stub(hero_user_pos, hole_cards_int, board_ints, state,
 
     start_credits_scaled = float(SLUMBOT_STACK_SIZE) * inv
 
+    # active_player: Slumbot pos → user pos (0↔1 swap)
+    active_player_user = 1 - int(state["active_pos"])
+
+    # several_all_in: True when ≥2 players are all-in (state 2)
+    several_all_in = int(np.sum(players_state_user == 2)) >= 2
+
     return SimpleNamespace(
         deck=np.array(deck, dtype=np.int64),
         num_players=num_players,
@@ -281,6 +287,9 @@ def _make_solver_table_stub(hero_user_pos, hole_cards_int, board_ints, state,
         n_raise_bins=len(raise_sizes[0]),
         big_blind=float(big_blind_internal),
         small_blind=float(small_blind_internal),
+        active_player=active_player_user,
+        several_all_in=several_all_in,
+        last_raise_size=float(state.get("last_bet_size", 0)) * inv or float(big_blind_internal),
     )
 
 

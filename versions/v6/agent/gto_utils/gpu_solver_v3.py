@@ -668,7 +668,7 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
     #   EV(raise|call) - EV(check) = b*(2*eq - 1)  (> 0 for eq > 0.5).
     new_pot = pot + raise_amount + (raise_amount - facing_bet)
 
-    call_cost = raise_amount - facing_bet
+    call_cost = max(0.0, raise_amount - facing_bet)
     pot_after_raise = new_pot
     raw_fold_threshold = call_cost / pot_after_raise if pot_after_raise > 0 else 0.5
     fold_threshold = raw_fold_threshold ** 0.85
@@ -760,7 +760,7 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
     # — see plan §"Edge cases / safety".
     eq_vs_reraisers = None
     if opp_eq_cpu is not None:
-        if smoothing_enabled and p_reraise_per_combo.sum().item() > 1e-6:
+        if smoothing_enabled and p_reraise_per_combo.sum().item() > 0.01:
             if combo_weights is not None and combo_weights[primary_idx] is not None:
                 base_w = combo_weights[primary_idx]
                 combined = base_w * p_reraise_per_combo
@@ -881,7 +881,8 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
             p_others_all_fold *= p_fold_j
 
         if smoothing_enabled:
-            if p_call_per_combo.sum().item() > 1e-6:
+            _pcall_sum = p_call_per_combo.sum().item()
+            if _pcall_sum > 0.01:
                 if combo_weights is not None and combo_weights[primary_idx] is not None:
                     base_w = combo_weights[primary_idx]
                     combined = base_w * p_call_per_combo
@@ -911,6 +912,14 @@ def _compute_ev_v3_from_state(state, pot, facing_bet, stack, hero_invested,
                 eq_vs_callers = float(masked_eq.mean().item())
         else:
             eq_vs_callers = raw_equity
+
+        # When hero is all-in, opponents can't reraise — merge reraise into call
+        is_allin = raise_amount >= stack - 1e-6
+        if is_allin and p_reraise > 0:
+            if eq_vs_reraisers is not None and (p_call + p_reraise) > 1e-8:
+                eq_vs_callers = (p_call * eq_vs_callers + p_reraise * eq_vs_reraisers) / (p_call + p_reraise)
+            p_call = p_call + p_reraise
+            p_reraise = 0.0
 
         eff_eq_callers = max(0.0, min(1.0, eq_vs_callers * eqr)) if eqr_enabled else eq_vs_callers
         showdown_ev = eff_eq_callers * (new_pot - total_raise) + (1 - eff_eq_callers) * (-total_raise)

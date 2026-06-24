@@ -270,7 +270,7 @@ def _make_solver_table_stub(hero_user_pos, hole_cards_int, board_ints, state,
     return SimpleNamespace(
         deck=np.array(deck, dtype=np.int64),
         num_players=num_players,
-        start_credits=start_credits_scaled,
+        start_credits=np.full(num_players, start_credits_scaled, dtype=np.float64),
         credits=credits_user,
         bets=bets_user,
         players_state=players_state_user,

@@ -179,6 +179,12 @@ def _action_idx_to_incr(state_pre, action_idx, raise_sizes_for_street,
         return "c" if facing_bet else "k"
 
     if new_total < min_legal_total:
+        call_total = high_bet
+        dist_to_call = new_total - call_total
+        dist_to_min = min_legal_total - new_total
+        if dist_to_call <= dist_to_min:
+            clamp_counters["raise_rounded_to_call"] += 1
+            return "c" if facing_bet else "k"
         clamp_counters["raise_bumped"] += 1
         new_total = min_legal_total
     if new_total > cap:
@@ -677,7 +683,7 @@ def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scal
         n_raise_bins=n_raise_bins,
         is_terminal=False,
         several_all_in=False,
-        big_blind=float(big_blind_internal) * inv_scale if big_blind_internal is not None else float(state.get("high_bet", 10.0)) * inv_scale,
+        big_blind=float(big_blind_internal) if big_blind_internal is not None else float(state.get("high_bet", 10.0)) * inv_scale,
     )
 
 

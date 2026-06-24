@@ -636,10 +636,15 @@ def main():
                     if str(device).startswith("cuda"):
                         torch.cuda.empty_cache()
             else:
-                # Single-agent
+                # Single-agent — load from trained save dir (where phases
+                # 1-4 saved), falling back to agent_dir only if no trained
+                # checkpoint exists yet.
                 agent = ASI(log, config)
                 agent.set_device(device)
-                if agent_dir:
+                single_opp_load = base_dir
+                if os.path.isdir(single_opp_load):
+                    agent.load_checkpoint(single_opp_load)
+                elif agent_dir:
                     agent.load_checkpoint(agent_dir)
 
                 single_temp = config.get("solver", {}).get("gto_temperature", 1.0)
@@ -656,6 +661,11 @@ def main():
                 del agent
                 if str(device).startswith("cuda"):
                     torch.cuda.empty_cache()
+
+    # Free datasets no longer needed — reclaim RAM before the memory-intensive
+    # MCTS phase.
+    base_scenarios = None
+    opp_scenarios = None
 
     # --- MCTS cyclic collect → train ---
     if pipeline_cfg.get("run_mcts_train", False):
@@ -887,6 +897,10 @@ def main():
                         agent_obj, loaded_ckpt, ckpt_path,
                         mcts_train_cfg, n_cycles, agent_log)
 
+                    from utils import get_amp_config
+                    _, _, _, use_scaler = get_amp_config(device)
+                    agent_scaler = torch.amp.GradScaler(enabled=use_scaler)
+
                     trained_agents.append({
                         "agent": agent_obj,
                         "norm_stats": _checkpoint_metadata(agent_obj),
@@ -898,9 +912,10 @@ def main():
                         "cumulative_step": cumulative_step,
                         "optimizer": optimizer,
                         "scheduler": scheduler,
+                        "scaler": agent_scaler,
                     })
             else:
-                single_load_dir = agent_dir or save_base_dir_mcts
+                single_load_dir = save_base_dir_mcts or agent_dir
                 agent_obj = ASI(log, config)
                 agent_obj.set_device(device)
                 agent_obj.load_checkpoint(single_load_dir)
@@ -1121,6 +1136,7 @@ def main():
                                                "init_time", None),
                         optimizer=agent_info["optimizer"],
                         scheduler=agent_info["scheduler"],
+                        scaler=agent_info.get("scaler"),
                     )
                     agent_info["cumulative_step"] = new_step
 

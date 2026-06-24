@@ -327,7 +327,7 @@ def _mcts_forward(agent, event_sequences, chains, device,
             ctx_mask = mask_init
             for a in action_path:
                 a_embs = agent.modelling_head(ctx, mask=ctx_mask)  # (1, n_actions, d)
-                emb_tok = a_embs[:, int(a), :].unsqueeze(1)        # (1, 1, d)
+                emb_tok = a_embs[:, int(a), :].unsqueeze(1).detach()  # (1, 1, d)
                 ones = torch.ones(1, 1, dtype=ctx_mask.dtype, device=device)
                 ctx = torch.cat([ctx, emb_tok], dim=1)
                 ctx_mask = torch.cat([ctx_mask, ones], dim=1)
@@ -549,7 +549,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                run_dir=None, history_path=None, cycle_id=0,
                global_step_offset=0, save_checkpoint=True,
                run_timestamp=None,
-               optimizer=None, scheduler=None):
+               optimizer=None, scheduler=None, scaler=None):
     """Train all agent heads on MCTS-derived training data.
 
     Supports cross-cycle continuity for cyclic self-play training:
@@ -645,7 +645,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     # AMP
     from utils import get_amp_config
     amp_enabled, device_type, amp_dtype, use_scaler = get_amp_config(device)
-    scaler = torch.amp.GradScaler(enabled=use_scaler)
+    if scaler is None:
+        scaler = torch.amp.GradScaler(enabled=use_scaler)
     amp_cfg = (amp_enabled, device_type, amp_dtype)
 
     # Opponent embedding table
@@ -769,9 +770,11 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if scaler.get_scale() >= scale_before:
+                scheduler.step()
             if opp_table is not None:
                 opp_table.detach_all()
 

@@ -147,7 +147,8 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
 
             terminal.Q = q_chips / scale
 
-        re_backup_terminals(root)
+        opp_alpha = float(cfg.get("opp_pessimism_alpha", 1.0))
+        re_backup_terminals(root, opp_pessimism_alpha=opp_alpha)
 
     return combo_probs_cache
 
@@ -720,6 +721,8 @@ def _action_to_category(action_idx, game_state):
     else:
         # Raise or all-in
         if game_state.turn == 0:
+            if game_state.high_bet <= game_state.big_blind:
+                return "open"
             return "3bet"
         else:
             return "bet_postflop"

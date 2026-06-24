@@ -1196,9 +1196,12 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
         for ex in examples:
             realized = float(ex.value_target)
             root_q_raw = float(ex.root_q_ratio)
-            q_in_new = root_q_raw * rescale_q
             realized_in_new = realized / new_scale
-            blend = alpha * q_in_new + (1.0 - alpha) * realized_in_new
+            if np.isnan(root_q_raw):
+                blend = realized_in_new
+            else:
+                q_in_new = root_q_raw * rescale_q
+                blend = alpha * q_in_new + (1.0 - alpha) * realized_in_new
             ex.value_target = max(-clip_val, min(clip_val, blend))
             n_root += 1
             if abs(blend) > clip_val:

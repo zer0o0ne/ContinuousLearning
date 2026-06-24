@@ -97,8 +97,8 @@
                 "type": "solver",
                 "solver_overrides": {
                     "mc_iterations": 5000,
-                    "combo_response_iters": 30,
-                    "gto_temperature": 0.2
+                    "combo_response_iters": 100,
+                    "gto_temperature": 0.35
                 }
             },
             {

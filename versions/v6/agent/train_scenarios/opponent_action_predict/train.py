@@ -450,9 +450,11 @@ def train_opponent_action(agent, train_cfg, device, log,
             scaler.scale(batch_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if scaler.get_scale() >= scale_before:
+                scheduler.step()
             if opp_table is not None:
                 opp_table.detach_all()
 

@@ -486,9 +486,11 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
             scaler.scale(batch_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if scaler.get_scale() >= scale_before:
+                scheduler.step()
 
             step_loss = batch_loss.item()
             history["step_loss"].append((global_step, step_loss))

@@ -99,7 +99,7 @@ class Judger:
             if (rank == r).sum() == 4:
                 fourakind = True
                 fourakind_coef = r * 13
-            if (rank == r).sum() >= 2 and threeakind:
+            if (rank == r).sum() >= 2 and threeakind and not full:
                 full = True
                 full_coef = threeakind_coef + r
             if (rank == r).sum() == 3 and not threeakind:

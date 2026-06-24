@@ -666,21 +666,26 @@ class MCTS:
             return max(root.children, key=lambda a: root.children[a].N)
         actions = list(root.children.keys())
         counts = np.array([root.children[a].N for a in actions], dtype=np.float64)
-        counts = counts ** (1.0 / self.temperature)
-        total = counts.sum()
+        log_counts = np.log(np.maximum(counts, 1e-30)) / self.temperature
+        log_counts -= log_counts.max()
+        probs = np.exp(log_counts)
+        total = probs.sum()
         if total == 0:
             return random.choice(actions)
-        probs = counts / total
+        probs /= total
         return actions[np.random.choice(len(actions), p=probs)]
 
 
 def _collect_terminals(node):
-    """DFS to collect all terminal nodes in the tree."""
-    if node.is_terminal:
-        return [node]
+    """Iterative DFS to collect all terminal nodes in the tree."""
     terminals = []
-    for child in node.children.values():
-        terminals.extend(_collect_terminals(child))
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.is_terminal:
+            terminals.append(n)
+        else:
+            stack.extend(n.children.values())
     return terminals
 
 
@@ -696,7 +701,7 @@ def action_path_from_root(node):
     return path
 
 
-def re_backup_terminals(root):
+def re_backup_terminals(root, opp_pessimism_alpha=1.0):
     """Propagate equity-based terminal Q values up to ancestors after search.
 
     During search each terminal already backs up a value (fold = deterministic,
@@ -713,7 +718,9 @@ def re_backup_terminals(root):
         therefore constant along the whole walk to the root.
       - **Q recompute**: opp ancestor `Q = W/N`; hero ancestor
         `Q = max(child.Q for visited)` — read from children already updated
-        below in the bottom-up walk.
+        below in the bottom-up walk. Opp ancestor Q is pessimism-blended
+        (matching search-time ``_refresh_opp_q``) when
+        ``opp_pessimism_alpha < 1.0``.
 
     Multiple terminals are processed sequentially; the per-node W sums and the
     hero `max(child.Q)` recomputation are both order-independent. Idempotent:
@@ -739,6 +746,16 @@ def re_backup_terminals(root):
                     node.Q = node.W / node.N if node.N > 0 else 0.0
             else:
                 node.Q = node.W / node.N if node.N > 0 else 0.0
+                if opp_pessimism_alpha < 1.0:
+                    visited = [c for c in node.children.values() if c.N > 0]
+                    if visited:
+                        total_p = sum(c.P for c in visited)
+                        if total_p < 1e-12:
+                            expected_q = sum(c.Q for c in visited) / float(len(visited))
+                        else:
+                            expected_q = sum(c.P * c.Q for c in visited) / total_p
+                        min_q = min(c.Q for c in visited)
+                        node.Q = opp_pessimism_alpha * expected_q + (1.0 - opp_pessimism_alpha) * min_q
             node = node.parent
 
 

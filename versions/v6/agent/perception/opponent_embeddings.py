@@ -17,9 +17,13 @@ class OpponentEmbeddingTable:
     forward across steps, the gradient history does not.
     """
 
-    def __init__(self, d_model):
+    DEFAULT_MAX_SIZE = 10000
+
+    def __init__(self, d_model, max_size=None):
         self.d_model = d_model
+        self.max_size = max_size if max_size is not None else self.DEFAULT_MAX_SIZE
         self.embeddings = {}  # str -> Tensor(d_model)
+        self._access_order = []  # LRU tracking
 
     def get(self, opponent_id, device):
         """Return the stored embedding for opponent_id (detached zero if new).
@@ -28,9 +32,14 @@ class OpponentEmbeddingTable:
         semantics.
         """
         if opponent_id not in self.embeddings:
+            if self.max_size and len(self.embeddings) >= self.max_size:
+                self._evict_oldest()
             self.embeddings[opponent_id] = torch.zeros(
                 self.d_model, device=device,
             )
+        if opponent_id in self._access_order:
+            self._access_order.remove(opponent_id)
+        self._access_order.append(opponent_id)
         emb = self.embeddings[opponent_id]
         # A.4.5: compare device TYPE, not the full device. `torch.device("cuda")`
         # has index None while a tensor lives on "cuda:0", so a plain `!=` was
@@ -38,6 +47,12 @@ class OpponentEmbeddingTable:
         if emb.device.type != torch.device(device).type:
             self.embeddings[opponent_id] = emb.to(device).detach()
         return self.embeddings[opponent_id]
+
+    def _evict_oldest(self):
+        """Remove the least recently used entry."""
+        if self._access_order:
+            oldest = self._access_order.pop(0)
+            self.embeddings.pop(oldest, None)
 
     def detach_all(self):
         """Detach all embeddings from computation graph (truncated BPTT)."""
@@ -51,8 +66,9 @@ class OpponentEmbeddingTable:
         clone so the live training table is never advanced by the val set.
         Detaching makes this safe even if entries are still in the graph.
         """
-        new = OpponentEmbeddingTable(self.d_model)
+        new = OpponentEmbeddingTable(self.d_model, max_size=self.max_size)
         new.embeddings = {k: v.detach().clone() for k, v in self.embeddings.items()}
+        new._access_order = list(self._access_order)
         return new
 
     def __len__(self):

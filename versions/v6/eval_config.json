@@ -85,7 +85,7 @@
         "password": "",
         "request_timeout": 30,
         "log_every": 5000,
-        "n_hands": 150000,
+        "n_hands": 10000,
         "n_workers": 6,
         "max_consecutive_failures": 20,
         "retries": 4,
@@ -93,7 +93,7 @@
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "solver_v3_baseline",
+                "name": "01_baseline",
                 "type": "solver",
                 "solver_overrides": {
                     "mc_iterations": 5000,
@@ -102,25 +102,131 @@
                 }
             },
             {
-                "name": "gto_pure_mcts_5",
-                "type": "model",
-                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_06_10_20_01_49/best.pt",
-                "use_opponent_embedding": true,
-                "use_mcts": true
+                "name": "02_high_precision",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 15000,
+                    "combo_response_iters": 200,
+                    "gto_temperature": 0.35
+                }
             },
             {
-                "name": "gto_pure_gto_train",
-                "type": "model",
-                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/gto_predict/2026_06_09_05_50_26/best.pt",
-                "use_opponent_embedding": false,
-                "use_mcts": false
+                "name": "03_low_temp",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 5000,
+                    "combo_response_iters": 100,
+                    "gto_temperature": 0.15
+                }
             },
             {
-                "name": "gto_pure_mcts_1",
-                "type": "model",
-                "path": "/root/ContinuousLearning/data/v5/5_final_agents/gto_pure/mcts_predict/2026_06_10_20_01_49/cycles/cycle_0000.pt",
-                "use_opponent_embedding": true,
-                "use_mcts": true
+                "name": "04_near_deterministic",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 10000,
+                    "combo_response_iters": 150,
+                    "gto_temperature": 0.05
+                }
+            },
+            {
+                "name": "05_smoothing",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 5000,
+                    "combo_response_iters": 100,
+                    "gto_temperature": 0.35,
+                    "threshold_smoothing": {
+                        "enabled": true,
+                        "beta_fold": 0.07,
+                        "beta_reraise": 0.07
+                    }
+                }
+            },
+            {
+                "name": "06_smooth_polar",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 5000,
+                    "combo_response_iters": 100,
+                    "gto_temperature": 0.35,
+                    "threshold_smoothing": {
+                        "enabled": true,
+                        "beta_fold": 0.07,
+                        "beta_reraise": 0.07
+                    },
+                    "polarized_reraise": {
+                        "enabled": true,
+                        "bluff_threshold": 0.25,
+                        "beta_bluff": 0.10,
+                        "bluff_frequency": 0.30
+                    }
+                }
+            },
+            {
+                "name": "07_smooth_polar_exploit",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 10000,
+                    "combo_response_iters": 150,
+                    "gto_temperature": 0.15,
+                    "threshold_smoothing": {
+                        "enabled": true,
+                        "beta_fold": 0.07,
+                        "beta_reraise": 0.07
+                    },
+                    "polarized_reraise": {
+                        "enabled": true,
+                        "bluff_threshold": 0.25,
+                        "beta_bluff": 0.10,
+                        "bluff_frequency": 0.30
+                    }
+                }
+            },
+            {
+                "name": "08_low_reraise_thresh",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 5000,
+                    "combo_response_iters": 100,
+                    "gto_temperature": 0.25,
+                    "reraise_threshold": 0.60,
+                    "threshold_smoothing": {
+                        "enabled": true,
+                        "beta_fold": 0.07,
+                        "beta_reraise": 0.07
+                    }
+                }
+            },
+            {
+                "name": "09_no_eqr",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 5000,
+                    "combo_response_iters": 100,
+                    "gto_temperature": 0.20,
+                    "eqr_enabled": false
+                }
+            },
+            {
+                "name": "10_full_max",
+                "type": "solver",
+                "solver_overrides": {
+                    "mc_iterations": 15000,
+                    "combo_response_iters": 200,
+                    "gto_temperature": 0.10,
+                    "reraise_threshold": 0.65,
+                    "threshold_smoothing": {
+                        "enabled": true,
+                        "beta_fold": 0.05,
+                        "beta_reraise": 0.05
+                    },
+                    "polarized_reraise": {
+                        "enabled": true,
+                        "bluff_threshold": 0.20,
+                        "beta_bluff": 0.08,
+                        "bluff_frequency": 0.35
+                    }
+                }
             }
         ]
     }

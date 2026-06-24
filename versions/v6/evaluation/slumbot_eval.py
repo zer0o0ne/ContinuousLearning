@@ -328,6 +328,8 @@ def _solver_choose_action(bundle, state, hero_user_pos, hole_cards_int,
         combo_response_iters=int(scfg.get("combo_response_iters", 30)),
         reraise_threshold=float(scfg.get("reraise_threshold", 0.72)),
         weighted_sampling=bool(scfg.get("weighted_sampling", True)),
+        threshold_smoothing=scfg.get("threshold_smoothing"),
+        polarized_reraise=scfg.get("polarized_reraise"),
     )
     if evs is None or meta is None:
         # Solver failure (rare — usually MC OOM/timeout). Fall back to

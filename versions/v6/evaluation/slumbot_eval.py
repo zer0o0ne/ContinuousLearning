@@ -57,6 +57,7 @@ from agent.perception.opponent_embeddings import OpponentEmbeddingTable
 from agent.train_scenarios.generation.generate import (
     _compute_all_action_evs,
     _get_raise_sizes,
+    _get_solver,
 )
 from evaluation.evaluate import (
     _find_best_checkpoint,
@@ -350,6 +351,225 @@ def _solver_choose_action(bundle, state, hero_user_pos, hole_cards_int,
     probs = F.softmax(evs_masked / max(normalizer, 1e-6), dim=0)
     if not torch.isfinite(probs).all() or probs.sum() <= 0:
         # All legal actions masked or numerical blow-up — pick first legal.
+        legal_idx = torch.nonzero(legal_mask, as_tuple=False).flatten()
+        return int(legal_idx[0].item()) if len(legal_idx) else 1
+    return int(torch.multinomial(probs, 1).item())
+
+
+def _v4_init_bayesian_state(hero_user_pos, num_players=2):
+    """Initialize per-hand Bayesian opponent range for v4 solver."""
+    _, _, v4_mods = _get_solver("v4")
+    get_pos_range = v4_mods["get_position_range"]
+    expand_range = v4_mods["expand_range"]
+
+    opp_state = {}
+    for pos in range(num_players):
+        if pos == hero_user_pos:
+            continue
+        ht = get_pos_range(pos, num_players)
+        combos = expand_range(ht, set())
+        weights = torch.ones(combos.shape[0], dtype=torch.float32)
+        weights = weights / weights.sum()
+        opp_state[pos] = {"hand_types": ht, "combos": combos, "weights": weights}
+    return opp_state
+
+
+def _v4_update_opponent_range(bayesian_state, opp_user_pos, observed_action_idx,
+                              board_ints, hero_cards_int, table_stub,
+                              action_history, n_actions, scfg):
+    """Bayesian update of opponent range after observing their action."""
+    if opp_user_pos not in bayesian_state:
+        return
+
+    _, _, v4_mods = _get_solver("v4")
+    compute_marg = v4_mods["compute_marginalized_action_probs"]
+    bayes_update = v4_mods["bayesian_range_update"]
+    filter_dead = v4_mods["filter_dead_combos"]
+    expand_range = v4_mods["expand_range"]
+
+    bs = bayesian_state[opp_user_pos]
+    device = scfg.get("device", "cpu")
+
+    board_ids = [int(b) for b in board_ints if b >= 0]
+    dead = set(board_ids) | set(int(c) for c in hero_cards_int)
+
+    valid_combos, valid_weights = filter_dead(bs["combos"], bs["weights"], dead)
+    if valid_combos.shape[0] == 0:
+        return
+
+    board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
+
+    opp_ranges_ht = []
+    opp_positions = []
+    for pos in range(table_stub.num_players):
+        if pos == opp_user_pos:
+            continue
+        opp_ranges_ht.append(
+            bayesian_state[pos]["hand_types"] if pos in bayesian_state
+            else [])
+        opp_positions.append(pos)
+
+    hero_invested = float(table_stub.start_credits[opp_user_pos]) - float(table_stub.credits[opp_user_pos])
+    facing_bet = max(0.0, float(table_stub.high_bet) - float(table_stub.bets[opp_user_pos]))
+    stack = float(table_stub.credits[opp_user_pos])
+    pot = float(table_stub.pot)
+    hero_bets = float(table_stub.bets[opp_user_pos])
+    effective_pot = max(pot - hero_bets, 1e-6)
+    street_raises = table_stub.raise_sizes[table_stub.turn]
+    temperature = max(float(scfg.get("gto_temperature", 0.2)), 1e-3)
+    big_blind = float(table_stub.big_blind)
+
+    try:
+        _, per_combo_probs = compute_marg(
+            valid_combos, valid_weights, board_t, opp_ranges_ht,
+            pot, facing_bet, stack, hero_invested,
+            n_actions, street_raises, effective_pot,
+            temperature, big_blind,
+            n_iters=int(scfg.get("marginal_mc_iters", 3000)),
+            device=device,
+            hero_position=opp_user_pos,
+            street=table_stub.turn,
+            n_players=table_stub.num_players,
+            eqr_enabled=bool(scfg.get("eqr_enabled", True)),
+            combo_response_iters=int(scfg.get("marginal_response_iters", 30)),
+            reraise_threshold=float(scfg.get("reraise_threshold", 0.72)),
+            weighted_sampling=bool(scfg.get("weighted_sampling", True)),
+            action_history=action_history,
+            opponent_positions=opp_positions,
+            dynamic_reraise=True,
+        )
+
+        updated = bayes_update(
+            valid_weights, per_combo_probs, observed_action_idx,
+            combos=valid_combos, dead_cards=dead,
+        )
+        bs["weights"] = updated
+        bs["combos"] = valid_combos
+    except Exception:
+        pass
+
+
+def _v4_solver_choose_action(bundle, state, hero_user_pos, hole_cards_int,
+                             board_ints, action_history, raise_sizes, n_raise_bins,
+                             n_actions, chip_scale, big_blind_internal,
+                             small_blind_internal):
+    """v4 solver: uses compute_ev_batched with Bayesian-narrowed opponent range."""
+    from agent.gto_utils.gpu_solver_v4 import compute_ev_batched
+    from agent.gto_utils.gpu_solver_v3 import get_position_range, expand_range
+
+    scfg = bundle["solver_cfg"]
+    device = scfg.get("device", "cpu")
+    inv = 1.0 / chip_scale
+
+    hero_t = torch.tensor(hole_cards_int, dtype=torch.long).unsqueeze(0)
+    board_ids = [int(b) for b in board_ints if b >= 0]
+    board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
+
+    hero_invested = float(state["bets"][1 - hero_user_pos]) * inv
+    # Hero's bets in user frame
+    hero_bets_slumbot = state["bets"][1 - hero_user_pos]
+    hero_credits_slumbot = state["credits"][1 - hero_user_pos]
+    pot = float(state["pot"]) * inv
+    high_bet = float(state["high_bet"]) * inv
+    hero_bets_u = float(hero_bets_slumbot) * inv
+    facing_bet = max(0.0, high_bet - hero_bets_u)
+    stack = float(hero_credits_slumbot) * inv
+    start_credits = float(SLUMBOT_STACK_SIZE) * inv
+    hero_invested = start_credits - stack
+
+    dead = set(hole_cards_int) | set(board_ids)
+    bayesian = bundle.get("_v4_bayesian")
+    opp_user_pos = 1 - hero_user_pos
+
+    if bayesian and opp_user_pos in bayesian:
+        bs = bayesian[opp_user_pos]
+        from agent.gto_utils.gpu_solver_v4 import filter_dead_combos
+        valid_combos, valid_weights = filter_dead_combos(bs["combos"], bs["weights"], dead)
+        if valid_combos.shape[0] > 0:
+            opp_range_combos = [valid_combos]
+        else:
+            opp_ht = get_position_range(opp_user_pos, 2)
+            opp_range_combos = [expand_range(opp_ht, dead)]
+    else:
+        opp_ht = get_position_range(opp_user_pos, 2)
+        opp_range_combos = [expand_range(opp_ht, dead)]
+
+    opp_range_hand_types = [get_position_range(opp_user_pos, 2)]
+    opp_positions = [opp_user_pos]
+
+    street = int(state["turn"])
+    street_raises = raise_sizes[street]
+    n_raise_bins_actual = len(street_raises)
+    effective_pot = max(pot - hero_bets_u, 1e-6)
+
+    evs = torch.zeros(n_actions, dtype=torch.float)
+    evs[0] = -hero_invested
+
+    ev_kwargs = dict(
+        n_iters=int(scfg.get("mc_iterations", 5000)),
+        device=device,
+        hero_position=hero_user_pos,
+        street=street,
+        n_players=2,
+        eqr_enabled=bool(scfg.get("eqr_enabled", True)),
+        combo_response_iters=int(scfg.get("combo_response_iters", 30)),
+        reraise_threshold=float(scfg.get("reraise_threshold", 0.72)),
+        weighted_sampling=bool(scfg.get("weighted_sampling", True)),
+        action_history=action_history,
+        opponent_positions=opp_positions,
+        dynamic_reraise=True,
+    )
+
+    def _raise_to_solver_frac(raise_pct):
+        return raise_pct * effective_pot / max(pot + facing_bet, 1e-6)
+
+    try:
+        fold_evs, call_evs, _ = compute_ev_batched(
+            hero_t, board_t, opp_range_hand_types,
+            pot, facing_bet, stack, hero_invested,
+            raise_frac=1.0, **ev_kwargs,
+        )
+        evs[1] = call_evs[0].item()
+    except Exception:
+        return 1
+
+    allin_frac = stack / max(pot + facing_bet, 1e-6)
+    try:
+        _, _, allin_evs = compute_ev_batched(
+            hero_t, board_t, opp_range_hand_types,
+            pot, facing_bet, stack, hero_invested,
+            raise_frac=allin_frac, **ev_kwargs,
+        )
+        evs[n_raise_bins + 2] = allin_evs[0].item()
+    except Exception:
+        evs[n_raise_bins + 2] = evs[0]
+
+    for b in range(n_raise_bins_actual):
+        raise_pct = street_raises[b]
+        actual_bet = facing_bet + raise_pct * effective_pot
+        if actual_bet >= stack:
+            evs[b + 2] = evs[n_raise_bins + 2]
+        else:
+            try:
+                solver_frac = _raise_to_solver_frac(raise_pct)
+                _, _, raise_evs = compute_ev_batched(
+                    hero_t, board_t, opp_range_hand_types,
+                    pot, facing_bet, stack, hero_invested,
+                    raise_frac=solver_frac, **ev_kwargs,
+                )
+                evs[b + 2] = raise_evs[0].item()
+            except Exception:
+                evs[b + 2] = evs[n_raise_bins + 2]
+
+    gs = _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins,
+                           chip_scale, big_blind_internal=big_blind_internal)
+    legal_mask = torch.tensor(gs.get_legal_action_mask(n_actions), dtype=torch.bool)
+
+    temperature = max(float(bundle["temperature"]), 1e-3)
+    normalizer = max(pot + facing_bet, float(big_blind_internal)) * temperature
+    evs_masked = evs.masked_fill(~legal_mask, float("-inf"))
+    probs = F.softmax(evs_masked / max(normalizer, 1e-6), dim=0)
+    if not torch.isfinite(probs).all() or probs.sum() <= 0:
         legal_idx = torch.nonzero(legal_mask, as_tuple=False).flatten()
         return int(legal_idx[0].item()) if len(legal_idx) else 1
     return int(torch.multinomial(probs, 1).item())
@@ -910,6 +1130,13 @@ def _choose_action(bundle, events, state, hero_user_pos, hole_cards_int,
     Solver path uses hole_cards/board/action_history; model path ignores them.
     """
     if bundle.get("type") == "solver":
+        scfg = bundle.get("solver_cfg", {})
+        if scfg.get("type") == "v4":
+            return _v4_solver_choose_action(
+                bundle, state, hero_user_pos, hole_cards_int, board_ints,
+                action_history, raise_sizes, n_raise_bins, n_actions, chip_scale,
+                big_blind_internal, small_blind_internal,
+            )
         return _solver_choose_action(
             bundle, state, hero_user_pos, hole_cards_int, board_ints,
             action_history, raise_sizes, n_raise_bins, n_actions, chip_scale,
@@ -967,6 +1194,12 @@ def _play_one_hand(client, bundle, config, raise_sizes, n_raise_bins, n_actions,
     board_ints = _board_to_ints(r.get("board") or [])
     hero_action_indices = []
 
+    is_v4 = (bundle.get("type") == "solver"
+             and bundle.get("solver_cfg", {}).get("type") == "v4")
+    if is_v4:
+        bundle["_v4_bayesian"] = _v4_init_bayesian_state(hero_user_pos, num_players=2)
+    prev_action_history_len = 0
+
     while True:
         # Update board if Slumbot revealed more cards
         if r.get("board"):
@@ -981,6 +1214,30 @@ def _play_one_hand(client, bundle, config, raise_sizes, n_raise_bins, n_actions,
             action_str, hole_cards_int, board_ints, client_pos,
             raise_sizes, n_raise_bins, n_actions, hero_action_indices,
         )
+
+        # v4 Bayesian update: process any new opponent actions since last iteration
+        if is_v4 and len(action_history) > prev_action_history_len:
+            scfg = bundle["solver_cfg"]
+            opp_user_pos = 1 - hero_user_pos
+            for ah_idx in range(prev_action_history_len, len(action_history)):
+                acting_pos, act_type = action_history[ah_idx]
+                if acting_pos == opp_user_pos and act_type is not None:
+                    opp_action_idx = {
+                        "call": 1, "call_postflop": 1,
+                        "open": 2, "3bet": n_raise_bins + 2,
+                        "bet_postflop": 2,
+                    }.get(act_type, 1)
+                    table_stub = _make_solver_table_stub(
+                        hero_user_pos, hole_cards_int, board_ints, state,
+                        raise_sizes, big_blind_internal, small_blind_internal,
+                        chip_scale, num_players=2,
+                    )
+                    _v4_update_opponent_range(
+                        bundle["_v4_bayesian"], opp_user_pos, opp_action_idx,
+                        board_ints, hole_cards_int, table_stub,
+                        action_history[:ah_idx], n_actions, scfg,
+                    )
+            prev_action_history_len = len(action_history)
 
         if state["is_terminal"]:
             # Server should respond with winnings on next /act, but we shouldn't

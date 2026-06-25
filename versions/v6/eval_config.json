@@ -50,15 +50,15 @@
 
     "solver": {
         "type": "v4",
-        "mc_iterations": 25000,
+        "mc_iterations": 15000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
         "combo_response_iters": 200,
         "reraise_threshold": 0.72,
         "weighted_sampling": true,
-        "marginal_mc_iters": 0,
-        "marginal_response_iters": 0,
+        "marginal_mc_iters": 5000,
+        "marginal_response_iters": 100,
         "threshold_smoothing": {
             "enabled": true,
             "beta_fold": 0.07,
@@ -109,136 +109,7 @@
                 "name": "01_baseline",
                 "type": "solver",
                 "solver_overrides": {
-                    "mc_iterations": 5000,
-                    "combo_response_iters": 100,
-                    "gto_temperature": 0.35
-                }
-            },
-            {
-                "name": "02_high_precision",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 15000,
-                    "combo_response_iters": 200,
-                    "gto_temperature": 0.35
-                }
-            },
-            {
-                "name": "03_low_temp",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 5000,
-                    "combo_response_iters": 100,
                     "gto_temperature": 0.15
-                }
-            },
-            {
-                "name": "04_near_deterministic",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 10000,
-                    "combo_response_iters": 150,
-                    "gto_temperature": 0.05
-                }
-            },
-            {
-                "name": "05_smoothing",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 5000,
-                    "combo_response_iters": 100,
-                    "gto_temperature": 0.35,
-                    "threshold_smoothing": {
-                        "enabled": true,
-                        "beta_fold": 0.07,
-                        "beta_reraise": 0.07
-                    }
-                }
-            },
-            {
-                "name": "06_smooth_polar",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 5000,
-                    "combo_response_iters": 100,
-                    "gto_temperature": 0.35,
-                    "threshold_smoothing": {
-                        "enabled": true,
-                        "beta_fold": 0.07,
-                        "beta_reraise": 0.07
-                    },
-                    "polarized_reraise": {
-                        "enabled": true,
-                        "bluff_threshold": 0.25,
-                        "beta_bluff": 0.10,
-                        "bluff_frequency": 0.30
-                    }
-                }
-            },
-            {
-                "name": "07_smooth_polar_exploit",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 10000,
-                    "combo_response_iters": 150,
-                    "gto_temperature": 0.15,
-                    "threshold_smoothing": {
-                        "enabled": true,
-                        "beta_fold": 0.07,
-                        "beta_reraise": 0.07
-                    },
-                    "polarized_reraise": {
-                        "enabled": true,
-                        "bluff_threshold": 0.25,
-                        "beta_bluff": 0.10,
-                        "bluff_frequency": 0.30
-                    }
-                }
-            },
-            {
-                "name": "08_low_reraise_thresh",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 5000,
-                    "combo_response_iters": 100,
-                    "gto_temperature": 0.25,
-                    "reraise_threshold": 0.60,
-                    "threshold_smoothing": {
-                        "enabled": true,
-                        "beta_fold": 0.07,
-                        "beta_reraise": 0.07
-                    }
-                }
-            },
-            {
-                "name": "09_no_eqr",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 5000,
-                    "combo_response_iters": 100,
-                    "gto_temperature": 0.20,
-                    "eqr_enabled": false
-                }
-            },
-            {
-                "name": "10_full_max",
-                "type": "solver",
-                "solver_overrides": {
-                    "mc_iterations": 15000,
-                    "combo_response_iters": 200,
-                    "gto_temperature": 0.10,
-                    "reraise_threshold": 0.65,
-                    "threshold_smoothing": {
-                        "enabled": true,
-                        "beta_fold": 0.05,
-                        "beta_reraise": 0.05
-                    },
-                    "polarized_reraise": {
-                        "enabled": true,
-                        "bluff_threshold": 0.20,
-                        "beta_bluff": 0.08,
-                        "bluff_frequency": 0.35
-                    }
                 }
             }
         ]

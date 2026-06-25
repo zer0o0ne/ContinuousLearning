@@ -173,7 +173,7 @@ class _TensorCollate:
         event_sequences = [item[0] for item in batch]
         targets = torch.stack([item[1] for item in batch])
         precomputed = extract_event_tensors(event_sequences, self.max_players)
-        return precomputed, targets
+        return event_sequences, precomputed, targets
 
 
 def make_tensor_collate(max_players):

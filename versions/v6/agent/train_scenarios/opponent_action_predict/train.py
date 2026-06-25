@@ -145,11 +145,11 @@ def _run_validation(agent, val_loader, device, amp_config=None,
                     batch_loss = _kl_loss(logits, target_probs)
                 n_samples = cached_p.shape[0]
             else:
-                precomputed, target_probs = batch
+                event_sequences, precomputed, target_probs = batch
                 target_probs = target_probs.to(device)
                 n_samples = precomputed["B"] if precomputed is not None else 0
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
-                    out = agent.forward_batch(None, skip_memory=True,
+                    out = agent.forward_batch(event_sequences, skip_memory=True,
                                               heads={"opponent_action"},
                                               skip_opponent_emb=skip_opp,
                                               opponent_emb_table=opponent_emb_table,
@@ -432,12 +432,12 @@ def train_opponent_action(agent, train_cfg, device, log,
                     batch_loss = _kl_loss(logits, target_probs)
                 n_samples = cached_p.shape[0]
             else:
-                precomputed, target_probs = batch
+                event_sequences, precomputed, target_probs = batch
                 target_probs = target_probs.to(device)
                 n_samples = precomputed["B"] if precomputed is not None else 0
                 with torch.autocast(device_type=device_type, dtype=amp_dtype,
                                     enabled=amp_enabled):
-                    out = agent.forward_batch(None, skip_memory=True,
+                    out = agent.forward_batch(event_sequences, skip_memory=True,
                                               heads={"opponent_action"},
                                               skip_opponent_emb=(opp_table is None),
                                               opponent_emb_table=opp_table,

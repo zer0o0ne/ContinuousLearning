@@ -67,7 +67,7 @@ class _TensorCollate:
         chains = [item[3] for item in batch]
         terminal_targets = [item[4] for item in batch]
         precomputed = extract_event_tensors(event_sequences, self.max_players)
-        return precomputed, value_targets, action_targets, chains, terminal_targets
+        return event_sequences, precomputed, value_targets, action_targets, chains, terminal_targets
 
 
 def make_tensor_collate(max_players):

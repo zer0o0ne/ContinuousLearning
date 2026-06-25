@@ -522,12 +522,12 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
     sums = {k: 0.0 for k in _LOSS_KEYS}
     count = 0
     with torch.no_grad():
-        for precomputed, val_targets, act_targets, chains, term_tgts in val_loader:
+        for event_sequences, precomputed, val_targets, act_targets, chains, term_tgts in val_loader:
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 forward_out = _mcts_forward(
-                    agent, None, chains, device,
+                    agent, event_sequences, chains, device,
                     opponent_emb_table=opponent_emb_table,
                     p_tf=0.0,
                     stop_grad_old_embs=stop_grad_old_embs,
@@ -748,14 +748,14 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (precomputed, val_targets, act_targets, chains, term_tgts) in enumerate(train_loader):
+        for batch_idx, (event_sequences, precomputed, val_targets, act_targets, chains, term_tgts) in enumerate(train_loader):
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
             n_samples = precomputed["B"] if precomputed is not None else 0
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 forward_out = _mcts_forward(
-                    agent, None, chains, device,
+                    agent, event_sequences, chains, device,
                     opponent_emb_table=opp_table,
                     p_tf=p_tf,
                     stop_grad_old_embs=stop_grad_old_embs,

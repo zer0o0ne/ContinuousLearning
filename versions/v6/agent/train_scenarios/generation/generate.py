@@ -1472,6 +1472,18 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                     initial=start_attempts)
 
         if worker_args:
+            import threading
+
+            _pbar_stop = threading.Event()
+
+            def _pbar_poller():
+                while not _pbar_stop.wait(0.3):
+                    pbar.n = counter.value
+                    pbar.refresh()
+
+            pbar_thread = threading.Thread(target=_pbar_poller, daemon=True)
+            pbar_thread.start()
+
             with ctx.Pool(n_workers, initializer=_init_worker,
                           initargs=(counter, config, worker_device)) as pool:
                 for worker_scenarios, ok, failed in pool.imap_unordered(
@@ -1481,14 +1493,15 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                     total_failed += failed
                     completed_attempts = counter.value
                     completed_hands = total_ok
-                    pbar.n = counter.value
-                    pbar.refresh()
 
                     if counter.value - last_save_count >= save_every_hands:
                         _persist(meta_done=False)
                         last_save_count = counter.value
                         if log:
                             log(f"  Incremental save: {len(scenarios)} samples ({counter.value} hands)")
+
+            _pbar_stop.set()
+            pbar_thread.join(timeout=1.0)
 
         pbar.n = n_scenarios
         pbar.refresh()

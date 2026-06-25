@@ -1,11 +1,11 @@
 {
-    "name": "small_train_test",
+    "name": "first_spark_train",
     "agent_dir": "",
     "architecture": {
-        "d_model": 64,
+        "d_model": 384,
         "n_heads": 8,
         "n_kv_heads": 2,
-        "d_ff": 128,
+        "d_ff": 1536,
         "n_encoder_layers": 6,
         "n_decoder_layers": 6,
         "n_value_layers": 6,
@@ -25,7 +25,7 @@
         }
     },
     "multi_agent": {
-        "save_dir": "5_tests_agents",
+        "save_dir": "5_agents",
         "agents": [
             {
                 "name": "gto_pure",
@@ -81,11 +81,11 @@
     },
     "solver": {
         "type": "v3",
-        "mc_iterations": 5000,
+        "mc_iterations": 25000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 30,
+        "combo_response_iters": 200,
         "reraise_threshold": 0.72,
         "weighted_sampling": true,
         "marginal_mc_iters": 0,

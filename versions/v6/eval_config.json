@@ -49,14 +49,27 @@
     },
 
     "solver": {
-        "type": "v3",
-        "mc_iterations": 5000,
+        "type": "v4",
+        "mc_iterations": 25000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 30,
+        "combo_response_iters": 200,
         "reraise_threshold": 0.72,
-        "weighted_sampling": true
+        "weighted_sampling": true,
+        "marginal_mc_iters": 0,
+        "marginal_response_iters": 0,
+        "threshold_smoothing": {
+            "enabled": true,
+            "beta_fold": 0.07,
+            "beta_reraise": 0.07
+        },
+        "polarized_reraise": {
+            "enabled": true,
+            "bluff_threshold": 0.25,
+            "beta_bluff": 0.10,
+            "bluff_frequency": 0.30
+        }
     },
 
     "internal_evaluation": {

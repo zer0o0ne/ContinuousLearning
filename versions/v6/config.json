@@ -156,7 +156,7 @@
     },
     "opponent_data": {
         "agents_dir": "5_tests_agents",
-        "n_hands": 155,
+        "n_hands": 135,
         "n_workers": 1,
         "server_max_batch": 256,
         "server_linger_ms": 2,

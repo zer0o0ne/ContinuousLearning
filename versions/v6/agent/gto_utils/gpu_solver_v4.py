@@ -540,16 +540,11 @@ def compute_ev_batched(hero_cards_batch, board_cards, opp_range_hand_types,
     call_evs = call_evs * _street_discount
 
     # --- Raise EV with batched per-combo response ---
-    # NOTE (Audit B.1): value-bet pot bug — should be
-    # `pot + raise_amount + (raise_amount - facing_bet)` (see gpu_solver_v3.py).
-    # This is v4's own batched EV (NOT inherited from compute_ev_v3). NOT fixed
-    # here: v4 is off the live path (config solver.type=v3). Apply the v3 fix
-    # before selecting solver.type="v4".
     raise_amount = min(facing_bet + raise_frac * (pot + facing_bet), stack)
     total_raise = hero_invested + raise_amount
-    new_pot = pot + facing_bet + raise_amount
+    new_pot = pot + raise_amount + (raise_amount - facing_bet)
 
-    call_cost = raise_amount
+    call_cost = max(0.0, raise_amount - facing_bet)
     pot_after_raise = new_pot
     # Fix 8: nonlinear fold threshold — S-curve closer to real solver outputs
     raw_fold_threshold = call_cost / pot_after_raise if pot_after_raise > 0 else 0.5

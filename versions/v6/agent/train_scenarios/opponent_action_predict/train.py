@@ -341,11 +341,9 @@ def train_opponent_action(agent, train_cfg, device, log,
         max_players = agent.perception.embedder.max_players
         _tc = make_tensor_collate(max_players)
         train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                                  collate_fn=_tc, num_workers=2,
-                                  persistent_workers=True)
+                                  collate_fn=_tc, num_workers=0)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                                collate_fn=_tc, num_workers=2,
-                                persistent_workers=True)
+                                collate_fn=_tc, num_workers=0)
     else:
         # E.5.1: pre-compute frozen perception outputs (all perception params
         # frozen when opp_emb disabled — outputs are deterministic)

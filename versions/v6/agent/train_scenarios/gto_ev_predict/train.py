@@ -227,11 +227,9 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
     _tensor_collate = make_tensor_collate(max_players)
     train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                              collate_fn=_tensor_collate, num_workers=2,
-                              persistent_workers=True)
+                              collate_fn=_tensor_collate, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            collate_fn=_tensor_collate, num_workers=2,
-                            persistent_workers=True)
+                            collate_fn=_tensor_collate, num_workers=0)
 
     log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:

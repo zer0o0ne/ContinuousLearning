@@ -688,11 +688,9 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     max_players = agent.perception.embedder.max_players
     _tensor_collate = make_tensor_collate(max_players)
     train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                              collate_fn=_tensor_collate, num_workers=2,
-                              persistent_workers=True)
+                              collate_fn=_tensor_collate, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            collate_fn=_tensor_collate, num_workers=2,
-                            persistent_workers=True)
+                            collate_fn=_tensor_collate, num_workers=0)
 
     log(f"Train: {n_train}, Val: {n_val}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     log(f"Weights: value={value_weight}, action={action_weight}, "

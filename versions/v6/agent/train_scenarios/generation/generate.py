@@ -516,8 +516,7 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                     dynamic_reraise=True,
                     polarized_reraise=polarized_reraise,
                 )
-            except Exception as e:
-                import traceback; traceback.print_exc()
+            except Exception:
                 return None, None
 
             eq = state["raw_equity"]
@@ -527,8 +526,7 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                     state, pot, facing_bet, stack, hero_invested,
                     raise_frac=1.0, dynamic_reraise=True,
                 )
-            except Exception as e:
-                import traceback; traceback.print_exc()
+            except Exception:
                 return None, None
             evs[1] = call_ev
 

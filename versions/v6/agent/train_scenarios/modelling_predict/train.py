@@ -28,6 +28,34 @@ from agent.resume import atomic_torch_save
 from agent.train_scenarios._history import IncrementalHistory
 
 
+class _CachedDataset(torch.utils.data.Dataset):
+    def __init__(self, indices, p_outs, p_masks, base_dataset):
+        self.indices = list(indices)
+        self.p_outs = p_outs
+        self.p_masks = p_masks
+        self.base = base_dataset
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, idx):
+        oidx = self.indices[idx]
+        events, target = self.base[oidx]
+        return self.p_outs[oidx], self.p_masks[oidx], events, target
+
+
+def _cached_collate(batch):
+    p_outs_b, masks_b, events_b, targets_b = zip(*batch)
+    max_len = max(p.shape[0] for p in p_outs_b)
+    B = len(batch)
+    d = p_outs_b[0].shape[-1]
+    padded_p = torch.zeros(B, max_len, d)
+    padded_m = torch.zeros(B, max_len, dtype=masks_b[0].dtype)
+    for i, (p, m) in enumerate(zip(p_outs_b, masks_b)):
+        L = p.shape[0]
+        padded_p[i, :L] = p
+        padded_m[i, :L] = m
+    return padded_p, padded_m, list(events_b), torch.stack(targets_b)
+
+
 _PHASE = "modelling_predict"
 
 
@@ -378,32 +406,6 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                 _p_outs.append(p_out[k, :L].detach().cpu())
                 _p_masks.append(m[k, :L].detach().cpu())
     log(f"Cached {len(_p_outs)} perception outputs")
-
-    class _CachedDataset(torch.utils.data.Dataset):
-        def __init__(self, indices, p_outs, p_masks, base_dataset):
-            self.indices = list(indices)
-            self.p_outs = p_outs
-            self.p_masks = p_masks
-            self.base = base_dataset
-        def __len__(self):
-            return len(self.indices)
-        def __getitem__(self, idx):
-            oidx = self.indices[idx]
-            events, target = self.base[oidx]
-            return self.p_outs[oidx], self.p_masks[oidx], events, target
-
-    def _cached_collate(batch):
-        p_outs_b, masks_b, events_b, targets_b = zip(*batch)
-        max_len = max(p.shape[0] for p in p_outs_b)
-        B = len(batch)
-        d = p_outs_b[0].shape[-1]
-        padded_p = torch.zeros(B, max_len, d)
-        padded_m = torch.zeros(B, max_len, dtype=masks_b[0].dtype)
-        for i, (p, m) in enumerate(zip(p_outs_b, masks_b)):
-            L = p.shape[0]
-            padded_p[i, :L] = p
-            padded_m[i, :L] = m
-        return padded_p, padded_m, list(events_b), torch.stack(targets_b)
 
     cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
     cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)

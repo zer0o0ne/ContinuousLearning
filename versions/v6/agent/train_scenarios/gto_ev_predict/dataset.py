@@ -34,14 +34,18 @@ def batch_collate(batch):
     return event_sequences, ev_targets
 
 
-def make_tensor_collate(max_players):
-    """Return a collate that pre-extracts event tensors on CPU."""
-    from agent.perception.perception import extract_event_tensors
+class _TensorCollate:
+    def __init__(self, max_players):
+        self.max_players = max_players
 
-    def _collate(batch):
+    def __call__(self, batch):
+        from agent.perception.perception import extract_event_tensors
         event_sequences = [item[0] for item in batch]
         ev_targets = torch.stack([item[1] for item in batch])
-        precomputed = extract_event_tensors(event_sequences, max_players)
+        precomputed = extract_event_tensors(event_sequences, self.max_players)
         return precomputed, ev_targets
 
-    return _collate
+
+def make_tensor_collate(max_players):
+    """Return a collate that pre-extracts event tensors on CPU."""
+    return _TensorCollate(max_players)

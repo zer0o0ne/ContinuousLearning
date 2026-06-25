@@ -304,11 +304,9 @@ def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None,
 
     train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
     train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
-                              collate_fn=_cached_collate, num_workers=2,
-                              persistent_workers=True)
+                              collate_fn=_cached_collate, num_workers=0)
     val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
-                            collate_fn=_cached_collate, num_workers=2,
-                            persistent_workers=True)
+                            collate_fn=_cached_collate, num_workers=0)
 
     log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:

@@ -722,7 +722,8 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     if progress_counter is not None:
         hand_iter = range(n_hands)
     else:
-        hand_iter = (tqdm(range(n_hands), desc="MCTS collection")
+        hand_iter = (tqdm(range(n_hands), desc="MCTS collection",
+                          smoothing=0)
                      if progress else range(n_hands))
     for hand_i in hand_iter:
         # With swap_prob, reshuffle the entire table: new count + new agents
@@ -1450,7 +1451,8 @@ def _run_parallel_collection(agents_list, config, device, log, n_hands,
     # thread reading `progress_counter`. Refreshes every 100ms.
     import threading as _threading
     pbar = tqdm(total=n_hands,
-                desc=f"MCTS collect cycle {cycle_idx + 1}/{n_cycles}")
+                desc=f"MCTS collect cycle {cycle_idx + 1}/{n_cycles}",
+                smoothing=0)
     pbar_stop = _threading.Event()
 
     def _pbar_loop():

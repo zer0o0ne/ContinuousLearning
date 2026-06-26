@@ -24,7 +24,7 @@ class SimpleDealer:
         self.brain.sit(n_players, with_human = with_human)
         self.brain.set_device(device)
         self.init_history__()
-        iterations = tqdm(range(n_games), desc = "games")
+        iterations = tqdm(range(n_games), desc="games", smoothing=0)
         if with_human: iterations = range(n_games)
 
         for game in iterations:

@@ -1433,7 +1433,8 @@ def _run_agent_session_sequential(
                            timeout=timeout, retries=retries, backoff=backoff,
                            log=log)
     buffers = _make_session_buffers(n_actions)
-    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand")
+    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand",
+                smoothing=0)
     for hand_idx in range(n_hands):
         try:
             w, b = _play_one_hand(
@@ -1712,7 +1713,8 @@ def _run_agent_session_parallel(
         p.start()
         procs.append(p)
 
-    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand")
+    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand",
+                smoothing=0)
     workers_alive = n_workers
     fatal_tb = None
     aborted = []
@@ -1996,7 +1998,8 @@ def _run_agent_session_parallel_solver(
         p.start()
         procs.append(p)
 
-    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand")
+    pbar = tqdm(total=n_hands, desc=f"Slumbot/{name}", unit="hand",
+                smoothing=0)
     workers_alive = n_workers
     fatal_tb = None
     aborted = []

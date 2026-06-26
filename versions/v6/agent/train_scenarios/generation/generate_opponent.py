@@ -973,7 +973,8 @@ def generate_opponent_dataset(config, save_dir, device, log,
             log(f"Resuming sequential opponent generation: "
                 f"{remaining} attempts remaining")
 
-        for offset in tqdm(range(remaining), desc="Generating opponent data"):
+        for offset in tqdm(range(remaining), desc="Generating opponent data",
+                           smoothing=0):
             hand_i = start_attempts + offset
             # Simulate player rotation — occasionally swap seat identities
             for pos in range(max_players):
@@ -1054,7 +1055,8 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
         if progress_counter is not None:
             it = range(n_hands)
         else:
-            it = tqdm(range(n_hands), desc=f"opp actor {worker_id}") \
+            it = tqdm(range(n_hands), desc=f"opp actor {worker_id}",
+                      smoothing=0) \
                 if progress else range(n_hands)
         for hand_i in it:
             for pos in range(max_players):
@@ -1219,7 +1221,7 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
     # Single unified tqdm for the whole generation; updated by a daemon
     # thread reading `progress_counter`. Refreshes every 100ms.
     import threading as _threading
-    pbar = tqdm(total=n_hands, desc="Generating opponent data")
+    pbar = tqdm(total=n_hands, desc="Generating opponent data", smoothing=0)
     pbar_stop = _threading.Event()
 
     def _pbar_loop():

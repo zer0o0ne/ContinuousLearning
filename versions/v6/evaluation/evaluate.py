@@ -761,7 +761,7 @@ def run_evaluation(config, device, log, results_dir_override=None):
         table_states.append(ts)
         hands_started += 1
 
-    pbar = tqdm(total=n_hands, desc="Evaluating")
+    pbar = tqdm(total=n_hands, desc="Evaluating", smoothing=0)
 
     dummy_action = torch.zeros(n_actions, dtype=torch.float32)
 

@@ -50,15 +50,15 @@
 
     "solver": {
         "type": "v4",
-        "mc_iterations": 15000,
+        "mc_iterations": 5000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 200,
+        "combo_response_iters": 100,
         "reraise_threshold": 0.72,
         "weighted_sampling": true,
-        "marginal_mc_iters": 5000,
-        "marginal_response_iters": 100,
+        "marginal_mc_iters": 200,
+        "marginal_response_iters": 5,
         "threshold_smoothing": {
             "enabled": true,
             "beta_fold": 0.07,
@@ -99,7 +99,7 @@
         "request_timeout": 30,
         "log_every": 5000,
         "n_hands": 10000,
-        "n_workers": 6,
+        "n_workers": 4,
         "max_consecutive_failures": 20,
         "retries": 4,
         "backoff": 1.0,

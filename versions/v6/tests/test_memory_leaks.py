@@ -153,6 +153,17 @@ class TestScenarioStorageEfficiency(unittest.TestCase):
                 f"scenario[{i}].forward_weights is {type(s['forward_weights']).__name__}, "
                 f"expected numpy.ndarray")
 
+    def test_forward_combos_is_numpy(self):
+        """forward_combos must be a numpy int32 array, not Python list of lists.
+        Python list of lists wastes ~160 KB per scenario vs ~10 KB as numpy."""
+        if self._scenarios is None:
+            self.skipTest("Could not generate scenarios")
+        for i, s in enumerate(self._scenarios):
+            self.assertIsInstance(
+                s["forward_combos"], np.ndarray,
+                f"scenario[{i}].forward_combos is {type(s['forward_combos']).__name__}, "
+                f"expected numpy.ndarray")
+
 
 # ---------------------------------------------------------------------------
 # 2. _load_agents must not double-load checkpoints. The agent already stores
@@ -450,6 +461,210 @@ class TestPipelineFreesOppScenariosBeforeMCTS(unittest.TestCase):
             break
         else:
             self.fail("Could not find main() in pipeline.py")
+
+
+# ---------------------------------------------------------------------------
+# 8. _release_memory must be called after each major cleanup in pipeline.
+# ---------------------------------------------------------------------------
+
+class TestPipelineCallsReleaseMemory(unittest.TestCase):
+    """Pipeline must call _release_memory at key cleanup points to force
+    Python's allocator to return freed pages to the OS (malloc_trim)."""
+
+    def test_release_memory_function_exists(self):
+        import importlib
+        pipeline = importlib.import_module("pipeline")
+        self.assertTrue(
+            hasattr(pipeline, "_release_memory"),
+            "_release_memory function not found in pipeline.py")
+
+    def test_release_memory_called_after_base_scenarios_freed(self):
+        """_release_memory must be called near `base_scenarios = None`
+        (before opponent phase) to return heap to OS."""
+        pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
+        with open(pipeline_path) as f:
+            lines = f.readlines()
+
+        found_pair = False
+        for i, line in enumerate(lines):
+            if "base_scenarios = None" in line and i > 100:
+                window = "".join(lines[i:i + 3])
+                if "_release_memory" in window:
+                    found_pair = True
+                    break
+
+        self.assertTrue(
+            found_pair,
+            "_release_memory not called near `base_scenarios = None`. "
+            "Without malloc_trim, Python keeps freed heap pages and RSS "
+            "stays inflated by tens of GB on unified-memory systems.")
+
+    def test_release_memory_called_after_del_agent_modified(self):
+        """_release_memory must be called after `del agent, modified`."""
+        pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
+        with open(pipeline_path) as f:
+            lines = f.readlines()
+
+        found = False
+        for i, line in enumerate(lines):
+            if "del agent, modified" in line:
+                window = "".join(lines[i:i + 3])
+                if "_release_memory" in window:
+                    found = True
+                    break
+
+        self.assertTrue(found,
+                        "_release_memory not called after `del agent, modified`")
+
+
+# ---------------------------------------------------------------------------
+# 9. _run_or_resume_phase must not hold ckpt dict after extracting fields.
+# ---------------------------------------------------------------------------
+
+class TestResumePhaseFreesCheckpoint(unittest.TestCase):
+    """_run_or_resume_phase must `del ckpt` after extracting resume_state
+    so the model_state_dict (~200 MB) is freed during training."""
+
+    def test_ckpt_deleted_in_resume_path(self):
+        import ast
+        pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
+        with open(pipeline_path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "_run_or_resume_phase":
+                continue
+
+            found_del_ckpt = False
+            for child in ast.walk(node):
+                if isinstance(child, ast.Delete):
+                    for target in child.targets:
+                        if isinstance(target, ast.Name) and target.id == "ckpt":
+                            found_del_ckpt = True
+                        elif isinstance(target, ast.Subscript):
+                            val = child.targets[0]
+                            if (isinstance(val, ast.Subscript)
+                                    and isinstance(val.value, ast.Name)
+                                    and val.value.id == "ckpt"):
+                                found_del_ckpt = True
+
+            self.assertTrue(
+                found_del_ckpt,
+                "`del ckpt` not found in _run_or_resume_phase. The full "
+                "checkpoint dict (model_state_dict ~200 MB) stays alive "
+                "through the entire training run via resume_state's "
+                "reference to the parent dict.")
+            break
+        else:
+            self.fail("Could not find _run_or_resume_phase function")
+
+
+# ---------------------------------------------------------------------------
+# 10. ASI.load_checkpoint must store _checkpoint_temperature.
+# ---------------------------------------------------------------------------
+
+class TestAgentStoresCheckpointTemperature(unittest.TestCase):
+    """ASI.load_checkpoint must extract temperature from the checkpoint
+    so _load_agents doesn't need a second torch.load."""
+
+    def test_checkpoint_temperature_stored(self):
+        from agent.agent import ASI
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = lambda msg: None
+            agent = ASI(log, config=_TINY_CONFIG)
+
+            ckpt_path = os.path.join(tmpdir, "best.pt")
+            torch.save({
+                "model_state_dict": agent.state_dict(),
+                "norm_stats": {"pot_mean": 0.0, "pot_std": 1.0,
+                               "stack_mean": 0.0, "stack_std": 1.0,
+                               "bets_mean": 0.0, "bets_std": 1.0,
+                               "blind_mean": 0.0, "blind_std": 1.0},
+                "temperature": 0.42,
+            }, ckpt_path)
+
+            agent2 = ASI(log, config=_TINY_CONFIG)
+            self.assertIsNone(agent2._checkpoint_temperature)
+
+            agent2.load_checkpoint(ckpt_path)
+            self.assertEqual(agent2._checkpoint_temperature, 0.42,
+                             "load_checkpoint must store temperature in "
+                             "_checkpoint_temperature")
+
+    def test_checkpoint_temperature_none_when_absent(self):
+        from agent.agent import ASI
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = lambda msg: None
+            agent = ASI(log, config=_TINY_CONFIG)
+
+            ckpt_path = os.path.join(tmpdir, "best.pt")
+            torch.save({
+                "model_state_dict": agent.state_dict(),
+            }, ckpt_path)
+
+            agent2 = ASI(log, config=_TINY_CONFIG)
+            agent2.load_checkpoint(ckpt_path)
+            self.assertIsNone(agent2._checkpoint_temperature)
+
+
+# ---------------------------------------------------------------------------
+# 11. OpponentActionDataset._observer_target works with numpy forward_combos.
+# ---------------------------------------------------------------------------
+
+class TestDatasetWorksWithNumpyCombos(unittest.TestCase):
+    """The observer_target blocker logic must handle numpy int32 arrays
+    for forward_combos (not just Python lists)."""
+
+    def test_numpy_forward_combos_blocker_works(self):
+        from agent.train_scenarios.opponent_action_predict.dataset import (
+            OpponentActionDataset,
+        )
+
+        combos = np.array([[10, 20], [30, 40], [10, 50]], dtype=np.int32)
+        probs = np.array([
+            [0.5, 0.3, 0.1, 0.05, 0.05],
+            [0.2, 0.4, 0.2, 0.1, 0.1],
+            [0.1, 0.1, 0.3, 0.3, 0.2],
+        ], dtype=np.float32)
+        weights = np.array([0.4, 0.4, 0.2], dtype=np.float32)
+
+        scenario = {
+            "events": [{"pot": 10, "bets": np.array([5, 5]),
+                        "table": [-1, -1, -1, -1, -1],
+                        "hand": [0, 1], "hands": {},
+                        "acting_pos": 0, "hero_pos": 1,
+                        "num_players": 2, "stacks": [100, 100],
+                        "action": [1.0, 0.0, 0.0, 0.0, 0.0]}],
+            "opponent_action_probs": [0.3, 0.3, 0.2, 0.1, 0.1],
+            "hero_positions": [1],
+            "acting_pos": 0,
+            "num_players": 2,
+            "forward_combos": combos,
+            "per_combo_probs": probs,
+            "forward_weights": weights,
+            "pot": 10,
+            "facing_bet": 0,
+            "n_events": 1,
+        }
+
+        dataset = OpponentActionDataset([scenario])
+        target = dataset._observer_target(scenario, hero_hand=[10, 11])
+
+        self.assertEqual(target.shape, (5,))
+        self.assertAlmostEqual(float(target.sum()), 1.0, places=5)
+        # Hero holds card 10 → combos 0 and 2 are blocked (contain card 10)
+        # Only combo 1 ([30, 40]) survives → target should be combo 1's probs
+        expected = torch.tensor([0.2, 0.4, 0.2, 0.1, 0.1])
+        for i in range(5):
+            self.assertAlmostEqual(
+                float(target[i]), float(expected[i]), places=4,
+                msg=f"target[{i}] mismatch with numpy forward_combos")
 
 
 if __name__ == "__main__":

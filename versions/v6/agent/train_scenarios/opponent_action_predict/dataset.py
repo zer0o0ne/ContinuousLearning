@@ -88,15 +88,20 @@ class OpponentActionDataset(Dataset):
         is blocked. Re-averaging over ALL combos reproduces the stored average.
         """
         fc = scenario.get("forward_combos")
-        if not fc:
+        if fc is None or len(fc) == 0:
             return torch.tensor(scenario["opponent_action_probs"], dtype=torch.float32)
         pcp = torch.tensor(scenario["per_combo_probs"], dtype=torch.float32)  # (K, n_actions)
         w = torch.tensor(scenario["forward_weights"], dtype=torch.float32)    # (K,)
-        blockers = {int(hero_hand[0]), int(hero_hand[1])}
-        keep = torch.tensor(
-            [c[0] not in blockers and c[1] not in blockers for c in fc],
-            dtype=torch.bool,
-        )
+        b0, b1 = int(hero_hand[0]), int(hero_hand[1])
+        if isinstance(fc, np.ndarray):
+            keep = torch.from_numpy(
+                (fc[:, 0] != b0) & (fc[:, 1] != b0) &
+                (fc[:, 0] != b1) & (fc[:, 1] != b1))
+        else:
+            keep = torch.tensor(
+                [c[0] not in (b0, b1) and c[1] not in (b0, b1) for c in fc],
+                dtype=torch.bool,
+            )
         w = w * keep.to(w.dtype)
         if float(w.sum()) < 1e-9:
             return torch.tensor(scenario["opponent_action_probs"], dtype=torch.float32)

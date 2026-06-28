@@ -721,7 +721,7 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         scenarios.append({
             "events": [{**e} for e in shared_events],
             "opponent_action_probs": avg_probs.tolist(),
-            "forward_combos": [[int(c1), int(c2)] for (c1, c2) in forward_combos],
+            "forward_combos": np.array(forward_combos, dtype=np.int32),
             "per_combo_probs": per_combo_probs.cpu().numpy().copy(),
             "forward_weights": forward_weights_t.cpu().numpy().copy(),
             "acting_pos": active_pos,

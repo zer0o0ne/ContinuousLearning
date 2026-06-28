@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import gc
 import json
 import copy
 from math import ceil
@@ -14,6 +15,25 @@ from agent.train_scenarios._checkpoint_io import (
     restore_optim_sched,
 )
 from agent.train_scenarios._history import IncrementalHistory
+
+
+def _release_memory(device="cpu"):
+    """Force Python to return freed memory to the OS.
+
+    CPython's pymalloc holds freed arenas indefinitely; on unified-memory
+    systems (DGX Spark) this inflates RSS by tens of GB after large
+    dataset operations.  gc.collect() breaks reference cycles, then
+    malloc_trim asks glibc to release free pages back to the kernel.
+    """
+    gc.collect()
+    import torch
+    if str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def _find_latest_best_ckpt(scenario_dir):
@@ -174,12 +194,13 @@ def _run_or_resume_phase(state, agent, agent_name, scenario_name,
                 ckpt = torch.load(
                     latest_path, weights_only=False, map_location=device)
                 agent.load_state_dict(ckpt["model_state_dict"], strict=False)
+                del ckpt["model_state_dict"]
                 ns = ckpt.get("norm_stats")
                 if ns is not None:
                     agent._checkpoint_norm_stats = ns
                 resume_state = {
-                    "optimizer_state_dict": ckpt["optimizer_state_dict"],
-                    "scheduler_state_dict": ckpt["scheduler_state_dict"],
+                    "optimizer_state_dict": ckpt.pop("optimizer_state_dict"),
+                    "scheduler_state_dict": ckpt.pop("scheduler_state_dict"),
                     "start_epoch":     int(ckpt.get("next_epoch", 0)),
                     "global_step":     int(ckpt.get("global_step", 0)),
                     "best_val_loss":   float(ckpt.get("best_val_loss",
@@ -187,6 +208,7 @@ def _run_or_resume_phase(state, agent, agent_name, scenario_name,
                     "fails_since_best": int(ckpt.get("fails_since_best", 0)),
                     "norm_stats":      ns,
                 }
+                del ckpt
                 agent_log(
                     f"  [resume] {scenario_name}: starting from "
                     f"epoch={resume_state['start_epoch']}, "
@@ -507,8 +529,7 @@ def main():
             # contiguous arena. Especially helpful with multi-agent runs on
             # 24GB cards where each phase's optim ~= 2× params.
             del agent, modified
-            if str(device).startswith("cuda"):
-                torch.cuda.empty_cache()
+            _release_memory(device)
 
     elif needs_training:
         # --- Single-agent training ---
@@ -555,6 +576,7 @@ def main():
 
     # Free GTO dataset before the memory-intensive opponent phase.
     base_scenarios = None
+    _release_memory(device)
 
     # --- Opponent data generation + training ---
     if pipeline_cfg.get("run_opponent_data", False):
@@ -578,11 +600,7 @@ def main():
             config, opp_save_dir, device, log,
             resume=resume, config_hash=config_hash)
 
-        # `_load_agents` inside puts N agents on CUDA; they go out of scope
-        # when the function returns but the caching allocator holds the
-        # fragments. Free them before the next phase allocates fresh agents.
-        if str(device).startswith("cuda"):
-            torch.cuda.empty_cache()
+        _release_memory(device)
 
         if resume and opp_scenarios:
             state.set_dataset(
@@ -636,8 +654,7 @@ def main():
                             run_dir=run_dir, resume_state=resume_state))
 
                     del agent
-                    if str(device).startswith("cuda"):
-                        torch.cuda.empty_cache()
+                    _release_memory(device)
             else:
                 # Single-agent — load from trained save dir (where phases
                 # 1-4 saved), falling back to agent_dir only if no trained
@@ -662,13 +679,13 @@ def main():
                         agent.load_checkpoint(best_ckpt)
 
                 del agent
-                if str(device).startswith("cuda"):
-                    torch.cuda.empty_cache()
+                _release_memory(device)
 
     # Free datasets no longer needed — reclaim RAM before the memory-intensive
     # MCTS phase.
     base_scenarios = None
     opp_scenarios = None
+    _release_memory(device)
 
     # --- MCTS cyclic collect → train ---
     if pipeline_cfg.get("run_mcts_train", False):
@@ -831,11 +848,7 @@ def main():
                 agent_log(msg)
                 return opt, sched
 
-            # MCTS phase will hold N agents + N persistent optimizers on GPU
-            # for the entire run. Clear caching allocator first so it starts
-            # from as clean an arena as possible.
-            if str(device).startswith("cuda"):
-                torch.cuda.empty_cache()
+            _release_memory(device)
 
             # Resume state for MCTS (no-op when state.resume == False).
             mcts_state = state.get_mcts() or {}

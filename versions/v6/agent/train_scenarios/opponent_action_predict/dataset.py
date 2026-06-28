@@ -27,7 +27,7 @@ class OpponentActionDataset(Dataset):
     """
 
     def __init__(self, scenarios, norm_stats=None):
-        self.scenarios = scenarios
+        self.scenarios = list(scenarios)
         self.norm_stats = norm_stats
         # Pre-expand into (scenario_idx, hero_pos) index
         self.indices = []

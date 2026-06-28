@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from tqdm.auto import tqdm
 
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
     _compute_norm_stats, _normalize_scenarios, _shallow_copy_scenarios
@@ -287,8 +288,10 @@ def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None,
     log("Pre-computing frozen perception outputs...")
     _p_outs = []
     _p_masks = []
+    n_batches = (len(dataset) + batch_size - 1) // batch_size
     with torch.no_grad():
-        for start in range(0, len(dataset), batch_size):
+        for start in tqdm(range(0, len(dataset), batch_size),
+                          total=n_batches, desc="Caching perception", smoothing=0):
             end = min(start + batch_size, len(dataset))
             batch_events = [dataset[j][0] for j in range(start, end)]
             p_out, _, m = agent.perception.forward_batch(
@@ -362,7 +365,8 @@ def train_gto_probs(agent, train_cfg, device, log, scenarios_override=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (cached_p, cached_m, target_probs) in enumerate(train_loader):
+        for batch_idx, (cached_p, cached_m, target_probs) in enumerate(
+                tqdm(train_loader, desc=f"GTO probs epoch {epoch+1}/{epochs}", leave=False, smoothing=0)):
             cached_p = cached_p.to(device)
             cached_m = cached_m.to(device)
             target_probs = target_probs.to(device)

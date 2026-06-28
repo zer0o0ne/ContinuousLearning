@@ -16,7 +16,6 @@ Can be run standalone:
 """
 
 import os
-import copy
 import random
 import warnings
 import argparse
@@ -73,8 +72,7 @@ def _load_agents(agents_dir, config, device, log, fallback_temperature):
         agent.load_checkpoint(ckpt_path)
         agent.eval()
 
-        ckpt = torch.load(ckpt_path, weights_only=False, map_location=device)
-        norm_stats = ckpt.get("norm_stats")
+        norm_stats = agent._checkpoint_norm_stats
         if norm_stats is None:
             log(f"WARNING: no norm_stats for '{name}', using identity")
             norm_stats = {
@@ -84,7 +82,7 @@ def _load_agents(agents_dir, config, device, log, fallback_temperature):
                 "blind_mean": 0.0, "blind_std": 1.0,
             }
 
-        temperature = ckpt.get("temperature")
+        temperature = agent._checkpoint_temperature
         if temperature is None:
             temperature = fallback_temperature
 
@@ -721,11 +719,11 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         # average (fallback / acting-player view); re-averaging over all combos
         # reproduces it exactly.
         scenarios.append({
-            "events": copy.deepcopy(shared_events),
+            "events": [{**e} for e in shared_events],
             "opponent_action_probs": avg_probs.tolist(),
             "forward_combos": [[int(c1), int(c2)] for (c1, c2) in forward_combos],
-            "per_combo_probs": per_combo_probs.cpu().tolist(),
-            "forward_weights": forward_weights_t.cpu().tolist(),
+            "per_combo_probs": per_combo_probs.cpu().numpy().copy(),
+            "forward_weights": forward_weights_t.cpu().numpy().copy(),
             "acting_pos": active_pos,
             "hero_positions": hero_positions,
             "num_players": num_players,

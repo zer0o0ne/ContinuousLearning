@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from tqdm.auto import tqdm
 
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
     _compute_norm_stats, _normalize_scenarios, _shallow_copy_scenarios
@@ -285,7 +286,8 @@ def train_gto_ev(agent, train_cfg, device, log, scenarios_override=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (precomputed, ev_targets) in enumerate(train_loader):
+        for batch_idx, (precomputed, ev_targets) in enumerate(
+                tqdm(train_loader, desc=f"GTO EV epoch {epoch+1}/{epochs}", leave=False, smoothing=0)):
             ev_targets = ev_targets.to(device)
             n_samples = precomputed["B"] if precomputed is not None else 0
 

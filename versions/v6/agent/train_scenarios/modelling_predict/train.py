@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from tqdm.auto import tqdm
 
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
     _compute_norm_stats, _normalize_scenarios, _shallow_copy_scenarios
@@ -286,7 +287,7 @@ def _check_val(val_loss, best_val_loss, fails_since_best, interrupt_after_fails,
 def _normalize_action_evs(scenarios, norm_stats):
     """Normalize action_evs identically to ev_target: scale by (pot+facing_bet), then z-score."""
     ev_m, ev_s = norm_stats["ev_mean"], norm_stats["ev_std"]
-    for s in scenarios:
+    for s in tqdm(scenarios, desc="Normalizing action EVs", leave=False, smoothing=0):
         denom = max(s.get("pot", 0) + s.get("facing_bet", 0),
                     s["events"][-1]["big_blind"])
         evs = s["action_evs"]
@@ -395,8 +396,10 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
     log("Pre-computing frozen perception outputs...")
     _p_outs = []
     _p_masks = []
+    n_batches = (len(dataset) + batch_size - 1) // batch_size
     with torch.no_grad():
-        for start in range(0, len(dataset), batch_size):
+        for start in tqdm(range(0, len(dataset), batch_size),
+                          total=n_batches, desc="Caching perception", smoothing=0):
             end = min(start + batch_size, len(dataset))
             batch_events = [dataset[j][0] for j in range(start, end)]
             p_out, _, m = agent.perception.forward_batch(
@@ -468,7 +471,8 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (cached_p, cached_m, event_sequences, action_evs) in enumerate(train_loader):
+        for batch_idx, (cached_p, cached_m, event_sequences, action_evs) in enumerate(
+                tqdm(train_loader, desc=f"Modelling epoch {epoch+1}/{epochs}", leave=False, smoothing=0)):
             cached_p = cached_p.to(device)
             cached_m = cached_m.to(device)
             action_evs = _compress_targets(action_evs.to(device))

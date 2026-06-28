@@ -77,6 +77,7 @@ class ASI(nn.Module):
         self.optimizer = None
         self.loss_buffer = []
         self._checkpoint_norm_stats = None
+        self._checkpoint_temperature = None
 
     def forward_batch(self, event_sequences, skip_memory=True, heads=None,
                       skip_opponent_emb=True, opponent_emb_table=None,
@@ -153,6 +154,8 @@ class ASI(nn.Module):
         # can reuse the distribution perception was trained on.
         if ckpt.get("norm_stats") is not None:
             self._checkpoint_norm_stats = ckpt["norm_stats"]
+        if ckpt.get("temperature") is not None:
+            self._checkpoint_temperature = ckpt["temperature"]
 
         if missing:
             self.log(f"WARNING: Loaded checkpoint from {ckpt_path}, but {len(missing)} parameters "

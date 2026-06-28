@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from tqdm.auto import tqdm
 
 from agent.train_scenarios.opponent_action_predict.dataset import (
     OpponentActionDataset, batch_collate,
@@ -90,7 +91,7 @@ class LengthGroupedBatchSampler(Sampler):
 def _compute_norm_stats(scenarios):
     """Compute normalization stats from shared-format opponent scenarios."""
     pots, stacks, all_bets, blinds = [], [], [], []
-    for s in scenarios:
+    for s in tqdm(scenarios, desc="Computing norm stats", leave=False, smoothing=0):
         for event in s["events"]:
             pots.append(event["pot"])
             stacks.extend(event["stacks"])
@@ -350,8 +351,10 @@ def train_opponent_action(agent, train_cfg, device, log,
         log("Pre-computing frozen perception outputs...")
         _p_outs = []
         _p_masks = []
+        n_batches = (len(dataset) + batch_size - 1) // batch_size
         with torch.no_grad():
-            for start in range(0, len(dataset), batch_size):
+            for start in tqdm(range(0, len(dataset), batch_size),
+                              total=n_batches, desc="Caching perception", smoothing=0):
                 end = min(start + batch_size, len(dataset))
                 batch_events = [dataset[j][0] for j in range(start, end)]
                 p_out, _, m = agent.perception.forward_batch(
@@ -418,7 +421,8 @@ def train_opponent_action(agent, train_cfg, device, log,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(
+                tqdm(train_loader, desc=f"Opp action epoch {epoch+1}/{epochs}", leave=False, smoothing=0)):
             if _use_perception_cache:
                 cached_p, cached_m, target_probs = batch
                 cached_p = cached_p.to(device)

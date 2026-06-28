@@ -1056,7 +1056,7 @@ def _compute_norm_stats(scenarios):
     dependence, then z-score stats are computed on the ratio.
     """
     evs, pots, stacks, all_bets, blinds = [], [], [], [], []
-    for s in scenarios:
+    for s in tqdm(scenarios, desc="Computing norm stats", leave=False, smoothing=0):
         # Scale EV by pot + facing_bet before computing stats
         denom = max(s.get("pot", 0) + s.get("facing_bet", 0),
                     s["events"][-1]["big_blind"])
@@ -1111,7 +1111,7 @@ def _normalize_scenarios(scenarios, norm_stats):
     bets_m, bets_s = norm_stats["bets_mean"], norm_stats["bets_std"]
     blind_m, blind_s = norm_stats["blind_mean"], norm_stats["blind_std"]
 
-    for s in scenarios:
+    for s in tqdm(scenarios, desc="Normalizing scenarios", leave=False, smoothing=0):
         denom = max(s.get("pot", 0) + s.get("facing_bet", 0),
                     s["events"][-1]["big_blind"])
         s["ev_target"] = (s["ev_target"] / denom - ev_m) / ev_s

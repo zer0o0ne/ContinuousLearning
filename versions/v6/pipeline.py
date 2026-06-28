@@ -506,7 +506,7 @@ def main():
             # fragmented blocks to the allocator so the next ASI gets a clean
             # contiguous arena. Especially helpful with multi-agent runs on
             # 24GB cards where each phase's optim ~= 2× params.
-            del agent
+            del agent, modified
             if str(device).startswith("cuda"):
                 torch.cuda.empty_cache()
 
@@ -552,6 +552,9 @@ def main():
             modelling_cfg = _merge_train_config(config, "modelling_train")
             train_modelling(agent, modelling_cfg, device, log,
                             scenarios_override=base_scenarios, temperature=single_temperature)
+
+    # Free GTO dataset before the memory-intensive opponent phase.
+    base_scenarios = None
 
     # --- Opponent data generation + training ---
     if pipeline_cfg.get("run_opponent_data", False):

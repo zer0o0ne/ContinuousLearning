@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from tqdm.auto import tqdm
 
 from agent.train_scenarios.mcts_predict.dataset import MCTSDataset, batch_collate, make_tensor_collate
 from agent.train_scenarios._checkpoint_io import make_checkpoint
@@ -748,7 +749,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         train_loss_sum = 0.0
         train_count = 0
 
-        for batch_idx, (event_sequences, precomputed, val_targets, act_targets, chains, term_tgts) in enumerate(train_loader):
+        for batch_idx, (event_sequences, precomputed, val_targets, act_targets, chains, term_tgts) in enumerate(
+                tqdm(train_loader, desc=f"MCTS cycle {cycle_id} epoch {epoch+1}/{epochs}", leave=False, smoothing=0)):
             val_targets = val_targets.to(device)
             act_targets = act_targets.to(device)
             n_samples = precomputed["B"] if precomputed is not None else 0

@@ -321,8 +321,94 @@ def _shared_to_standard(shared_events, hero_pos, hero_hand):
 
 
 # ---------------------------------------------------------------------------
+# Templated tensor tiling for range inference
+# ---------------------------------------------------------------------------
+
+def _tile_template_precomputed(template_pc, hand_pairs, max_players):
+    """Tile a single-sample precomputed dict to N combos, varying only hand cards.
+
+    Args:
+        template_pc: dict from extract_event_tensors([template_events], max_players)
+                     — single sample, T=E events.
+        hand_pairs: list of (c1, c2) — N combos.
+        max_players: for consistency check.
+
+    Returns:
+        precomputed dict ready for forward_batch(precomputed=...) with B=N samples.
+    """
+    E = template_pc["card_ids"].shape[0]
+    N = len(hand_pairs)
+
+    card_ids = template_pc["card_ids"].repeat(N, 1)  # (N*E, 7)
+    hand_t = torch.tensor(hand_pairs, dtype=torch.long)  # (N, 2)
+    hand_t = hand_t.clamp(0, 52)
+    hand_expanded = hand_t.unsqueeze(1).expand(N, E, 2).reshape(N * E, 2)
+    card_ids[:, 5] = hand_expanded[:, 0]
+    card_ids[:, 6] = hand_expanded[:, 1]
+
+    batch_idx_single = template_pc["batch_idx"]  # (E,) all zeros
+    event_idx_single = template_pc["event_idx"]  # (E,) 0..E-1
+    batch_idx = torch.arange(N, dtype=torch.long).unsqueeze(1).expand(N, E).reshape(N * E)
+    event_idx = event_idx_single.repeat(N)
+
+    return {
+        "card_ids": card_ids,
+        "hero_pos": template_pc["hero_pos"].repeat(N),
+        "acting_pos": template_pc["acting_pos"].repeat(N),
+        "num_players": template_pc["num_players"].repeat(N),
+        "scalars": template_pc["scalars"].repeat(N, 1),
+        "bets": template_pc["bets"].repeat(N, 1),
+        "stacks": template_pc["stacks"].repeat(N, 1),
+        "actions": template_pc["actions"].repeat(N, 1),
+        "batch_idx": batch_idx,
+        "event_idx": event_idx,
+        "seq_lengths": [template_pc["seq_lengths"][0]] * N,
+        "max_events": template_pc["max_events"],
+        "B": N,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Range inference
 # ---------------------------------------------------------------------------
+
+def _compute_range_probs_templated(agent, shared_events, combos, active_pos,
+                                   norm_stats, temperature, device, n_actions,
+                                   max_batch, amp_config):
+    """Templated version of _compute_range_probs for sequential (in-process) mode.
+
+    Extracts event tensors from the template ONCE, then tiles per combo batch —
+    only hand card IDs vary. Produces identical results to the per-combo copy
+    approach but avoids re-extracting all event fields for every combo.
+    """
+    amp_enabled, device_type, amp_dtype = amp_config
+
+    template = _shared_to_standard(shared_events, active_pos, [0, 1])
+    _normalize_events_inplace(template, norm_stats)
+
+    from agent.perception.perception import extract_event_tensors
+    max_players = agent.perception.embedder.max_players
+    template_pc = extract_event_tensors([template], max_players)
+
+    all_probs = []
+
+    for start in range(0, len(combos), max_batch):
+        batch_combos = combos[start:start + max_batch]
+        precomputed = _tile_template_precomputed(template_pc, batch_combos, max_players)
+
+        with torch.no_grad():
+            with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                out = agent.forward_batch(
+                    None, skip_memory=True, heads={"action"},
+                    precomputed=precomputed)
+            logits = out["action_logits"]
+
+        logits = logits.float()
+        probs = F.softmax(logits / temperature, dim=-1)
+        all_probs.append(probs.cpu())
+
+    return torch.cat(all_probs, dim=0)
+
 
 def _compute_range_probs(agent, shared_events, combos, active_pos,
                          norm_stats, temperature, device, n_actions,
@@ -369,17 +455,21 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
         except ImportError:
             use_templated = False
 
+    template_pc = None
+    if proxy is None and hasattr(agent, "perception"):
+        from agent.perception.perception import extract_event_tensors
+        max_players = agent.perception.embedder.max_players
+        template_pc = extract_event_tensors([template], max_players)
+
     all_probs = []
 
     for start in range(0, len(combos), max_batch):
         batch_combos = combos[start:start + max_batch]
 
         if use_templated:
-            # Send template once + N hand pairs. Server replicates and runs.
             logits = proxy.forward_batch_templated(
                 agent_name, template, batch_combos, heads=("action",))
         elif proxy is not None:
-            # Legacy parallel path: actor builds N event copies and ships them.
             batch_events = []
             for c1, c2 in batch_combos:
                 events = [dict(e) for e in template]
@@ -387,8 +477,15 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
                     e["hand"] = [c1, c2]
                 batch_events.append(events)
             logits = proxy.forward_batch(agent_name, batch_events, heads=("action",))
+        elif template_pc is not None:
+            precomputed = _tile_template_precomputed(template_pc, batch_combos, max_players)
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
+                    out = agent.forward_batch(
+                        None, skip_memory=True, heads={"action"},
+                        precomputed=precomputed)
+                logits = out["action_logits"]
         else:
-            # Sequential path: in-process forward, unchanged.
             batch_events = []
             for c1, c2 in batch_combos:
                 events = [dict(e) for e in template]
@@ -398,7 +495,7 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                     out = agent.forward_batch(batch_events, skip_memory=True, heads={"action"})
-                logits = out["action_logits"]  # (batch, n_actions)
+                logits = out["action_logits"]
 
         # Softmax in fp32 even when the forward ran under fp16 autocast.
         # fp16 softmax can emit slight negatives / nan at the edge, which

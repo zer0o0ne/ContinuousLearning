@@ -46,7 +46,7 @@ def main():
     from utils import get_amp_config
 
     agent = ASI(lambda m: None, config=cfg)
-    agent.to(device)
+    agent.set_device(device)
     agent.eval()
 
     norm_stats = {

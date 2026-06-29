@@ -412,43 +412,21 @@ def test_bug5_gradscaler_not_recreated_per_cycle():
 
 # ── Bug 7: base_scenarios / opp_scenarios not freed during MCTS ────────
 
-def test_bug7_base_scenarios_freed_before_mcts():
-    """base_scenarios (GTO dataset) should be freed (del/set to None) before
-    the MCTS phase begins. It's loaded early and never used during MCTS,
-    wasting hundreds of MB of RAM during the most memory-intensive phase."""
+def test_bug7_no_inmemory_dataset_before_mcts():
+    """Pipeline must not hold a full in-memory dataset (base_scenarios) during
+    the MCTS phase. With sharded storage, only scenarios_dir (a string path)
+    should be passed — no large list of scenarios in RAM."""
     from pipeline import main
     src = inspect.getsource(main)
 
-    # Find where MCTS phase starts — use the definitive section comment
     mcts_pos = src.find("# --- MCTS cyclic collect")
     if mcts_pos == -1:
         mcts_pos = src.find("Cyclic MCTS")
     assert mcts_pos != -1, "Cannot find MCTS section in pipeline.main()"
 
-    # base_scenarios is loaded around line 393, used until ~line 554.
-    # After that it's never referenced but stays in scope for the entire
-    # MCTS phase (line 660+). Check it's explicitly freed between last use
-    # and MCTS start.
-    # Find last use of base_scenarios (as an argument, not initialization)
-    last_use = src.rfind("base_scenarios", 0, mcts_pos)
-    if last_use != -1:
-        # Check that between last use and MCTS section, there's a free
-        between_section = src[last_use:mcts_pos]
-        freed = ("del base_scenarios" in between_section
-                 or "base_scenarios = None" in between_section)
-    else:
-        freed = True  # not used at all before MCTS, no need to free
-
-    # Also check the full section after all GTO training but before MCTS
-    after_last_use = src[last_use:mcts_pos] if last_use != -1 else ""
-    freed = ("del base_scenarios" in after_last_use
-             or "base_scenarios = None" in after_last_use)
-
-    assert freed, (
-        "base_scenarios is never freed before the MCTS phase. "
-        "The full GTO dataset stays in RAM for the entire multi-day MCTS run, "
-        "wasting hundreds of MB to gigabytes during the most memory-intensive phase. "
-        "Add 'del base_scenarios' or 'base_scenarios = None' after GTO training."
+    assert "base_scenarios" not in src, (
+        "pipeline.main() still references 'base_scenarios' — the full GTO "
+        "dataset should never be loaded into memory. Use scenarios_dir (path) instead."
     )
 
 

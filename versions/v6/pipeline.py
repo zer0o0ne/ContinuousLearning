@@ -269,9 +269,10 @@ def _merge_train_config(config, scenario_key):
 
 def _load_or_generate_dataset(config, base_dir, device, log,
                               state=None, config_hash=None, resume=False):
-    """Load dataset from `dataset_dir`, or generate into it / base_dir.
+    """Load or generate the GTO dataset.
 
-    Returns raw (unnormalized) scenarios list.
+    Returns the save directory path (string).  The dataset is stored as
+    numbered shards on disk and never fully loaded into memory.
 
     When `resume=True`:
     - The default save directory is `<base_dir>/dataset/` (no timestamp), so
@@ -283,7 +284,6 @@ def _load_or_generate_dataset(config, base_dir, device, log,
     - The pipeline-state file mirrors the per-dataset status so other
       operations (force_restart, hash mismatch) see one source of truth.
     """
-    import torch
     from agent.train_scenarios.generation.generate import generate_dataset, load_dataset
 
     dataset_cfg = config.get("dataset", {})
@@ -304,30 +304,27 @@ def _load_or_generate_dataset(config, base_dir, device, log,
     elif dataset_dir:
         dataset_save_dir = dataset_dir
     elif resume:
-        # Stable path so the SAME location is found on every restart.
         dataset_save_dir = os.path.join(base_dir, "dataset")
     else:
-        # Legacy path with init_time — fresh dir per run.
         dataset_save_dir = os.path.join(base_dir, "dataset", log.init_time)
 
     if not resume and dataset_dir:
-        # Legacy non-resume: try loading from the explicit dataset_dir first.
-        scenarios = load_dataset(dataset_dir, log=log)
-        if scenarios is not None:
-            return scenarios
+        existing = load_dataset(dataset_dir, log=log)
+        if existing is not None:
+            return dataset_dir
         log(f"Dataset not found at {dataset_dir}, generating...")
 
     os.makedirs(dataset_save_dir, exist_ok=True)
 
-    scenarios = generate_dataset(
+    result = generate_dataset(
         gen_cfg, dataset_save_dir, log=log,
         resume=resume, config_hash=config_hash)
 
-    if state is not None and scenarios:
+    if state is not None and result:
         state.set_dataset(
             "gto", path=dataset_save_dir, target=int(gen_cfg.get("n_scenarios", 0)),
-            completed_hands=len(scenarios), done=True, config_hash=config_hash)
-    return scenarios
+            done=True, config_hash=config_hash)
+    return dataset_save_dir
 
 
 def main():
@@ -409,13 +406,55 @@ def main():
                       or pipeline_cfg.get("run_gto_training", False)
                       or pipeline_cfg.get("run_modelling", False))
 
+    # In resume mode, skip loading the (potentially huge) GTO dataset if
+    # every enabled training phase is already done for every agent. The
+    # dataset is only consumed by the GTO training loop; when all phases
+    # are complete the loop will `_run_or_resume_phase` → return
+    # immediately for each phase anyway, so loading is pure waste.
+    if resume and needs_training:
+        _PHASE_FLAGS = [
+            ("gto_ev_predict",    "run_gto_ev",       True),
+            ("gto_probs_predict", "run_gto_probs",    False),
+            ("gto_predict",       "run_gto_training", False),
+            ("modelling_predict", "run_modelling",    False),
+        ]
+        all_done = True
+        agent_names = []
+        if multi_agent:
+            skip_training = set(multi_agent.get("skip_training", []))
+            agent_names = [
+                a["name"] for a in multi_agent.get("agents", [])
+                if a["name"] not in skip_training
+            ]
+        else:
+            agent_names = [name]
+
+        for aname in agent_names:
+            for phase_name, flag_key, flag_default in _PHASE_FLAGS:
+                if not pipeline_cfg.get(flag_key, flag_default):
+                    continue
+                if state.should_force_restart_phase(aname, phase_name):
+                    all_done = False
+                    break
+                phase = state.get_phase(aname, phase_name)
+                if not phase or phase.get("status") != "done":
+                    all_done = False
+                    break
+            if not all_done:
+                break
+
+        if all_done:
+            log("[resume] All GTO training phases already done — "
+                "skipping dataset load")
+            needs_training = False
+
     # --- Load/generate dataset only if training is enabled ---
-    base_scenarios = None
+    scenarios_dir = None
     if needs_training:
-        base_scenarios = _load_or_generate_dataset(
+        scenarios_dir = _load_or_generate_dataset(
             config, base_dir, device, log,
             state=state, config_hash=config_hash, resume=resume)
-        if not base_scenarios:
+        if not scenarios_dir:
             log("No dataset available. Aborting.")
             return
 
@@ -424,8 +463,6 @@ def main():
 
     if multi_agent and needs_training:
         # --- Multi-agent training ---
-        from agent.train_scenarios.modifiers import apply_modifiers
-
         save_dir_cfg = multi_agent.get("save_dir", "")
         if save_dir_cfg and os.path.isabs(save_dir_cfg):
             save_base_dir = save_dir_cfg
@@ -450,7 +487,6 @@ def main():
                     f"(listed in multi_agent.skip_training) ===")
                 continue
 
-            # Extract effective temperature for this agent
             agent_temperature = temperature
             for mod in modifiers:
                 if mod.get("type") == "temperature":
@@ -465,7 +501,6 @@ def main():
             agent = ASI(agent_log, config)
             agent.set_device(device)
             if agent_dir:
-                # Try per-agent checkpoint first, fall back to shared agent_dir
                 per_agent_dir = os.path.join(agent_dir, agent_name)
                 if os.path.isdir(per_agent_dir):
                     agent.load_checkpoint(per_agent_dir)
@@ -474,8 +509,7 @@ def main():
             else:
                 agent_log("Agent initialized randomly")
 
-            modified = apply_modifiers(base_scenarios, modifiers, n_actions,
-                                       big_blind, temperature)
+            mod_params = (n_actions, big_blind, temperature)
 
             ev_train_cfg = _merge_train_config(config, "gto_ev_train")
             probs_train_cfg = _merge_train_config(config, "gto_probs_train")
@@ -486,7 +520,8 @@ def main():
                     agent_base, agent_log, device,
                     lambda run_dir, resume_state: train_gto_ev(
                         agent, ev_train_cfg, device, agent_log,
-                        scenarios_override=modified,
+                        scenarios_dir=scenarios_dir,
+                        modifiers=modifiers, mod_params=mod_params,
                         temperature=agent_temperature,
                         run_dir=run_dir, resume_state=resume_state))
 
@@ -496,7 +531,8 @@ def main():
                     agent_base, agent_log, device,
                     lambda run_dir, resume_state: train_gto_probs(
                         agent, probs_train_cfg, device, agent_log,
-                        scenarios_override=modified,
+                        scenarios_dir=scenarios_dir,
+                        modifiers=modifiers, mod_params=mod_params,
                         temperature=agent_temperature,
                         run_dir=run_dir, resume_state=resume_state))
 
@@ -507,7 +543,8 @@ def main():
                     agent_base, agent_log, device,
                     lambda run_dir, resume_state: train_gto(
                         agent, gto_train_cfg, device, agent_log,
-                        scenarios_override=modified,
+                        scenarios_dir=scenarios_dir,
+                        modifiers=modifiers, mod_params=mod_params,
                         temperature=agent_temperature,
                         run_dir=run_dir, resume_state=resume_state))
 
@@ -518,17 +555,12 @@ def main():
                     agent_base, agent_log, device,
                     lambda run_dir, resume_state: train_modelling(
                         agent, modelling_cfg, device, agent_log,
-                        scenarios_override=modified,
+                        scenarios_dir=scenarios_dir,
+                        modifiers=modifiers, mod_params=mod_params,
                         temperature=agent_temperature,
                         run_dir=run_dir, resume_state=resume_state))
 
-            # Per-agent cleanup: drop the agent + its train-local Adam state
-            # before the next agent allocates. CPython refcounting reclaims
-            # them at the next reassignment anyway, but `empty_cache` returns
-            # fragmented blocks to the allocator so the next ASI gets a clean
-            # contiguous arena. Especially helpful with multi-agent runs on
-            # 24GB cards where each phase's optim ~= 2× params.
-            del agent, modified
+            del agent
             _release_memory(device)
 
     elif needs_training:
@@ -545,7 +577,7 @@ def main():
 
         if pipeline_cfg.get("run_gto_ev", True):
             _, ev_run_dir = train_gto_ev(agent, ev_train_cfg, device, log,
-                         scenarios_override=base_scenarios, temperature=single_temperature)
+                         scenarios_dir=scenarios_dir, temperature=single_temperature)
             if ev_run_dir:
                 best_ckpt = os.path.join(ev_run_dir, "best.pt")
                 if os.path.exists(best_ckpt):
@@ -554,7 +586,7 @@ def main():
         if pipeline_cfg.get("run_gto_probs", False):
             probs_train_cfg = _merge_train_config(config, "gto_probs_train")
             _, probs_run_dir = train_gto_probs(agent, probs_train_cfg, device, log,
-                            scenarios_override=base_scenarios, temperature=single_temperature)
+                            scenarios_dir=scenarios_dir, temperature=single_temperature)
             if probs_run_dir:
                 best_ckpt = os.path.join(probs_run_dir, "best.pt")
                 if os.path.exists(best_ckpt):
@@ -563,7 +595,7 @@ def main():
         if pipeline_cfg.get("run_gto_training", False):
             gto_train_cfg = _merge_train_config(config, "gto_train")
             _, gto_run_dir = train_gto(agent, gto_train_cfg, device, log,
-                            scenarios_override=base_scenarios, temperature=single_temperature)
+                            scenarios_dir=scenarios_dir, temperature=single_temperature)
             if gto_run_dir:
                 best_ckpt = os.path.join(gto_run_dir, "best.pt")
                 if os.path.exists(best_ckpt):
@@ -572,119 +604,133 @@ def main():
         if pipeline_cfg.get("run_modelling", False):
             modelling_cfg = _merge_train_config(config, "modelling_train")
             train_modelling(agent, modelling_cfg, device, log,
-                            scenarios_override=base_scenarios, temperature=single_temperature)
+                            scenarios_dir=scenarios_dir, temperature=single_temperature)
 
-    # Free GTO dataset before the memory-intensive opponent phase.
-    base_scenarios = None
+    scenarios_dir = None
     _release_memory(device)
 
     # --- Opponent data generation + training ---
     if pipeline_cfg.get("run_opponent_data", False):
-        from agent.train_scenarios.generation.generate_opponent import generate_opponent_dataset
+        from agent.train_scenarios.generation.generate_opponent import (
+            generate_opponent_dataset, load_opponent_shards,
+        )
 
         opp_cfg = config.get("opponent_data", {})
         opp_save_cfg = opp_cfg.get("save_dir", "")
         if opp_save_cfg and os.path.isabs(opp_save_cfg):
             opp_save_dir = opp_save_cfg
         elif opp_save_cfg:
-            # Relative path — anchor at project_root/data/<version>/.
             opp_save_dir = os.path.join(project_root, "data", version, opp_save_cfg)
         elif resume:
-            # Stable path so resume always points at the same file.
             opp_save_dir = os.path.join(base_dir, "opponent_dataset")
         else:
-            # Legacy: timestamped fresh dir.
             opp_save_dir = os.path.join(base_dir, "opponent_dataset", log.init_time)
 
-        opp_scenarios = generate_opponent_dataset(
+        # generate_opponent_dataset returns save_dir (string), NOT the
+        # loaded list.  Data stays on disk as shards until we explicitly
+        # call load_opponent_shards — only when training actually needs it.
+        opp_data_dir = generate_opponent_dataset(
             config, opp_save_dir, device, log,
             resume=resume, config_hash=config_hash)
 
         _release_memory(device)
 
-        if resume and opp_scenarios:
+        if resume and opp_data_dir:
             state.set_dataset(
                 "opponent", path=opp_save_dir,
                 target=int(opp_cfg.get("n_hands", 0)),
-                completed_hands=len(opp_scenarios),
                 done=True, config_hash=config_hash)
 
-        if pipeline_cfg.get("run_opponent_action_train", False) and opp_scenarios:
+        if pipeline_cfg.get("run_opponent_action_train", False) and opp_data_dir:
             from agent.train_scenarios.opponent_action_predict.train import train_opponent_action
 
-            opp_train_cfg = config.get("opponent_action_train", {})
+            all_opp_train_done = False
+            if resume:
+                all_opp_train_done = True
+                _opp_agents = (
+                    [a["name"] for a in multi_agent.get("agents", [])]
+                    if multi_agent else [name]
+                )
+                for aname in _opp_agents:
+                    if state.should_force_restart_phase(
+                            aname, "opponent_action_predict"):
+                        all_opp_train_done = False
+                        break
+                    phase = state.get_phase(aname, "opponent_action_predict")
+                    if not phase or phase.get("status") != "done":
+                        all_opp_train_done = False
+                        break
 
-            if multi_agent:
-                # Train each agent's opponent_action_head on shared opponent data
-                save_dir_cfg = multi_agent.get("save_dir", "")
-                if save_dir_cfg and os.path.isabs(save_dir_cfg):
-                    save_base_dir_opp = save_dir_cfg
+            if all_opp_train_done:
+                log("[resume] All opponent_action_predict phases done — "
+                    "skipping data load")
+            else:
+                opp_scenarios_dir = (opp_data_dir if isinstance(opp_data_dir, str)
+                                     else opp_save_dir)
+
+                opp_train_cfg = config.get("opponent_action_train", {})
+
+                if multi_agent:
+                    save_dir_cfg = multi_agent.get("save_dir", "")
+                    if save_dir_cfg and os.path.isabs(save_dir_cfg):
+                        save_base_dir_opp = save_dir_cfg
+                    else:
+                        save_base_dir_opp = os.path.join(project_root, "data", version,
+                                                         save_dir_cfg or name)
+
+                    for agent_cfg in multi_agent["agents"]:
+                        agent_name = agent_cfg["name"]
+                        agent_temperature = config.get("solver", {}).get("gto_temperature", 1.0)
+                        for mod in agent_cfg.get("modifiers", []):
+                            if mod.get("type") == "temperature":
+                                agent_temperature = mod["value"]
+
+                        agent_base = os.path.join(save_base_dir_opp, agent_name)
+                        agent_log = Logger(agent_base)
+                        agent_log(f"\n=== Opponent Action Training: {agent_name} ===")
+
+                        agent = ASI(agent_log, config)
+                        agent.set_device(device)
+                        agent.load_checkpoint(agent_base)
+
+                        _run_phase(
+                            state, "opponent_action_predict", agent, agent_name,
+                            agent_base, agent_log, device,
+                            lambda run_dir, resume_state, _agent=agent,
+                                   _temp=agent_temperature: train_opponent_action(
+                                _agent, opp_train_cfg, device, agent_log,
+                                scenarios_dir=opp_scenarios_dir,
+                                temperature=_temp,
+                                run_dir=run_dir, resume_state=resume_state))
+
+                        del agent
+                        _release_memory(device)
+
                 else:
-                    save_base_dir_opp = os.path.join(project_root, "data", version,
-                                                     save_dir_cfg or name)
-
-                for agent_cfg in multi_agent["agents"]:
-                    agent_name = agent_cfg["name"]
-                    modifiers = agent_cfg.get("modifiers", [])
-                    agent_temperature = config.get("solver", {}).get("gto_temperature", 1.0)
-                    for mod in modifiers:
-                        if mod.get("type") == "temperature":
-                            agent_temperature = mod["value"]
-
-                    agent_base = os.path.join(save_base_dir_opp, agent_name)
-                    agent_log = Logger(agent_base)
-                    agent_log(f"\n=== Opponent Action Training: {agent_name} ===")
-
-                    agent = ASI(agent_log, config)
+                    agent = ASI(log, config)
                     agent.set_device(device)
-                    # Load best checkpoint for this agent. For resume runs
-                    # the model state will be overwritten from latest.pt
-                    # inside `_run_or_resume_phase` if the phase was
-                    # in_progress.
-                    agent.load_checkpoint(agent_base)
+                    single_opp_load = base_dir
+                    if os.path.isdir(single_opp_load):
+                        agent.load_checkpoint(single_opp_load)
+                    elif agent_dir:
+                        agent.load_checkpoint(agent_dir)
 
-                    _run_phase(
-                        state, "opponent_action_predict", agent, agent_name,
-                        agent_base, agent_log, device,
-                        lambda run_dir, resume_state, _agent=agent,
-                               _temp=agent_temperature: train_opponent_action(
-                            _agent, opp_train_cfg, device, agent_log,
-                            scenarios_override=opp_scenarios,
-                            temperature=_temp,
-                            run_dir=run_dir, resume_state=resume_state))
+                    single_temp = config.get("solver", {}).get("gto_temperature", 1.0)
+                    _, opp_run_dir = train_opponent_action(
+                        agent, opp_train_cfg, device, log,
+                        scenarios_dir=opp_scenarios_dir,
+                        temperature=single_temp,
+                    )
+                    if opp_run_dir:
+                        best_ckpt = os.path.join(opp_run_dir, "best.pt")
+                        if os.path.exists(best_ckpt):
+                            agent.load_checkpoint(best_ckpt)
 
                     del agent
                     _release_memory(device)
-            else:
-                # Single-agent — load from trained save dir (where phases
-                # 1-4 saved), falling back to agent_dir only if no trained
-                # checkpoint exists yet.
-                agent = ASI(log, config)
-                agent.set_device(device)
-                single_opp_load = base_dir
-                if os.path.isdir(single_opp_load):
-                    agent.load_checkpoint(single_opp_load)
-                elif agent_dir:
-                    agent.load_checkpoint(agent_dir)
 
-                single_temp = config.get("solver", {}).get("gto_temperature", 1.0)
-                _, opp_run_dir = train_opponent_action(
-                    agent, opp_train_cfg, device, log,
-                    scenarios_override=opp_scenarios,
-                    temperature=single_temp,
-                )
-                if opp_run_dir:
-                    best_ckpt = os.path.join(opp_run_dir, "best.pt")
-                    if os.path.exists(best_ckpt):
-                        agent.load_checkpoint(best_ckpt)
+            _release_memory(device)
 
-                del agent
-                _release_memory(device)
-
-    # Free datasets no longer needed — reclaim RAM before the memory-intensive
-    # MCTS phase.
-    base_scenarios = None
-    opp_scenarios = None
     _release_memory(device)
 
     # --- MCTS cyclic collect → train ---

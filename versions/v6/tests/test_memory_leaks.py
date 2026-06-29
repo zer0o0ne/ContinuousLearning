@@ -270,61 +270,18 @@ class TestEventsShallowCopy(unittest.TestCase):
 #    generation, not after it.
 # ---------------------------------------------------------------------------
 
-class TestPipelineFreesBaseBeforeOpponent(unittest.TestCase):
-    """base_scenarios must be set to None before the opponent data phase
-    so the GTO dataset isn't held in memory during opponent generation."""
+class TestPipelineNoInMemoryDataset(unittest.TestCase):
+    """Pipeline must not hold a full in-memory dataset (base_scenarios).
+    With sharded storage, only scenarios_dir (a string path) is passed."""
 
-    def test_base_scenarios_freed_before_opponent_data(self):
-        import ast
+    def test_no_base_scenarios_in_pipeline(self):
         pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
         with open(pipeline_path) as f:
             source = f.read()
 
-        tree = ast.parse(source)
-
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            if node.name != "main":
-                continue
-
-            none_lines = []
-            opponent_data_line = None
-
-            for child in ast.walk(node):
-                if (isinstance(child, ast.Assign)
-                        and len(child.targets) == 1
-                        and isinstance(child.targets[0], ast.Name)
-                        and child.targets[0].id == "base_scenarios"
-                        and isinstance(child.value, ast.Constant)
-                        and child.value.value is None):
-                    none_lines.append(child.lineno)
-
-                if isinstance(child, ast.If):
-                    src_segment = ast.dump(child.test)
-                    if "run_opponent_data" in src_segment:
-                        opponent_data_line = child.lineno
-
-            self.assertIsNotNone(opponent_data_line,
-                                 "Could not find `run_opponent_data` check")
-
-            # Filter: only None-assignments BETWEEN the initial declaration
-            # and the opponent data block count. The initial `base_scenarios
-            # = None` on ~line 391 is just declaration, not cleanup.
-            cleanup_lines = [
-                ln for ln in none_lines
-                if ln > 400 and ln < opponent_data_line
-            ]
-
-            self.assertTrue(
-                len(cleanup_lines) > 0,
-                f"base_scenarios is only freed at line(s) {none_lines}, "
-                f"but opponent_data starts at line {opponent_data_line}. "
-                f"Must free base_scenarios BEFORE opponent data generation "
-                f"to avoid holding ~1 GB of GTO data during opponent phase.")
-            break
-        else:
-            self.fail("Could not find main() in pipeline.py")
+        self.assertNotIn("base_scenarios", source,
+            "pipeline.py still references 'base_scenarios' — the full GTO "
+            "dataset should never be loaded into memory. Use scenarios_dir.")
 
 
 # ---------------------------------------------------------------------------
@@ -332,38 +289,19 @@ class TestPipelineFreesBaseBeforeOpponent(unittest.TestCase):
 #    multi-agent loop (alongside `del agent`).
 # ---------------------------------------------------------------------------
 
-class TestPipelineFreesModifiedPerAgent(unittest.TestCase):
-    """The multi-agent loop must free `modified` alongside `agent`."""
+class TestPipelineNoModifiedList(unittest.TestCase):
+    """With sharded storage, modifiers are applied lazily per-scenario in
+    ShardedGTODataset.__getitem__. Pipeline must not create an in-memory
+    'modified' list."""
 
-    def test_modified_freed_in_agent_loop(self):
-        import ast
+    def test_no_modified_scenarios_in_pipeline(self):
         pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
         with open(pipeline_path) as f:
             source = f.read()
 
-        tree = ast.parse(source)
-
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            if node.name != "main":
-                continue
-
-            found_del_modified = False
-            for child in ast.walk(node):
-                if isinstance(child, ast.Delete):
-                    for target in child.targets:
-                        if isinstance(target, ast.Name) and target.id == "modified":
-                            found_del_modified = True
-
-            self.assertTrue(
-                found_del_modified,
-                "`del modified` not found in main(). The modified "
-                "scenarios list (~same size as base_scenarios) must be "
-                "explicitly freed after each agent finishes training.")
-            break
-        else:
-            self.fail("Could not find main() in pipeline.py")
+        self.assertNotIn("apply_modifiers(", source,
+            "pipeline.py still calls apply_modifiers() — modifiers should be "
+            "applied lazily per-scenario in ShardedGTODataset, not upfront.")
 
 
 # ---------------------------------------------------------------------------
@@ -414,53 +352,21 @@ class TestOpponentTrainReleasesScenarios(unittest.TestCase):
 # 7. opp_scenarios must be freed before MCTS phase.
 # ---------------------------------------------------------------------------
 
-class TestPipelineFreesOppScenariosBeforeMCTS(unittest.TestCase):
-    """opp_scenarios must be set to None before the MCTS block."""
+class TestPipelineNoInMemoryOppScenarios(unittest.TestCase):
+    """With sharded storage, pipeline passes opp_scenarios_dir (string path),
+    not an in-memory opp_scenarios list."""
 
-    def test_opp_scenarios_freed_before_mcts(self):
-        import ast
+    def test_no_opp_scenarios_list_in_pipeline(self):
         pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
         with open(pipeline_path) as f:
             source = f.read()
 
-        tree = ast.parse(source)
-
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            if node.name != "main":
-                continue
-
-            opp_free_line = None
-            mcts_line = None
-
-            for child in ast.walk(node):
-                if (isinstance(child, ast.Assign)
-                        and len(child.targets) == 1
-                        and isinstance(child.targets[0], ast.Name)
-                        and child.targets[0].id == "opp_scenarios"
-                        and isinstance(child.value, ast.Constant)
-                        and child.value.value is None):
-                    if opp_free_line is None or child.lineno > opp_free_line:
-                        opp_free_line = child.lineno
-
-                if isinstance(child, ast.If):
-                    src_segment = ast.dump(child.test)
-                    if "run_mcts_train" in src_segment:
-                        mcts_line = child.lineno
-
-            self.assertIsNotNone(opp_free_line,
-                                 "Could not find `opp_scenarios = None`")
-            self.assertIsNotNone(mcts_line,
-                                 "Could not find run_mcts_train block")
-
-            self.assertLess(
-                opp_free_line, mcts_line,
-                f"opp_scenarios freed at line {opp_free_line} but MCTS starts "
-                f"at line {mcts_line}.")
-            break
-        else:
-            self.fail("Could not find main() in pipeline.py")
+        import re
+        bare = re.findall(r'\bopp_scenarios\b(?!_dir)', source)
+        self.assertEqual(len(bare), 0,
+            f"pipeline.py has {len(bare)} reference(s) to 'opp_scenarios' "
+            f"(not 'opp_scenarios_dir'). Opponent data must use sharded "
+            f"paths, not in-memory lists.")
 
 
 # ---------------------------------------------------------------------------
@@ -478,43 +384,23 @@ class TestPipelineCallsReleaseMemory(unittest.TestCase):
             hasattr(pipeline, "_release_memory"),
             "_release_memory function not found in pipeline.py")
 
-    def test_release_memory_called_after_base_scenarios_freed(self):
-        """_release_memory must be called near `base_scenarios = None`
-        (before opponent phase) to return heap to OS."""
-        pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
-        with open(pipeline_path) as f:
-            lines = f.readlines()
-
-        found_pair = False
-        for i, line in enumerate(lines):
-            if "base_scenarios = None" in line and i > 100:
-                window = "".join(lines[i:i + 3])
-                if "_release_memory" in window:
-                    found_pair = True
-                    break
-
-        self.assertTrue(
-            found_pair,
-            "_release_memory not called near `base_scenarios = None`. "
-            "Without malloc_trim, Python keeps freed heap pages and RSS "
-            "stays inflated by tens of GB on unified-memory systems.")
-
-    def test_release_memory_called_after_del_agent_modified(self):
-        """_release_memory must be called after `del agent, modified`."""
+    def test_release_memory_called_after_del_agent(self):
+        """_release_memory must be called after `del agent` in the
+        multi-agent training loop."""
         pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
         with open(pipeline_path) as f:
             lines = f.readlines()
 
         found = False
         for i, line in enumerate(lines):
-            if "del agent, modified" in line:
-                window = "".join(lines[i:i + 3])
+            if "del agent" in line and i > 100:
+                window = "".join(lines[i:i + 5])
                 if "_release_memory" in window:
                     found = True
                     break
 
         self.assertTrue(found,
-                        "_release_memory not called after `del agent, modified`")
+                        "_release_memory not called near `del agent`")
 
 
 # ---------------------------------------------------------------------------
@@ -665,6 +551,321 @@ class TestDatasetWorksWithNumpyCombos(unittest.TestCase):
             self.assertAlmostEqual(
                 float(target[i]), float(expected[i]), places=4,
                 msg=f"target[{i}] mismatch with numpy forward_combos")
+
+
+# ---------------------------------------------------------------------------
+# 12. Pipeline skips GTO dataset load when all training phases are done.
+# ---------------------------------------------------------------------------
+
+class TestPipelineSkipsDatasetWhenDone(unittest.TestCase):
+    """In resume mode, if every enabled training phase is status=done for
+    every agent, the pipeline must NOT load the (10+ GB) GTO dataset."""
+
+    def test_needs_training_false_when_all_done(self):
+        """Verify the AST pattern: resume + needs_training → check state →
+        set needs_training = False."""
+        import ast
+        pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
+        with open(pipeline_path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "main":
+                continue
+
+            found_all_done_check = False
+            found_needs_training_false = False
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and child.id == "all_done":
+                    found_all_done_check = True
+                if (isinstance(child, ast.Assign)
+                        and len(child.targets) == 1
+                        and isinstance(child.targets[0], ast.Name)
+                        and child.targets[0].id == "needs_training"
+                        and isinstance(child.value, ast.Constant)
+                        and child.value.value is False):
+                    found_needs_training_false = True
+
+            self.assertTrue(
+                found_all_done_check,
+                "main() doesn't check `all_done` for training phases in "
+                "resume mode. Without this, the GTO dataset (~10 GB) is "
+                "loaded even when all phases are complete.")
+            self.assertTrue(
+                found_needs_training_false,
+                "main() doesn't set `needs_training = False` when all "
+                "phases are done.")
+            break
+        else:
+            self.fail("Could not find main() in pipeline.py")
+
+
+# ---------------------------------------------------------------------------
+# 13. Opponent data uses shard-based storage, not monolithic torch.save.
+# ---------------------------------------------------------------------------
+
+class TestOpponentDataShardedStorage(unittest.TestCase):
+    """generate_opponent_dataset must use shard-based storage instead of
+    re-serialising the entire scenario list on every periodic save."""
+
+    def test_shard_helpers_exist(self):
+        from agent.train_scenarios.generation.generate_opponent import (
+            _opp_shard_dir, _save_opp_shard, _list_opp_shard_paths,
+            load_opponent_shards,
+        )
+        self.assertTrue(callable(_opp_shard_dir))
+        self.assertTrue(callable(_save_opp_shard))
+        self.assertTrue(callable(_list_opp_shard_paths))
+        self.assertTrue(callable(load_opponent_shards))
+
+    def test_save_and_load_shards_roundtrip(self):
+        from agent.train_scenarios.generation.generate_opponent import (
+            _save_opp_shard, load_opponent_shards,
+        )
+        from agent.train_scenarios.generation.generate import _write_meta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shard0 = [{"x": 1}, {"x": 2}]
+            shard1 = [{"x": 3}]
+            _save_opp_shard(shard0, tmpdir, 0)
+            _save_opp_shard(shard1, tmpdir, 1)
+            _write_meta(tmpdir, {"storage": "sharded", "done": True})
+
+            loaded = load_opponent_shards(tmpdir)
+            self.assertEqual(len(loaded), 3)
+            self.assertEqual([s["x"] for s in loaded], [1, 2, 3])
+
+    def test_load_shards_backward_compat_with_legacy_dataset_pt(self):
+        """If only dataset.pt exists (no shards), load_opponent_shards
+        must still work (backward compat with pre-shard runs)."""
+        from agent.train_scenarios.generation.generate_opponent import (
+            load_opponent_shards,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy_data = [{"x": 10}, {"x": 20}]
+            torch.save(legacy_data, os.path.join(tmpdir, "dataset.pt"))
+
+            loaded = load_opponent_shards(tmpdir)
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual([s["x"] for s in loaded], [10, 20])
+
+
+# ---------------------------------------------------------------------------
+# 14. Opponent data resume does NOT torch.load prior scenarios.
+# ---------------------------------------------------------------------------
+
+class TestOpponentResumeZeroMemory(unittest.TestCase):
+    """On resume, generate_opponent_dataset must NOT load the entire
+    prior dataset into memory. It should read only meta.json."""
+
+    def test_sequential_resume_does_not_load_prior_data(self):
+        """AST check: the sequential resume path must NOT have
+        `torch.load(dataset_path)` — it should read meta.json only."""
+        import ast
+
+        path = os.path.join(
+            _PKG_ROOT, "agent", "train_scenarios", "generation",
+            "generate_opponent.py")
+        with open(path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "generate_opponent_dataset":
+                continue
+
+            # Look for torch.load calls that load dataset_path in the
+            # resume/prior_scenarios section. The ONLY torch.load should
+            # be via load_opponent_shards at the end (return value).
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                func = child.func
+                is_torch_load = (
+                    (isinstance(func, ast.Attribute) and func.attr == "load"
+                     and isinstance(func.value, ast.Name)
+                     and func.value.id == "torch")
+                )
+                if not is_torch_load:
+                    continue
+                if child.args:
+                    arg0 = child.args[0]
+                    if isinstance(arg0, ast.Name) and arg0.id == "dataset_path":
+                        self.fail(
+                            "generate_opponent_dataset still calls "
+                            "torch.load(dataset_path) in its body. The "
+                            "resume path must NOT load the prior dataset — "
+                            "only meta.json should be read (O(1) memory). "
+                            "Prior data stays on disk as shards.")
+            break
+        else:
+            self.fail("Could not find generate_opponent_dataset")
+
+    def test_no_prior_scenarios_variable(self):
+        """The old `prior_scenarios` list variable should be gone —
+        it loaded the entire dataset into memory on resume."""
+        import ast
+
+        path = os.path.join(
+            _PKG_ROOT, "agent", "train_scenarios", "generation",
+            "generate_opponent.py")
+        with open(path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "generate_opponent_dataset":
+                continue
+
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and child.id == "prior_scenarios":
+                    self.fail(
+                        "`prior_scenarios` variable still exists in "
+                        "generate_opponent_dataset. This means the old "
+                        "torch.load(dataset_path) path is still present.")
+            break
+        else:
+            self.fail("Could not find generate_opponent_dataset")
+
+
+# ---------------------------------------------------------------------------
+# 15. Pipeline skips opponent data load when all opp training done.
+# ---------------------------------------------------------------------------
+
+class TestPipelineSkipsOppDataWhenDone(unittest.TestCase):
+    """In resume mode, if all opponent_action_predict phases are done,
+    the pipeline must NOT call load_opponent_shards (multi-GB load)."""
+
+    def test_all_opp_train_done_check_exists(self):
+        """Pipeline must check if all opponent training is done before
+        loading the (multi-GB) opponent dataset for training."""
+        import ast
+        pipeline_path = os.path.join(_PKG_ROOT, "pipeline.py")
+        with open(pipeline_path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "main":
+                continue
+
+            found = False
+            for child in ast.walk(node):
+                if (isinstance(child, ast.Name)
+                        and child.id == "all_opp_train_done"):
+                    found = True
+                    break
+            self.assertTrue(
+                found,
+                "main() does not check `all_opp_train_done`. Without this, "
+                "the opponent dataset (multi-GB) is loaded even when all "
+                "opponent_action_predict phases are done.")
+            break
+        else:
+            self.fail("Could not find main() in pipeline.py")
+
+
+# ---------------------------------------------------------------------------
+# 16. generate_opponent_dataset returns save_dir, not loaded list.
+# ---------------------------------------------------------------------------
+
+class TestGenerateOpponentReturnsDir(unittest.TestCase):
+    """generate_opponent_dataset must return save_dir (str), not
+    the loaded scenario list. The pipeline loads data only when
+    training actually needs it."""
+
+    def test_return_is_not_list(self):
+        """AST check: final return must NOT be a variable named 'scenarios'."""
+        import ast
+
+        path = os.path.join(
+            _PKG_ROOT, "agent", "train_scenarios", "generation",
+            "generate_opponent.py")
+        with open(path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "generate_opponent_dataset":
+                continue
+
+            returns = [n for n in ast.walk(node)
+                       if isinstance(n, ast.Return)]
+            for ret in returns:
+                if (ret.value and isinstance(ret.value, ast.Name)
+                        and ret.value.id == "scenarios"):
+                    self.fail(
+                        "generate_opponent_dataset returns `scenarios` "
+                        "(the loaded list). It should return `save_dir` "
+                        "(str) so the caller can decide when/whether to "
+                        "load the data.")
+            break
+        else:
+            self.fail("Could not find generate_opponent_dataset")
+
+
+# ---------------------------------------------------------------------------
+# 17. Periodic save uses shards (O(buffer) per save, not O(total)).
+# ---------------------------------------------------------------------------
+
+class TestPeriodicSaveUsesShards(unittest.TestCase):
+    """Periodic saves during opponent generation must write only the new
+    buffer to a shard file, not re-serialise the entire growing list."""
+
+    def test_no_atomic_torch_save_of_full_list(self):
+        """generate_opponent_dataset must NOT call atomic_torch_save with
+        the full scenarios list. Only _save_opp_shard (or _flush_buffer)
+        with a small buffer should be used."""
+        import ast
+
+        path = os.path.join(
+            _PKG_ROOT, "agent", "train_scenarios", "generation",
+            "generate_opponent.py")
+        with open(path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "generate_opponent_dataset":
+                continue
+
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                func = child.func
+                is_save = (
+                    isinstance(func, ast.Name) and func.id == "atomic_torch_save"
+                )
+                if is_save and child.args:
+                    arg0 = child.args[0]
+                    if isinstance(arg0, ast.Name) and arg0.id == "scenarios":
+                        self.fail(
+                            "generate_opponent_dataset calls "
+                            "atomic_torch_save(scenarios, ...) — this "
+                            "re-serialises the ENTIRE growing list on each "
+                            "periodic save (O(n²) I/O). Use shard-based "
+                            "saves instead.")
+            break
+        else:
+            self.fail("Could not find generate_opponent_dataset")
 
 
 if __name__ == "__main__":

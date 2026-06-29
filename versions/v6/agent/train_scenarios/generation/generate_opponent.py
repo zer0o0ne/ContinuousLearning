@@ -798,6 +798,60 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
 
 
 # ---------------------------------------------------------------------------
+# Shard-based dataset I/O
+# ---------------------------------------------------------------------------
+
+def _opp_shard_dir(save_dir):
+    return os.path.join(save_dir, "shards")
+
+
+def _save_opp_shard(scenarios, save_dir, shard_idx):
+    sd = _opp_shard_dir(save_dir)
+    os.makedirs(sd, exist_ok=True)
+    path = os.path.join(sd, f"shard_{shard_idx:06d}.pt")
+    atomic_torch_save(scenarios, path)
+    return path
+
+
+def _list_opp_shard_paths(save_dir):
+    sd = _opp_shard_dir(save_dir)
+    if not os.path.isdir(sd):
+        return []
+    return sorted(
+        os.path.join(sd, f) for f in os.listdir(sd)
+        if f.startswith("shard_") and f.endswith(".pt")
+    )
+
+
+def load_opponent_shards(save_dir, log=None):
+    """Load all opponent data: legacy dataset.pt + any shards.
+
+    Returns a plain list of scenario dicts. Loads one shard at a time
+    so peak memory is (accumulated + one_shard), not (2 × everything).
+    """
+    scenarios = []
+    legacy_path = os.path.join(save_dir, "dataset.pt")
+    meta = _read_meta(save_dir)
+    storage = (meta or {}).get("storage", "monolithic")
+
+    if os.path.exists(legacy_path) and storage != "sharded":
+        scenarios = torch.load(legacy_path, weights_only=False)
+        if log:
+            log(f"  Loaded legacy dataset.pt: {len(scenarios)} scenarios")
+
+    shard_paths = _list_opp_shard_paths(save_dir)
+    for path in shard_paths:
+        chunk = torch.load(path, weights_only=False)
+        scenarios.extend(chunk)
+        del chunk
+    if shard_paths and log:
+        log(f"  Loaded {len(shard_paths)} shard(s), "
+            f"total {len(scenarios)} scenarios")
+
+    return scenarios
+
+
+# ---------------------------------------------------------------------------
 # Dataset generation
 # ---------------------------------------------------------------------------
 
@@ -843,11 +897,17 @@ def generate_opponent_dataset(config, save_dir, device, log,
     dataset_path = os.path.join(save_dir, "dataset.pt")
 
     # -----------------------------------------------------------------
-    # Resume bookkeeping (sequential path only; parallel mode is
-    # all-or-nothing because actors don't checkpoint individually).
+    # Resume bookkeeping
+    #
+    # Shard-based storage: new scenarios are saved as numbered shards
+    # instead of re-serialising the entire list every `save_every_hands`.
+    # On resume, we read only meta.json (O(1)) instead of torch.load-ing
+    # the full dataset (O(n) memory + deserialization). Prior scenarios
+    # stay on disk untouched; loading happens once at the end for the
+    # return value (which the caller passes to training).
     # -----------------------------------------------------------------
-    prior_scenarios = []
     start_attempts = 0
+    start_shard_idx = 0
     n_workers_cfg = int(opp_cfg.get("n_workers", 1) or 1)
 
     if resume:
@@ -863,6 +923,10 @@ def generate_opponent_dataset(config, save_dir, device, log,
                     f"starting fresh.")
                 if os.path.exists(dataset_path):
                     os.replace(dataset_path, stale)
+                import shutil as _shutil
+                sd = _opp_shard_dir(save_dir)
+                if os.path.isdir(sd):
+                    _shutil.rmtree(sd, ignore_errors=True)
                 try:
                     os.unlink(_meta_path(save_dir))
                 except OSError:
@@ -870,26 +934,32 @@ def generate_opponent_dataset(config, save_dir, device, log,
             elif meta.get("done") and meta.get("target", 0) >= n_hands:
                 log(f"Opponent dataset already complete at {save_dir} "
                     f"(target={meta['target']} >= {n_hands})")
-                return torch.load(dataset_path, weights_only=False)
-            elif os.path.exists(dataset_path):
+                return save_dir
+            else:
                 if n_workers_cfg > 1:
                     log(f"Partial opponent dataset present but n_workers>1; "
                         f"parallel mode does not support mid-generation "
                         f"resume — regenerating from scratch.")
-                    os.unlink(dataset_path)
+                    if os.path.exists(dataset_path):
+                        os.unlink(dataset_path)
+                    import shutil as _shutil
+                    sd = _opp_shard_dir(save_dir)
+                    if os.path.isdir(sd):
+                        _shutil.rmtree(sd, ignore_errors=True)
                     try:
                         os.unlink(_meta_path(save_dir))
                     except OSError:
                         pass
                 else:
-                    prior_scenarios = torch.load(
-                        dataset_path, weights_only=False)
                     start_attempts = int(meta.get("completed_attempts", 0))
+                    start_shard_idx = int(meta.get("n_shards", 0))
+                    if start_shard_idx == 0 and os.path.exists(dataset_path):
+                        start_shard_idx = 1
                     log(f"Resuming opponent dataset: "
                         f"{start_attempts}/{n_hands} attempts done, "
-                        f"{len(prior_scenarios)} scenarios on disk")
+                        f"{start_shard_idx} shard(s) on disk "
+                        f"(zero-memory resume — prior data NOT loaded)")
     else:
-        # Legacy non-resume: prefer any existing dataset.pt as-is.
         existing = load_dataset(save_dir, log=log)
         if existing is not None:
             return existing
@@ -939,42 +1009,49 @@ def generate_opponent_dataset(config, save_dir, device, log,
     table_roster = list(player_pool[:max_players])
     log(f"Player pool: {n_player_pool} IDs, swap_prob={swap_prob}")
 
-    def _persist(scenarios_list, completed_attempts, meta_done):
-        atomic_torch_save(scenarios_list, dataset_path)
+    shard_idx = start_shard_idx
+    total_scenarios_on_disk = 0
+
+    def _flush_buffer(buf, completed_attempts, meta_done):
+        nonlocal shard_idx, total_scenarios_on_disk
+        if buf:
+            _save_opp_shard(buf, save_dir, shard_idx)
+            total_scenarios_on_disk += len(buf)
+            shard_idx += 1
         if config_hash is not None or resume:
             _write_meta(save_dir, {
                 "version":            1,
+                "storage":            "sharded",
                 "target":             n_hands,
                 "completed_attempts": completed_attempts,
-                "completed_hands":    len(scenarios_list),
+                "n_shards":           shard_idx,
                 "done":               bool(meta_done),
                 "config_hash":        config_hash,
                 "n_workers":          n_workers_cfg,
             })
 
-    # Dispatch: parallel (opponent_data.n_workers > 1) reuses the MCTS GPU
-    # inference server — CPU actors play hands + range bookkeeping and offload
-    # the action-head combo inference (FORWARD_BATCH) to one GPU server. The
-    # default (n_workers <= 1) keeps the original sequential path unchanged.
     n_workers = n_workers_cfg
     if n_workers > 1:
-        # All-or-nothing parallel path. No prior partial scenarios are used.
         scenarios = _run_parallel_opponent(
             agents_list, config, gen_cfg, device, log, n_hands, n_workers,
             max_players, n_player_pool, swap_prob, player_pool)
         log(f"Generated {len(scenarios)} scenarios (parallel, {n_workers} actors)")
+        _save_opp_shard(scenarios, save_dir, shard_idx)
+        shard_idx += 1
+        total_scenarios_on_disk = len(scenarios)
+        del scenarios
     else:
-        scenarios = list(prior_scenarios)
-        failed = max(0, start_attempts - len(prior_scenarios))
+        buffer = []
+        failed = max(0, start_attempts)  # conservative
         remaining = n_hands - start_attempts
         if start_attempts > 0:
             log(f"Resuming sequential opponent generation: "
                 f"{remaining} attempts remaining")
 
+        buffer_scenarios = 0
         for offset in tqdm(range(remaining), desc="Generating opponent data",
                            smoothing=0):
             hand_i = start_attempts + offset
-            # Simulate player rotation — occasionally swap seat identities
             for pos in range(max_players):
                 if random.random() < swap_prob:
                     table_roster[pos] = random.choice(player_pool)
@@ -984,30 +1061,37 @@ def generate_opponent_dataset(config, save_dir, device, log,
             if result is not None:
                 for s in result:
                     s["hand_id"] = hand_i
-                scenarios.extend(result)
+                buffer.extend(result)
+                buffer_scenarios += len(result)
             else:
                 failed += 1
 
-            if (hand_i + 1) % save_every == 0:
-                _persist(scenarios, hand_i + 1, meta_done=False)
-                log(f"  Incremental save: {len(scenarios)} scenarios ({hand_i + 1} hands)")
+            if (hand_i + 1) % save_every == 0 and buffer:
+                _flush_buffer(buffer, hand_i + 1, meta_done=False)
+                log(f"  Shard {shard_idx - 1}: {len(buffer)} scenarios "
+                    f"({hand_i + 1} hands)")
+                buffer = []
 
-        log(f"Generated {len(scenarios)} scenarios from "
-            f"{n_hands - failed} hands ({failed} failed)")
+        if buffer:
+            _flush_buffer(buffer, n_hands, meta_done=False)
+            buffer = []
 
-    if scenarios:
-        ess_values = [s["range_ess"] for s in scenarios]
-        top_mass_values = [s["range_top_mass_size"] for s in scenarios]
-        log(f"Range ESS: min={min(ess_values):.1f}, max={max(ess_values):.1f}, "
-            f"avg={sum(ess_values) / len(ess_values):.1f}")
-        log(f"Range top_mass: min={min(top_mass_values)}, "
-            f"max={max(top_mass_values)}, "
-            f"avg={sum(top_mass_values) / len(top_mass_values):.1f}")
+        log(f"Generated {buffer_scenarios} new scenarios from "
+            f"{remaining} hands ({failed} failed total)")
 
-    _persist(scenarios, n_hands, meta_done=True)
-    log(f"Dataset saved to {dataset_path}")
+    _write_meta(save_dir, {
+        "version":            1,
+        "storage":            "sharded",
+        "target":             n_hands,
+        "completed_attempts": n_hands,
+        "n_shards":           shard_idx,
+        "done":               True,
+        "config_hash":        config_hash,
+        "n_workers":          n_workers_cfg,
+    })
 
-    return scenarios
+    log(f"Dataset saved to {save_dir} ({shard_idx} shards)")
+    return save_dir
 
 
 # ---------------------------------------------------------------------------

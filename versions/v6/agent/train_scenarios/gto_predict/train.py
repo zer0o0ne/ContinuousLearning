@@ -178,6 +178,7 @@ def _check_val(val_loss, best_val_loss, fails_since_best, interrupt_after_fails,
 
 
 def train_gto(agent, train_cfg, device, log, scenarios_override=None,
+              scenarios_dir=None, modifiers=None, mod_params=None,
               temperature=None, run_dir=None, resume_state=None):
     """Main training entry point for combined GTO prediction.
 
@@ -242,41 +243,84 @@ def train_gto(agent, train_cfg, device, log, scenarios_override=None,
     if amp_enabled:
         log(f"AMP enabled: {device_type}, dtype={amp_dtype}, scaler={use_scaler}")
 
-    # Dataset is provided by pipeline (loaded/generated there)
-    if scenarios_override is not None:
-        scenarios = scenarios_override
-        log(f"Using provided scenarios ({len(scenarios)} samples)")
+    # Dataset setup
+    if scenarios_dir is not None:
+        from agent.train_scenarios.sharded import (
+            ShardedScenarios, ShardedGTODataset, ShardBatchSampler,
+            scan_shard_metadata, compute_norm_stats_from_shards,
+            shard_aware_split,
+        )
+        shards = ShardedScenarios(scenarios_dir)
+        log(f"Using sharded scenarios from {scenarios_dir} ({len(shards)} samples, {shards.n_shards} shards)")
+
+        hand_ids, n_events = scan_shard_metadata(shards)
+
+        if resume_state is not None and resume_state.get("norm_stats"):
+            norm_stats = resume_state["norm_stats"]
+            log(f"Norm stats (resumed): " + ", ".join(
+                f"{k}={v:.4f}" for k, v in norm_stats.items()))
+        else:
+            norm_stats = compute_norm_stats_from_shards(shards, modifiers=modifiers, mod_params=mod_params)
+            log(f"Norm stats: " + ", ".join(
+                f"{k}={v:.4f}" for k, v in norm_stats.items()))
+
+        train_indices, val_indices = shard_aware_split(hand_ids, val_split)
+
+        train_dataset = ShardedGTODataset(shards, norm_stats, phase="combined",
+                                          modifiers=modifiers, mod_params=mod_params,
+                                          indices=train_indices)
+        val_dataset = ShardedGTODataset(shards, norm_stats, phase="combined",
+                                        modifiers=modifiers, mod_params=mod_params,
+                                        indices=val_indices)
+
+        max_players = agent.perception.embedder.max_players
+        _tensor_collate = make_tensor_collate(max_players)
+        train_sampler = ShardBatchSampler(
+            shards.shard_sizes, shards.shard_offsets, batch_size,
+            indices=train_indices, n_events=n_events)
+        train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                  collate_fn=_tensor_collate, num_workers=0)
+        val_sampler = ShardBatchSampler(
+            shards.shard_sizes, shards.shard_offsets, batch_size,
+            indices=val_indices)
+        val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
+                                collate_fn=_tensor_collate, num_workers=0)
     else:
-        scenarios = generate_dataset(train_cfg, run_dir, log=log)
-        if not scenarios:
-            log("No scenarios generated. Aborting training.")
-            return None, run_dir
+        # Original in-memory path
+        if scenarios_override is not None:
+            scenarios = scenarios_override
+            log(f"Using provided scenarios ({len(scenarios)} samples)")
+        else:
+            scenarios = generate_dataset(train_cfg, run_dir, log=log)
+            if not scenarios:
+                log("No scenarios generated. Aborting training.")
+                return None, run_dir
 
-    # Compute norm_stats and normalize (per-agent). On resume, reuse
-    # the stats from the prior run.
-    scenarios = _shallow_copy_scenarios(scenarios)
-    if resume_state is not None and resume_state.get("norm_stats"):
-        norm_stats = resume_state["norm_stats"]
-        log(f"Norm stats (resumed): " + ", ".join(
-            f"{k}={v:.4f}" for k, v in norm_stats.items()))
-    else:
-        norm_stats = _compute_norm_stats(scenarios)
-        log(f"Norm stats: " + ", ".join(
-            f"{k}={v:.4f}" for k, v in norm_stats.items()))
-    _normalize_scenarios(scenarios, norm_stats)
+        # Compute norm_stats and normalize (per-agent). On resume, reuse
+        # the stats from the prior run.
+        scenarios = _shallow_copy_scenarios(scenarios)
+        if resume_state is not None and resume_state.get("norm_stats"):
+            norm_stats = resume_state["norm_stats"]
+            log(f"Norm stats (resumed): " + ", ".join(
+                f"{k}={v:.4f}" for k, v in norm_stats.items()))
+        else:
+            norm_stats = _compute_norm_stats(scenarios)
+            log(f"Norm stats: " + ", ".join(
+                f"{k}={v:.4f}" for k, v in norm_stats.items()))
+        _normalize_scenarios(scenarios, norm_stats)
 
-    # Train/val split (hand-aware: no hand leaks between sets)
-    from agent.train_scenarios.split import hand_aware_split
-    dataset = GTODataset(scenarios)
-    train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
+        # Train/val split (hand-aware: no hand leaks between sets)
+        from agent.train_scenarios.split import hand_aware_split
+        dataset = GTODataset(scenarios)
+        train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
 
-    max_players = agent.perception.embedder.max_players
-    _tensor_collate = make_tensor_collate(max_players)
-    train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
-    train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                              collate_fn=_tensor_collate, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            collate_fn=_tensor_collate, num_workers=0)
+        max_players = agent.perception.embedder.max_players
+        _tensor_collate = make_tensor_collate(max_players)
+        train_sampler = LengthGroupedBatchSampler(train_dataset, batch_size)
+        train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                  collate_fn=_tensor_collate, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                collate_fn=_tensor_collate, num_workers=0)
 
     log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:

@@ -298,6 +298,7 @@ def _normalize_action_evs(scenarios, norm_stats):
 
 
 def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
+                    scenarios_dir=None, modifiers=None, mod_params=None,
                     temperature=None, run_dir=None, resume_state=None):
     """Main training entry point for modelling head.
 
@@ -358,66 +359,128 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
     if amp_enabled:
         log(f"AMP enabled: {device_type}, dtype={amp_dtype}, scaler={use_scaler}")
 
-    # Dataset
-    if scenarios_override is not None:
-        scenarios = scenarios_override
-        log(f"Using provided scenarios ({len(scenarios)} samples)")
-    else:
-        scenarios = generate_dataset(train_cfg, run_dir, log=log)
-        if not scenarios:
-            log("No scenarios generated. Aborting training.")
-            return None, run_dir
+    # Dataset setup
+    if scenarios_dir is not None:
+        from agent.train_scenarios.sharded import (
+            ShardedScenarios, ShardedGTODataset, ShardBatchSampler,
+            scan_shard_metadata, compute_norm_stats_from_shards,
+            shard_aware_split,
+        )
+        shards = ShardedScenarios(scenarios_dir)
+        log(f"Using sharded scenarios from {scenarios_dir} ({len(shards)} samples, {shards.n_shards} shards)")
 
-    # Use norm stats from checkpoint (same distribution perception was trained on)
-    # to avoid distribution mismatch with frozen perception. On resume, the
-    # pipeline has already restored `_checkpoint_norm_stats` from `latest.pt`.
-    scenarios = _shallow_copy_scenarios(scenarios)
-    if resume_state is not None and resume_state.get("norm_stats"):
-        norm_stats = resume_state["norm_stats"]
-        log("Using norm stats from resume_state")
-    else:
-        checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
-        if checkpoint_norm_stats is not None:
-            norm_stats = checkpoint_norm_stats
-            log("Using norm stats from agent checkpoint (matches perception training)")
+        hand_ids, n_events = scan_shard_metadata(shards)
+
+        # Use norm stats from checkpoint (same distribution perception was trained on)
+        # to avoid distribution mismatch with frozen perception.
+        if resume_state is not None and resume_state.get("norm_stats"):
+            norm_stats = resume_state["norm_stats"]
+            log("Using norm stats from resume_state")
         else:
-            norm_stats = _compute_norm_stats(scenarios)
-            log("No checkpoint norm stats — computing from scenarios")
-    log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
-    _normalize_action_evs(scenarios, norm_stats)  # BEFORE _normalize_scenarios (uses raw big_blind)
-    _normalize_scenarios(scenarios, norm_stats)
+            checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
+            if checkpoint_norm_stats is not None:
+                norm_stats = checkpoint_norm_stats
+                log("Using norm stats from agent checkpoint (matches perception training)")
+            else:
+                norm_stats = compute_norm_stats_from_shards(shards, modifiers=modifiers, mod_params=mod_params)
+                log("No checkpoint norm stats — computing from shards")
+        log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
 
-    # Train/val split (hand-aware: no hand leaks between sets)
-    from agent.train_scenarios.split import hand_aware_split
-    dataset = GTOModellingDataset(scenarios)
-    train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
+        train_indices, val_indices = shard_aware_split(hand_ids, val_split)
 
-    # E.5.1: pre-compute frozen perception outputs once
-    log("Pre-computing frozen perception outputs...")
-    _p_outs = []
-    _p_masks = []
-    n_batches = (len(dataset) + batch_size - 1) // batch_size
-    with torch.no_grad():
-        for start in tqdm(range(0, len(dataset), batch_size),
-                          total=n_batches, desc="Caching perception", smoothing=0):
-            end = min(start + batch_size, len(dataset))
-            batch_events = [dataset[j][0] for j in range(start, end)]
-            p_out, _, m = agent.perception.forward_batch(
-                batch_events, device=device, skip_memory=True)
-            for k in range(p_out.shape[0]):
-                L = int(m[k].sum().item())
-                _p_outs.append(p_out[k, :L].detach().cpu())
-                _p_masks.append(m[k, :L].detach().cpu())
-    log(f"Cached {len(_p_outs)} perception outputs")
+        # E.5.1: pre-compute frozen perception outputs using a full dataset
+        # (sequential access — shard LRU cache handles ordering)
+        full_dataset = ShardedGTODataset(shards, norm_stats, phase="modelling",
+                                         modifiers=modifiers, mod_params=mod_params)
+        log("Pre-computing frozen perception outputs...")
+        _p_outs = []
+        _p_masks = []
+        n_batches = (len(full_dataset) + batch_size - 1) // batch_size
+        with torch.no_grad():
+            for start in tqdm(range(0, len(full_dataset), batch_size),
+                              total=n_batches, desc="Caching perception", smoothing=0):
+                end = min(start + batch_size, len(full_dataset))
+                batch_events = [full_dataset[j][0] for j in range(start, end)]
+                p_out, _, m = agent.perception.forward_batch(
+                    batch_events, device=device, skip_memory=True)
+                for k in range(p_out.shape[0]):
+                    L = int(m[k].sum().item())
+                    _p_outs.append(p_out[k, :L].detach().cpu())
+                    _p_masks.append(m[k, :L].detach().cpu())
+        log(f"Cached {len(_p_outs)} perception outputs")
 
-    cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
-    cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
+        cached_train = _CachedDataset(train_indices, _p_outs, _p_masks, full_dataset)
+        cached_val = _CachedDataset(val_indices, _p_outs, _p_masks, full_dataset)
 
-    train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
-    train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
-                              collate_fn=_cached_collate, num_workers=0)
-    val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
-                            collate_fn=_cached_collate, num_workers=0)
+        train_dataset = cached_train
+        val_dataset = cached_val
+
+        train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
+        train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
+                                  collate_fn=_cached_collate, num_workers=0)
+        val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
+                                collate_fn=_cached_collate, num_workers=0)
+    else:
+        # Original in-memory path
+        if scenarios_override is not None:
+            scenarios = scenarios_override
+            log(f"Using provided scenarios ({len(scenarios)} samples)")
+        else:
+            scenarios = generate_dataset(train_cfg, run_dir, log=log)
+            if not scenarios:
+                log("No scenarios generated. Aborting training.")
+                return None, run_dir
+
+        # Use norm stats from checkpoint (same distribution perception was trained on)
+        # to avoid distribution mismatch with frozen perception. On resume, the
+        # pipeline has already restored `_checkpoint_norm_stats` from `latest.pt`.
+        scenarios = _shallow_copy_scenarios(scenarios)
+        if resume_state is not None and resume_state.get("norm_stats"):
+            norm_stats = resume_state["norm_stats"]
+            log("Using norm stats from resume_state")
+        else:
+            checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
+            if checkpoint_norm_stats is not None:
+                norm_stats = checkpoint_norm_stats
+                log("Using norm stats from agent checkpoint (matches perception training)")
+            else:
+                norm_stats = _compute_norm_stats(scenarios)
+                log("No checkpoint norm stats — computing from scenarios")
+        log(f"Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
+        _normalize_action_evs(scenarios, norm_stats)  # BEFORE _normalize_scenarios (uses raw big_blind)
+        _normalize_scenarios(scenarios, norm_stats)
+
+        # Train/val split (hand-aware: no hand leaks between sets)
+        from agent.train_scenarios.split import hand_aware_split
+        dataset = GTOModellingDataset(scenarios)
+        train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
+
+        # E.5.1: pre-compute frozen perception outputs once
+        log("Pre-computing frozen perception outputs...")
+        _p_outs = []
+        _p_masks = []
+        n_batches = (len(dataset) + batch_size - 1) // batch_size
+        with torch.no_grad():
+            for start in tqdm(range(0, len(dataset), batch_size),
+                              total=n_batches, desc="Caching perception", smoothing=0):
+                end = min(start + batch_size, len(dataset))
+                batch_events = [dataset[j][0] for j in range(start, end)]
+                p_out, _, m = agent.perception.forward_batch(
+                    batch_events, device=device, skip_memory=True)
+                for k in range(p_out.shape[0]):
+                    L = int(m[k].sum().item())
+                    _p_outs.append(p_out[k, :L].detach().cpu())
+                    _p_masks.append(m[k, :L].detach().cpu())
+        log(f"Cached {len(_p_outs)} perception outputs")
+
+        cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
+        cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
+
+        train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
+        train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
+                                  collate_fn=_cached_collate, num_workers=0)
+        val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
+                                collate_fn=_cached_collate, num_workers=0)
 
     log(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     if val_every:

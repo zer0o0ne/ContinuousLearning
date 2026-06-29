@@ -1154,25 +1154,52 @@ def _write_meta(dataset_dir, meta):
     atomic_json_dump(meta, _meta_path(dataset_dir))
 
 
+def _convert_monolithic_to_shards(save_dir, dataset_path, log, shard_size=10000):
+    """One-time conversion: split dataset.pt into numbered shards."""
+    if log:
+        log("Converting monolithic dataset.pt to shards (one-time)...")
+    scenarios = torch.load(dataset_path, weights_only=False)
+    shard_dir = os.path.join(save_dir, "dataset_shards")
+    os.makedirs(shard_dir, exist_ok=True)
+    shard_counts = []
+    shard_idx = 0
+    for i in range(0, len(scenarios), shard_size):
+        chunk = scenarios[i:i + shard_size]
+        shard_path = os.path.join(shard_dir, f"shard_{shard_idx:06d}.pt")
+        atomic_torch_save(chunk, shard_path)
+        shard_counts.append(len(chunk))
+        shard_idx += 1
+    del scenarios
+    meta = _read_meta(save_dir) or {}
+    meta["storage"] = "sharded"
+    meta["shard_counts"] = shard_counts
+    meta["n_shards"] = shard_idx
+    _write_meta(save_dir, meta)
+    os.unlink(dataset_path)
+    if log:
+        log(f"  Converted to {shard_idx} shards, removed dataset.pt")
+
+
 def load_dataset(dataset_dir, log=None, strict_done=False):
     """Load a raw dataset from a directory.
 
+    Checks for shards in ``<dataset_dir>/dataset_shards/`` first, then
+    falls back to a legacy monolithic ``dataset.pt``.
+
     Args:
-        dataset_dir: directory containing dataset.pt
+        dataset_dir: directory containing dataset shards or dataset.pt
         log: optional logger
         strict_done: if True, only return scenarios when meta.json marks the
-            dataset as fully generated (`done: true`). Resumable callers use
-            this to avoid loading a partial dataset as complete. Legacy
-            callers (no meta.json) keep the old behaviour: load whatever's
+            dataset as fully generated (``done: true``). Resumable callers
+            use this to avoid loading a partial dataset as complete. Legacy
+            callers (no meta.json) keep the old behaviour: load whatever is
             on disk.
 
     Returns:
         scenarios list, or None if missing / partial-when-strict
     """
     dataset_path = os.path.join(dataset_dir, "dataset.pt")
-
-    if not os.path.exists(dataset_path):
-        return None
+    shard_dir = os.path.join(dataset_dir, "dataset_shards")
 
     meta = _read_meta(dataset_dir)
     if strict_done:
@@ -1181,6 +1208,30 @@ def load_dataset(dataset_dir, log=None, strict_done=False):
                 log(f"Dataset at {dataset_dir} present but not marked done; "
                     f"will resume/regenerate")
             return None
+
+    # --- Try shards first ---
+    if os.path.isdir(shard_dir):
+        import glob as _glob
+        shard_files = sorted(_glob.glob(
+            os.path.join(shard_dir, "shard_*.pt")))
+        if shard_files:
+            scenarios = []
+            for sf in shard_files:
+                chunk = torch.load(sf, weights_only=False)
+                scenarios.extend(chunk)
+                del chunk
+            if log:
+                log(f"Loaded dataset from {dataset_dir} "
+                    f"({len(scenarios)} samples, {len(shard_files)} shards)")
+            return scenarios
+
+    # --- Legacy monolithic dataset.pt ---
+    if meta is not None and meta.get("storage") == "sharded":
+        # Meta says sharded but no shards found — nothing to load.
+        return None
+
+    if not os.path.exists(dataset_path):
+        return None
 
     scenarios = torch.load(dataset_path, weights_only=False)
     if log:
@@ -1282,7 +1333,8 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
             dataset is still compatible. Required when `resume=True`.
 
     Returns:
-        scenarios list
+        save_dir (str) — path to the directory containing the dataset shards.
+            Callers use ``load_dataset(save_dir)`` to materialise the list.
     """
     n_scenarios = config.get("n_scenarios", 50000)
     n_workers = config.get("n_workers", 0)
@@ -1341,85 +1393,72 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                     pass
             elif meta.get("done") and meta.get("target", 0) >= n_scenarios:
                 # Fully generated previously with at least as many attempts
-                # as we want now — just load and return.
+                # as we want now — return save_dir.
                 if log:
                     log(f"Dataset already complete at {save_dir} "
                         f"(target={meta['target']} >= {n_scenarios})")
-                return torch.load(dataset_path, weights_only=False)
-            elif os.path.exists(dataset_path):
-                # Partial dataset compatible with current config — load it
-                # and continue from where the prior run stopped. Both the
-                # sequential and parallel paths below honour `start_attempts`
-                # / `start_hand_id`; in parallel mode resume granularity is
-                # `save_every_hands` (anything between the last incremental
-                # _persist and the kill is regenerated).
-                scenarios = torch.load(dataset_path, weights_only=False)
-                # E.3.4: replay any un-compacted shards on top of dataset.pt
-                _shard_resume_dir = os.path.join(save_dir, "dataset_shards")
-                if os.path.isdir(_shard_resume_dir):
-                    import glob as _glob
-                    shard_files = sorted(_glob.glob(
-                        os.path.join(_shard_resume_dir, "shard_*.pt")))
-                    for sf in shard_files:
-                        try:
-                            delta = torch.load(sf, weights_only=False)
-                            scenarios.extend(delta)
-                        except Exception:
-                            pass
-                    if shard_files and log:
-                        log(f"  Replayed {len(shard_files)} shard(s) "
-                            f"→ {len(scenarios)} total samples")
+                if meta.get("storage") != "sharded" and os.path.exists(dataset_path):
+                    _convert_monolithic_to_shards(save_dir, dataset_path, log)
+                return save_dir
+            elif meta.get("completed_attempts", 0) > 0:
+                # Zero-memory resume: do NOT load prior data into RAM.
+                # Prior shards stay on disk; new generation appends new
+                # shards. `_shard_idx` is set below to continue numbering.
                 start_attempts = int(meta.get("completed_attempts", 0))
                 start_hand_id = int(meta.get("completed_hands", 0))
                 initial_failed = max(0, start_attempts - start_hand_id)
+                # Count existing shards for shard_idx continuation
+                _shard_resume_dir = os.path.join(save_dir, "dataset_shards")
+                _existing_shards = 0
+                if os.path.isdir(_shard_resume_dir):
+                    import glob as _glob
+                    _existing_shards = len(_glob.glob(
+                        os.path.join(_shard_resume_dir, "shard_*.pt")))
+                # Include legacy dataset.pt as shard 0 equivalent
+                if _existing_shards == 0 and os.path.exists(dataset_path):
+                    _existing_shards = 1  # dataset.pt counts as shard 0
                 if log:
                     log(f"Resuming dataset at {save_dir}: "
                         f"{start_attempts}/{n_scenarios} attempts done, "
-                        f"{len(scenarios)} samples on disk, "
-                        f"next hand_id={start_hand_id}")
+                        f"{_existing_shards} shard(s) on disk "
+                        f"(zero-memory resume — prior data NOT loaded)")
 
     # If we reach here without a partial-resume and the dataset is already
-    # present (legacy non-resume usage), short-circuit as before.
+    # present (legacy non-resume usage), short-circuit.
     if not resume and start_attempts == 0:
         existing = load_dataset(save_dir, log=log)
         if existing is not None:
-            return existing
+            return save_dir
 
-    # E.3.4: shard-based incremental saving. Mid-generation saves write only
-    # new scenarios to numbered shard files instead of rewriting the entire
-    # list (which is O(N) per save → O(N²/k) total serialization). The final
-    # save compacts everything into dataset.pt.
+    # Shard-based incremental saving. Mid-generation saves write only new
+    # scenarios to numbered shard files. No final compaction — data stays
+    # sharded on disk.
     shard_dir = os.path.join(save_dir, "dataset_shards")
-    _persisted_count = len(scenarios)  # scenarios loaded from prior run
-    _shard_idx = 0
+    _persisted_count = len(scenarios)  # 0 for zero-memory resume
+    # Continue shard numbering from existing shards
+    if os.path.isdir(shard_dir):
+        import glob as _gl
+        _shard_idx = len(_gl.glob(os.path.join(shard_dir, "shard_*.pt")))
+    else:
+        _shard_idx = 0
+    # Track shard counts for meta
+    if resume:
+        _resume_meta = _read_meta(save_dir)
+        _shard_counts = list((_resume_meta or {}).get("shard_counts", []))
+    else:
+        _shard_counts = []
 
     def _persist(meta_done):
         nonlocal _persisted_count, _shard_idx
-        if meta_done:
-            # Final save: compact everything into dataset.pt
-            atomic_torch_save(scenarios, dataset_path)
-            # Remove shard files
-            if os.path.isdir(shard_dir):
-                import glob
-                for sf in glob.glob(os.path.join(shard_dir, "shard_*.pt")):
-                    try:
-                        os.unlink(sf)
-                    except OSError:
-                        pass
-                try:
-                    os.rmdir(shard_dir)
-                except OSError:
-                    pass
-        else:
-            # Incremental: save only new scenarios as a shard
-            new_count = len(scenarios)
-            if new_count > _persisted_count:
-                os.makedirs(shard_dir, exist_ok=True)
-                delta = scenarios[_persisted_count:]
-                shard_path = os.path.join(shard_dir, f"shard_{_shard_idx:06d}.pt")
-                atomic_torch_save(delta, shard_path)
-                _shard_idx += 1
-                _persisted_count = new_count
+        new_count = len(scenarios)
+        if new_count > _persisted_count:
+            os.makedirs(shard_dir, exist_ok=True)
+            delta = scenarios[_persisted_count:]
+            shard_path = os.path.join(shard_dir, f"shard_{_shard_idx:06d}.pt")
+            atomic_torch_save(delta, shard_path)
+            _shard_counts.append(len(delta))
+            _shard_idx += 1
+            _persisted_count = new_count
         if config_hash is not None or resume:
             _write_meta(save_dir, {
                 "version":            1,
@@ -1429,23 +1468,25 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                 "done":               bool(meta_done),
                 "config_hash":        config_hash,
                 "n_workers":          n_workers,
+                "storage":            "sharded",
+                "shard_counts":       _shard_counts,
+                "n_shards":           _shard_idx,
             })
 
     if n_workers > 1 and n_scenarios >= n_workers * 2:
-        # --- Multiprocessing path with mid-generation resume ---
+        # --- Multiprocessing path with zero-memory resume ---
         # Worker tasks are 1 hand each, dispatched by `worker_id` =
-        # `start_attempts..n_scenarios-1`. Already-completed scenarios are
-        # carried over in `scenarios` from the prior run's incremental
-        # save; resume granularity is `save_every_hands` (any tasks whose
-        # results were received but not yet persisted before the kill are
-        # regenerated with the same `worker_id`, harmless).
+        # `start_attempts..n_scenarios-1`. Prior data stays on disk as
+        # shards (NOT loaded into RAM); new results accumulate in
+        # `scenarios` and are persisted as new shard files. Resume
+        # granularity is `save_every_hands`.
         worker_device = _get_generation_device(config.get("device"))
         if log:
             if start_attempts > 0:
                 log(f"Resuming parallel generation on {worker_device}: "
                     f"{n_scenarios - start_attempts} attempts remaining of "
                     f"{n_scenarios} (prior: {start_attempts} attempts, "
-                    f"{len(scenarios)} samples loaded)")
+                    f"zero-memory resume)")
             else:
                 log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
             log(f"Incremental save every {save_every_hands} hands")
@@ -1557,9 +1598,9 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
 
     _persist(meta_done=True)
     if log:
-        log(f"Dataset saved to {dataset_path}")
+        log(f"Dataset saved to {save_dir} ({_shard_idx} shards)")
 
-    return scenarios
+    return save_dir
 
 
 if __name__ == "__main__":
@@ -1580,9 +1621,12 @@ if __name__ == "__main__":
     train_cfg.update(config.get("dataset", {}))
     train_cfg.update(config.get("gto_ev_train", {}))
 
-    scenarios, norm_stats = generate_dataset(train_cfg, args.save_dir, log=print)
-    print(f"Total scenarios: {len(scenarios)}")
+    dataset_dir = generate_dataset(train_cfg, args.save_dir, log=print)
+    scenarios = load_dataset(dataset_dir, log=print)
     if scenarios:
+        print(f"Total scenarios: {len(scenarios)}")
         evs = [s["ev_target"] for s in scenarios]
-        print(f"Normalized EV range: [{min(evs):.2f}, {max(evs):.2f}]")
+        print(f"EV range: [{min(evs):.2f}, {max(evs):.2f}]")
         print(f"Action probs sample: {scenarios[0]['action_probs']}")
+    else:
+        print("No scenarios generated.")

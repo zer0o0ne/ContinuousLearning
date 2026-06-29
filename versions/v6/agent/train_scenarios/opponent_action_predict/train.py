@@ -206,7 +206,8 @@ def _save_latest(agent, optimizer, scheduler, norm_stats, run_dir,
 
 
 def train_opponent_action(agent, train_cfg, device, log,
-                          scenarios_override=None, temperature=None,
+                          scenarios_override=None, scenarios_dir=None,
+                          temperature=None,
                           run_dir=None, resume_state=None):
     """Train opponent_action_head on range-based opponent action data.
 
@@ -219,6 +220,7 @@ def train_opponent_action(agent, train_cfg, device, log,
         device: torch device string
         log: logger callable
         scenarios_override: raw opponent scenarios (shared event format)
+        scenarios_dir: path to sharded opponent data directory
         temperature: agent temperature (saved in checkpoint)
         run_dir: pre-existing run directory (reused on resume).
         resume_state: optimizer/scheduler/counters from a prior interrupted
@@ -282,38 +284,72 @@ def train_opponent_action(agent, train_cfg, device, log,
     if amp_enabled:
         log(f"AMP enabled: {device_type}, dtype={amp_dtype}, scaler={use_scaler}")
 
-    # Dataset
-    if scenarios_override is None:
-        log("ERROR: scenarios_override required for opponent action training")
-        return None, run_dir
-    scenarios = scenarios_override
-    log(f"Using {len(scenarios)} raw scenarios")
+    # Dataset — sharded path (scenarios_dir) or legacy list path (scenarios_override)
+    _sharded = scenarios_dir is not None
+    if _sharded:
+        from agent.train_scenarios.sharded import (
+            ShardedScenarios, ShardedOpponentDataset, ShardBatchSampler,
+            scan_opponent_metadata, compute_opponent_norm_stats_from_shards,
+            shard_aware_split_expanded,
+        )
+        shards = ShardedScenarios(scenarios_dir, shard_subdir="shards")
+        log(f"Using sharded opponent data from {scenarios_dir} "
+            f"({len(shards)} scenarios, {shards.n_shards} shards)")
+        hand_ids, n_events, expanded_indices = scan_opponent_metadata(shards)
+        log(f"Expanded samples: {len(expanded_indices)}")
 
-    # Use norm stats from checkpoint (same distribution perception was trained on)
-    # to avoid distribution mismatch with frozen perception. On resume, the
-    # stats in `resume_state` take precedence.
-    if resume_state is not None and resume_state.get("norm_stats"):
-        norm_stats = resume_state["norm_stats"]
-        log("Using norm stats from resume_state")
-    else:
-        checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
-        if checkpoint_norm_stats is not None:
-            norm_stats = checkpoint_norm_stats
-            log("Using norm stats from agent checkpoint (matches perception training)")
+        if resume_state is not None and resume_state.get("norm_stats"):
+            norm_stats = resume_state["norm_stats"]
+            log("Using norm stats from resume_state")
         else:
-            norm_stats = _compute_norm_stats(scenarios)
-            log("No checkpoint norm stats — computing from opponent scenarios")
-    log("Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
+            checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
+            if checkpoint_norm_stats is not None:
+                norm_stats = checkpoint_norm_stats
+                log("Using norm stats from agent checkpoint (matches perception training)")
+            else:
+                norm_stats = compute_opponent_norm_stats_from_shards(shards)
+                log("No checkpoint norm stats — computed from opponent shards")
+        log("Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
 
-    # Train/val split (hand-aware, mapped to expanded indices)
-    from agent.train_scenarios.split import hand_aware_split_expanded
-    dataset = OpponentActionDataset(scenarios, norm_stats=norm_stats)
-    train_dataset, val_dataset = hand_aware_split_expanded(
-        dataset, scenarios, val_split, dataset.indices)
+        train_exp_idx, val_exp_idx = shard_aware_split_expanded(
+            hand_ids, expanded_indices, val_split)
+        log(f"Split: train {len(train_exp_idx)}, val {len(val_exp_idx)}")
+
+        dataset = ShardedOpponentDataset(shards, expanded_indices, norm_stats=norm_stats)
+        train_dataset = ShardedOpponentDataset(shards, expanded_indices,
+                                                norm_stats=norm_stats,
+                                                subset_indices=train_exp_idx)
+        val_dataset = ShardedOpponentDataset(shards, expanded_indices,
+                                              norm_stats=norm_stats,
+                                              subset_indices=val_exp_idx)
+
+    elif scenarios_override is not None:
+        scenarios = scenarios_override
+        log(f"Using {len(scenarios)} raw scenarios")
+
+        if resume_state is not None and resume_state.get("norm_stats"):
+            norm_stats = resume_state["norm_stats"]
+            log("Using norm stats from resume_state")
+        else:
+            checkpoint_norm_stats = getattr(agent, '_checkpoint_norm_stats', None)
+            if checkpoint_norm_stats is not None:
+                norm_stats = checkpoint_norm_stats
+                log("Using norm stats from agent checkpoint (matches perception training)")
+            else:
+                norm_stats = _compute_norm_stats(scenarios)
+                log("No checkpoint norm stats — computing from opponent scenarios")
+        log("Norm stats: " + ", ".join(f"{k}={v:.4f}" for k, v in norm_stats.items()))
+
+        from agent.train_scenarios.split import hand_aware_split_expanded
+        dataset = OpponentActionDataset(scenarios, norm_stats=norm_stats)
+        train_dataset, val_dataset = hand_aware_split_expanded(
+            dataset, scenarios, val_split, dataset.indices)
+    else:
+        log("ERROR: scenarios_override or scenarios_dir required for opponent action training")
+        return None, run_dir
 
     log(f"Expanded samples: {len(dataset)} (train: {len(train_dataset)}, val: {len(val_dataset)})")
 
-    # Opponent embedding table (persistent across batches, detached after each backward)
     opp_table = None
     if use_opp_emb:
         from agent.perception.opponent_embeddings import OpponentEmbeddingTable
@@ -323,18 +359,25 @@ def train_opponent_action(agent, train_cfg, device, log,
     _use_perception_cache = not use_opp_emb
 
     if use_opp_emb:
-        # A.4.4: feed in hand_id (chronological) order so the opponent GRU table
-        # accumulates exactly as it would at inference — not length-shuffled.
         from agent.train_scenarios.split import OrderedBatchSampler
-        base_ds = train_dataset.dataset       # OpponentActionDataset
-        expanded = base_ds.indices            # [(s_idx, hero_pos), ...]
-        scens = base_ds.scenarios
-        keyed = []
-        for pos, exp_idx in enumerate(train_dataset.indices):
-            s_idx = expanded[exp_idx][0]
-            hid = scens[s_idx].get("hand_id", s_idx)
-            keyed.append((hid, exp_idx, pos))
-        keyed.sort(key=lambda t: (t[0], t[1]))   # hand_id, then scenario order
+
+        if _sharded:
+            keyed = []
+            for pos, exp_idx in enumerate(train_exp_idx):
+                s_idx = expanded_indices[exp_idx][0]
+                hid = hand_ids[s_idx] if s_idx < len(hand_ids) else s_idx
+                keyed.append((hid, exp_idx, pos))
+        else:
+            base_ds = train_dataset.dataset
+            expanded = base_ds.indices
+            scens = base_ds.scenarios
+            keyed = []
+            for pos, exp_idx in enumerate(train_dataset.indices):
+                s_idx = expanded[exp_idx][0]
+                hid = scens[s_idx].get("hand_id", s_idx)
+                keyed.append((hid, exp_idx, pos))
+
+        keyed.sort(key=lambda t: (t[0], t[1]))
         order = [pos for _, _, pos in keyed]
         train_sampler = OrderedBatchSampler(order, batch_size)
         log("Opponent GRU active → chronological (hand_id) batch order")
@@ -346,8 +389,6 @@ def train_opponent_action(agent, train_cfg, device, log,
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                                 collate_fn=_tc, num_workers=0)
     else:
-        # E.5.1: pre-compute frozen perception outputs (all perception params
-        # frozen when opp_emb disabled — outputs are deterministic)
         log("Pre-computing frozen perception outputs...")
         _p_outs = []
         _p_masks = []
@@ -365,8 +406,12 @@ def train_opponent_action(agent, train_cfg, device, log,
                     _p_masks.append(m[k, :L].detach().cpu())
         log(f"Cached {len(_p_outs)} perception outputs")
 
-        cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
-        cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
+        if _sharded:
+            cached_train = _CachedDataset(train_exp_idx, _p_outs, _p_masks, dataset)
+            cached_val = _CachedDataset(val_exp_idx, _p_outs, _p_masks, dataset)
+        else:
+            cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
+            cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
 
         train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
         train_loader = DataLoader(cached_train, batch_sampler=train_sampler,

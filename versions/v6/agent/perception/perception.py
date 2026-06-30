@@ -57,8 +57,10 @@ def extract_event_tensors(event_sequences, max_players):
                     padded_bets[k] = float(b)
             all_bets.append(padded_bets)
 
-            raw_stacks = event.get("stacks") or []
-            if isinstance(raw_stacks, np.ndarray):
+            raw_stacks = event.get("stacks")
+            if raw_stacks is None:
+                raw_stacks = []
+            elif isinstance(raw_stacks, np.ndarray):
                 raw_stacks = raw_stacks.tolist()
             padded_stacks = [0.0] * max_players
             for k, sv in enumerate(raw_stacks):
@@ -183,8 +185,10 @@ class EventSequenceEmbedder(nn.Module):
 
         # B.6.2: per-position stacks vector (mirrors bets). Missing → zeros.
         stacks = torch.zeros(self.max_players, dtype=torch.float, device=device)
-        raw_stacks = event.get("stacks") or []
-        if isinstance(raw_stacks, np.ndarray):
+        raw_stacks = event.get("stacks")
+        if raw_stacks is None:
+            raw_stacks = []
+        elif isinstance(raw_stacks, np.ndarray):
             raw_stacks = raw_stacks.tolist()
         for i, sv in enumerate(raw_stacks):
             if i < self.max_players:
@@ -317,8 +321,10 @@ class EventSequenceEmbedder(nn.Module):
                         padded_bets[k] = float(b)
                 all_bets.append(padded_bets)
 
-                raw_stacks = event.get("stacks") or []
-                if isinstance(raw_stacks, np.ndarray):
+                raw_stacks = event.get("stacks")
+                if raw_stacks is None:
+                    raw_stacks = []
+                elif isinstance(raw_stacks, np.ndarray):
                     raw_stacks = raw_stacks.tolist()
                 padded_stacks = [0.0] * self.max_players
                 for k, sv in enumerate(raw_stacks):

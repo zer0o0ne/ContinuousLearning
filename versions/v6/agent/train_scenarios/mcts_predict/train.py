@@ -550,7 +550,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                run_dir=None, history_path=None, cycle_id=0,
                global_step_offset=0, save_checkpoint=True,
                run_timestamp=None,
-               optimizer=None, scheduler=None, scaler=None):
+               optimizer=None, scheduler=None, scaler=None,
+               save_every_cycles=1):
     """Train all agent heads on MCTS-derived training data.
 
     Supports cross-cycle continuity for cyclic self-play training:
@@ -835,7 +836,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                                run_dir, global_step, epoch, vl, log,
                                temperature=temperature, cycle_id=cycle_id,
                                examples_in_cycle=len(examples),
-                               write_snapshot=save_checkpoint)
+                               write_snapshot=save_checkpoint,
+                               save_every_cycles=save_every_cycles)
                 else:
                     fails_since_best += 1
                     if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
@@ -876,7 +878,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                        global_step, epoch, val_avg, log,
                        temperature=temperature, cycle_id=cycle_id,
                        examples_in_cycle=len(examples),
-                       write_snapshot=save_checkpoint)
+                       write_snapshot=save_checkpoint,
+                       save_every_cycles=save_every_cycles)
         else:
             fails_since_best += 1
             if interrupt_after_fails and fails_since_best >= interrupt_after_fails:
@@ -910,7 +913,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                global_step, final_epoch, final_val, log,
                temperature=temperature, cycle_id=cycle_id,
                examples_in_cycle=len(examples), reason="cycle_end",
-               write_snapshot=save_checkpoint)
+               write_snapshot=save_checkpoint,
+               save_every_cycles=save_every_cycles)
 
     # Cycle summary for analytics
     history["cycles"].append({
@@ -963,7 +967,7 @@ def _cleanup_old_snapshots(snapshots_dir, keep_last=3, keep_every=10, log=None):
 def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
                global_step, epoch, val_loss, log, temperature=None,
                cycle_id=None, examples_in_cycle=None, reason="val_improved",
-               write_snapshot=True):
+               write_snapshot=True, save_every_cycles=1):
     """Save checkpoint to a rolling `best.pt` (always) and optionally a
     per-cycle snapshot `cycles/cycle_<N>.pt`. The rolling file is what
     `_find_best_checkpoint` loads (latest state); the per-cycle snapshot is
@@ -994,7 +998,8 @@ def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
         snapshot_written = True
 
     if snapshot_written:
-        _cleanup_old_snapshots(snapshots_dir, keep_last=3, keep_every=10, log=log)
+        _cleanup_old_snapshots(snapshots_dir, keep_last=3,
+                               keep_every=max(1, save_every_cycles), log=log)
 
     snap_str = " + snapshot" if snapshot_written else ""
     log(f"  Saved best.pt{snap_str} ({reason}, val={val_loss:.6f}, "

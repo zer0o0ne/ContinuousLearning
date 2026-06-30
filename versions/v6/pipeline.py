@@ -1199,6 +1199,7 @@ def main():
                         optimizer=agent_info["optimizer"],
                         scheduler=agent_info["scheduler"],
                         scaler=agent_info.get("scaler"),
+                        save_every_cycles=save_every_cycles,
                     )
                     agent_info["cumulative_step"] = new_step
 

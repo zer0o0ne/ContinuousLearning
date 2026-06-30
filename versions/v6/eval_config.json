@@ -106,11 +106,25 @@
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "01_baseline",
-                "type": "solver",
-                "solver_overrides": {
-                    "gto_temperature": 0.15
-                }
+                "name": "gto_pure_mcts_1",
+                "type": "model",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/cycles/cycle_0000.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
+            },
+            {
+                "name": "gto_pure_mcts_6",
+                "type": "model",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/cycles/cycle_0005.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
+            },
+            {
+                "name": "gto_pure_mcts_best",
+                "type": "model",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/best.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
             }
         ]
     }

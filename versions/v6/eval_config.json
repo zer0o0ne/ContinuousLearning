@@ -2,16 +2,16 @@
     "name": "eval",
     "architecture": {
         "d_model": 384,
-        "n_heads": 16,
-        "n_kv_heads": 4,
-        "d_ff": 1280,
+        "n_heads": 8,
+        "n_kv_heads": 2,
+        "d_ff": 1536,
         "n_encoder_layers": 6,
         "n_decoder_layers": 6,
         "n_value_layers": 6,
         "n_action_layers": 6,
         "n_opponent_action_layers": 8,
         "n_modelling_layers": 4,
-        "max_seq_len": 1024,
+        "max_seq_len": 1536,
         "max_players": 9,
         "memory": {
             "n_levels": 2,
@@ -35,7 +35,7 @@
         "big_blind": 10
     },
     "mcts": {
-        "n_simulations": 512,
+        "n_simulations": 3000,
         "c_puct": 1.5,
         "dirichlet_alpha": 0.3,
         "dirichlet_epsilon": 0.0,
@@ -98,7 +98,7 @@
         "password": "",
         "request_timeout": 30,
         "log_every": 5000,
-        "n_hands": 10000,
+        "n_hands": 20000,
         "n_workers": 4,
         "max_consecutive_failures": 20,
         "retries": 4,

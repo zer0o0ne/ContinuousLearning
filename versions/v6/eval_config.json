@@ -49,16 +49,16 @@
     },
 
     "solver": {
-        "type": "v4",
-        "mc_iterations": 5000,
+        "type": "v3",
+        "mc_iterations": 25000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 100,
-        "reraise_threshold": 0.72,
+        "combo_response_iters": 200,
+        "reraise_threshold": 0.65,
         "weighted_sampling": true,
-        "marginal_mc_iters": 200,
-        "marginal_response_iters": 5,
+        "marginal_mc_iters": 0,
+        "marginal_response_iters": 0,
         "threshold_smoothing": {
             "enabled": true,
             "beta_fold": 0.07,
@@ -98,7 +98,7 @@
         "password": "",
         "request_timeout": 30,
         "log_every": 5000,
-        "n_hands": 20000,
+        "n_hands": 10000,
         "n_workers": 4,
         "max_consecutive_failures": 20,
         "retries": 4,
@@ -106,25 +106,25 @@
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "gto_pure_mcts_1",
+                "name": "gto_pure_mcts_21",
                 "type": "model",
-                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/cycles/cycle_0000.pt",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/cycles/cycle_0020.pt",
                 "use_opponent_embedding": true,
                 "use_mcts": true
             },
             {
-                "name": "gto_pure_mcts_6",
+                "name": "gto_pure_mcts_31",
                 "type": "model",
-                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/cycles/cycle_0005.pt",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/cycles/cycle_0030.pt",
                 "use_opponent_embedding": true,
                 "use_mcts": true
             },
             {
-                "name": "gto_pure_mcts_best",
+                "name": "gto_pure_gto",
                 "type": "model",
-                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents/gto_pure/mcts_predict/2026_06_30_01_54_15/best.pt",
-                "use_opponent_embedding": true,
-                "use_mcts": true
+                "path": "ContinuousLearning/data/v6/5_agents/gto_pure/gto_predict/2026_06_26_17_17_33/best.pt",
+                "use_opponent_embedding": false,
+                "use_mcts": false
             }
         ]
     }

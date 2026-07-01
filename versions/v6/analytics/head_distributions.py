@@ -63,6 +63,7 @@ if _VERSION_DIR not in sys.path:
     sys.path.insert(0, _VERSION_DIR)
 
 from agent.agent import ASI  # noqa: E402
+from agent.train_scenarios.generation.generate import load_dataset  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +127,13 @@ def normalize_events(events, norm_stats):
         else:
             ne["bets"] = np.array(
                 [(b - bet_m) / bet_s for b in raw], dtype=np.float64)
+        if "stacks" in e:
+            raw_stacks = e["stacks"]
+            if isinstance(raw_stacks, np.ndarray):
+                ne["stacks"] = (raw_stacks - stk_m) / stk_s
+            else:
+                ne["stacks"] = np.array(
+                    [(s - stk_m) / stk_s for s in raw_stacks], dtype=np.float64)
         out.append(ne)
     return out
 
@@ -240,9 +248,9 @@ def run_inference(config: dict, ckpt_path: str, samples: List[dict],
 # ---------------------------------------------------------------------------
 
 def _bucketize_probs(p):
-    """fold / call / raise (any sized) / all-in masses for an n_actions==14 head."""
+    """fold / call / raise (any sized) / all-in masses."""
     arr = np.asarray(p, dtype=np.float64)
-    return float(arr[0]), float(arr[1]), float(arr[2:13].sum()), float(arr[13])
+    return float(arr[0]), float(arr[1]), float(arr[2:-1].sum()), float(arr[-1])
 
 
 def _kl(p, q):
@@ -407,27 +415,54 @@ def _project_root():
     return os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 
 
+def _resolve_data_path(config, rel_path):
+    """Resolve a relative path against data/<version>/ like the pipeline does."""
+    if rel_path and os.path.isabs(rel_path):
+        return rel_path
+    version = os.path.basename(_VERSION_DIR)
+    project_root = _project_root()
+    name = config.get("name", "experiment")
+    base = os.path.join(project_root, "data", version)
+    if rel_path:
+        return os.path.join(base, rel_path)
+    return os.path.join(base, name)
+
+
 def analyze(config_path: str, agents_dir: Optional[str], dataset_path: Optional[str],
             out_dir: Optional[str], n_per_bucket: int, seed: int,
             device: Optional[str], chunk_size: int, agents_filter: Optional[List[str]]):
     config = json.load(open(config_path))
 
     if agents_dir is None:
-        agents_dir = config.get("multi_agent", {}).get("save_dir")
-        if not agents_dir:
+        save_dir_cfg = config.get("multi_agent", {}).get("save_dir")
+        if not save_dir_cfg:
             raise ValueError("agents_dir not given and config has no "
                              "multi_agent.save_dir")
+        agents_dir = _resolve_data_path(config, save_dir_cfg)
     agents_dir = os.path.abspath(agents_dir)
 
-    if dataset_path is None:
-        dataset_path = os.path.join(
-            config["dataset"]["dataset_dir"], "dataset.pt")
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"dataset.pt not found at {dataset_path}")
-
     device = _detect_device(device)
-    print(f"Loading dataset from {dataset_path} ...", flush=True)
-    dataset = torch.load(dataset_path, weights_only=False, map_location="cpu")
+
+    if dataset_path is not None:
+        if os.path.isdir(dataset_path):
+            print(f"Loading dataset from directory {dataset_path} ...", flush=True)
+            dataset = load_dataset(dataset_path, log=print)
+        else:
+            print(f"Loading dataset from {dataset_path} ...", flush=True)
+            dataset = torch.load(dataset_path, weights_only=False, map_location="cpu")
+    else:
+        dataset_dir = config["dataset"].get("dataset_dir", "")
+        if dataset_dir:
+            dataset_dir = _resolve_data_path(config, dataset_dir) if not os.path.isabs(dataset_dir) else dataset_dir
+        else:
+            dataset_dir = os.path.join(_resolve_data_path(config, ""), "dataset")
+        print(f"Loading dataset from {dataset_dir} ...", flush=True)
+        dataset = load_dataset(dataset_dir, log=print)
+
+    if dataset is None:
+        raise FileNotFoundError(
+            f"No dataset found. Tried shards and legacy dataset.pt. "
+            f"Pass --dataset <path> explicitly.")
     print(f"  {len(dataset)} samples loaded", flush=True)
 
     picks, bucket_of = pick_situations(dataset, n_per_bucket, seed)
@@ -529,8 +564,8 @@ def _parse_args():
                    help="Directory containing per-agent folders. Defaults to "
                         "config.multi_agent.save_dir.")
     p.add_argument("--dataset", default=None,
-                   help="Path to dataset.pt. Defaults to "
-                        "config.dataset.dataset_dir/dataset.pt.")
+                   help="Path to dataset directory (with shards) or legacy "
+                        "dataset.pt file. Defaults to auto-resolve from config.")
     p.add_argument("--out_dir", default=None,
                    help="Where to write outputs (default: "
                         "<agents_dir>/analysis/head_distributions/<ts>).")

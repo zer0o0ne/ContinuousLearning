@@ -26,10 +26,18 @@ Plots produced:
 
 import argparse
 import os
+import sys
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_VERSION_DIR = os.path.abspath(os.path.join(_HERE, ".."))
+if _VERSION_DIR not in sys.path:
+    sys.path.insert(0, _VERSION_DIR)
+
+from agent.train_scenarios._history import IncrementalHistory  # noqa: E402
 
 
 # ---------- Loading helpers ----------
@@ -47,11 +55,18 @@ def _smooth(x, w):
     return np.convolve(xp, np.ones(w) / w, mode="valid")[: len(x)]
 
 
+_HISTORY_KEYS = ["step_loss", "val_loss", "epoch_train_loss",
+                 "epoch_val_loss", "cycles"]
+
+
 def load_history(agent_dir):
     hist_path = os.path.join(agent_dir, "history.pt")
-    if not os.path.isfile(hist_path):
-        raise FileNotFoundError(f"history.pt not found at {hist_path}")
-    return torch.load(hist_path, weights_only=False)
+    shard_dir = os.path.join(agent_dir, "history_shards")
+    if not os.path.isfile(hist_path) and not os.path.isdir(shard_dir):
+        raise FileNotFoundError(
+            f"Neither history.pt nor history_shards/ found at {agent_dir}")
+    hist = IncrementalHistory(agent_dir, keys=_HISTORY_KEYS)
+    return hist.data
 
 
 # ---------- Plot 1: 2x3 overview ----------

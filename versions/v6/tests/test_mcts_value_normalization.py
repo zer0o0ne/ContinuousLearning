@@ -73,9 +73,14 @@ def _run_finalize(
     big_blind=10.0,
     norm_stats=None,
     agent_name="agent_a",
+    ema=0.0,
 ):
     """Thin wrapper: pack into the dict-of-lists structure _finalize_value_targets
-    expects, run it, and return the (possibly mutated) examples list."""
+    expects, run it, and return the (possibly mutated) examples list.
+
+    `ema=0.0` (default) keeps an existing `mcts_value_scale` unchanged —
+    the fixed-scale setting the math tests below rely on. Pass `ema>0`
+    to exercise the per-cycle EMA scale update."""
     ns = dict(norm_stats) if norm_stats else {}
     agents_list = [{"name": agent_name, "norm_stats": ns}]
     per_agent_examples = {agent_name: examples}
@@ -88,6 +93,7 @@ def _run_finalize(
         clip_val=clip_val,
         big_blind=float(big_blind),
         log=_null_log,
+        ema=ema,
     )
     return examples, ns
 
@@ -692,7 +698,8 @@ class TestScaleStoredInNormStats:
         assert ns["mcts_value_scale"] > 0
 
     def test_existing_scale_reused(self):
-        """When 'mcts_value_scale' already exists, it is not overwritten."""
+        """With ema=0 (default), an existing 'mcts_value_scale' is not
+        overwritten (fixed-scale behaviour)."""
         existing_scale = 77.0
         ns = {"mcts_value_scale": existing_scale}
         ex = _make_example(value_target=50.0, root_q_ratio=float("nan"))
@@ -709,16 +716,17 @@ class TestScaleStoredInNormStats:
         )
         assert ns["mcts_value_scale"] == pytest.approx(existing_scale)
 
-    def test_pending_rebootstrap_flag_replaces_scale(self):
-        """When _mcts_value_scale_pending_rebootstrap is True, scale is rebootstrapped."""
+    def test_ema_moves_scale_toward_cycle_data(self):
+        """With ema>0 an existing scale is EMA-blended toward the cycle's
+        robust scale (replaces the removed one-shot forced rebootstrap: the
+        scale still tracks fresh chip-delta data, just gradually)."""
         old_scale = 999.0
-        ns = {
-            "mcts_value_scale": old_scale,
-            "_mcts_value_scale_pending_rebootstrap": True,
-        }
-        # Provide several examples with known chip deltas to anchor new scale
+        ema = 0.1
+        ns = {"mcts_value_scale": old_scale}
+        # Chip deltas: median 0, MAD 30 → cycle_scale = 1.4826 * 30
+        chips = [50.0, -50.0, 30.0, -30.0, 20.0, -20.0]
         examples = [_make_example(value_target=float(v), root_q_ratio=float("nan"))
-                    for v in [50.0, -50.0, 30.0, -30.0, 20.0, -20.0]]
+                    for v in chips]
         agent_info = {"name": "a", "norm_stats": ns}
         per_agent_examples = {"a": examples}
         _finalize_value_targets(
@@ -729,11 +737,15 @@ class TestScaleStoredInNormStats:
             clip_val=100.0,
             big_blind=10.0,
             log=_null_log,
+            ema=ema,
         )
-        # The pending flag must be consumed (removed)
-        assert "_mcts_value_scale_pending_rebootstrap" not in ns
-        # Scale must change from old_scale (999) to something derived from the chip deltas
-        assert ns["mcts_value_scale"] != pytest.approx(old_scale)
+        cycle_scale = 1.4826 * 30.0
+        expected = (1.0 - ema) * old_scale + ema * cycle_scale
+        assert ns["mcts_value_scale"] == pytest.approx(expected)
+        # Bookkeeping reflects THIS cycle's sample count and chip range.
+        assert ns["mcts_value_scale_n_samples"] == len(chips)
+        assert ns["mcts_value_chip_min"] == pytest.approx(-50.0)
+        assert ns["mcts_value_chip_max"] == pytest.approx(50.0)
 
     def test_scale_is_positive_after_bootstrap(self):
         examples = [_make_example(value_target=float(v), root_q_ratio=float("nan"))
@@ -1039,3 +1051,81 @@ class TestInPlaceMutation:
         # After rescale + clip, the Q should be 1.0 (clipped from 100/100*1 = 1.0... exactly clip)
         result_q = ex.terminal_targets[0][1]
         assert abs(result_q) <= 1.0 + 1e-9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Per-cycle EMA scale smoothing (mcts_train.value_scale_ema)
+#     e2e over two simulated cycles: cycle 0 full-bootstraps, cycle 1
+#     EMA-updates; Q rescaling bridges the collection-time snapshot axis
+#     onto the updated axis, and is the identity when the scale is stable.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEMAScaleTrajectory:
+    """Deterministic two-cycle trajectory of mcts_value_scale under EMA."""
+
+    # Chip sets with exactly known robust scales (median 0 → MAD is the
+    # median of |chips|).
+    CYCLE0_CHIPS = [100.0, -100.0, 80.0, -80.0, 60.0, -60.0]   # MAD 80
+    CYCLE1_CHIPS = [50.0, -50.0, 40.0, -40.0, 30.0, -30.0]     # MAD 40
+    SCALE0 = 1.4826 * 80.0    # cycle-0 full bootstrap
+    CYCLE1_SCALE = 1.4826 * 40.0
+    EMA = 0.1
+
+    def _cycle(self, chips, ns, search_scale, alpha=0.0, q=float("nan")):
+        """Simulate one collection cycle's finalize pass. Returns examples."""
+        examples = [_make_example(value_target=float(c), root_q_ratio=q)
+                    for c in chips]
+        agent_info = {"name": "a", "norm_stats": ns}
+        _finalize_value_targets(
+            per_agent_examples={"a": examples},
+            agents_list=[agent_info],
+            search_scales={"a": search_scale},
+            alpha=alpha,
+            clip_val=100.0,
+            big_blind=10.0,
+            log=_null_log,
+            ema=self.EMA,
+        )
+        return examples
+
+    def test_two_cycle_ema_trajectory(self):
+        """Cycle 0: full bootstrap from the cycle's chips (no EMA — no prior
+        scale). Cycle 1: EMA blend of the previous scale and the cycle's
+        robust scale."""
+        ns = {}
+        # Cycle 0 — no existing scale; search ran on the BB fallback (10).
+        self._cycle(self.CYCLE0_CHIPS, ns, search_scale=10.0)
+        assert ns["mcts_value_scale"] == pytest.approx(self.SCALE0)
+        assert ns["mcts_value_scale_n_samples"] == len(self.CYCLE0_CHIPS)
+
+        # Cycle 1 — search snapshot is the cycle-0 scale; EMA update.
+        self._cycle(self.CYCLE1_CHIPS, ns, search_scale=ns["mcts_value_scale"])
+        expected1 = (1.0 - self.EMA) * self.SCALE0 + self.EMA * self.CYCLE1_SCALE
+        assert ns["mcts_value_scale"] == pytest.approx(expected1)
+        assert ns["mcts_value_scale_n_samples"] == len(self.CYCLE1_CHIPS)
+
+    def test_q_rescaled_from_snapshot_axis_onto_ema_axis(self):
+        """Cycle 1's root.Q (stored in the collection-start snapshot scale)
+        must be multiplied by search_scale/new_scale — the snapshot scale
+        over the EMA-updated scale."""
+        ns = {"mcts_value_scale": self.SCALE0}
+        q = 0.7
+        examples = self._cycle(self.CYCLE1_CHIPS, ns,
+                               search_scale=self.SCALE0, alpha=1.0, q=q)
+        new_scale = (1.0 - self.EMA) * self.SCALE0 + self.EMA * self.CYCLE1_SCALE
+        expected_q = q * (self.SCALE0 / new_scale)
+        for ex in examples:
+            assert ex.value_target == pytest.approx(expected_q)
+
+    def test_q_rescale_is_identity_when_scale_stable(self):
+        """When the cycle's robust scale equals the existing scale, the EMA
+        update is a fixed point (new == old) and rescale_q == 1: root.Q
+        passes through unchanged (alpha=1)."""
+        ns = {"mcts_value_scale": self.SCALE0}
+        q = 0.7
+        # CYCLE0_CHIPS reproduce exactly the existing scale → stable.
+        examples = self._cycle(self.CYCLE0_CHIPS, ns,
+                               search_scale=self.SCALE0, alpha=1.0, q=q)
+        assert ns["mcts_value_scale"] == pytest.approx(self.SCALE0)
+        for ex in examples:
+            assert ex.value_target == pytest.approx(q)

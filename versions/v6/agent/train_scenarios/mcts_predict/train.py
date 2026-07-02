@@ -79,6 +79,11 @@ def _mcts_forward(agent, event_sequences, chains, device,
       action_preds: (B, n_actions) — root prediction only
       chain_action_preds / chain_action_targets / chain_is_hero:
           per-batch list of lists (n_actions,) / (n_actions,) / bool
+      chain_action_valid: per-batch list of lists of bool, aligned with
+          chain_action_preds. False for forced single-legal-action steps
+          (ChainStep.target_valid=False) whose target_distribution is a
+          uniform placeholder — `_compute_loss` excludes them from the
+          chain KL. Legacy ChainSteps without the field default to True.
       chain_value_preds / chain_value_targets:
           per-batch list of lists, scalar tensors
       chain_recon_preds / chain_recon_targets / chain_recon_depths:
@@ -157,6 +162,7 @@ def _mcts_forward(agent, event_sequences, chains, device,
     #    depth across examples in one padded forward instead of B=1 per step.
     chain_action_preds = [[] for _ in range(B)]
     chain_action_targets = [[] for _ in range(B)]
+    chain_action_valid = [[] for _ in range(B)]
     chain_is_hero = [[] for _ in range(B)]
     chain_value_preds = [[] for _ in range(B)]
     chain_value_targets = [[] for _ in range(B)]
@@ -270,6 +276,8 @@ def _mcts_forward(agent, event_sequences, chains, device,
             chain_action_preds[b].append(act_pred.squeeze(0))
             chain_action_targets[b].append(torch.tensor(
                 step.target_distribution, dtype=torch.float32, device=device))
+            chain_action_valid[b].append(
+                bool(getattr(step, "target_valid", True)))
             chain_is_hero[b].append(bool(step.is_hero))
             chain_value_preds[b].append(batch_values[idx].reshape(()))
             chain_value_targets[b].append(torch.tensor(
@@ -344,6 +352,7 @@ def _mcts_forward(agent, event_sequences, chains, device,
         "action_preds": action_preds,
         "chain_action_preds": chain_action_preds,
         "chain_action_targets": chain_action_targets,
+        "chain_action_valid": chain_action_valid,
         "chain_is_hero": chain_is_hero,
         "chain_value_preds": chain_value_preds,
         "chain_value_targets": chain_value_targets,
@@ -421,15 +430,37 @@ def _compute_loss(forward_out, value_targets, action_targets,
         return torch.stack(per_ex).mean()
 
     # --- Chain action KL (depth-weighted per example) ---
+    # Steps with target_valid=False (forced single-legal-action decisions —
+    # no MCTS tree, no fallback distribution, uniform placeholder target)
+    # contribute neither loss nor normalization weight. gamma^i keeps the
+    # ORIGINAL chain depth `i` for the remaining steps. Missing key (legacy
+    # callers constructing forward_out by hand) → all steps valid.
+    chain_valid = forward_out.get("chain_action_valid")
+    if chain_valid is None:
+        chain_valid = [[True] * len(p)
+                       for p in forward_out["chain_action_preds"]]
     chain_kl_per_example = []
-    for b_preds, b_targets in zip(forward_out["chain_action_preds"],
-                                   forward_out["chain_action_targets"]):
-        steps = []
-        for pred, target in zip(b_preds, b_targets):
+    for b_preds, b_targets, b_valid in zip(forward_out["chain_action_preds"],
+                                            forward_out["chain_action_targets"],
+                                            chain_valid):
+        losses = []
+        weights = []
+        for i, (pred, target) in enumerate(zip(b_preds, b_targets)):
+            if not b_valid[i]:
+                continue
             log_probs = F.log_softmax(pred, dim=-1)
-            steps.append(F.kl_div(log_probs, target, reduction="sum"))
-        chain_kl_per_example.append(steps)
-    chain_loss = _per_example_weighted(chain_kl_per_example, chain_depth_gamma)
+            losses.append(F.kl_div(log_probs, target, reduction="sum"))
+            weights.append(chain_depth_gamma ** i)
+        if not losses:
+            continue
+        total_w = sum(weights) or 1.0
+        weighted_sum = torch.stack(
+            [w * s for w, s in zip(weights, losses)]).sum()
+        chain_kl_per_example.append(weighted_sum / total_w)
+    if chain_kl_per_example:
+        chain_loss = torch.stack(chain_kl_per_example).mean()
+    else:
+        chain_loss = torch.tensor(0.0, device=device)
 
     # --- Chain value (depth-weighted per example, SmoothL1) ---
     chain_value_per_example = []

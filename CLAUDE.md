@@ -160,7 +160,7 @@ Each agent gets full independent training on modifier-adjusted targets. `save_di
 **`conditional_bias`** — same formula, gated by condition (`"equity < 0.3"`, `"pos > 5"`, etc.).
 **`temperature`** — overrides `gto_temperature` for softmax recomputation.
 
-All bias modifiers accumulate factors per action from original values, then apply once. `apply_modifiers()` always deepcopies first.
+All bias modifiers accumulate factors per action from original values, then apply once. `apply_modifiers()` shallow-copies each scenario (`{**s}` + fresh lists for mutated fields); originals stay unmutated. When recomputing `action_probs` from modified EVs, the scenario's persisted `legal_mask` is applied (masked_fill −inf before the tempered softmax) exactly like generation does; old-format scenarios without `legal_mask` warn once per run and proceed unmasked — regenerate the dataset.
 
 ### Action selectors
 
@@ -171,7 +171,7 @@ Explicit: `[0, 1, 52]`. Slice: `"15:35"`, `"2:52:2"`.
 
 ### GTO Data (`generation/generate.py`)
 
-Simulates poker hands with GTO-sampled actions. Each sample: `events` (variable-length event dicts, each with a per-position `stacks` vector — B.6.2), `ev_target`, `action_evs`, `action_probs`, metadata (`equity`, `pot`, `facing_bet`, `stack`, etc.). Saved **raw** (unnormalized).
+Simulates poker hands with GTO-sampled actions. Each sample: `events` (variable-length event dicts, each with a per-position `stacks` vector — B.6.2), `ev_target`, `action_evs` (raw, unmasked), `action_probs`, `legal_mask` (per-action bools — the mask used for the policy softmax, persisted so training-time modifiers can recompute `action_probs` with the same mask), metadata (`equity`, `pot`, `facing_bet`, `stack`, etc.). Saved **raw** (unnormalized).
 
 Audit-B fixes baked in here: per-seat independent starting stacks (B.6.1); event `acting_pos` uses the next-player convention, consistent with collect/eval (B.2); `action_probs`/sampling mask illegal+dominated actions via the same `GameState.get_legal_action_mask` the MCTS/eval paths use — fold is dropped when checking is free and capped raise bins collapse into the single all-in (B.5.2/B.5.3); preflop raises are classified open vs 3bet+ by raises-this-street (B.5.6); raise-size→solver-frac conversion divides by `pot+facing_bet` (B.5.1); `max_actions = 6*num_players+8`, truncations warned not silently dropped (B.6.3). The v3 solver's value-bet pot is `pot + raise_amount + (raise_amount − facing_bet)` (B.1) and raise EV is multiway-aware (`Π p_fold` to win uncontested, else showdown vs callers — B.5.4).
 
@@ -253,9 +253,10 @@ Read it before changing anything in `_make_terminal_evaluator`,
   `α · root_q_ratio + (1−α) · realized` after Step 1; the realized half is
   the **equity-based** chip delta after Step 2 (was: single-sample MC).
 - **Terminal Q has two stages**:
-  - During search: `_make_terminal_evaluator` uses fast heuristic
-    `pot/n_active − invested` (chips / `search_scale`). Good enough for
-    selection.
+  - During search (v6): `_deterministic_terminal_value` in `mcts.py` —
+    fold-family terminals exact (chips / `search_scale`), showdown via
+    value head. (The v5 `_make_terminal_evaluator` heuristic
+    `pot/n_active − invested` no longer exists in v6.)
   - Post-hand: `evaluate_all_terminals` in `terminal_eval.py` overrides
     every terminal across every MCTS tree. Fold = deterministic; showdown
     = `equity * pot − hero_invested` via `gpu_equity_v2` with opponent
@@ -288,15 +289,24 @@ Read it before changing anything in `_make_terminal_evaluator`,
 - **Q normalization** in `_finalize_value_targets` passes through
   `search_scale → chips → new_scale`. NOT double-division: the
   multiplication undoes terminal_evaluator's division so we can re-apply
-  the cycle's freshly bootstrapped `new_scale`. When stable
+  the cycle's updated `new_scale`. When stable
   (`search_scale == new_scale`), the ratio is 1 → identity. Plan §4.1.
+- **Per-cycle EMA scale update** (`mcts_train.value_scale_ema`, default
+  0.1): every cycle, `mcts_value_scale ← (1−ema)·old + ema·cycle_scale`
+  where `cycle_scale` = `_robust_scale` (MAD·1.4826) of the cycle's
+  realized chip deltas. Cycle 0 (no existing scale) does a full
+  bootstrap; `ema = 0` reuses the stored scale. This replaced the
+  one-shot `value_norm_rebootstrap_every` rebootstrap (removed 2026-07:
+  the axis shock at the rebootstrap cycle degraded search and collapsed
+  agents — the value head gets only ~10–25 grad steps/cycle and cannot
+  re-map a jumped target axis).
 - **Legacy `norm_stats` keys** `mcts_ev_mean`, `mcts_ev_std`,
   `mcts_ev_n_samples`, `mcts_ev_ratio_min`, `mcts_ev_ratio_max` stay in
   checkpoints for backward-compat but are unused. New keys:
   `mcts_value_scale` (chips), `mcts_value_scale_n_samples`,
-  `mcts_value_chip_min`, `mcts_value_chip_max`.
-  `pipeline.py:_MCTS_NORM_KEYS` controls clearing on
-  `value_norm_rebootstrap_every`.
+  `mcts_value_chip_min`, `mcts_value_chip_max` (last three now record
+  the current cycle's values). `pipeline.py:_LEGACY_MCTS_NORM_KEYS`
+  kept for checkpoint backward-compat.
 - **Belief-based equity ≠ per-hand zero-sum.** Each hero's equity is vs
   the OPPONENT'S range (not opponent's actual cards), so
   `Σ_p equity_p ≠ 1` on a single hand. Zero-sum holds in expectation

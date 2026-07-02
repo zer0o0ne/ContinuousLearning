@@ -5,8 +5,27 @@ ev_target and action_probs consistently from the modified EVs.
 """
 
 import copy
+import warnings
+
 import torch
 import torch.nn.functional as F
+
+# Warn only once per run when old-format scenarios (no `legal_mask`) are seen.
+_LEGAL_MASK_WARNED = False
+
+
+def _warn_missing_legal_mask():
+    global _LEGAL_MASK_WARNED
+    if _LEGAL_MASK_WARNED:
+        return
+    _LEGAL_MASK_WARNED = True
+    warnings.warn(
+        "Scenario has no 'legal_mask' (old-format dataset): recomputing "
+        "action_probs UNMASKED — fold regains probability when checking is "
+        "free and capped raise bins duplicate the all-in mass. Regenerate the "
+        "dataset to fix. (warned once per run)",
+        stacklevel=3,
+    )
 
 
 def resolve_actions(selector, n_actions):
@@ -166,6 +185,16 @@ def apply_modifiers(scenarios, modifiers, n_actions, big_blind, temperature):
         evs_t = torch.tensor(evs, dtype=torch.float32)
         s["action_evs"] = evs
         s["ev_target"] = float(evs_t.max().item())
-        s["action_probs"] = F.softmax(evs_t / normalizer, dim=0).tolist()
+        # Apply the scenario's legal mask exactly like generation does
+        # (generate.py:997-999): illegal/dominated actions get -inf before the
+        # tempered softmax, so they carry zero probability in the target.
+        legal_mask = s.get("legal_mask")
+        if legal_mask is not None:
+            mask_t = torch.tensor(legal_mask, dtype=torch.bool)
+            probs_evs = evs_t.masked_fill(~mask_t, float("-inf"))
+        else:
+            _warn_missing_legal_mask()
+            probs_evs = evs_t
+        s["action_probs"] = F.softmax(probs_evs / normalizer, dim=0).tolist()
 
     return scenarios

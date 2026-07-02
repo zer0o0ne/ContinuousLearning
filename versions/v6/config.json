@@ -209,7 +209,7 @@
         "server_max_batch": 768,
         "server_linger_ms": 2,
         "save_every_cycles": 5,
-        "value_norm_rebootstrap_every": 25,
+        "value_scale_ema": 0.1,
         "min_players": 2,
         "max_players": 9,
         "player_swap_prob": 0.01,

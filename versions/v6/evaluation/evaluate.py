@@ -205,7 +205,7 @@ class _EvalInferenceServer:
         tl.worker_id = wid
         return wid, self._all_resp_qs[wid]
 
-    def create_mcts(self, agent_name, mcts_cfg, n_actions):
+    def create_mcts(self, agent_name, mcts_cfg, n_actions, search_scale=1.0):
         """Create an MCTS instance with a RemoteEvaluator for use in a thread.
 
         Must be called from within the thread that will use it (so the
@@ -213,13 +213,19 @@ class _EvalInferenceServer:
 
         Opponent embedding is handled server-side (the server creates its own
         per-(worker, agent) tables), so no opp_table is needed here.
+
+        `search_scale`: the agent's `mcts_value_scale` from its checkpoint
+        norm_stats (fallback big blind) — projects deterministic fold-terminal
+        chip values onto the value head's unit-scale axis inside PUCT. Same
+        derivation as collection (collect.py).
         """
         from agent.mcts.mcts import MCTS
         from agent.mcts.evaluator import RemoteEvaluator
 
         wid, resp_q = self._get_thread_slot()
         ev = RemoteEvaluator(wid, agent_name, self._req_q, resp_q, n_actions)
-        return MCTS(None, "cpu", mcts_cfg, evaluator=ev)
+        return MCTS(None, "cpu", mcts_cfg, evaluator=ev,
+                    search_scale=search_scale)
 
     def submit_mcts_search(self, fn, *args, **kwargs):
         """Submit an MCTS search function to the thread pool.
@@ -301,7 +307,16 @@ def _build_agent_bundle(name, ckpt_path, config, device, log,
     mcts = None
     if use_mcts:
         from agent.mcts.mcts import MCTS  # lazy import — see top-of-module note
-        mcts = MCTS(agent, device, mcts_cfg or {}, opponent_emb_table=opp_table)
+        # Search-time value scale: the checkpoint's `mcts_value_scale`,
+        # fallback big blind — same derivation as collection (collect.py).
+        # Without it, raw-chip fold-terminal values are compared against
+        # unit-scale value-head outputs in PUCT.
+        eval_bb = config.get("evaluation", {}).get(
+            "big_blind", config.get("game", {}).get("big_blind", 10))
+        search_scale = float(norm_stats.get("mcts_value_scale",
+                                            float(eval_bb)))
+        mcts = MCTS(agent, device, mcts_cfg or {}, opponent_emb_table=opp_table,
+                    search_scale=search_scale)
 
     return {
         "agent": agent,
@@ -858,7 +873,8 @@ def run_evaluation(config, device, log, results_dir_override=None):
                                             street, _server=mcts_server,
                                             _mcts_cfg=mcts_cfg_local,
                                             _n_actions=n_actions,
-                                            _table_states=table_states):
+                                            _table_states=table_states,
+                                            _big_blind=big_blind):
                         """Run one MCTS search in a worker thread. Creates a
                         fresh MCTS + RemoteEvaluator per call (thread-local
                         worker_id assigned on first use)."""
@@ -867,8 +883,15 @@ def run_evaluation(config, device, log, results_dir_override=None):
                         table = _table_states[ti]["table"]
                         active_pos = table.active_player
                         gs = GameState.from_table(table, active_pos)
+                        # Per-agent search_scale from the acting agent's
+                        # checkpoint norm_stats (fallback BB) — same
+                        # derivation as collection (collect.py).
+                        search_scale = float(
+                            (agent_info.get("norm_stats") or {}).get(
+                                "mcts_value_scale", float(_big_blind)))
                         mcts_inst = _server.create_mcts(
-                            agent_info["name"], _mcts_cfg, _n_actions)
+                            agent_info["name"], _mcts_cfg, _n_actions,
+                            search_scale=search_scale)
                         action_idx = int(mcts_inst.search([events], gs))
                         return pidx, action_idx, agent_info["name"], street
 

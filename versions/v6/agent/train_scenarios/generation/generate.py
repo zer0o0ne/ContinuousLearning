@@ -1003,6 +1003,12 @@ def generate_scenario(config, device="mps"):
             "ev_target": best_ev,
             "action_probs": action_probs.tolist(),
             "action_evs": all_evs.tolist(),
+            # Persist the legal mask used for the policy softmax above so
+            # training-time modifiers (modifiers.py / sharded.py) can recompute
+            # action_probs from modified EVs with the SAME mask. Without it,
+            # fold regains probability when checking is free and capped raise
+            # bins duplicate the all-in mass. action_evs stay raw/unmasked.
+            "legal_mask": list(meta["legal_mask"]),
             "equity": float(meta["equity"]),
             "pot": float(meta["pot"]),
             "facing_bet": float(meta["facing_bet"]),

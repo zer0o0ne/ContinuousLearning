@@ -305,7 +305,10 @@ def apply_modifier_single(scenario, modifiers, n_actions, big_blind, temperature
         else:
             bias_mods.append(mod)
 
-    from agent.train_scenarios.modifiers import resolve_actions, _parse_condition, _check_condition
+    from agent.train_scenarios.modifiers import (
+        resolve_actions, _parse_condition, _check_condition,
+        _warn_missing_legal_mask,
+    )
     parsed = []
     for mod in bias_mods:
         entry = {
@@ -338,7 +341,17 @@ def apply_modifier_single(scenario, modifiers, n_actions, big_blind, temperature
     evs_t = torch.tensor(evs, dtype=torch.float32)
     s["action_evs"] = evs
     s["ev_target"] = float(evs_t.max().item())
-    s["action_probs"] = F.softmax(evs_t / normalizer, dim=0).tolist()
+    # Apply the scenario's legal mask exactly like generation does
+    # (generate.py:997-999); old-format scenarios without it warn once per run
+    # and proceed unmasked.
+    legal_mask = s.get("legal_mask")
+    if legal_mask is not None:
+        mask_t = torch.tensor(legal_mask, dtype=torch.bool)
+        probs_evs = evs_t.masked_fill(~mask_t, float("-inf"))
+    else:
+        _warn_missing_legal_mask()
+        probs_evs = evs_t
+    s["action_probs"] = F.softmax(probs_evs / normalizer, dim=0).tolist()
     return s
 
 

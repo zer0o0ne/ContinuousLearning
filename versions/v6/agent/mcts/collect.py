@@ -196,6 +196,14 @@ class ChainStep:
         realized ratio via `value_target_alpha` to produce the final
         value-head training target. NaN ⇒ TD-blend unavailable (legacy
         data) → caller falls back to pure MC for this step.
+      target_valid: False when the future decision has no usable policy
+        target — a forced single-legal-action decision by an ACTIVE agent
+        (no MCTS tree, no fallback_action_distribution). Such steps still
+        extend the modelling-chain context (their action_taken matters for
+        subsequent steps) and keep their realized value_target, but are
+        EXCLUDED from the chain KL loss; `target_distribution` holds a
+        uniform placeholder. Default True keeps legacy pickles trainable
+        and past-snapshot fallback targets active.
     """
     action_taken: int
     target_distribution: list
@@ -203,6 +211,7 @@ class ChainStep:
     events_at_step: list = field(default_factory=list)
     value_target: float = 0.0
     root_q_ratio: float = float("nan")
+    target_valid: bool = True
 
 
 @dataclass
@@ -382,11 +391,20 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                 # That IS their "true" policy in this collection, so it's the
                 # right KL target for opponent_action_head.
                 target_dist = list(future_dec.get("fallback_action_distribution") or [])
-                if len(target_dist) != n_actions:
+                # Forced decisions (single legal action) by ACTIVE agents
+                # also have `mcts_root is None` but NO fallback distribution
+                # — there is no policy target at all. Keep the step (its
+                # action still extends the modelling-chain context and its
+                # realized value target is valid) but mark it invalid so the
+                # chain KL loss skips it instead of training toward the
+                # uniform placeholder below.
+                target_valid = (len(target_dist) == n_actions)
+                if not target_valid:
                     target_dist = [1.0 / n_actions] * n_actions
                 # No root.Q to TD-blend against → caller falls back to pure MC.
                 step_root_q_ratio = float("nan")
             else:
+                target_valid = True
                 target_dist = get_n_distribution(
                     future_root, n_actions, label_smoothing=action_label_smoothing)
                 # C.2: `future_root.Q` is the backed-up value of the FUTURE
@@ -420,6 +438,7 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                 events_at_step=events_at_step,
                 value_target=value_target_step,
                 root_q_ratio=step_root_q_ratio,
+                target_valid=target_valid,
             ))
 
         # C.3: store terminal Q RAW (in `search_scale` units, like `root.Q`).
@@ -544,9 +563,9 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
     # snapshot used by `evaluate_all_terminals` (via `value_scales_by_position`)
     # to divide equity-based terminal Q into the same axis as the value head's
     # outputs at non-terminal leaves. Captured once at the start so the final
-    # normalization can convert root.Q back into chips even if
-    # mcts_value_scale is re-bootstrapped later in the same call. Fallback to
-    # BB on the first-ever cycle (no bootstrap yet).
+    # normalization can convert root.Q back into chips even though
+    # `_finalize_value_targets` EMA-updates mcts_value_scale at the end of
+    # this call. Fallback to BB on the first-ever cycle (no bootstrap yet).
     search_scales = {}
     for a in agents_list:
         ns = a.get("norm_stats") or {}
@@ -618,10 +637,11 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
             log=log, progress=True,
             past_snapshot_specs=past_snapshot_specs)
 
-    # Per-agent bootstrap + hybrid + clip. See
+    # Per-agent bootstrap + per-cycle EMA scale update + hybrid + clip. See
     # `versions/v5/PLAN_MCTS_VALUE_REDESIGN.md` §4 + §5 for math.
     alpha = float(mcts_train_cfg.get("value_target_alpha", 0.5))
     clip_val = float(mcts_train_cfg.get("value_target_clip", 5.0))
+    value_scale_ema = float(mcts_train_cfg.get("value_scale_ema", 0.1))
     _finalize_value_targets(
         per_agent_examples=per_agent_examples,
         agents_list=agents_list,
@@ -630,6 +650,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
         clip_val=clip_val,
         big_blind=float(big_blind),
         log=log,
+        ema=value_scale_ema,
     )
 
     for name, exs in per_agent_examples.items():
@@ -1112,7 +1133,7 @@ def _robust_scale(chips, fallback):
 
 
 def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
-                              alpha, clip_val, big_blind, log):
+                              alpha, clip_val, big_blind, log, ema=0.0):
     """Bootstrap `mcts_value_scale` and apply hybrid blend + clip in place.
 
     The value_target field of each MCTSTrainingExample / ChainStep enters
@@ -1126,10 +1147,15 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
         before this cycle's collection — the same scale `evaluate_all_terminals`
         divided terminal Q by, so `root.Q` lives on `search_scale` axis
         (fallback `big_blind` on the first-ever cycle, before any bootstrap).
-      - `new_scale` is either the existing `mcts_value_scale` from
-        `norm_stats`, or freshly bootstrapped as a robust scale (MAD/IQR, see
-        `_robust_scale` — C.7.4) of the chip deltas if the key is absent
-        (first cycle or post-rebootstrap).
+      - `new_scale` is the per-cycle-updated `mcts_value_scale`: freshly
+        bootstrapped as a robust scale (MAD/IQR, see `_robust_scale` —
+        C.7.4) of this cycle's chip deltas when the key is absent
+        (first-ever cycle), otherwise EMA-smoothed toward this cycle's
+        robust scale: `new = (1 − ema) · old + ema · cycle_scale`. `ema = 0`
+        keeps the existing scale unchanged (legacy behaviour). The gradual
+        EMA drift replaces the old one-shot forced rebootstrap, which
+        shocked the target axis faster than the value head (few grad
+        steps/cycle) could re-map.
       - `root_q_ratio` is stored in `search_scale`-units; rescaling by
         `search_scale / new_scale` lifts it onto the same target axis as
         `realized_chips / new_scale`. The multiplication is **not** a
@@ -1156,31 +1182,41 @@ def _finalize_value_targets(per_agent_examples, agents_list, search_scales,
             ns = {}
             agent_info["norm_stats"] = ns
 
-        # 1. Bootstrap new_scale from raw chip-delta std if absent OR if the
-        # pipeline asked for a forced rebootstrap this cycle (flag set by
-        # `value_norm_rebootstrap_every`). The flag path keeps the OLD scale
-        # in `ns` until this moment so MCTS search & inference earlier in the
-        # cycle used a coherent value scale; we only now swap to the fresh one.
-        pending = bool(ns.pop("_mcts_value_scale_pending_rebootstrap", False))
-        need_bootstrap = ("mcts_value_scale" not in ns) or pending
-        if need_bootstrap:
-            chips = np.array(
-                [float(ex.value_target) for ex in examples],
-                dtype=np.float64,
-            )
+        # 1. Update the target scale. First-ever cycle (no existing scale):
+        # full bootstrap from this cycle's raw chip-delta spread. Later
+        # cycles (ema > 0): EMA-smooth toward this cycle's robust scale so
+        # the target axis drifts gradually with the policy instead of
+        # jumping in a one-shot rebootstrap. The OLD scale stayed in `ns`
+        # throughout this cycle's collection (search_scales snapshot), so
+        # MCTS search & terminal eval used one coherent axis; we only now
+        # move it, and `rescale_q` below bridges Q onto the new axis.
+        chips = np.array(
+            [float(ex.value_target) for ex in examples],
+            dtype=np.float64,
+        )
+        if "mcts_value_scale" not in ns:
             # C.7.4: robust scale (MAD/IQR) instead of std — fat tails + tiny
             # samples make std over-inflate.
-            scale_c = _robust_scale(chips, bb)
-            old_scale = ns.get("mcts_value_scale")
-            ns["mcts_value_scale"] = scale_c
+            cycle_scale = _robust_scale(chips, bb)
+            ns["mcts_value_scale"] = cycle_scale
             ns["mcts_value_scale_n_samples"] = int(len(chips))
             ns["mcts_value_chip_min"] = float(chips.min())
             ns["mcts_value_chip_max"] = float(chips.max())
-            origin = "rebootstrapped" if pending else "bootstrapped"
-            old_s = (f" (was {old_scale:.2f})"
-                      if isinstance(old_scale, (int, float)) else "")
-            log(f"  {name}: {origin} mcts_value_scale = {scale_c:.2f} "
-                f"chips (robust MAD/IQR){old_s} (n={len(chips)}, range "
+            log(f"  {name}: bootstrapped mcts_value_scale = {cycle_scale:.2f} "
+                f"chips (robust MAD/IQR) (n={len(chips)}, range "
+                f"[{chips.min():.1f}, {chips.max():.1f}])")
+        elif ema > 0.0:
+            old_scale = float(ns["mcts_value_scale"])
+            cycle_scale = _robust_scale(chips, bb)
+            ema_scale = ((1.0 - float(ema)) * old_scale
+                         + float(ema) * cycle_scale)
+            ns["mcts_value_scale"] = ema_scale
+            ns["mcts_value_scale_n_samples"] = int(len(chips))
+            ns["mcts_value_chip_min"] = float(chips.min())
+            ns["mcts_value_chip_max"] = float(chips.max())
+            log(f"  {name}: EMA mcts_value_scale — old={old_scale:.2f}, "
+                f"cycle={cycle_scale:.2f}, new={ema_scale:.2f} chips "
+                f"(ema={float(ema):.3f}, n={len(chips)}, range "
                 f"[{chips.min():.1f}, {chips.max():.1f}])")
         else:
             log(f"  {name}: reusing mcts_value_scale = "

@@ -61,6 +61,7 @@ from agent.train_scenarios.generation.generate import (
 )
 from evaluation.evaluate import (
     _find_best_checkpoint,
+    _get_table_display_from_turn,
     _normalize_events_inplace,
     _resolve_checkpoint_path,
 )
@@ -199,20 +200,28 @@ def _action_idx_to_incr(state_pre, action_idx, raise_sizes_for_street,
 # Solver helpers (used by type == "solver" agent entries)
 # ============================================================================
 
-def _action_idx_to_history_act_type(action_idx, n_raise_bins, street):
+def _action_idx_to_history_act_type(action_idx, n_raise_bins, street,
+                                    street_raise_count):
     """Map an action_idx applied at the given street to generate.py's act_type.
 
-    Mirrors the classification in generate.py so the solver's opponent-range
-    narrowing matches what the dataset generator does. Folds return None and
-    are not appended to action_history (narrow_range has no "fold" key).
+    Mirrors the classification in generate.py (B.5.6) so the solver's
+    opponent-range narrowing matches what the dataset generator does. Folds
+    return None and are not appended to action_history (narrow_range has no
+    "fold" key).
+
+    B.5.6: preflop raises are classified by the number of raises ALREADY made
+    this street, not by all-in-vs-sized. Any raise (sized bin or all-in) is an
+    "open" when it is the first raise of the street and a "3bet" when it
+    raises over a raise.
     """
     if action_idx == 0:
         return None
     if action_idx == 1:
         return "call" if street == 0 else "call_postflop"
-    if action_idx == n_raise_bins + 2:
-        return "3bet" if street == 0 else "bet_postflop"
-    return "open" if street == 0 else "bet_postflop"
+    # Any raise (sized bin or all-in).
+    if street == 0:
+        return "3bet" if street_raise_count >= 1 else "open"
+    return "bet_postflop"
 
 
 def _make_solver_table_stub(hero_user_pos, hole_cards_int, board_ints, state,
@@ -297,6 +306,16 @@ def _make_solver_table_stub(hero_user_pos, hole_cards_int, board_ints, state,
         active_player=active_player_user,
         several_all_in=several_all_in,
         last_raise_size=float(state.get("last_bet_size", 0)) * inv or float(big_blind_internal),
+        # C.7.5: level of the last FULL raise, mirroring env/table.py semantics:
+        # preflop before any raise it equals the big blind (= high_bet), each
+        # full raise moves it to the new high_bet, and a street change resets
+        # it to 0.0 (= high_bet after bets reset). The harness cannot observe
+        # short-all-in raises separately, so every raise is treated as full —
+        # `high_bet` scaled covers all three cases. Without this attribute,
+        # GameState.from_table defaults it to big_blind, which would set
+        # short_allin_restricted and strip raises from the legal mask whenever
+        # hero's street bet >= 1BB while facing a raise.
+        _last_full_raise_level=float(state["high_bet"]) * inv,
     )
 
 
@@ -742,9 +761,11 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
     """Re-parse the entire Slumbot action string from scratch, building
     SlumbotState + snapshot list.
 
-    The snapshot pattern matches evaluate.py training distribution:
-    initial pre-decision snap, then for each action (pre-decision, post-action)
-    pairs. Pre-decision snap mirrors the prior post-action snap with action=None.
+    The snapshot pattern matches the generate.py/evaluate.py training
+    distribution: initial snap (action=None), then for EACH action a
+    (pre-decision action=None, post-action) pair — so sequences always open
+    with TWO action=None snapshots (initial + first pre-decision), exactly
+    like generate.py:723-731/813-822 and evaluate.py:565-572/798-806.
 
     Also returns `action_history`: list of (user_pos, act_type) tuples in the
     same shape generate.py produces for the GTO solver. Folds are excluded
@@ -755,17 +776,22 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
     """
     state = _initial_state(hole_cards_int, board_ints)
     state["_first_in_street"] = True
-    # Initial snap also serves as pre-decision for the first action
+    # Initial snapshot (no action yet) — mirrors generate.py:723-731
     snapshots = [_make_snapshot(state, n_actions, None, client_pos)]
     hero_moves_seen = 0
     action_history = []
+
+    # B.5.6: number of raises made so far on the CURRENT street, used to
+    # classify a preflop raise as an open (first raise) vs a 3bet+ (raise over
+    # a raise). Reset whenever the street advances.
+    street_raise_count = 0
+    cur_street = int(state["turn"])
 
     if not action_str:
         return state, snapshots, hero_moves_seen, action_history
 
     i = 0
     sz = len(action_str)
-    is_first_token = True
     while i < sz:
         c = action_str[i]
         if c == "/":
@@ -785,15 +811,21 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
         else:
             raise ValueError(f"Unknown char {c!r} at offset {i} in {action_str!r}")
 
-        # Pre-decision snap (skip for first token — initial snap covers it)
-        if not is_first_token:
-            snapshots.append(_make_snapshot(state, n_actions, None, client_pos))
-        is_first_token = False
+        # Pre-decision snap (action=None) — one for EVERY action, including
+        # the hand's first token. Training sequences open with TWO action=None
+        # snapshots (initial + first pre-decision): generate.py:723-731 posts
+        # the initial snap and :813-822 a decision snap before every action.
+        snapshots.append(_make_snapshot(state, n_actions, None, client_pos))
 
         # Capture the acting position and street BEFORE the token mutates state,
         # so action_history is built in the same frame generate.py uses.
         acting_pos_user = 1 - state["active_pos"]
         street_pre = int(state["turn"])
+
+        # B.5.6: reset the per-street raise counter when the street advances.
+        if street_pre != cur_street:
+            cur_street = street_pre
+            street_raise_count = 0
 
         is_hero = (state["active_pos"] == client_pos)
         if is_hero and hero_moves_seen < len(hero_action_indices):
@@ -806,10 +838,14 @@ def _replay_action_string(action_str, hole_cards_int, board_ints,
                 hero_moves_seen += 1
 
         act_type = _action_idx_to_history_act_type(
-            action_idx, n_raise_bins, street_pre,
+            action_idx, n_raise_bins, street_pre, street_raise_count,
         )
         if act_type is not None:
             action_history.append((acting_pos_user, act_type))
+
+        # Count this raise toward the current street's raise tally (B.5.6).
+        if action_idx >= 2:
+            street_raise_count += 1
 
         if state["is_terminal"]:
             snapshots.append(_make_snapshot(state, n_actions, action_idx, client_pos))
@@ -838,10 +874,13 @@ def _build_events(snapshots, hole_cards_int, board_ints, hero_user_pos,
     """
     events = []
     inv_scale = 1.0 / chip_scale
-    # Always include all 5 board slots (-1 for unrevealed)
-    table = list(board_ints)
 
     for snap in snapshots:
+        # Board masked to the snapshot's street — matches the training
+        # convention (_get_table_display_from_turn in generate.py/evaluate.py):
+        # preflop events show [-1]*5, flop events 3 cards, etc. Stamping the
+        # CURRENT board into past events would leak future cards.
+        table = _get_table_display_from_turn(board_ints, snap["turn"])
         action = snap["action"]
         if action is None:
             action = torch.zeros(n_actions, dtype=torch.float32)
@@ -891,6 +930,18 @@ def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scal
         credits_user[user_pos] = float(state["credits"][slumbot_pos]) * inv_scale
         players_state_user[user_pos] = int(state["players_state"][slumbot_pos])
 
+    bb_internal = (float(big_blind_internal) if big_blind_internal is not None
+                   else float(state.get("high_bet", 10.0)) * inv_scale)
+    # C.7.5: propagate the min-raise state. The harness tracks the last raise
+    # increment in state["last_bet_size"] (Slumbot chip units); scale it into
+    # internal chips. Table semantics keep last_raise_size >= big_blind
+    # (preflop it starts at BB; a street change resets it to BB), and Slumbot's
+    # own min-raise rule is high_bet + max(BB, last_bet_size) — so floor at BB.
+    # Without this, GameState defaults last_raise_size to big_blind and the
+    # legal mask admits sub-min-raise bins when facing a large bet.
+    last_raise_size = max(bb_internal,
+                          float(state.get("last_bet_size", 0.0)) * inv_scale)
+
     return GameState(
         num_players=2,
         hero_pos=hero_user_pos,
@@ -905,7 +956,8 @@ def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scal
         n_raise_bins=n_raise_bins,
         is_terminal=False,
         several_all_in=False,
-        big_blind=float(big_blind_internal) if big_blind_internal is not None else float(state.get("high_bet", 10.0)) * inv_scale,
+        last_raise_size=last_raise_size,
+        big_blind=bb_internal,
     )
 
 
@@ -1100,7 +1152,14 @@ def _load_one_agent(agent_entry, config, device, project_root, version,
     mcts = None
     if use_mcts:
         mcts_cfg = config.get("mcts", {})
-        mcts = MCTS(asi, device, mcts_cfg, opponent_emb_table=opp_table)
+        # Same derivation as collect.py:52 — deterministic terminals (fold/
+        # uncontested win) must be projected onto the value head's
+        # mcts_value_scale axis, not left in raw chips (which breaks PUCT).
+        big_blind_internal = float(config.get("game", {}).get("big_blind", 10))
+        search_scale = float((norm_stats or {}).get("mcts_value_scale",
+                                                    big_blind_internal))
+        mcts = MCTS(asi, device, mcts_cfg, opponent_emb_table=opp_table,
+                    search_scale=search_scale)
 
     log(f"Loaded '{name}' from {ckpt_path} "
         f"(temp={temperature}, mcts={use_mcts}, opp_emb={opp_table is not None})")
@@ -1555,7 +1614,13 @@ def _slumbot_worker_process(
         mcts = None
         if use_mcts:
             mcts_cfg = config.get("mcts", {})
-            mcts = MCTS(asi, device, mcts_cfg, opponent_emb_table=opp_table)
+            # Same derivation as collect.py:52 (see _load_one_agent).
+            big_blind_internal = float(
+                config.get("game", {}).get("big_blind", 10))
+            search_scale = float((norm_stats or {}).get(
+                "mcts_value_scale", big_blind_internal))
+            mcts = MCTS(asi, device, mcts_cfg, opponent_emb_table=opp_table,
+                        search_scale=search_scale)
 
         bundle = {
             "name": agent_name,

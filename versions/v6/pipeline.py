@@ -1029,22 +1029,24 @@ def main():
                     "scheduler": scheduler,
                 })
 
-            # Periodic re-bootstrap of MCTS value norm. The agent's policy
-            # drifts during cyclic training, so realised-outcome distribution
-            # shifts. Clearing the mcts_ev_* keys forces run_mcts_collection
-            # to recompute fresh stats from the current cycle's data. Set to
-            # 0/None to disable (norm stats stay frozen from first bootstrap).
-            value_norm_rebootstrap_every = mcts_train_cfg.get(
-                "value_norm_rebootstrap_every", 0) or 0
-
+            # MCTS value-norm drift is handled per cycle inside
+            # `_finalize_value_targets` (collect.py): the agent's policy
+            # drifts during cyclic training, so `mcts_value_scale` is
+            # EMA-smoothed toward each cycle's freshly observed robust scale
+            # (`mcts_train.value_scale_ema`). The old one-shot forced
+            # rebootstrap (`value_norm_rebootstrap_every`) was removed — it
+            # shocked the target axis faster than the value head (few grad
+            # steps/cycle) could re-map. `mcts_value_scale` is NEVER popped
+            # here: search and terminal eval must keep one coherent axis
+            # within a cycle (popping it made `evaluate_all_terminals` fall
+            # back to BB while the value head was still on the old scale →
+            # PUCT compared apples to oranges → fold collapse).
             log(f"\nCyclic MCTS: {n_cycles} cycles, "
-                f"save_every_cycles={save_every_cycles}, "
-                f"value_norm_rebootstrap_every={value_norm_rebootstrap_every}")
+                f"save_every_cycles={save_every_cycles}")
 
-            # Legacy `mcts_ev_*` keys (pre-Step-1 redesign) are unused but
-            # cleared opportunistically for hygiene. The live key
-            # `mcts_value_scale` (+ its companions) is NEVER popped here —
-            # see comment below.
+            # Legacy `mcts_ev_*` keys (pre-Step-1 redesign) are unused; the
+            # tuple is kept for checkpoint backward-compat (older best.pt
+            # files still carry these keys).
             # See versions/v5/PLAN_MCTS_VALUE_REDESIGN.md for math.
             _LEGACY_MCTS_NORM_KEYS = ("mcts_ev_mean", "mcts_ev_std",
                                        "mcts_ev_n_samples",
@@ -1057,41 +1059,6 @@ def main():
 
             for cycle in range(start_cycle, n_cycles):
                 log(f"\n=== MCTS Cycle {cycle + 1}/{n_cycles} ===")
-
-                # Re-bootstrap value norm? (only on non-zero cycle id, every N)
-                #
-                # IMPORTANT: do NOT pop `mcts_value_scale` here. Doing so
-                # makes `evaluate_all_terminals` fall back to BB when dividing
-                # equity-based terminal Q (via `value_scales_by_position`),
-                # while the value head is still trained on the OLD scale →
-                # terminal contributions and value-head outputs end up on
-                # different axes inside ancestors' W, PUCT compares apples to
-                # oranges, and the agent typically collapses (e.g. into
-                # always-fold). Instead we keep the old scale alive for
-                # collection and inference, and set a "pending rebootstrap"
-                # flag that `_finalize_value_targets` consumes AFTER
-                # collection: it overwrites `mcts_value_scale` from this
-                # cycle's freshly observed chip deltas. The rescale math
-                # in `_finalize_value_targets` (search_scale / new_scale)
-                # correctly bridges old-scale results onto the new target
-                # axis.
-                if (value_norm_rebootstrap_every > 0
-                        and cycle > 0
-                        and cycle % value_norm_rebootstrap_every == 0):
-                    for agent_info in trained_agents:
-                        ns = agent_info.get("norm_stats")
-                        if ns is not None:
-                            for k in _LEGACY_MCTS_NORM_KEYS:
-                                ns.pop(k, None)
-                            ns["_mcts_value_scale_pending_rebootstrap"] = True
-                            old_scale = ns.get("mcts_value_scale")
-                            old_scale_s = (f"{old_scale:.2f}"
-                                            if isinstance(old_scale, (int, float))
-                                            else "absent")
-                            agent_info["agent_log"](
-                                f"  [{agent_info['name']}] marked for "
-                                f"mcts_value_scale rebootstrap this cycle "
-                                f"(keeping old scale={old_scale_s} for search)")
 
                 # --- Collection (or resume from saved examples) ---
                 per_agent_examples = None

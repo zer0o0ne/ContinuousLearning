@@ -46,7 +46,7 @@ Event sequence (N events)
   → ValueHead (Qwen3 self-attn → masked mean pool → Linear → scalar)
   → ActionHead (Qwen3 self-attn → masked mean pool → Linear → n_actions logits)
   → OpponentActionHead (same architecture as ActionHead)
-  → ModellingHead (learnable action queries → cross-attn to decoder output → Qwen3 self-attn → (B, n_actions, d_model))
+  → ModellingHead (causal Qwen3 self-attn over decoder output → action-conditioned MLP → (B, n_actions, d_model) at last true position)
 ```
 
 ### EventSequenceEmbedder (`perception/perception.py`)
@@ -88,7 +88,7 @@ Same architecture as ActionHead. Predicts range-averaged opponent action distrib
 
 ### ModellingHead (`modelling/modelling.py`)
 
-**Cross-attention architecture**: learnable `Embedding(n_actions, d_model)` as queries attend to decoder output (keys/values) via Qwen3-style cross-attention (GQA + QK-norm + RoPE), then refine via Qwen3 self-attention + FFN. Output: `(B, n_actions, d_model)` — one embedding vector per action. Used during MCTS rollout to extend context with action representations.
+**Autoregressive action-conditioned next-decision-state predictor** (redesigned 2026-07, see `versions/v6/PLAN_MODELLING_HEAD_REDESIGN.md` — the old cross-attention-query head had a proven collapse attractor, `analytics/modelling_head_collapse_analysis.pdf`). Causal Qwen3 self-attn stack over decoder output → per-position state `s_t` → `h(t, a) = norm(mlp_out(GELU(mlp_in(cat(s_t, e_a)))))` with `e_a = Embedding(n_actions, d_model)`. Two forwards: `forward(context, mask)` → `(B, n_actions, d_model)` at each example's last true position (same signature/consumers as before — MCTS unchanged); `forward_positions(context, mask, batch_idx, positions, actions)` → `(M, d_model)` for LM-style training. Module-level helpers `build_lm_pairs` (pair convention: source = pre-decision token q−1, action = argmax at post-action q, target = next decision-point token q+1) and `lm_loss` (MSE + `infonce_weight`·InfoNCE over in-batch negatives, τ = `infonce_temperature`) are shared by phases 4 and 6. Targets are always detached (stop-grad); actions conditioned independently (perturbing e_a does not affect other actions' outputs).
 
 ### Agent (`agent/agent.py`)
 
@@ -136,11 +136,11 @@ Agent-vs-agent evaluation. Loads agents from subdirectories, seats them at table
 | `gto_ev_train` | Phase 1 hyperparams |
 | `gto_probs_train` | Phase 2 hyperparams |
 | `gto_train` | Phase 3 hyperparams + `action_loss_weight` |
-| `modelling_train` | Phase 4 hyperparams + `recon_weight` |
+| `modelling_train` | Phase 4 hyperparams + `recon_weight`, `infonce_weight`, `infonce_temperature` |
 | `opponent_data` | Opponent data generation: `agents_dir`, `n_hands`, `action_temperature` (dead `range_threshold` removed — B.7.3) |
 | `opponent_action_train` | Phase 5 hyperparams |
 | `mcts` | MCTS search params: `n_simulations`, `c_puct`, `dirichlet_alpha/epsilon`, `temperature` |
-| `mcts_train` | Phase 6: `n_cycles`, `n_hands_per_cycle`, `value/action/chain_weight` |
+| `mcts_train` | Phase 6: `n_cycles`, `n_hands_per_cycle`, `value/action/chain_weight`, `gru_window` (opponent-GRU truncated-BPTT depth in phase-6 forwards; default 1). Opponent-embedding tables persist ACROSS cycles (pipeline owns them: collection dict + per-agent `agent_info["opp_emb_table"]`) — long-run context about repeat opponents accumulates instead of resetting every cycle |
 | `evaluation` | `agents_dir`, `n_hands`, `n_tables`, `use_opponent_emb`, `server_max_batch`, `server_linger_ms` |
 | `pipeline` | Flags: `run_gto_ev`, `run_gto_probs`, `run_gto_training`, `run_modelling`, `run_opponent_data`, `run_opponent_action_train`, `run_mcts_train`, `run_evaluation` |
 | `multi_agent` | Agent pool with per-agent modifiers (see below) |
@@ -229,9 +229,9 @@ config.json → pipeline.py
 | GTO EV | SmoothL1 (Huber) | action, modelling, opponent_action | perception, value |
 | GTO Probs | KL divergence | perception, value, modelling, opponent_action | action |
 | GTO Combined | SmoothL1 + `action_loss_weight` * KL | modelling, opponent_action | perception, value, action |
-| Modelling | SmoothL1(predicted_evs) + `recon_weight` * MSE(state_reconstruction) | perception, value, action | modelling |
+| Modelling | SmoothL1(predicted_evs) + `recon_weight` * (MSE + `infonce_weight`·InfoNCE)(LM next-decision-state pairs) | perception, value, action | modelling |
 | Opponent Action | KL divergence | perception, value, action, modelling | opponent_action (+ opponent_gru if enabled) |
-| MCTS | `value_weight`·SmoothL1(root) + `action_weight`·KL(root) + `chain_weight`·KL(chain) + `recon_weight`·MSE + `value_chain_weight`·SmoothL1(chain). Value-target = `clip(α·(root.Q rescaled) + (1−α)·(equity_realized/new_scale), ±clip)`; equity-anchored root.Q (terminal_eval) + equity-based realized outcome at actual hand-end | — | all heads |
+| MCTS | `value_weight`·SmoothL1(root) + `action_weight`·KL(root) + `chain_weight`·KL(chain) + `recon_weight`·(MSE + `infonce_weight`·InfoNCE)(LM pairs: root-sequence pairs [always teacher-forced] + rolled chain-step embeddings vs last true token of the real next decision — one pooled InfoNCE batch, no depth gamma) + `value_chain_weight`·SmoothL1(chain). Value-target = `clip(α·(root.Q rescaled) + (1−α)·(equity_realized/new_scale), ±clip)`; equity-anchored root.Q (terminal_eval) + equity-based realized outcome at actual hand-end. `teacher_forcing` p_start=p_end=0.7 (fixed 0.7/0.3 mix, no decay) | — | all heads |
 
 All phases: LR warmup (100 steps) + cosine decay, gradient clipping (max_norm=1.0), early stopping, intra-epoch validation, AMP when available.
 
@@ -313,7 +313,7 @@ Read it before changing anything in `_make_terminal_evaluator`,
   across hands. This is correct: training signal must come from what
   hero can estimate at decision time, not omniscient ground truth.
 
-**Modelling forward**: perception(frozen) → modelling_head produces per-action embeddings → each action embedding appended to perception output → value_head(frozen params, grad flows through) predicts EV per action. Reconstruction loss: action embedding for taken action ≈ next perception state.
+**Modelling forward**: perception(frozen) → modelling_head produces per-action embeddings (at last true position) → each action embedding appended to perception output → value_head(frozen params, grad flows through) predicts EV per action. LM loss (replaced the old reconstruction loss): `forward_positions` at every decision position vs the next decision-point token (detached), MSE + InfoNCE.
 
 **MCTS chain forward**: perception → root value + action predictions. Then for each subsequent decision in hand: modelling_head → action embedding for taken action → extend context → predict next action distribution (action_head if hero, opponent_action_head if opponent).
 

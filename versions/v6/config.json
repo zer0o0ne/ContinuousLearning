@@ -141,7 +141,9 @@
         "val_every": 500,
         "interrupt_after_fails": 10,
         "scheduler_eta_min": 5e-7,
-        "recon_weight": 0.8
+        "recon_weight": 0.8,
+        "infonce_weight": 0.5,
+        "infonce_temperature": 0.1
     },
     "gto_train": {
         "lr": 2e-5,
@@ -232,6 +234,9 @@
         "max_chain_depth": 5,
         "chain_depth_gamma": 0.9,
         "recon_weight": 0.5,
+        "infonce_weight": 0.5,
+        "infonce_temperature": 0.1,
+        "gru_window": 32,
         "value_chain_weight": 0.1,
         "value_target_alpha": 0.5,
         "value_target_clip": 5.0,
@@ -243,8 +248,8 @@
         "terminal_value_k_best": 4,
         "gradient_checkpointing": true,
         "teacher_forcing": {
-            "p_start": 1.0,
-            "p_end": 0.0,
+            "p_start": 0.7,
+            "p_end": 0.7,
             "decay_cycles": 50
         },
         "past_opponents": {

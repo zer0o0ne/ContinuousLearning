@@ -1,7 +1,9 @@
 """Stage A audit tests: architecture fixes.
 
 A.1: Causal attention (all 5 modules use build_causal_padding_mask).
-A.2: ModellingHead cross-attn has no RoPE; self-attn is all-visible.
+A.2: ModellingHead is autoregressive (PLAN_MODELLING_HEAD_REDESIGN.md §2):
+     no cross-attention modules; the context self-attn stack is CAUSAL;
+     action conditioning is a per-action-independent MLP.
 A.3: head_dim = d_model // n_heads in all configs.
 A.5.2: Sequence capping guard on max_seq_len.
 A.5.3: Card clamp replaced by assert.
@@ -20,7 +22,7 @@ from agent.perception.encoder import Encoder
 from agent.perception.decoder import Decoder
 from agent.value.value import ValueHead
 from agent.action.action import ActionHead
-from agent.modelling.modelling import ModellingHead, Qwen3CrossAttention
+from agent.modelling.modelling import ModellingHead
 
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
@@ -201,45 +203,25 @@ def test_all_modules_use_causal_mask():
             f"{f} does not use build_causal_padding_mask")
 
 
-# ── A.2: ModellingHead cross-attn no RoPE, self-attn all-visible ────────────
+# ── A.2: ModellingHead autoregressive — no cross-attn, causal self-attn ─────
 
-def test_modelling_cross_attn_no_rope():
-    """Qwen3CrossAttention.forward must not apply RoPE to queries or keys.
-
-    Check that the actual code lines (excluding comments/docstrings) don't
-    call any rope or position_embeddings function on q/k tensors.
-    """
-    src_path = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "agent/modelling/modelling.py")
-    with open(src_path) as f:
-        source = f.read()
-    class_start = source.find("class Qwen3CrossAttention")
-    forward_start = source.find("def forward(", class_start)
-    next_class = source.find("\nclass ", forward_start + 1)
-    forward_body = source[forward_start:next_class if next_class > 0 else len(source)]
-    # Check actual code lines, not comments
-    code_lines = []
-    in_docstring = False
-    for line in forward_body.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith('"""') or stripped.startswith("'''"):
-            if in_docstring:
-                in_docstring = False
-                continue
-            if stripped.count('"""') == 1 or stripped.count("'''") == 1:
-                in_docstring = True
-                continue
-        if in_docstring or stripped.startswith("#"):
-            continue
-        code_lines.append(stripped)
-    code_text = "\n".join(code_lines)
-    # The cross-attention forward should NOT apply RoPE to q or k
-    assert "self.rope" not in code_text and "rotary_emb" not in code_text, (
-        "Qwen3CrossAttention.forward code should not apply RoPE")
+def test_modelling_no_cross_attention():
+    """The redesigned ModellingHead must have NO cross-attention path:
+    Qwen3CrossAttention removed from the module, no cross_attns/cross_norms
+    submodules, no cross-attention keys in the state_dict."""
+    import agent.modelling.modelling as modelling_module
+    assert not hasattr(modelling_module, "Qwen3CrossAttention"), (
+        "Qwen3CrossAttention must be removed from agent.modelling.modelling")
+    mod = _build_modelling()
+    assert not hasattr(mod, "cross_attns"), "ModellingHead must not have cross_attns"
+    assert not hasattr(mod, "cross_norms"), "ModellingHead must not have cross_norms"
+    cross_keys = [k for k in mod.state_dict() if "cross" in k]
+    assert cross_keys == [], (
+        f"ModellingHead state_dict must have no cross-attention keys: {cross_keys}")
 
 
-def test_modelling_self_attn_all_visible():
-    """ModellingHead self-attention mask should be all-zeros (symmetric)."""
+def test_modelling_forward_shape():
+    """forward keeps the old head's (B, n_actions, d_model) output contract."""
     mod = _build_modelling()
     mod.eval()
     B = 2
@@ -250,8 +232,39 @@ def test_modelling_self_attn_all_visible():
     assert out.shape == (B, N_ACTIONS, D_MODEL)
 
 
-def test_modelling_self_attn_symmetry():
-    """Perturbing action query 0 should affect action query N-1 and vice versa."""
+def test_modelling_self_attn_causal():
+    """The context self-attn stack must be CAUSAL: perturbing token t must NOT
+    change the per-position states at positions < t (the head predicts the
+    NEXT decision state; seeing the future would let it cheat)."""
+    torch.manual_seed(42)
+    mod = _build_modelling()
+    mod.eval()
+    B, S = 1, 6
+    x = torch.randn(B, S, D_MODEL)
+    mask = torch.ones(B, S)
+
+    with torch.no_grad():
+        s1 = mod._encode(x, mask=mask)
+
+    x2 = x.clone()
+    x2[0, 4] += 10.0
+    with torch.no_grad():
+        s2 = mod._encode(x2, mask=mask)
+
+    diff_before = (s1[0, :4] - s2[0, :4]).abs().max().item()
+    assert diff_before < 1e-5, (
+        f"Perturbing token 4 changed modelling states at positions 0-3 by "
+        f"{diff_before} — self-attn stack is not causal")
+
+    diff_at = (s1[0, 4] - s2[0, 4]).abs().max().item()
+    assert diff_at > 1e-3, (
+        f"Perturbing token 4 should change its own state; diff={diff_at}")
+
+
+def test_modelling_action_conditioning_independent():
+    """Action conditioning is a per-action MLP: perturbing action 0's embedding
+    must NOT change action N-1's output (old symmetric cross-talk removed),
+    but must change action 0's own output."""
     torch.manual_seed(42)
     mod = _build_modelling()
     mod.eval()
@@ -270,8 +283,13 @@ def test_modelling_self_attn_symmetry():
     mod.action_embeddings.weight.data[0] = orig_emb
 
     diff_last = (out_base[0, -1] - out_perturbed[0, -1]).abs().max().item()
-    assert diff_last > 1e-4, (
-        f"Perturbing action 0 should affect action {N_ACTIONS-1} via symmetric self-attn; diff={diff_last}")
+    assert diff_last == 0.0, (
+        f"Perturbing action 0 must NOT affect action {N_ACTIONS-1} "
+        f"(independent MLP conditioning); diff={diff_last}")
+
+    diff_self = (out_base[0, 0] - out_perturbed[0, 0]).abs().max().item()
+    assert diff_self > 1e-4, (
+        f"Perturbing action 0 must change its own output; diff={diff_self}")
 
 
 # ── A.3: head_dim = d_model // n_heads ──────────────────────────────────────

@@ -142,9 +142,8 @@ def _forward_out(preds, targets, valid):
         "chain_is_hero": [[True] * len(preds)],
         "chain_value_preds": [[]],
         "chain_value_targets": [[]],
-        "chain_recon_preds": [[]],
-        "chain_recon_targets": [[]],
-        "chain_recon_depths": [[]],
+        # No LM pairs (modelling-head redesign): _compute_loss falls back
+        # to a zero recon loss when "lm_pred" is absent.
         "terminal_value_preds": [[]],
         "terminal_value_targets": [[]],
     }

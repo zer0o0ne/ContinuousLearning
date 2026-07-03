@@ -2,7 +2,10 @@
 Training loop for modelling head (Recipe Step 3).
 
 Trains modelling_head to produce per-action state embeddings such that
-the frozen value_head can predict each action's EV from them.
+the frozen value_head can predict each action's EV from them, plus an
+LM-style next-decision-state loss (PLAN_MODELLING_HEAD_REDESIGN.md §5):
+h(t, a_t) is supervised against the REAL perception state that followed
+a_t (MSE + InfoNCE over in-batch negatives), gated by `recon_weight`.
 
 Perception, value_head, and action_head are all frozen.
 Gradients flow through value_head (params frozen, graph intact) back to modelling_head.
@@ -12,12 +15,12 @@ import os
 import random
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm.auto import tqdm
 
+from agent.modelling.modelling import build_lm_pairs, lm_loss
 from agent.train_scenarios.generation.generate import generate_dataset, load_dataset, \
     _compute_norm_stats, _normalize_scenarios, _shallow_copy_scenarios
 from agent.train_scenarios.modelling_predict.dataset import GTOModellingDataset, batch_collate
@@ -149,60 +152,50 @@ def _modelling_forward(agent, event_sequences, device, cached_perception=None):
     return predicted_evs, action_embs, perception_out
 
 
-def _reconstruction_loss(action_embs, perception_out, event_sequences):
-    """State reconstruction auxiliary loss.
+def _reconstruction_loss(agent, perception_out, mask, event_sequences,
+                         infonce_weight=0.5, infonce_temperature=0.1):
+    """LM-style next-decision-state loss (PLAN_MODELLING_HEAD_REDESIGN.md §3–4).
 
-    For consecutive events (t, t+1) where event[t] has a non-zero action,
-    the modelling embedding for that action should approximate the next
-    perception state. This teaches modelling to emit vectors in perception's
-    representation space — critical for MCTS rollout.
-
-    Uses causal property: perception_out[:, t, :] depends only on events[0..t],
-    so internal transitions within a scenario provide valid training pairs.
+    Pairs via `build_lm_pairs`: for every post-action event q (one-hot max
+    ≥ 0.5), the head's prediction h(src=q−1, action=argmax) is supervised
+    against the NEXT decision-point perception state at q+1 (stop-grad).
+    Dense supervision over all decision positions of every sequence via
+    `forward_positions`; loss = MSE + infonce_weight · InfoNCE (`lm_loss`).
 
     Args:
-        action_embs: (B, K, D) — per-action embeddings from modelling head
+        agent: ASI (or stub) exposing `modelling_head.forward_positions`
         perception_out: (B, N, D) — detached perception output
-        event_sequences: list of lists of event dicts
+        mask: (B, N) float — 1 for real tokens, 0 for padding
+        event_sequences: list of lists of event dicts (aligned with rows
+            of perception_out)
+        infonce_weight: weight of the InfoNCE term inside L_lm
+        infonce_temperature: τ for the cosine-similarity logits
 
     Returns:
-        scalar loss (MSE), or zero-grad tensor if no valid pairs found
+        (loss, components) — scalar loss and {"mse", "infonce"} floats for
+        logging. Zero-grad tensor + zero components if no valid pairs found.
     """
-    batch_indices = []
-    action_indices = []
-    target_positions = []
+    device = perception_out.device
+    batch_idx, src_positions, actions, tgt_positions = build_lm_pairs(event_sequences)
 
-    for i, seq in enumerate(event_sequences):
-        for t in range(len(seq) - 1):
-            action = seq[t]["action"]
-            if isinstance(action, torch.Tensor):
-                max_val = action.max().item()
-                action_idx = action.argmax().item()
-            else:
-                max_val = max(action) if action else 0
-                action_idx = int(np.argmax(action))
+    if batch_idx.numel() == 0:
+        zero = torch.tensor(0.0, device=device, requires_grad=True)
+        return zero, {"mse": 0.0, "infonce": 0.0}
 
-            if max_val < 0.5:  # no clear action at this step (e.g. initial state)
-                continue
+    batch_idx = batch_idx.to(device)
+    src_positions = src_positions.to(device)
+    actions = actions.to(device)
+    tgt_positions = tgt_positions.to(device)
 
-            batch_indices.append(i)
-            action_indices.append(action_idx)
-            target_positions.append(t + 1)
+    pred = agent.modelling_head.forward_positions(
+        perception_out, mask, batch_idx, src_positions, actions)   # (M, D)
+    target = perception_out[batch_idx, tgt_positions].detach()     # (M, D)
 
-    if not batch_indices:
-        return torch.tensor(0.0, device=action_embs.device, requires_grad=True)
-
-    bi = torch.tensor(batch_indices, dtype=torch.long, device=action_embs.device)
-    ai = torch.tensor(action_indices, dtype=torch.long, device=action_embs.device)
-    tp = torch.tensor(target_positions, dtype=torch.long, device=action_embs.device)
-
-    predicted = action_embs[bi, ai]          # (M, D)
-    target = perception_out[bi, tp].detach() # (M, D)
-
-    return F.mse_loss(predicted, target)
+    return lm_loss(pred, target, infonce_weight, infonce_temperature)
 
 
 def _run_validation(agent, val_loader, loss_fn, device, recon_weight=0.0,
+                    infonce_weight=0.5, infonce_temperature=0.1,
                     amp_config=None):
     """Run validation and return average loss.
 
@@ -224,8 +217,11 @@ def _run_validation(agent, val_loader, loss_fn, device, recon_weight=0.0,
                     cached_perception=(cached_p, cached_m))
                 batch_loss = loss_fn(predicted_evs, action_evs)
                 if recon_weight > 0:
-                    batch_loss = batch_loss + recon_weight * _reconstruction_loss(
-                        action_embs, perception_out, event_sequences)
+                    lm, _ = _reconstruction_loss(
+                        agent, perception_out, cached_m, event_sequences,
+                        infonce_weight=infonce_weight,
+                        infonce_temperature=infonce_temperature)
+                    batch_loss = batch_loss + recon_weight * lm
             val_loss_sum += batch_loss.item() * cached_p.shape[0]
             val_count += cached_p.shape[0]
     agent.train()
@@ -321,11 +317,15 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
     val_every = train_cfg.get("val_every", None)
     interrupt_after_fails = train_cfg.get("interrupt_after_fails", None)
     recon_weight = train_cfg.get("recon_weight", 0.1)
+    infonce_weight = train_cfg.get("infonce_weight", 0.5)
+    infonce_temperature = train_cfg.get("infonce_temperature", 0.1)
 
     log("=== Modelling Head Training (Step 3) ===")
     log("Memory: DISABLED (skip_memory=True)")
     if recon_weight > 0:
-        log(f"State reconstruction loss: weight={recon_weight}")
+        log(f"LM next-decision-state loss: weight={recon_weight}, "
+            f"infonce_weight={infonce_weight}, "
+            f"infonce_temperature={infonce_temperature}")
 
     # Freeze everything except modelling_head
     for param in agent.perception.parameters():
@@ -533,6 +533,8 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         agent.train()
         train_loss_sum = 0.0
         train_count = 0
+        lm_mse_sum = 0.0
+        lm_nce_sum = 0.0
 
         for batch_idx, (cached_p, cached_m, event_sequences, action_evs) in enumerate(
                 tqdm(train_loader, desc=f"Modelling epoch {epoch+1}/{epochs}", leave=False, smoothing=0)):
@@ -545,9 +547,13 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                     agent, event_sequences, device,
                     cached_perception=(cached_p, cached_m))
                 batch_loss = loss_fn(predicted_evs, action_evs)
+                lm_components = None
                 if recon_weight > 0:
-                    batch_loss = batch_loss + recon_weight * _reconstruction_loss(
-                        action_embs, perception_out, event_sequences)
+                    lm, lm_components = _reconstruction_loss(
+                        agent, perception_out, cached_m, event_sequences,
+                        infonce_weight=infonce_weight,
+                        infonce_temperature=infonce_temperature)
+                    batch_loss = batch_loss + recon_weight * lm
 
             optimizer.zero_grad()
             scaler.scale(batch_loss).backward()
@@ -565,17 +571,27 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
 
             train_loss_sum += step_loss * cached_p.shape[0]
             train_count += cached_p.shape[0]
+            if lm_components is not None:
+                lm_mse_sum += lm_components["mse"] * cached_p.shape[0]
+                lm_nce_sum += lm_components["infonce"] * cached_p.shape[0]
 
             if (batch_idx + 1) % log_every == 0:
                 avg = train_loss_sum / train_count
                 cur_lr = scheduler.get_last_lr()[0]
-                log(f"  Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}, "
-                    f"Train Loss: {avg:.6f}, LR: {cur_lr:.2e}")
+                msg = (f"  Epoch {epoch+1}/{epochs}, Batch {batch_idx+1}, "
+                       f"Train Loss: {avg:.6f}, LR: {cur_lr:.2e}")
+                if recon_weight > 0:
+                    msg += (f", LM mse: {lm_mse_sum / train_count:.6f}, "
+                            f"LM infonce: {lm_nce_sum / train_count:.6f}")
+                log(msg)
 
             # Intra-epoch validation
             if val_every and (global_step % val_every == 0):
                 val_loss = _run_validation(agent, val_loader, loss_fn, device,
-                                           recon_weight=recon_weight, amp_config=amp_cfg)
+                                           recon_weight=recon_weight,
+                                           infonce_weight=infonce_weight,
+                                           infonce_temperature=infonce_temperature,
+                                           amp_config=amp_cfg)
                 history["val_loss"].append((global_step, val_loss))
                 _save_history(hist)
                 log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}")
@@ -599,7 +615,10 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
 
         # --- End-of-epoch validation ---
         val_loss_avg = _run_validation(agent, val_loader, loss_fn, device,
-                                       recon_weight=recon_weight, amp_config=amp_cfg)
+                                       recon_weight=recon_weight,
+                                       infonce_weight=infonce_weight,
+                                       infonce_temperature=infonce_temperature,
+                                       amp_config=amp_cfg)
         history["val_loss"].append((global_step, val_loss_avg))
 
         history["epoch_train_loss"].append(train_loss_avg)

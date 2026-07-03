@@ -469,7 +469,8 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
 
 def run_mcts_collection(agents_list, config, device, log, n_hands,
                           cycle_idx=0, n_cycles=1,
-                          past_snapshot_specs=None):
+                          past_snapshot_specs=None,
+                          opp_tables=None):
     """Play hands with MCTS decisions and collect training examples.
 
     Each agent uses MCTS for its decisions. After each hand, training
@@ -547,17 +548,24 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
     # Per-agent OpponentEmbeddingTable. Used at MCTS root perception call so
     # search sees the same opponent context as supervised training does. Each
     # agent has its own table because GRU updates are agent-specific (the GRU
-    # lives inside Perception). Tables persist across hands within this call,
-    # mirroring how training accumulates embeddings within an epoch.
-    opp_tables = {}
+    # lives inside Perception). Tables persist across hands within this call;
+    # when the caller passes `opp_tables` (pipeline's cyclic loop), the SAME
+    # dict is reused across cycles so long-run context about frequently-seen
+    # players accumulates instead of resetting every cycle. Sequential path
+    # only — the parallel path (n_workers>1) keeps its per-(worker, agent)
+    # server-side tables.
+    if opp_tables is None:
+        opp_tables = {}
     for a in agents_list:
         asi = a["agent"]
-        if asi.perception.opp_emb_enabled:
+        if asi.perception.opp_emb_enabled and a["name"] not in opp_tables:
             from agent.perception.opponent_embeddings import OpponentEmbeddingTable
             opp_tables[a["name"]] = OpponentEmbeddingTable(asi.perception.d_model)
     if opp_tables:
+        n_entries = sum(len(t.embeddings) for t in opp_tables.values())
         log(f"MCTS collection: opponent_embedding active at root for "
-            f"{len(opp_tables)}/{len(agents_list)} agent(s)")
+            f"{len(opp_tables)}/{len(agents_list)} agent(s) "
+            f"({n_entries} persisted entr{'y' if n_entries == 1 else 'ies'})")
 
     # Per-agent search-time value scale: the per-cycle `mcts_value_scale`
     # snapshot used by `evaluate_all_terminals` (via `value_scales_by_position`)

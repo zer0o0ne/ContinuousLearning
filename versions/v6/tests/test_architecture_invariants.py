@@ -444,61 +444,77 @@ class TestCausalAttention(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Invariant 7 — Non-causal (symmetric) attention in ModellingHead self-attn
+# Invariant 7 — Causal attention in ModellingHead self-attn stack
 # ---------------------------------------------------------------------------
 
-class TestModellingHeadSymmetricSelfAttn(unittest.TestCase):
-    """ModellingHead uses an all-zeros self-attention mask so every action
-    query can attend to every other action query. Actions are orderless (fold
-    is not 'before' call in any meaningful sense), so causal masking would
-    impose a spurious ordering. The all-zeros mask is explicit in the source
-    (A.2 comment) and disables Qwen3's built-in is_causal."""
+class TestModellingHeadCausalSelfAttn(unittest.TestCase):
+    """The redesigned ModellingHead (PLAN_MODELLING_HEAD_REDESIGN.md §2) runs a
+    CAUSAL Qwen3 self-attn stack over the decoder context: s_t must see only
+    positions <= t, because h(t, a) is trained to predict the NEXT decision
+    state from the state at t — access to future tokens would let the head
+    cheat during teacher-forced LM training. Causality comes from the shared
+    build_causal_padding_mask (an explicit mask disables Qwen3's is_causal)."""
 
-    def test_self_attn_mask_is_all_zeros(self):
-        """The self_attn_mask created in forward must be all zeros."""
+    def _make_head(self):
         from agent.modelling.modelling import ModellingHead
-        mh = ModellingHead(D_MODEL, N_ACTIONS, N_HEADS, N_KV_HEADS,
-                           N_LAYERS, D_FF, HEAD_MAX_SEQ)
+        return ModellingHead(D_MODEL, N_ACTIONS, N_HEADS, N_KV_HEADS,
+                             N_LAYERS, D_FF, HEAD_MAX_SEQ)
+
+    def test_encode_uses_build_causal_padding_mask(self):
+        """ModellingHead._encode must build its mask via build_causal_padding_mask
+        (the single source of truth for causality + padding)."""
+        from agent.modelling.modelling import ModellingHead
+        src = inspect.getsource(ModellingHead._encode)
+        self.assertIn(
+            "build_causal_padding_mask", src,
+            "ModellingHead._encode must call build_causal_padding_mask",
+        )
+
+    def test_self_attn_stack_is_causal(self):
+        """Perturbing context tokens strictly AFTER position t must leave the
+        head's output at t exactly unchanged; perturbing token t itself must
+        change it (sanity check that the test is live)."""
+        mh = self._make_head()
         mh.eval()
+        torch.manual_seed(3)
+        seq_len = 8
+        t = 4
+        context = torch.randn(1, seq_len, D_MODEL)
+        mask = torch.ones(1, seq_len)
+        batch_idx = torch.zeros(N_ACTIONS, dtype=torch.long)
+        positions = torch.full((N_ACTIONS,), t, dtype=torch.long)
+        actions = torch.arange(N_ACTIONS)
 
-        captured_mask = {}
-
-        # Patch forward to intercept the mask used for self-attention
-        original_forward = mh.forward
-
-        def patched_forward(context, mask=None):
-            b = context.shape[0]
-            # Recreate the mask exactly as the real forward does
-            m = torch.zeros(b, 1, N_ACTIONS, N_ACTIONS,
-                            dtype=context.dtype, device=context.device)
-            captured_mask["mask"] = m
-            return original_forward(context, mask=mask)
-
-        context = torch.randn(2, 5, D_MODEL)
-        mask = torch.ones(2, 5)
         with torch.no_grad():
-            patched_forward(context, mask=mask)
+            base = mh.forward_positions(context, mask, batch_idx, positions, actions)
+
+            future = context.clone()
+            future[0, t + 1:] += 5.0  # only tokens AFTER t
+            out_future = mh.forward_positions(future, mask, batch_idx,
+                                              positions, actions)
+
+            at_t = context.clone()
+            at_t[0, t] += 5.0
+            out_at_t = mh.forward_positions(at_t, mask, batch_idx,
+                                            positions, actions)
 
         self.assertTrue(
-            (captured_mask["mask"] == 0.0).all(),
-            "ModellingHead self-attention mask must be all zeros (non-causal)",
+            torch.equal(base, out_future),
+            "Output at position t changed when tokens after t were perturbed "
+            "— ModellingHead self-attn stack is not causal",
+        )
+        self.assertFalse(
+            torch.allclose(base, out_at_t, atol=1e-5),
+            "Perturbing token t had no effect at t — test is not exercising "
+            "real computation",
         )
 
-    def test_self_attn_mask_shape_from_source(self):
-        """Verify the self_attn_mask shape in the source is (B,1,n_actions,n_actions)."""
-        from agent.modelling.modelling import ModellingHead
-        src = inspect.getsource(ModellingHead.forward)
-        self.assertIn(
-            "torch.zeros", src,
-            "ModellingHead.forward must construct an all-zeros self_attn_mask",
-        )
-
-    def test_perturbing_one_action_affects_another(self):
-        """Perturbing action b's embedding must affect action a's output
-        (and vice versa), confirming full visibility."""
-        from agent.modelling.modelling import ModellingHead
-        mh = ModellingHead(D_MODEL, N_ACTIONS, N_HEADS, N_KV_HEADS,
-                           N_LAYERS, D_FF, HEAD_MAX_SEQ)
+    def test_perturbing_one_action_does_not_affect_another(self):
+        """Action conditioning is a per-action MLP on cat(s_t, e_a): perturbing
+        action b's embedding must leave action a's output EXACTLY unchanged
+        (the old symmetric cross-action attention is gone), while changing
+        action b's own output."""
+        mh = self._make_head()
         mh.eval()
         torch.manual_seed(3)
         context = torch.randn(1, 6, D_MODEL)
@@ -514,73 +530,73 @@ class TestModellingHeadSymmetricSelfAttn(unittest.TestCase):
             out_b = mh(context, mask=mask)
             mh.action_embeddings.weight.data.copy_(w_orig)
 
-            mh.action_embeddings.weight.data[a] += 4.0
-            out_a = mh(context, mask=mask)
-            mh.action_embeddings.weight.data.copy_(w_orig)
-
         effect_a_from_b = (out_b[0, a] - base[0, a]).abs().max().item()
-        effect_b_from_a = (out_a[0, b] - base[0, b]).abs().max().item()
+        effect_b_from_b = (out_b[0, b] - base[0, b]).abs().max().item()
 
-        self.assertGreater(
-            effect_a_from_b, 1e-4,
-            f"Perturbing action {b} must affect action {a} (got {effect_a_from_b})",
+        self.assertEqual(
+            effect_a_from_b, 0.0,
+            f"Perturbing action {b} must NOT affect action {a} "
+            f"(got {effect_a_from_b}) — conditioning must be per-action",
         )
         self.assertGreater(
-            effect_b_from_a, 1e-4,
-            f"Perturbing action {a} must affect action {b} (got {effect_b_from_a})",
+            effect_b_from_b, 1e-4,
+            f"Perturbing action {b} must affect its own output "
+            f"(got {effect_b_from_b})",
         )
 
 
 # ---------------------------------------------------------------------------
-# Invariant 8 — No RoPE in ModellingHead cross-attention
+# Invariant 8 — No cross-attention in ModellingHead
 # ---------------------------------------------------------------------------
 
-class TestModellingHeadNoCrossAttnRoPE(unittest.TestCase):
-    """Cross-attention in ModellingHead is RoPE-free by design (A.2 comment in
-    source). Action queries are orderless; only the self-attention refinement
-    uses RoPE. Adding RoPE to cross-attention would impose a positional bias
-    on the action→context attention patterns without any semantic justification."""
+class TestModellingHeadNoCrossAttention(unittest.TestCase):
+    """The cross-attention path (Qwen3CrossAttention + cross_norms/cross_attns
+    with learnable action queries) was REMOVED by the redesign
+    (PLAN_MODELLING_HEAD_REDESIGN.md §2): action conditioning is now a pure MLP
+    h(t, a) = mlp_out(GELU(mlp_in(cat(s_t, e_a)))). Reintroducing
+    cross-attention would resurrect the collapse dynamics proven in
+    analytics/modelling_head_collapse_analysis.pdf."""
 
-    def test_cross_attn_has_no_rope(self):
-        """Qwen3CrossAttention must NOT have a 'rope' or 'rotary_emb' attribute."""
-        from agent.modelling.modelling import Qwen3CrossAttention, ModellingHead
-        from transformers import Qwen3Config
-        cfg = Qwen3Config(
-            hidden_size=D_MODEL,
-            num_attention_heads=N_HEADS,
-            num_key_value_heads=N_KV_HEADS,
-            head_dim=D_MODEL // N_HEADS,
-            intermediate_size=D_FF,
-            num_hidden_layers=N_LAYERS,
-            max_position_embeddings=HEAD_MAX_SEQ,
-        )
-        ca = Qwen3CrossAttention(cfg)
+    def test_no_cross_attention_class_in_module(self):
+        """Qwen3CrossAttention must no longer exist in the modelling module."""
+        import agent.modelling.modelling as modelling_module
         self.assertFalse(
-            hasattr(ca, "rope") or hasattr(ca, "rotary_emb"),
-            "Qwen3CrossAttention must NOT have a rope/rotary_emb attribute",
+            hasattr(modelling_module, "Qwen3CrossAttention"),
+            "Qwen3CrossAttention must be removed from agent.modelling.modelling",
         )
 
-    def test_cross_attn_forward_no_position_embeddings(self):
-        """Qwen3CrossAttention.forward must NOT accept position_embeddings."""
-        from agent.modelling.modelling import Qwen3CrossAttention
-        sig = inspect.signature(Qwen3CrossAttention.forward)
-        params = list(sig.parameters.keys())
-        self.assertNotIn(
-            "position_embeddings", params,
-            "Qwen3CrossAttention.forward must not take position_embeddings",
+    def test_head_has_no_cross_attn_submodules(self):
+        """ModellingHead must have no cross_attns/cross_norms and no
+        cross-attention keys in its state_dict."""
+        from agent.modelling.modelling import ModellingHead
+        mh = ModellingHead(D_MODEL, N_ACTIONS, N_HEADS, N_KV_HEADS,
+                           N_LAYERS, D_FF, HEAD_MAX_SEQ)
+        self.assertFalse(hasattr(mh, "cross_attns"),
+                         "ModellingHead must not have cross_attns")
+        self.assertFalse(hasattr(mh, "cross_norms"),
+                         "ModellingHead must not have cross_norms")
+        cross_keys = [k for k in mh.state_dict() if "cross" in k]
+        self.assertEqual(
+            cross_keys, [],
+            f"ModellingHead state_dict must have no cross-attention keys: {cross_keys}",
         )
 
-    def test_source_says_no_rope_in_cross_attn(self):
-        """Source must contain the A.2 no-RoPE comment for cross-attention."""
-        from agent.modelling.modelling import Qwen3CrossAttention
-        src = inspect.getsource(Qwen3CrossAttention.forward)
-        self.assertIn(
-            "No RoPE", src,
-            "Qwen3CrossAttention.forward must document the no-RoPE design decision",
-        )
+    def test_action_conditioning_mlp_shapes(self):
+        """The replacement conditioning MLP maps cat(s_t, e_a): 2*d_model →
+        d_ff → d_model."""
+        from agent.modelling.modelling import ModellingHead
+        mh = ModellingHead(D_MODEL, N_ACTIONS, N_HEADS, N_KV_HEADS,
+                           N_LAYERS, D_FF, HEAD_MAX_SEQ)
+        self.assertEqual(mh.mlp_in.in_features, 2 * D_MODEL,
+                         "mlp_in.in_features must be 2 * d_model (cat(s, e))")
+        self.assertEqual(mh.mlp_in.out_features, D_FF)
+        self.assertEqual(mh.mlp_out.in_features, D_FF)
+        self.assertEqual(mh.mlp_out.out_features, D_MODEL,
+                         "mlp_out must project back to d_model")
 
     def test_modelling_head_self_attn_uses_rope(self):
-        """The self-attention refinement layers DO use RoPE (contrast with cross-attn)."""
+        """The causal self-attention stack DOES use RoPE (position_ids =
+        arange(N), mirroring perception/decoder.py conventions)."""
         from agent.modelling.modelling import ModellingHead
         mh = ModellingHead(D_MODEL, N_ACTIONS, N_HEADS, N_KV_HEADS,
                            N_LAYERS, D_FF, HEAD_MAX_SEQ)
@@ -915,27 +931,26 @@ class TestGQASupport(unittest.TestCase):
         enc = Encoder(D_MODEL, N_HEADS, N_KV_HEADS, N_LAYERS, D_FF, HEAD_MAX_SEQ)
         self.assertEqual(enc.config.num_key_value_heads, N_KV_HEADS)
 
-    def test_cross_attn_gqa(self):
-        """Qwen3CrossAttention must also support n_kv_heads < n_heads."""
-        from agent.modelling.modelling import Qwen3CrossAttention
-        from transformers import Qwen3Config
-        cfg = Qwen3Config(
-            hidden_size=D_MODEL,
-            num_attention_heads=N_HEADS,
-            num_key_value_heads=N_KV_HEADS,
-            head_dim=D_MODEL // N_HEADS,
-            intermediate_size=D_FF,
-            num_hidden_layers=N_LAYERS,
-            max_position_embeddings=HEAD_MAX_SEQ,
+    def test_modelling_self_attn_gqa(self):
+        """The ModellingHead causal self-attn stack must support
+        n_kv_heads < n_heads: config reflects it and the k_proj weight is
+        GQA-shaped (n_kv_heads * head_dim, d_model) vs the full q_proj."""
+        from agent.modelling.modelling import ModellingHead
+        mh = ModellingHead(D_MODEL, N_ACTIONS, N_HEADS, N_KV_HEADS,
+                           N_LAYERS, D_FF, HEAD_MAX_SEQ)
+        self.assertEqual(mh.config.num_key_value_heads, N_KV_HEADS)
+        head_dim = D_MODEL // N_HEADS
+        attn = mh.self_attn_layers[0].self_attn
+        self.assertEqual(
+            tuple(attn.q_proj.weight.shape), (D_MODEL, D_MODEL),
+            "modelling self-attn q_proj must be (d_model, d_model)",
         )
-        ca = Qwen3CrossAttention(cfg)
-        ca.eval()
-        query = torch.randn(B, N_ACTIONS, D_MODEL)
-        key_value = torch.randn(B, N_EVENTS, D_MODEL)
-        mask = torch.ones(B, N_EVENTS)
-        with torch.no_grad():
-            out = ca(query, key_value, mask=mask)
-        self.assertEqual(out.shape, (B, N_ACTIONS, D_MODEL))
+        self.assertEqual(
+            tuple(attn.k_proj.weight.shape),
+            (N_KV_HEADS * head_dim, D_MODEL),
+            "modelling self-attn k_proj must be GQA-shaped "
+            "(n_kv_heads * head_dim, d_model)",
+        )
 
 
 # ---------------------------------------------------------------------------

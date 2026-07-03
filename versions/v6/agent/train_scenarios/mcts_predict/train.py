@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Sampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm.auto import tqdm
 
+from agent.modelling.modelling import build_lm_pairs, lm_loss
 from agent.train_scenarios.mcts_predict.dataset import MCTSDataset, batch_collate, make_tensor_collate
 from agent.train_scenarios._checkpoint_io import make_checkpoint
 from agent.resume import atomic_torch_save
@@ -50,7 +51,8 @@ class LengthGroupedBatchSampler(Sampler):
 
 def _mcts_forward(agent, event_sequences, chains, device,
                   opponent_emb_table=None, p_tf=0.0, stop_grad_old_embs=True,
-                  examples_per_batch_terminals=None, precomputed=None):
+                  examples_per_batch_terminals=None, precomputed=None,
+                  gru_window=1):
     """Forward pass: perception → root predictions → modelling chain.
 
     Chain semantics (matches `collect.py:MCTSTrainingExample`):
@@ -71,8 +73,9 @@ def _mcts_forward(agent, event_sequences, chains, device,
         ctx_rolled for the next iteration, the appended emb is detached so the
         gradient at step i only updates modelling_head/perception via the
         CURRENT step's emb (and via the original root perception_out).
-      - Reconstruction (point 1) and per-step value (point 11) targets are
-        produced here and consumed by `_compute_loss`.
+      - LM supervision (PLAN_MODELLING_HEAD_REDESIGN.md §6) and per-step
+        value (point 11) targets are produced here and consumed by
+        `_compute_loss`.
 
     Returns: dict with keys
       value_preds: (B, 1) — root prediction only
@@ -86,13 +89,17 @@ def _mcts_forward(agent, event_sequences, chains, device,
           chain KL. Legacy ChainSteps without the field default to True.
       chain_value_preds / chain_value_targets:
           per-batch list of lists, scalar tensors
-      chain_recon_preds / chain_recon_targets / chain_recon_depths:
-          per-batch list of lists, (D,) tensors / (D,) tensors / int — the
-          depth `i` of each recon entry in the original chain. Targets
-          detached. Only populated for steps whose ChainStep.events_at_step
-          is non-empty; the depth list lets `_compute_loss` apply the same
-          `chain_depth_gamma` weighting as the action/value chain losses
-          even though recon is sparse over chain positions.
+      lm_pred / lm_target: (M, D) tensors — LM pairs for the modelling
+          head (PLAN §6). Root pairs (build_lm_pairs on the root event
+          sequences, forward_positions predictions, target =
+          perception_out[bi, q+1].detach()) and chain pairs (at depth d
+          the rolled-context emb for step.action_taken is supervised
+          against the LAST true token of the real next decision's
+          perception — chain_perception_out[tf_idx, L_true-1].detach())
+          are pooled into ONE batch so they share a single MSE+InfoNCE
+          call in `_compute_loss`. Targets detached. Chain pairs exist
+          only for hero steps whose ChainStep.events_at_step is non-empty
+          (same guard as the old recon). M may be 0 (empty tensors).
     """
     skip_opp = (opponent_emb_table is None)
 
@@ -100,20 +107,38 @@ def _mcts_forward(agent, event_sequences, chains, device,
     perception_out, _, mask = agent.perception.forward_batch(
         event_sequences, device=device, skip_memory=True,
         skip_opponent_emb=skip_opp, opponent_emb_table=opponent_emb_table,
-        precomputed=precomputed)
+        gru_window=gru_window, precomputed=precomputed)
 
     # 2. Root predictions
     value_preds = agent.value_head(perception_out, mask=mask)
     action_preds = agent.action_head(perception_out, mask=mask)
 
     B = perception_out.shape[0]
+    D_model = perception_out.shape[2]
+
+    # 2b. Root-sequence LM pairs (PLAN §6, always teacher-forced): for every
+    # decision in the root events prefix, the modelling head predicts the
+    # next decision-point token from the pre-decision token + taken action.
+    # Targets are detached (stop-grad, owner decision 4); the root
+    # value/action losses anchor perception.
+    lm_pred_parts = []
+    lm_target_parts = []
+    lm_bi, lm_src, lm_act, lm_tgt = build_lm_pairs(event_sequences)
+    if lm_bi.numel() > 0:
+        root_lm_pred = agent.modelling_head.forward_positions(
+            perception_out, mask, lm_bi, lm_src, lm_act)
+        root_lm_target = perception_out[
+            lm_bi.to(device), lm_tgt.to(device)].detach()
+        lm_pred_parts.append(root_lm_pred)
+        lm_target_parts.append(root_lm_target)
 
     # 3. Collect chain events for ONE batched perception forward.
     # D.3: only hero-owned steps — opp-step events contain the opponent's
     # private hand cards which are unavailable during search. Teacher
-    # forcing and recon on opp-steps would train on unreachable inputs.
+    # forcing and LM supervision on opp-steps would train on unreachable
+    # inputs.
     flat_step_events = []
-    step_index = {}  # (b, i) -> index into flat_step_events / chain_pooled
+    step_index = {}  # (b, i) -> index into flat_step_events / chain_perception_out
     for b, chain in enumerate(chains):
         for i, step in enumerate(chain):
             evts = getattr(step, "events_at_step", None) or []
@@ -123,7 +148,6 @@ def _mcts_forward(agent, event_sequences, chains, device,
 
     chain_perception_out = None
     chain_perception_mask = None
-    chain_pooled_detached = None
     need_grad_chain_perc = bool(flat_step_events) and p_tf > 0.0
     if flat_step_events:
         # Snapshot opp_table embeddings BEFORE chain perception so the GRU
@@ -138,7 +162,8 @@ def _mcts_forward(agent, event_sequences, chains, device,
                 agent.perception.forward_batch(
                     flat_step_events, device=device, skip_memory=True,
                     skip_opponent_emb=skip_opp,
-                    opponent_emb_table=opponent_emb_table)
+                    opponent_emb_table=opponent_emb_table,
+                    gru_window=gru_window)
             )
         else:
             with torch.no_grad():
@@ -146,17 +171,12 @@ def _mcts_forward(agent, event_sequences, chains, device,
                     agent.perception.forward_batch(
                         flat_step_events, device=device, skip_memory=True,
                         skip_opponent_emb=skip_opp,
-                        opponent_emb_table=opponent_emb_table)
+                        opponent_emb_table=opponent_emb_table,
+                        gru_window=gru_window)
                 )
 
         if opp_snapshot is not None:
             opponent_emb_table.embeddings = opp_snapshot
-
-        # Pool real-perception output to a single (D,) per step for recon target
-        m_float = chain_perception_mask.float().unsqueeze(-1)  # (M, S, 1)
-        sums = (chain_perception_out * m_float).sum(dim=1)     # (M, D)
-        counts = m_float.sum(dim=1).clamp(min=1.0)             # (M, 1)
-        chain_pooled_detached = (sums / counts).detach()       # (M, D)
 
     # 4. E.1.5: depth-batched chain loop — process chain steps of the same
     #    depth across examples in one padded forward instead of B=1 per step.
@@ -166,9 +186,6 @@ def _mcts_forward(agent, event_sequences, chains, device,
     chain_is_hero = [[] for _ in range(B)]
     chain_value_preds = [[] for _ in range(B)]
     chain_value_targets = [[] for _ in range(B)]
-    chain_recon_preds = [[] for _ in range(B)]
-    chain_recon_targets = [[] for _ in range(B)]
-    chain_recon_depths = [[] for _ in range(B)]
 
     # A.5.1: trim each example to its true length
     per_ex_ctx = [None] * B
@@ -180,7 +197,6 @@ def _mcts_forward(agent, event_sequences, chains, device,
             per_ex_mask[b] = mask[b:b+1, :L_b]
 
     max_depth = max((len(chains[b]) for b in range(B) if chains[b]), default=0)
-    D_model = perception_out.shape[2]
 
     for d in range(max_depth):
         active_bs = [b for b in range(B) if chains[b] and d < len(chains[b])]
@@ -284,22 +300,22 @@ def _mcts_forward(agent, event_sequences, chains, device,
                 float(getattr(step, "value_target", 0.0)),
                 dtype=torch.float32, device=device))
 
-            # D.3: recon only for hero-owned steps
+            # D.3 + PLAN §6: chain LM pair only for hero-owned steps with
+            # real events_at_step (same guard as the old recon). The
+            # current step's emb — h at the rolled context's last position
+            # — stays ATTACHED (the head gets gradient); the target is the
+            # LAST true token of the real next decision's perception (the
+            # next decision-point token: events_at_step ends at the
+            # pre-decision snapshot), detached.
             tf_idx_val = step_index.get((b, d))
-            if (tf_idx_val is not None and chain_pooled_detached is not None
+            if (tf_idx_val is not None and chain_perception_out is not None
                     and step.is_hero):
-                ones = torch.ones(1, 1, dtype=per_ex_mask[b].dtype,
-                                  device=device)
-                ctx_wn = torch.cat([per_ex_ctx[b], new_emb_tokens[idx]],
-                                   dim=1)
-                msk_wn = torch.cat([per_ex_mask[b], ones], dim=1)
-                m_fl = msk_wn.float().unsqueeze(-1)
-                sums_e = (ctx_wn * m_fl).sum(dim=1)
-                counts_e = m_fl.sum(dim=1).clamp(min=1.0)
-                recon_pred = (sums_e / counts_e).squeeze(0)
-                chain_recon_preds[b].append(recon_pred)
-                chain_recon_targets[b].append(chain_pooled_detached[tf_idx_val])
-                chain_recon_depths[b].append(d)
+                L_true = int(chain_perception_mask[tf_idx_val].sum().item())
+                lm_pred_parts.append(
+                    new_emb_tokens[idx].reshape(1, D_model))
+                lm_target_parts.append(
+                    chain_perception_out[tf_idx_val, L_true - 1]
+                    .detach().unsqueeze(0))
 
         # --- Update contexts for next depth ---
         for idx, b in enumerate(active_bs):
@@ -347,6 +363,16 @@ def _mcts_forward(agent, event_sequences, chains, device,
         terminal_value_preds.append(b_t_preds)
         terminal_value_targets.append(b_t_tgts)
 
+    # 6. Pool root + chain LM pairs into ONE batch (PLAN §6: both pair sets
+    # share one L_lm — bigger InfoNCE negative pool). Zero pairs → empty
+    # (0, D) tensors; `_compute_loss` maps that to a zero loss.
+    if lm_pred_parts:
+        lm_pred = torch.cat(lm_pred_parts, dim=0)
+        lm_target = torch.cat(lm_target_parts, dim=0)
+    else:
+        lm_pred = perception_out.new_zeros((0, D_model))
+        lm_target = perception_out.new_zeros((0, D_model))
+
     return {
         "value_preds": value_preds,
         "action_preds": action_preds,
@@ -356,9 +382,8 @@ def _mcts_forward(agent, event_sequences, chains, device,
         "chain_is_hero": chain_is_hero,
         "chain_value_preds": chain_value_preds,
         "chain_value_targets": chain_value_targets,
-        "chain_recon_preds": chain_recon_preds,
-        "chain_recon_targets": chain_recon_targets,
-        "chain_recon_depths": chain_recon_depths,
+        "lm_pred": lm_pred,
+        "lm_target": lm_target,
         "terminal_value_preds": terminal_value_preds,
         "terminal_value_targets": terminal_value_targets,
     }
@@ -368,21 +393,20 @@ def _compute_loss(forward_out, value_targets, action_targets,
                   value_weight=1.0, action_weight=1.0, chain_weight=1.0,
                   recon_weight=0.5, value_chain_weight=0.5,
                   chain_depth_gamma=0.7, entropy_weight=0.0,
-                  terminal_value_weight=0.0):
+                  terminal_value_weight=0.0, infonce_weight=0.5,
+                  infonce_temperature=0.1):
     """Compute combined loss across all heads.
 
     Aggregation policy (post-modifications):
-      - chain KL, chain value AND reconstruction are first weighted by
-        `gamma^i` within an example, normalized by the sum of weights for
-        that example, then averaged across examples (point 5 + point 3).
-        For recon, `i` is the original chain depth (not the position in
-        the filtered recon list) — recon entries exist only for steps with
-        non-empty `events_at_step`, so the gamma exponent must come from
-        `chain_recon_depths`, not from sequential indexing. This stops a
-        single long-chain example from dominating the gradient AND aligns
-        recon weighting with the action/value chain losses (deeper
-        modelling rollouts compound prediction error, so their recon
-        target is also intrinsically noisier).
+      - chain KL and chain value are first weighted by `gamma^i` within an
+        example, normalized by the sum of weights for that example, then
+        averaged across examples (point 5 + point 3). This stops a single
+        long-chain example from dominating the gradient.
+      - The modelling-head LM loss (PLAN_MODELLING_HEAD_REDESIGN.md §4/§6)
+        replaces the old reconstruction MSE: one `lm_loss` call (MSE +
+        `infonce_weight` · InfoNCE at temperature `infonce_temperature`)
+        over the pooled root + chain pairs in `forward_out["lm_pred"] /
+        ["lm_target"]`, gated by `recon_weight`. Zero pairs → zero loss.
       - Empty chains contribute nothing.
 
     Args:
@@ -390,7 +414,8 @@ def _compute_loss(forward_out, value_targets, action_targets,
         value_targets / action_targets: root targets (B,) / (B, n_actions).
 
     Returns: (total_loss, loss_dict) where loss_dict has float entries for
-        value / action / chain / chain_value / recon / total.
+        value / action / chain / chain_value / recon / recon_mse /
+        recon_infonce / total.
     """
     value_preds = forward_out["value_preds"]
     action_preds = forward_out["action_preds"]
@@ -473,26 +498,19 @@ def _compute_loss(forward_out, value_targets, action_targets,
     chain_value_loss = _per_example_weighted(chain_value_per_example,
                                               chain_depth_gamma)
 
-    # --- Reconstruction MSE (depth-weighted per example using ORIGINAL
-    # chain index, not the position within the recon-only sublist) ---
-    recon_per_example = []
-    for b_preds, b_targets, b_depths in zip(
-            forward_out["chain_recon_preds"],
-            forward_out["chain_recon_targets"],
-            forward_out["chain_recon_depths"]):
-        if not b_preds:
-            continue
-        step_losses = [F.mse_loss(p, t) for p, t in zip(b_preds, b_targets)]
-        weights = [chain_depth_gamma ** d for d in b_depths]
-        total_w = sum(weights) or 1.0
-        weighted_sum = torch.stack(
-            [w * s for w, s in zip(weights, step_losses)]
-        ).sum()
-        recon_per_example.append(weighted_sum / total_w)
-    if recon_per_example:
-        recon_loss = torch.stack(recon_per_example).mean()
+    # --- Modelling-head LM loss (PLAN §6): root pairs + chain pairs share
+    # ONE MSE+InfoNCE batch (bigger negative pool). No per-depth gamma —
+    # all pairs weigh equally. Missing key (legacy callers constructing
+    # forward_out by hand) or zero pairs → zero loss.
+    lm_pred = forward_out.get("lm_pred")
+    lm_target = forward_out.get("lm_target")
+    if lm_pred is not None and lm_pred.shape[0] > 0:
+        recon_loss, lm_comps = lm_loss(
+            lm_pred, lm_target, infonce_weight=infonce_weight,
+            infonce_temperature=infonce_temperature)
     else:
         recon_loss = torch.tensor(0.0, device=device)
+        lm_comps = {"mse": 0.0, "infonce": 0.0}
 
     # --- Terminal value MSE: direct supervision at tree-terminal states.
     # `equity_Q` (from `evaluate_all_terminals`) is the target; current
@@ -527,6 +545,8 @@ def _compute_loss(forward_out, value_targets, action_targets,
         "chain": chain_loss.item(),
         "chain_value": chain_value_loss.item(),
         "recon": recon_loss.item(),
+        "recon_mse": lm_comps["mse"],
+        "recon_infonce": lm_comps["infonce"],
         "terminal_value": terminal_value_loss.item(),
         "action_entropy": action_entropy.item(),
         "total": total.item(),
@@ -534,11 +554,13 @@ def _compute_loss(forward_out, value_targets, action_targets,
 
 
 _LOSS_KEYS = ("total", "value", "action", "chain", "chain_value", "recon",
-              "terminal_value", "action_entropy")
+              "recon_mse", "recon_infonce", "terminal_value",
+              "action_entropy")
 
 
 def _run_validation(agent, val_loader, device, weights, amp_config=None,
-                    opponent_emb_table=None, stop_grad_old_embs=True):
+                    opponent_emb_table=None, stop_grad_old_embs=True,
+                    gru_window=1):
     """Run validation. Returns dict with total + component losses.
 
     Validation always uses p_tf=0 (fully rolled chain) so the metric stays
@@ -564,7 +586,8 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
                     p_tf=0.0,
                     stop_grad_old_embs=stop_grad_old_embs,
                     examples_per_batch_terminals=term_tgts,
-                    precomputed=precomputed)
+                    precomputed=precomputed,
+                    gru_window=gru_window)
                 _, ldict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
             n = precomputed["B"] if precomputed is not None else 0
@@ -582,7 +605,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                global_step_offset=0, save_checkpoint=True,
                run_timestamp=None,
                optimizer=None, scheduler=None, scaler=None,
-               save_every_cycles=1):
+               save_every_cycles=1, opponent_emb_table=None):
     """Train all agent heads on MCTS-derived training data.
 
     Supports cross-cycle continuity for cyclic self-play training:
@@ -628,13 +651,18 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     stop_grad_old_embs = bool(train_cfg.get("stop_grad_old_embs", True))
     entropy_weight = float(train_cfg.get("entropy_weight", 0.0))
     terminal_value_weight = float(train_cfg.get("terminal_value_weight", 0.0))
+    infonce_weight = float(train_cfg.get("infonce_weight", 0.5))
+    infonce_temperature = float(train_cfg.get("infonce_temperature", 0.1))
+    gru_window = max(1, int(train_cfg.get("gru_window", 1)))
     gradient_checkpointing = bool(train_cfg.get("gradient_checkpointing", False))
     weights = {"value_weight": value_weight, "action_weight": action_weight,
                "chain_weight": chain_weight, "recon_weight": recon_weight,
                "value_chain_weight": value_chain_weight,
                "chain_depth_gamma": chain_depth_gamma,
                "entropy_weight": entropy_weight,
-               "terminal_value_weight": terminal_value_weight}
+               "terminal_value_weight": terminal_value_weight,
+               "infonce_weight": infonce_weight,
+               "infonce_temperature": infonce_temperature}
 
     # Teacher-forcing probability decays linearly from p_start → p_end over
     # `decay_cycles` cycles. Disabled (p_tf=0) when section is missing.
@@ -649,6 +677,7 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         p_tf = tf_p_start + (tf_p_end - tf_p_start) * frac
 
     log(f"=== MCTS Training (cycle {cycle_id}, save={save_checkpoint}) ===")
+    log(f"  gru_window={gru_window}")
 
     # Preserve norm_stats from checkpoint for saving. Use `is None` rather
     # than `or {}` so an empty-but-present dict still shares its identity
@@ -682,9 +711,14 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         scaler = torch.amp.GradScaler(enabled=use_scaler)
     amp_cfg = (amp_enabled, device_type, amp_dtype)
 
-    # Opponent embedding table
-    opp_table = None
-    if agent.perception.opp_emb_enabled:
+    # Opponent embedding table. When the caller passes one (pipeline's cyclic
+    # loop), it is reused across cycles so long-run context about players
+    # accumulates instead of resetting every cycle.
+    opp_table = opponent_emb_table
+    if opp_table is not None:
+        log(f"Opponent GRU embedding enabled "
+            f"(persistent table, {len(opp_table.embeddings)} entries)")
+    elif agent.perception.opp_emb_enabled:
         from agent.perception.opponent_embeddings import OpponentEmbeddingTable
         opp_table = OpponentEmbeddingTable(agent.perception.d_model)
         log("Opponent GRU embedding enabled")
@@ -728,7 +762,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     log(f"Train: {n_train}, Val: {n_val}, Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
     log(f"Weights: value={value_weight}, action={action_weight}, "
         f"chain={chain_weight}, recon={recon_weight}, "
-        f"chain_value={value_chain_weight}, depth_gamma={chain_depth_gamma}")
+        f"chain_value={value_chain_weight}, depth_gamma={chain_depth_gamma}, "
+        f"infonce_w={infonce_weight}, infonce_tau={infonce_temperature}")
     log(f"Chain extras: p_tf={p_tf:.3f} "
         f"(start={tf_p_start}, end={tf_p_end}, decay={tf_decay_cycles}), "
         f"stop_grad_old_embs={stop_grad_old_embs}")
@@ -794,7 +829,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                     p_tf=p_tf,
                     stop_grad_old_embs=stop_grad_old_embs,
                     examples_per_batch_terminals=term_tgts,
-                    precomputed=precomputed)
+                    precomputed=precomputed,
+                    gru_window=gru_window)
                 loss, loss_dict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
 
@@ -821,6 +857,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 "chain": loss_dict["chain"],
                 "chain_value": loss_dict["chain_value"],
                 "recon": loss_dict["recon"],
+                "recon_mse": loss_dict["recon_mse"],
+                "recon_infonce": loss_dict["recon_infonce"],
                 "terminal_value": loss_dict["terminal_value"],
                 "action_entropy": loss_dict["action_entropy"],
                 "p_tf": p_tf,
@@ -840,6 +878,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                     f"a={loss_dict['action']:.4f} c={loss_dict['chain']:.4f} "
                     f"cv={loss_dict['chain_value']:.4f} "
                     f"r={loss_dict['recon']:.4f} "
+                    f"(mse={loss_dict['recon_mse']:.4f} "
+                    f"nce={loss_dict['recon_infonce']:.4f}) "
                     f"tv={loss_dict['terminal_value']:.4f} "
                     f"H={loss_dict['action_entropy']:.4f}) "
                     f"lr={current_lr:.2e}")
@@ -848,7 +888,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                 val_dict = _run_validation(
                     agent, val_loader, device, weights, amp_cfg,
                     opponent_emb_table=opp_table,
-                    stop_grad_old_embs=stop_grad_old_embs)
+                    stop_grad_old_embs=stop_grad_old_embs,
+                    gru_window=gru_window)
                 vl = val_dict["total"]
                 history["val_loss"].append({
                     "step": global_step,
@@ -883,7 +924,8 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         val_dict = _run_validation(
             agent, val_loader, device, weights, amp_cfg,
             opponent_emb_table=opp_table,
-            stop_grad_old_embs=stop_grad_old_embs)
+            stop_grad_old_embs=stop_grad_old_embs,
+            gru_window=gru_window)
         val_avg = val_dict["total"]
         history["epoch_train_loss"].append({
             "step": global_step, "cycle_id": cycle_id,

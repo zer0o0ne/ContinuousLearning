@@ -906,6 +906,12 @@ def main():
 
             # Build the persistent agent registry once
             trained_agents = []  # list of dicts kept across cycles
+            # Opponent-embedding tables persist ACROSS cycles (collection dict
+            # keyed by agent name; per-agent training table lives in
+            # agent_info["opp_emb_table"]) so long-run context about players
+            # the agent has met many times accumulates instead of resetting
+            # every cycle.
+            mcts_collection_opp_tables = {}
             if multi_agent:
                 for agent_cfg in multi_agent["agents"]:
                     agent_name = agent_cfg["name"]
@@ -1118,7 +1124,8 @@ def main():
                     per_agent_examples = run_mcts_collection(
                         agents_for_play, config, device, log, n_hands_per_cycle,
                         cycle_idx=cycle, n_cycles=n_cycles,
-                        past_snapshot_specs=past_snapshot_specs)
+                        past_snapshot_specs=past_snapshot_specs,
+                        opp_tables=mcts_collection_opp_tables)
 
                     # Persist examples atomically BEFORE training so a crash
                     # during train_mcts can resume the SAME data on next start.
@@ -1152,6 +1159,14 @@ def main():
                         f"(cycle {cycle + 1}/{n_cycles}, {len(examples)} examples, "
                         f"save={is_save_cycle}) ---")
 
+                    if (agent_info.get("opp_emb_table") is None
+                            and agent_info["agent"].perception.opp_emb_enabled):
+                        from agent.perception.opponent_embeddings import (
+                            OpponentEmbeddingTable,
+                        )
+                        agent_info["opp_emb_table"] = OpponentEmbeddingTable(
+                            agent_info["agent"].perception.d_model)
+
                     _, _, new_step = train_mcts(
                         agent_info["agent"], mcts_train_cfg, device,
                         agent_info["agent_log"], examples,
@@ -1167,6 +1182,7 @@ def main():
                         scheduler=agent_info["scheduler"],
                         scaler=agent_info.get("scaler"),
                         save_every_cycles=save_every_cycles,
+                        opponent_emb_table=agent_info.get("opp_emb_table"),
                     )
                     agent_info["cumulative_step"] = new_step
 

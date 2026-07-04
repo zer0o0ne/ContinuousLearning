@@ -1186,6 +1186,21 @@ def _convert_monolithic_to_shards(save_dir, dataset_path, log, shard_size=10000)
         log(f"  Converted to {shard_idx} shards, removed dataset.pt")
 
 
+def dataset_exists(dataset_dir):
+    """Lightweight on-disk presence check — mirrors ``load_dataset``'s
+    found/not-found logic without loading any shard into memory."""
+    shard_dir = os.path.join(dataset_dir, "dataset_shards")
+    if os.path.isdir(shard_dir):
+        import glob as _glob
+        if _glob.glob(os.path.join(shard_dir, "shard_*.pt")):
+            return True
+    meta = _read_meta(dataset_dir)
+    if meta is not None and meta.get("storage") == "sharded":
+        # Meta says sharded but no shards found — nothing on disk.
+        return False
+    return os.path.exists(os.path.join(dataset_dir, "dataset.pt"))
+
+
 def load_dataset(dataset_dir, log=None, strict_done=False):
     """Load a raw dataset from a directory.
 
@@ -1430,17 +1445,17 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                         f"(zero-memory resume — prior data NOT loaded)")
 
     # If we reach here without a partial-resume and the dataset is already
-    # present (legacy non-resume usage), short-circuit.
-    if not resume and start_attempts == 0:
-        existing = load_dataset(save_dir, log=log)
-        if existing is not None:
-            return save_dir
+    # present (legacy non-resume usage), short-circuit. Existence check only —
+    # the data stays on disk.
+    if not resume and start_attempts == 0 and dataset_exists(save_dir):
+        if log:
+            log(f"Dataset already present at {save_dir} (not loaded)")
+        return save_dir
 
-    # Shard-based incremental saving. Mid-generation saves write only new
-    # scenarios to numbered shard files. No final compaction — data stays
-    # sharded on disk.
+    # Shard-based incremental saving. `scenarios` is a bounded buffer: each
+    # _persist() writes it as a new shard and clears it, so peak RAM is one
+    # shard (~save_every_hands worth), never the whole dataset.
     shard_dir = os.path.join(save_dir, "dataset_shards")
-    _persisted_count = len(scenarios)  # 0 for zero-memory resume
     # Continue shard numbering from existing shards
     if os.path.isdir(shard_dir):
         import glob as _gl
@@ -1453,18 +1468,24 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
         _shard_counts = list((_resume_meta or {}).get("shard_counts", []))
     else:
         _shard_counts = []
+    _new_samples = 0  # samples generated (and persisted) this run
+    _len_min, _len_max, _len_sum = None, None, 0  # n_events stats, streamed
 
     def _persist(meta_done):
-        nonlocal _persisted_count, _shard_idx
-        new_count = len(scenarios)
-        if new_count > _persisted_count:
+        nonlocal _shard_idx, _new_samples, _len_min, _len_max, _len_sum
+        if scenarios:
             os.makedirs(shard_dir, exist_ok=True)
-            delta = scenarios[_persisted_count:]
+            for s in scenarios:
+                n = s["n_events"]
+                _len_sum += n
+                _len_min = n if _len_min is None else min(_len_min, n)
+                _len_max = n if _len_max is None else max(_len_max, n)
             shard_path = os.path.join(shard_dir, f"shard_{_shard_idx:06d}.pt")
-            atomic_torch_save(delta, shard_path)
-            _shard_counts.append(len(delta))
+            atomic_torch_save(scenarios, shard_path)
+            _shard_counts.append(len(scenarios))
             _shard_idx += 1
-            _persisted_count = new_count
+            _new_samples += len(scenarios)
+            scenarios.clear()
         if config_hash is not None or resume:
             _write_meta(save_dir, {
                 "version":            1,
@@ -1543,7 +1564,7 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                         _persist(meta_done=False)
                         last_save_count = counter.value
                         if log:
-                            log(f"  Incremental save: {len(scenarios)} samples ({counter.value} hands)")
+                            log(f"  Incremental save: {_new_samples} samples ({counter.value} hands)")
 
             _pbar_stop.set()
             pbar_thread.join(timeout=1.0)
@@ -1553,7 +1574,7 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
         pbar.close()
 
         if log:
-            log(f"Generated {len(scenarios)} samples total "
+            log(f"Generated {_new_samples + len(scenarios)} samples total "
                 f"({total_ok} successful hands, {total_failed} failed)")
 
     else:
@@ -1591,18 +1612,17 @@ def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None)
                 _persist(meta_done=False)
                 last_save_at = completed_attempts
                 if log:
-                    log(f"  Incremental save: {len(scenarios)} samples "
+                    log(f"  Incremental save: {_new_samples} samples "
                         f"({completed_attempts} hands)")
 
         if log:
-            log(f"Generated {len(scenarios)} samples from "
+            log(f"Generated {_new_samples + len(scenarios)} samples from "
                 f"{completed_attempts - failed} hands ({failed} failed)")
 
-    if log and scenarios:
-        lengths = [s["n_events"] for s in scenarios]
-        log(f"Sequence lengths: min={min(lengths)}, max={max(lengths)}, avg={sum(lengths)/len(lengths):.1f}")
-
     _persist(meta_done=True)
+    if log and _new_samples:
+        log(f"Sequence lengths: min={_len_min}, max={_len_max}, "
+            f"avg={_len_sum / _new_samples:.1f}")
     if log:
         log(f"Dataset saved to {save_dir} ({_shard_idx} shards)")
 
@@ -1628,11 +1648,19 @@ if __name__ == "__main__":
     train_cfg.update(config.get("gto_ev_train", {}))
 
     dataset_dir = generate_dataset(train_cfg, args.save_dir, log=print)
-    scenarios = load_dataset(dataset_dir, log=print)
-    if scenarios:
-        print(f"Total scenarios: {len(scenarios)}")
-        evs = [s["ev_target"] for s in scenarios]
-        print(f"EV range: [{min(evs):.2f}, {max(evs):.2f}]")
-        print(f"Action probs sample: {scenarios[0]['action_probs']}")
+    # Stream stats shard-by-shard — the full dataset is never held in RAM.
+    from agent.train_scenarios.sharded import ShardedScenarios
+    shards = ShardedScenarios(dataset_dir)
+    if len(shards):
+        ev_min, ev_max = float("inf"), float("-inf")
+        for path, _ in shards.shard_info:
+            chunk = torch.load(path, weights_only=False)
+            for s in chunk:
+                ev_min = min(ev_min, s["ev_target"])
+                ev_max = max(ev_max, s["ev_target"])
+            del chunk
+        print(f"Total scenarios: {len(shards)}")
+        print(f"EV range: [{ev_min:.2f}, {ev_max:.2f}]")
+        print(f"Action probs sample: {shards[0]['action_probs']}")
     else:
         print("No scenarios generated.")

@@ -383,7 +383,7 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         from agent.train_scenarios.sharded import (
             ShardedScenarios, ShardedGTODataset, ShardBatchSampler,
             scan_shard_metadata, compute_norm_stats_from_shards,
-            shard_aware_split,
+            shard_aware_split, DiskShardedCache, CachedSubsetDataset,
         )
         shards = ShardedScenarios(scenarios_dir)
         log(f"Using sharded scenarios from {scenarios_dir} ({len(shards)} samples, {shards.n_shards} shards)")
@@ -407,18 +407,15 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
 
         train_indices, val_indices = shard_aware_split(hand_ids, val_split)
 
-        # E.5.1: pre-compute frozen perception outputs using a full dataset
-        # (sequential access — shard LRU cache handles ordering). LM pairs and
-        # targets are extracted in the same pass so training never touches the
-        # shards again (the length-grouped sampler's access order thrashes the
-        # LRU-1 shard cache — one torch.load per item, ~seconds each).
+        # E.5.1: pre-compute frozen perception outputs in one sequential pass
+        # (shard LRU cache handles ordering), spilled straight to disk shards —
+        # neither the raw dataset nor the perception cache is ever fully in
+        # RAM. LM pairs and targets are extracted in the same pass so training
+        # never touches the base shards again.
         full_dataset = ShardedGTODataset(shards, norm_stats, phase="modelling",
                                          modifiers=modifiers, mod_params=mod_params)
-        log("Pre-computing frozen perception outputs...")
-        _p_outs = []
-        _p_masks = []
-        _lm_pairs = []
-        _targets = []
+        _p_cache = DiskShardedCache(os.path.join(run_dir, "perception_cache"))
+        log("Pre-computing frozen perception outputs (disk cache)...")
         n_batches = (len(full_dataset) + batch_size - 1) // batch_size
         with torch.no_grad():
             for start in tqdm(range(0, len(full_dataset), batch_size),
@@ -430,27 +427,31 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                     batch_events, device=device, skip_memory=True)
                 for k in range(p_out.shape[0]):
                     L = int(m[k].sum().item())
-                    _p_outs.append(p_out[k, :L].detach().cpu())
-                    _p_masks.append(m[k, :L].detach().cpu())
-                for events_k, target_k in items:
+                    events_k, target_k = items[k]
                     _, src, act, tgt = build_lm_pairs([events_k])
-                    _lm_pairs.append((src, act, tgt))
-                    _targets.append(target_k)
+                    _p_cache.append((p_out[k, :L].detach().cpu(),
+                                     m[k, :L].detach().cpu(),
+                                     (src, act, tgt),
+                                     target_k))
+        _p_cache.finalize()
         shards.clear_cache()
-        log(f"Cached {len(_p_outs)} perception outputs")
+        log(f"Cached {len(_p_cache)} perception outputs → {_p_cache.cache_dir}")
 
-        cached_train = _CachedDataset(train_indices, _p_outs, _p_masks,
-                                      _lm_pairs, _targets)
-        cached_val = _CachedDataset(val_indices, _p_outs, _p_masks,
-                                    _lm_pairs, _targets)
+        cached_train = CachedSubsetDataset(_p_cache, train_indices)
+        cached_val = CachedSubsetDataset(_p_cache, val_indices)
 
         train_dataset = cached_train
         val_dataset = cached_val
 
-        train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
+        train_sampler = ShardBatchSampler(
+            _p_cache.shard_sizes, _p_cache.shard_offsets, batch_size,
+            indices=train_indices, n_events=n_events)
         train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
                                   collate_fn=_cached_collate, num_workers=0)
-        val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
+        val_sampler = ShardBatchSampler(
+            _p_cache.shard_sizes, _p_cache.shard_offsets, batch_size,
+            indices=val_indices)
+        val_loader = DataLoader(cached_val, batch_sampler=val_sampler,
                                 collate_fn=_cached_collate, num_workers=0)
     else:
         # Original in-memory path
@@ -697,5 +698,8 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
 
     log(f"=== Modelling Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
     hist.compact()
+
+    if scenarios_dir is not None:
+        _p_cache.cleanup()
 
     return history, run_dir

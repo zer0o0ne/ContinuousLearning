@@ -395,11 +395,20 @@ def train_opponent_action(agent, train_cfg, device, log,
                                 collate_fn=_tc, num_workers=0)
     else:
         # Targets extracted in the same pass so training never touches the
-        # shards again (see _CachedDataset docstring).
+        # shards again (see _CachedDataset docstring). In the sharded path
+        # the cache is spilled to disk shards (DiskShardedCache) — neither
+        # the raw dataset nor the perception cache is ever fully in RAM.
         log("Pre-computing frozen perception outputs...")
-        _p_outs = []
-        _p_masks = []
-        _targets = []
+        if _sharded:
+            from agent.train_scenarios.sharded import (
+                DiskShardedCache, CachedSubsetDataset,
+            )
+            _p_cache = DiskShardedCache(
+                os.path.join(run_dir, "perception_cache"))
+        else:
+            _p_outs = []
+            _p_masks = []
+            _targets = []
         n_batches = (len(dataset) + batch_size - 1) // batch_size
         with torch.no_grad():
             for start in tqdm(range(0, len(dataset), batch_size),
@@ -411,25 +420,43 @@ def train_opponent_action(agent, train_cfg, device, log,
                     batch_events, device=device, skip_memory=True)
                 for k in range(p_out.shape[0]):
                     L = int(m[k].sum().item())
-                    _p_outs.append(p_out[k, :L].detach().cpu())
-                    _p_masks.append(m[k, :L].detach().cpu())
-                _targets.extend(it[1] for it in items)
-        if _sharded:
-            shards.clear_cache()
-        log(f"Cached {len(_p_outs)} perception outputs")
+                    p_k = p_out[k, :L].detach().cpu()
+                    m_k = m[k, :L].detach().cpu()
+                    if _sharded:
+                        _p_cache.append((p_k, m_k, items[k][1]))
+                    else:
+                        _p_outs.append(p_k)
+                        _p_masks.append(m_k)
+                        _targets.append(items[k][1])
 
         if _sharded:
-            cached_train = _CachedDataset(train_exp_idx, _p_outs, _p_masks, _targets)
-            cached_val = _CachedDataset(val_exp_idx, _p_outs, _p_masks, _targets)
+            _p_cache.finalize()
+            shards.clear_cache()
+            log(f"Cached {len(_p_cache)} perception outputs → {_p_cache.cache_dir}")
+
+            cached_train = CachedSubsetDataset(_p_cache, train_exp_idx)
+            cached_val = CachedSubsetDataset(_p_cache, val_exp_idx)
+            exp_n_events = [n_events[s_idx] for s_idx, _ in expanded_indices]
+            train_sampler = ShardBatchSampler(
+                _p_cache.shard_sizes, _p_cache.shard_offsets, batch_size,
+                indices=train_exp_idx, n_events=exp_n_events)
+            train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
+                                      collate_fn=_cached_collate, num_workers=0)
+            val_sampler = ShardBatchSampler(
+                _p_cache.shard_sizes, _p_cache.shard_offsets, batch_size,
+                indices=val_exp_idx)
+            val_loader = DataLoader(cached_val, batch_sampler=val_sampler,
+                                    collate_fn=_cached_collate, num_workers=0)
         else:
+            log(f"Cached {len(_p_outs)} perception outputs")
             cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, _targets)
             cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, _targets)
 
-        train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
-        train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
-                                  collate_fn=_cached_collate, num_workers=0)
-        val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
-                                collate_fn=_cached_collate, num_workers=0)
+            train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
+            train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
+                                      collate_fn=_cached_collate, num_workers=0)
+            val_loader = DataLoader(cached_val, batch_size=batch_size, shuffle=False,
+                                    collate_fn=_cached_collate, num_workers=0)
 
     log(f"Epochs: {epochs}, LR: {lr}, Batch: {batch_size}")
 
@@ -610,5 +637,8 @@ def train_opponent_action(agent, train_cfg, device, log,
 
     log(f"=== Opponent Action Training Complete. Best Val Loss: {best_val_loss:.6f} ===")
     hist.compact()
+
+    if _sharded and _use_perception_cache:
+        _p_cache.cleanup()
 
     return history, run_dir

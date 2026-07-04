@@ -29,7 +29,7 @@ from tqdm.auto import tqdm
 from env.table import Table
 from evaluation.evaluate import _normalize_events_inplace
 from agent.train_scenarios.generation.generate import (
-    _get_raise_sizes, load_dataset, _read_meta, _write_meta, _meta_path,
+    _get_raise_sizes, _read_meta, _write_meta, _meta_path,
 )
 from agent.agent import ASI
 from agent.mcts.game_state import GameState
@@ -1057,9 +1057,11 @@ def generate_opponent_dataset(config, save_dir, device, log,
                         f"{start_shard_idx} shard(s) on disk "
                         f"(zero-memory resume — prior data NOT loaded)")
     else:
-        existing = load_dataset(save_dir, log=log)
-        if existing is not None:
-            return existing
+        # Existence check only (no loading): opponent shards live in
+        # <save_dir>/shards/, legacy monolithic data in dataset.pt.
+        if _list_opp_shard_paths(save_dir) or os.path.exists(dataset_path):
+            log(f"Opponent dataset already present at {save_dir} (not loaded)")
+            return save_dir
 
     # Merge game params into generation config
     gen_cfg = {}
@@ -1129,14 +1131,20 @@ def generate_opponent_dataset(config, save_dir, device, log,
 
     n_workers = n_workers_cfg
     if n_workers > 1:
-        scenarios = _run_parallel_opponent(
+        # Each actor's batch is flushed to its own shard as it arrives —
+        # the full dataset is never held in RAM at once.
+        def _flush_partial(partial):
+            nonlocal shard_idx, total_scenarios_on_disk
+            _save_opp_shard(partial, save_dir, shard_idx)
+            shard_idx += 1
+            total_scenarios_on_disk += len(partial)
+
+        _run_parallel_opponent(
             agents_list, config, gen_cfg, device, log, n_hands, n_workers,
-            max_players, n_player_pool, swap_prob, player_pool)
-        log(f"Generated {len(scenarios)} scenarios (parallel, {n_workers} actors)")
-        _save_opp_shard(scenarios, save_dir, shard_idx)
-        shard_idx += 1
-        total_scenarios_on_disk = len(scenarios)
-        del scenarios
+            max_players, n_player_pool, swap_prob, player_pool,
+            on_partial=_flush_partial)
+        log(f"Generated {total_scenarios_on_disk} scenarios "
+            f"(parallel, {n_workers} actors)")
     else:
         buffer = []
         failed = max(0, start_attempts)  # conservative
@@ -1291,9 +1299,14 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
 
 def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
                            n_workers, max_players, n_player_pool, swap_prob,
-                           player_pool):
+                           player_pool, on_partial=None):
     """Spawn the inference server + `n_workers` CPU actors, gather and merge
     their scenarios. Hand ids are contiguous across actors (offset per actor).
+
+    When `on_partial` is provided, each actor's result batch is handed to it
+    as soon as it arrives (e.g. to flush straight to a shard on disk) instead
+    of accumulating everything in RAM; the return value is then an empty list.
+    Peak memory with `on_partial` is one actor's batch (~n_hands/n_workers).
     """
     import torch.multiprocessing as tmp
     from agent.mcts.inference_server import server_main
@@ -1440,7 +1453,10 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
                 _os.unlink(path)
             except OSError:
                 pass
-            scenarios.extend(partial)
+            if on_partial is not None:
+                on_partial(partial)
+            else:
+                scenarios.extend(partial)
             received_from[wid_done] = True
         else:
             _, wid_done, tb = msg

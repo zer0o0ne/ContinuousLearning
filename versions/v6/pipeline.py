@@ -284,7 +284,7 @@ def _load_or_generate_dataset(config, base_dir, device, log,
     - The pipeline-state file mirrors the per-dataset status so other
       operations (force_restart, hash mismatch) see one source of truth.
     """
-    from agent.train_scenarios.generation.generate import generate_dataset, load_dataset
+    from agent.train_scenarios.generation.generate import generate_dataset, dataset_exists
 
     dataset_cfg = config.get("dataset", {})
     dataset_dir = dataset_cfg.get("dataset_dir", "")
@@ -309,8 +309,8 @@ def _load_or_generate_dataset(config, base_dir, device, log,
         dataset_save_dir = os.path.join(base_dir, "dataset", log.init_time)
 
     if not resume and dataset_dir:
-        existing = load_dataset(dataset_dir, log=log)
-        if existing is not None:
+        if dataset_exists(dataset_dir):
+            log(f"Using existing dataset at {dataset_dir} (not loaded into RAM)")
             return dataset_dir
         log(f"Dataset not found at {dataset_dir}, generating...")
 

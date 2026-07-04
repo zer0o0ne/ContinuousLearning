@@ -535,3 +535,310 @@ class TestShardedForwardPass:
 
             assert values.shape == (4, 1)
             assert torch.isfinite(values).all()
+
+
+# ─── Memory-bounded generation: incremental shards, no full-RAM dataset ────
+
+class TestGenerationMemoryBoundedShards:
+    """Scenario: real tiny generation run — incremental shards land on disk
+    as generation progresses (the in-RAM buffer is flushed per shard), the
+    final dataset loads back complete, and an already-present dataset
+    short-circuits without touching the shard files."""
+
+    @staticmethod
+    def _gen_cfg(n_scenarios):
+        return {
+            "raise_sizes": {
+                "preflop": [0.5, 1.0],
+                "flop": [0.5, 1.0],
+                "turn": [0.5, 1.0],
+                "river": [0.5, 1.0],
+            },
+            "max_players": MAX_PLAYERS,
+            "big_blind": 10,
+            "max_stack": 200,
+            "solver": "v1",
+            "mc_iterations": 20,
+            "n_scenarios": n_scenarios,
+            "n_workers": 1,
+            "save_every_hands": 1,
+            "device": "cpu",
+        }
+
+    def test_generation_writes_incremental_shards(self):
+        from agent.train_scenarios.generation.generate import (
+            generate_dataset, load_dataset,
+        )
+        random.seed(1)
+        np.random.seed(1)
+        torch.manual_seed(1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = generate_dataset(self._gen_cfg(3), tmpdir, log=None)
+            assert out == tmpdir
+
+            shard_dir = os.path.join(tmpdir, "dataset_shards")
+            shard_files = sorted(os.listdir(shard_dir))
+            # save_every_hands=1 → one shard per successful hand
+            assert len(shard_files) >= 2
+            # no monolithic dataset.pt
+            assert not os.path.exists(os.path.join(tmpdir, "dataset.pt"))
+
+            scen = load_dataset(tmpdir)
+            assert scen is not None and len(scen) > 0
+            assert all("events" in s and "ev_target" in s for s in scen)
+            # shards together contain exactly the loaded dataset
+            counts = [
+                len(torch.load(os.path.join(shard_dir, f), weights_only=False))
+                for f in shard_files
+            ]
+            assert sum(counts) == len(scen)
+
+    def test_existing_dataset_short_circuits_without_touching_shards(self):
+        from agent.train_scenarios.generation.generate import generate_dataset
+
+        scenarios = [_make_scenario(i) for i in range(12)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_shards(tmpdir, scenarios, shard_size=6)
+            shard_dir = os.path.join(tmpdir, "dataset_shards")
+            before = {
+                f: os.path.getmtime(os.path.join(shard_dir, f))
+                for f in os.listdir(shard_dir)
+            }
+
+            # n_scenarios=100 would take long if it actually regenerated —
+            # the presence check must return immediately without loading.
+            out = generate_dataset(self._gen_cfg(100), tmpdir, log=None)
+            assert out == tmpdir
+
+            after = {
+                f: os.path.getmtime(os.path.join(shard_dir, f))
+                for f in os.listdir(shard_dir)
+            }
+            assert after == before
+
+
+# ─── Disk-backed perception cache ───────────────────────────────────────────
+
+class TestDiskShardedCache:
+    """Scenario: precompute per-sample tensors into a disk-backed cache, run
+    one training epoch through ShardBatchSampler + DataLoader, verify every
+    subset item is served exactly once with intact content, batches never
+    cross cache shards, and cleanup removes the files."""
+
+    @staticmethod
+    def _build_cache(tmpdir, n_items=25, items_per_shard=10):
+        from agent.train_scenarios.sharded import DiskShardedCache
+
+        items = []
+        for i in range(n_items):
+            L = 2 + (i % 4)
+            items.append((torch.full((L, 8), float(i)),
+                          torch.ones(L),
+                          torch.tensor(float(i))))
+        cache = DiskShardedCache(os.path.join(tmpdir, "pcache"),
+                                 items_per_shard=items_per_shard)
+        for it in items:
+            cache.append(it)
+        cache.finalize()
+        return cache, items
+
+    def test_epoch_serves_each_subset_item_once_and_intact(self):
+        from agent.train_scenarios.sharded import (
+            CachedSubsetDataset, ShardBatchSampler,
+        )
+        from torch.utils.data import DataLoader
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache, items = self._build_cache(tmpdir)
+            assert len(cache) == 25
+            assert cache.shard_sizes == [10, 10, 5]
+            assert sorted(os.listdir(cache.cache_dir)) == [
+                "cache_000000.pt", "cache_000001.pt", "cache_000002.pt",
+            ]
+
+            subset = [i for i in range(25) if i % 5 != 0]
+            ds = CachedSubsetDataset(cache, subset)
+            n_events = [it[0].shape[0] for it in items]
+            sampler = ShardBatchSampler(
+                cache.shard_sizes, cache.shard_offsets, batch_size=4,
+                indices=subset, n_events=n_events)
+
+            random.seed(42)
+            loader = DataLoader(ds, batch_sampler=sampler,
+                                collate_fn=lambda b: b, num_workers=0)
+            seen = []
+            for batch in loader:
+                shard_ids = set()
+                for p, m, t in batch:
+                    gi = int(t.item())
+                    seen.append(gi)
+                    assert torch.equal(p, items[gi][0])
+                    assert torch.equal(m, items[gi][1])
+                    shard_ids.add(gi // 10)
+                # a batch must never span two cache shards (LRU-1 safety)
+                assert len(shard_ids) == 1
+            assert sorted(seen) == subset
+
+    def test_cleanup_removes_cache_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache, _ = self._build_cache(tmpdir)
+            cache_dir = cache.cache_dir
+            assert os.listdir(cache_dir)
+            cache.cleanup()
+            assert not os.path.exists(cache_dir)
+
+
+class _LogCapture:
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, msg):
+        self.lines.append(str(msg))
+
+    def contains(self, needle):
+        return any(needle in l for l in self.lines)
+
+
+class TestGtoProbsTrainsOnDiskCache:
+    """Scenario: full train_gto_probs run over a sharded dataset directory.
+    The perception cache is spilled to disk shards during training and the
+    cache directory is removed after training completes."""
+
+    def test_train_gto_probs_sharded(self):
+        from agent.agent import ASI
+        from agent.train_scenarios.gto_probs_predict.train import train_gto_probs
+
+        random.seed(0)
+        np.random.seed(0)
+        torch.manual_seed(0)
+        scenarios = [_make_scenario(i) for i in range(30)]
+        agent = ASI(lambda m: None, config=_TINY_CONFIG)
+        train_cfg = {"lr": 1e-3, "batch_size": 8, "epochs": 1,
+                     "val_split": 0.2, "log_every": 1000}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "data")
+            os.makedirs(data_dir)
+            _write_shards(data_dir, scenarios, shard_size=10)
+            run_dir = os.path.join(tmpdir, "run")
+
+            logger = _LogCapture()
+            history, out_dir = train_gto_probs(
+                agent, train_cfg, "cpu", logger,
+                scenarios_dir=data_dir, run_dir=run_dir)
+
+            assert logger.contains("perception_cache"), \
+                "training must go through the disk-backed perception cache"
+            assert history is not None
+            assert len(history["epoch_train_loss"]) == 1
+            assert os.path.exists(os.path.join(run_dir, "best.pt"))
+            # disk cache cleaned up after training
+            assert not os.path.exists(os.path.join(run_dir, "perception_cache"))
+
+
+class TestModellingTrainsOnDiskCache:
+    """Scenario: full train_modelling run over a sharded dataset directory —
+    the 4-tuple perception cache (p_out, mask, lm_pair, target) goes through
+    disk shards and is removed after training completes."""
+
+    def test_train_modelling_sharded(self):
+        from agent.agent import ASI
+        from agent.train_scenarios.modelling_predict.train import train_modelling
+
+        random.seed(0)
+        np.random.seed(0)
+        torch.manual_seed(0)
+        scenarios = [_make_scenario(i) for i in range(30)]
+        agent = ASI(lambda m: None, config=_TINY_CONFIG)
+        train_cfg = {"lr": 1e-3, "batch_size": 8, "epochs": 1,
+                     "val_split": 0.2, "log_every": 1000,
+                     "recon_weight": 0.5, "infonce_weight": 0.5,
+                     "infonce_temperature": 0.1}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "data")
+            os.makedirs(data_dir)
+            _write_shards(data_dir, scenarios, shard_size=10)
+            run_dir = os.path.join(tmpdir, "run")
+
+            logger = _LogCapture()
+            history, out_dir = train_modelling(
+                agent, train_cfg, "cpu", logger,
+                scenarios_dir=data_dir, run_dir=run_dir)
+
+            assert logger.contains("perception_cache"), \
+                "training must go through the disk-backed perception cache"
+            assert history is not None
+            assert len(history["epoch_train_loss"]) == 1
+            assert os.path.exists(os.path.join(run_dir, "best.pt"))
+            assert not os.path.exists(os.path.join(run_dir, "perception_cache"))
+
+
+class TestOpponentActionTrainsOnDiskCache:
+    """Scenario: full train_opponent_action run over a sharded opponent
+    dataset (shards/ subdir, expanded per-observer samples) — the perception
+    cache goes through disk shards and is removed after training completes."""
+
+    @staticmethod
+    def _make_opp_scenario(hand_id, rng):
+        n_events = 2 + hand_id % 3
+        events = []
+        for t in range(n_events):
+            action = [0.0] * N_ACTIONS
+            if t > 0:
+                action[rng.randint(0, N_ACTIONS - 1)] = 1.0
+            events.append({
+                "hands": {0: [8, 9], 1: [0, 4]},
+                "num_players": 2,
+                "acting_pos": t % 2,
+                "hero_pos": 0,
+                "big_blind": 10.0,
+                "small_blind": 5.0,
+                "stacks": [200.0, 200.0] + [0.0] * (MAX_PLAYERS - 2),
+                "table": [-1, -1, -1, -1, -1],
+                "pot": 30.0 + 10 * t,
+                "stack": 200.0 - 10 * t,
+                "bets": [5.0, 10.0] + [0.0] * (MAX_PLAYERS - 2),
+                "action": action,
+            })
+        probs_raw = [max(0.01, rng.random()) for _ in range(N_ACTIONS)]
+        total = sum(probs_raw)
+        return {
+            "hand_id": hand_id,
+            "events": events,
+            "hero_positions": [0, 1],
+            "opponent_action_probs": [p / total for p in probs_raw],
+        }
+
+    def test_train_opponent_action_sharded(self):
+        from agent.agent import ASI
+        from agent.train_scenarios.opponent_action_predict.train import (
+            train_opponent_action,
+        )
+
+        random.seed(0)
+        np.random.seed(0)
+        torch.manual_seed(0)
+        rng = random.Random(7)
+        scenarios = [self._make_opp_scenario(i, rng) for i in range(20)]
+        agent = ASI(lambda m: None, config=_TINY_CONFIG)
+        train_cfg = {"lr": 1e-3, "batch_size": 8, "epochs": 1,
+                     "val_split": 0.2, "log_every": 1000}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "data")
+            os.makedirs(data_dir)
+            _write_shards(data_dir, scenarios, shard_size=8, subdir="shards")
+            run_dir = os.path.join(tmpdir, "run")
+
+            logger = _LogCapture()
+            history, out_dir = train_opponent_action(
+                agent, train_cfg, "cpu", logger,
+                scenarios_dir=data_dir, run_dir=run_dir)
+
+            assert logger.contains("perception_cache"), \
+                "training must go through the disk-backed perception cache"
+            assert history is not None
+            assert len(history["epoch_train_loss"]) == 1
+            assert os.path.exists(os.path.join(run_dir, "best.pt"))
+            assert not os.path.exists(os.path.join(run_dir, "perception_cache"))

@@ -559,6 +559,113 @@ class ShardBatchSampler(Sampler):
 
 
 # ---------------------------------------------------------------------------
+# Disk-backed perception cache
+# ---------------------------------------------------------------------------
+
+class DiskShardedCache(Dataset):
+    """Disk-backed per-sample cache of precomputed tensors.
+
+    Replaces the fully in-RAM perception cache (E.5.1): items are appended
+    in global-index order during the pre-compute pass and flushed to
+    numbered shard files on disk; reads go through an LRU-1 shard cache.
+    Use with ShardBatchSampler (via ``shard_sizes``/``shard_offsets``) so
+    batches never cross shard boundaries and the LRU-1 cache never thrashes.
+
+    Peak RAM: one cache shard (``items_per_shard`` items), never the dataset.
+    """
+
+    def __init__(self, cache_dir, items_per_shard=4096):
+        import glob
+        self.cache_dir = cache_dir
+        self.items_per_shard = int(items_per_shard)
+        os.makedirs(cache_dir, exist_ok=True)
+        # Drop stale files from a previous (interrupted) run
+        for f in glob.glob(os.path.join(cache_dir, "cache_*.pt")):
+            os.unlink(f)
+        self._buf = []
+        self._sizes = []
+        self._offsets = []
+        self._total = 0
+        self._cache_idx = None
+        self._cache_data = None
+
+    def _shard_path(self, i):
+        return os.path.join(self.cache_dir, f"cache_{i:06d}.pt")
+
+    def append(self, item):
+        self._buf.append(item)
+        if len(self._buf) >= self.items_per_shard:
+            self._flush()
+
+    def _flush(self):
+        if not self._buf:
+            return
+        torch.save(self._buf, self._shard_path(len(self._sizes)))
+        self._offsets.append(self._total)
+        self._sizes.append(len(self._buf))
+        self._total += len(self._buf)
+        self._buf = []
+
+    def finalize(self):
+        """Flush the tail buffer. Call once after the last append()."""
+        self._flush()
+
+    @property
+    def shard_sizes(self):
+        return list(self._sizes)
+
+    @property
+    def shard_offsets(self):
+        return list(self._offsets)
+
+    def __len__(self):
+        return self._total
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self._total:
+            raise IndexError(idx)
+        si = bisect.bisect_right(self._offsets, idx) - 1
+        if self._cache_idx != si:
+            self._cache_data = torch.load(self._shard_path(si),
+                                          weights_only=False)
+            self._cache_idx = si
+        return self._cache_data[idx - self._offsets[si]]
+
+    def cleanup(self):
+        """Remove cache files from disk (call after training completes)."""
+        self._cache_data = None
+        self._cache_idx = None
+        for i in range(len(self._sizes)):
+            try:
+                os.unlink(self._shard_path(i))
+            except OSError:
+                pass
+        try:
+            os.rmdir(self.cache_dir)
+        except OSError:
+            pass
+
+
+class CachedSubsetDataset(Dataset):
+    """Subset view over a DiskShardedCache addressed by global indices.
+
+    Pass the SAME ``indices`` list to ShardBatchSampler — the sampler yields
+    batch-local positions into that list, which is exactly how this dataset
+    resolves them.
+    """
+
+    def __init__(self, cache, indices):
+        self.cache = cache
+        self.indices = list(indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.cache[self.indices[idx]]
+
+
+# ---------------------------------------------------------------------------
 # Shard-aware split
 # ---------------------------------------------------------------------------
 

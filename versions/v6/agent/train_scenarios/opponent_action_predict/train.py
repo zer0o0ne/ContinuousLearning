@@ -32,16 +32,21 @@ from agent.train_scenarios._history import IncrementalHistory
 
 
 class _CachedDataset(torch.utils.data.Dataset):
-    def __init__(self, indices, p_outs, p_masks, base_dataset):
+    """Fully in-RAM dataset: perception outputs and targets are pre-extracted,
+    so training never touches the sharded base dataset (whose LRU-1 shard
+    cache thrashes under the length-grouped sampler's shard-random access
+    order — one torch.load per item).
+    """
+    def __init__(self, indices, p_outs, p_masks, targets):
         self.indices = list(indices)
         self.p_outs = p_outs
         self.p_masks = p_masks
-        self.base = base_dataset
+        self.targets = targets
     def __len__(self):
         return len(self.indices)
     def __getitem__(self, idx):
         oidx = self.indices[idx]
-        return self.p_outs[oidx], self.p_masks[oidx], self.base[oidx][1]
+        return self.p_outs[oidx], self.p_masks[oidx], self.targets[oidx]
 
 
 def _cached_collate(batch):
@@ -389,29 +394,36 @@ def train_opponent_action(agent, train_cfg, device, log,
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                                 collate_fn=_tc, num_workers=0)
     else:
+        # Targets extracted in the same pass so training never touches the
+        # shards again (see _CachedDataset docstring).
         log("Pre-computing frozen perception outputs...")
         _p_outs = []
         _p_masks = []
+        _targets = []
         n_batches = (len(dataset) + batch_size - 1) // batch_size
         with torch.no_grad():
             for start in tqdm(range(0, len(dataset), batch_size),
                               total=n_batches, desc="Caching perception", smoothing=0):
                 end = min(start + batch_size, len(dataset))
-                batch_events = [dataset[j][0] for j in range(start, end)]
+                items = [dataset[j] for j in range(start, end)]
+                batch_events = [it[0] for it in items]
                 p_out, _, m = agent.perception.forward_batch(
                     batch_events, device=device, skip_memory=True)
                 for k in range(p_out.shape[0]):
                     L = int(m[k].sum().item())
                     _p_outs.append(p_out[k, :L].detach().cpu())
                     _p_masks.append(m[k, :L].detach().cpu())
+                _targets.extend(it[1] for it in items)
+        if _sharded:
+            shards.clear_cache()
         log(f"Cached {len(_p_outs)} perception outputs")
 
         if _sharded:
-            cached_train = _CachedDataset(train_exp_idx, _p_outs, _p_masks, dataset)
-            cached_val = _CachedDataset(val_exp_idx, _p_outs, _p_masks, dataset)
+            cached_train = _CachedDataset(train_exp_idx, _p_outs, _p_masks, _targets)
+            cached_val = _CachedDataset(val_exp_idx, _p_outs, _p_masks, _targets)
         else:
-            cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
-            cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
+            cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, _targets)
+            cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, _targets)
 
         train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
         train_loader = DataLoader(cached_train, batch_sampler=train_sampler,

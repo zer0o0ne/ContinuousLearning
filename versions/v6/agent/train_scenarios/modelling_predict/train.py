@@ -33,21 +33,27 @@ from agent.train_scenarios._history import IncrementalHistory
 
 
 class _CachedDataset(torch.utils.data.Dataset):
-    def __init__(self, indices, p_outs, p_masks, base_dataset):
+    """Fully in-RAM dataset: perception outputs, per-sample LM pairs and
+    targets are all pre-extracted, so training never touches the sharded
+    base dataset (whose LRU-1 shard cache thrashes under the length-grouped
+    sampler's shard-random access order).
+    """
+    def __init__(self, indices, p_outs, p_masks, lm_pairs, targets):
         self.indices = list(indices)
         self.p_outs = p_outs
         self.p_masks = p_masks
-        self.base = base_dataset
+        self.lm_pairs = lm_pairs    # per-sample (src_pos, actions, tgt_pos)
+        self.targets = targets
     def __len__(self):
         return len(self.indices)
     def __getitem__(self, idx):
         oidx = self.indices[idx]
-        events, target = self.base[oidx]
-        return self.p_outs[oidx], self.p_masks[oidx], events, target
+        return (self.p_outs[oidx], self.p_masks[oidx],
+                self.lm_pairs[oidx], self.targets[oidx])
 
 
 def _cached_collate(batch):
-    p_outs_b, masks_b, events_b, targets_b = zip(*batch)
+    p_outs_b, masks_b, pairs_b, targets_b = zip(*batch)
     max_len = max(p.shape[0] for p in p_outs_b)
     B = len(batch)
     d = p_outs_b[0].shape[-1]
@@ -57,7 +63,13 @@ def _cached_collate(batch):
         L = p.shape[0]
         padded_p[i, :L] = p
         padded_m[i, :L] = m
-    return padded_p, padded_m, list(events_b), torch.stack(targets_b)
+    batch_idx = torch.cat([torch.full((src.numel(),), i, dtype=torch.long)
+                           for i, (src, _, _) in enumerate(pairs_b)])
+    src_pos = torch.cat([src for src, _, _ in pairs_b])
+    actions = torch.cat([act for _, act, _ in pairs_b])
+    tgt_pos = torch.cat([tgt for _, _, tgt in pairs_b])
+    lm_pairs = (batch_idx, src_pos, actions, tgt_pos)
+    return padded_p, padded_m, lm_pairs, torch.stack(targets_b)
 
 
 _PHASE = "modelling_predict"
@@ -152,8 +164,9 @@ def _modelling_forward(agent, event_sequences, device, cached_perception=None):
     return predicted_evs, action_embs, perception_out
 
 
-def _reconstruction_loss(agent, perception_out, mask, event_sequences,
-                         infonce_weight=0.5, infonce_temperature=0.1):
+def _reconstruction_loss(agent, perception_out, mask, event_sequences=None,
+                         infonce_weight=0.5, infonce_temperature=0.1,
+                         lm_pairs=None):
     """LM-style next-decision-state loss (PLAN_MODELLING_HEAD_REDESIGN.md §3–4).
 
     Pairs via `build_lm_pairs`: for every post-action event q (one-hot max
@@ -167,16 +180,21 @@ def _reconstruction_loss(agent, perception_out, mask, event_sequences,
         perception_out: (B, N, D) — detached perception output
         mask: (B, N) float — 1 for real tokens, 0 for padding
         event_sequences: list of lists of event dicts (aligned with rows
-            of perception_out)
+            of perception_out). Ignored when `lm_pairs` is given.
         infonce_weight: weight of the InfoNCE term inside L_lm
         infonce_temperature: τ for the cosine-similarity logits
+        lm_pairs: optional pre-built (batch_idx, src_positions, actions,
+            tgt_positions) long tensors — skips `build_lm_pairs`
 
     Returns:
         (loss, components) — scalar loss and {"mse", "infonce"} floats for
         logging. Zero-grad tensor + zero components if no valid pairs found.
     """
     device = perception_out.device
-    batch_idx, src_positions, actions, tgt_positions = build_lm_pairs(event_sequences)
+    if lm_pairs is not None:
+        batch_idx, src_positions, actions, tgt_positions = lm_pairs
+    else:
+        batch_idx, src_positions, actions, tgt_positions = build_lm_pairs(event_sequences)
 
     if batch_idx.numel() == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -199,7 +217,7 @@ def _run_validation(agent, val_loader, loss_fn, device, recon_weight=0.0,
                     amp_config=None):
     """Run validation and return average loss.
 
-    E.5.1: val_loader yields (cached_p, cached_m, event_sequences, action_evs)
+    E.5.1: val_loader yields (cached_p, cached_m, lm_pairs, action_evs)
     when perception caching is active.
     """
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
@@ -207,20 +225,21 @@ def _run_validation(agent, val_loader, loss_fn, device, recon_weight=0.0,
     val_loss_sum = 0.0
     val_count = 0
     with torch.no_grad():
-        for cached_p, cached_m, event_sequences, action_evs in val_loader:
+        for cached_p, cached_m, lm_pairs, action_evs in val_loader:
             cached_p = cached_p.to(device)
             cached_m = cached_m.to(device)
             action_evs = _compress_targets(action_evs.to(device))
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 predicted_evs, action_embs, perception_out = _modelling_forward(
-                    agent, event_sequences, device,
+                    agent, None, device,
                     cached_perception=(cached_p, cached_m))
                 batch_loss = loss_fn(predicted_evs, action_evs)
                 if recon_weight > 0:
                     lm, _ = _reconstruction_loss(
-                        agent, perception_out, cached_m, event_sequences,
+                        agent, perception_out, cached_m,
                         infonce_weight=infonce_weight,
-                        infonce_temperature=infonce_temperature)
+                        infonce_temperature=infonce_temperature,
+                        lm_pairs=lm_pairs)
                     batch_loss = batch_loss + recon_weight * lm
             val_loss_sum += batch_loss.item() * cached_p.shape[0]
             val_count += cached_p.shape[0]
@@ -389,28 +408,41 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         train_indices, val_indices = shard_aware_split(hand_ids, val_split)
 
         # E.5.1: pre-compute frozen perception outputs using a full dataset
-        # (sequential access — shard LRU cache handles ordering)
+        # (sequential access — shard LRU cache handles ordering). LM pairs and
+        # targets are extracted in the same pass so training never touches the
+        # shards again (the length-grouped sampler's access order thrashes the
+        # LRU-1 shard cache — one torch.load per item, ~seconds each).
         full_dataset = ShardedGTODataset(shards, norm_stats, phase="modelling",
                                          modifiers=modifiers, mod_params=mod_params)
         log("Pre-computing frozen perception outputs...")
         _p_outs = []
         _p_masks = []
+        _lm_pairs = []
+        _targets = []
         n_batches = (len(full_dataset) + batch_size - 1) // batch_size
         with torch.no_grad():
             for start in tqdm(range(0, len(full_dataset), batch_size),
                               total=n_batches, desc="Caching perception", smoothing=0):
                 end = min(start + batch_size, len(full_dataset))
-                batch_events = [full_dataset[j][0] for j in range(start, end)]
+                items = [full_dataset[j] for j in range(start, end)]
+                batch_events = [it[0] for it in items]
                 p_out, _, m = agent.perception.forward_batch(
                     batch_events, device=device, skip_memory=True)
                 for k in range(p_out.shape[0]):
                     L = int(m[k].sum().item())
                     _p_outs.append(p_out[k, :L].detach().cpu())
                     _p_masks.append(m[k, :L].detach().cpu())
+                for events_k, target_k in items:
+                    _, src, act, tgt = build_lm_pairs([events_k])
+                    _lm_pairs.append((src, act, tgt))
+                    _targets.append(target_k)
+        shards.clear_cache()
         log(f"Cached {len(_p_outs)} perception outputs")
 
-        cached_train = _CachedDataset(train_indices, _p_outs, _p_masks, full_dataset)
-        cached_val = _CachedDataset(val_indices, _p_outs, _p_masks, full_dataset)
+        cached_train = _CachedDataset(train_indices, _p_outs, _p_masks,
+                                      _lm_pairs, _targets)
+        cached_val = _CachedDataset(val_indices, _p_outs, _p_masks,
+                                    _lm_pairs, _targets)
 
         train_dataset = cached_train
         val_dataset = cached_val
@@ -455,26 +487,36 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         dataset = GTOModellingDataset(scenarios)
         train_dataset, val_dataset = hand_aware_split(dataset, scenarios, val_split)
 
-        # E.5.1: pre-compute frozen perception outputs once
+        # E.5.1: pre-compute frozen perception outputs once (LM pairs and
+        # targets extracted in the same pass — see sharded branch above)
         log("Pre-computing frozen perception outputs...")
         _p_outs = []
         _p_masks = []
+        _lm_pairs = []
+        _targets = []
         n_batches = (len(dataset) + batch_size - 1) // batch_size
         with torch.no_grad():
             for start in tqdm(range(0, len(dataset), batch_size),
                               total=n_batches, desc="Caching perception", smoothing=0):
                 end = min(start + batch_size, len(dataset))
-                batch_events = [dataset[j][0] for j in range(start, end)]
+                items = [dataset[j] for j in range(start, end)]
+                batch_events = [it[0] for it in items]
                 p_out, _, m = agent.perception.forward_batch(
                     batch_events, device=device, skip_memory=True)
                 for k in range(p_out.shape[0]):
                     L = int(m[k].sum().item())
                     _p_outs.append(p_out[k, :L].detach().cpu())
                     _p_masks.append(m[k, :L].detach().cpu())
+                for events_k, target_k in items:
+                    _, src, act, tgt = build_lm_pairs([events_k])
+                    _lm_pairs.append((src, act, tgt))
+                    _targets.append(target_k)
         log(f"Cached {len(_p_outs)} perception outputs")
 
-        cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks, dataset)
-        cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks, dataset)
+        cached_train = _CachedDataset(train_dataset.indices, _p_outs, _p_masks,
+                                      _lm_pairs, _targets)
+        cached_val = _CachedDataset(val_dataset.indices, _p_outs, _p_masks,
+                                    _lm_pairs, _targets)
 
         train_sampler = LengthGroupedBatchSampler(cached_train, batch_size)
         train_loader = DataLoader(cached_train, batch_sampler=train_sampler,
@@ -536,7 +578,7 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
         lm_mse_sum = 0.0
         lm_nce_sum = 0.0
 
-        for batch_idx, (cached_p, cached_m, event_sequences, action_evs) in enumerate(
+        for batch_idx, (cached_p, cached_m, lm_pairs, action_evs) in enumerate(
                 tqdm(train_loader, desc=f"Modelling epoch {epoch+1}/{epochs}", leave=False, smoothing=0)):
             cached_p = cached_p.to(device)
             cached_m = cached_m.to(device)
@@ -544,15 +586,16 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
 
             with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                 predicted_evs, action_embs, perception_out = _modelling_forward(
-                    agent, event_sequences, device,
+                    agent, None, device,
                     cached_perception=(cached_p, cached_m))
                 batch_loss = loss_fn(predicted_evs, action_evs)
                 lm_components = None
                 if recon_weight > 0:
                     lm, lm_components = _reconstruction_loss(
-                        agent, perception_out, cached_m, event_sequences,
+                        agent, perception_out, cached_m,
                         infonce_weight=infonce_weight,
-                        infonce_temperature=infonce_temperature)
+                        infonce_temperature=infonce_temperature,
+                        lm_pairs=lm_pairs)
                     batch_loss = batch_loss + recon_weight * lm
 
             optimizer.zero_grad()

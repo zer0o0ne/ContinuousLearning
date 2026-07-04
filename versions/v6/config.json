@@ -1,5 +1,5 @@
 {
-    "name": "first_spark_train",
+    "name": "more_epochs_new_modelling",
     "agent_dir": "",
     "architecture": {
         "d_model": 384,
@@ -25,7 +25,7 @@
         }
     },
     "multi_agent": {
-        "save_dir": "5_agents",
+        "save_dir": "5_agents_more_epochs_new_modelling",
         "agents": [
             {
                 "name": "gto_pure",
@@ -103,7 +103,7 @@
         }
     },
     "dataset": {
-        "dataset_dir": "",
+        "dataset_dir": "/home/zer0o0ne/ContinuousLearning/data/v6/first_spark_train/dataset",
         "save_dir": "",
         "n_scenarios": 150000,
         "val_split": 0.02,
@@ -135,7 +135,7 @@
     "modelling_train": {
         "lr": 2e-5,
         "batch_size": 256,
-        "epochs": 1,
+        "epochs": 3,
         "max_grad_norm": 1.0,
         "log_every": 20,
         "val_every": 500,
@@ -148,7 +148,7 @@
     "gto_train": {
         "lr": 2e-5,
         "batch_size": 256,
-        "epochs": 1,
+        "epochs": 3,
         "max_grad_norm": 1.0,
         "log_every": 20,
         "val_every": 500,

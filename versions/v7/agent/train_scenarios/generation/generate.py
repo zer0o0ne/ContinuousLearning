@@ -1,0 +1,1678 @@
+"""
+Unified scenario generator for all GTO training scenarios.
+
+Generates poker hands using the Table simulator with GTO-based action
+sampling. Each sample is a sequence of events from hand start to a
+decision point, paired with:
+  - ev_target: scalar best EV (for value head training)
+  - action_evs: per-action EV vector (for action probability training)
+  - action_probs: softmax(action_evs / (big_blind * gto_temperature))
+
+Both labels are computed in a single simulation pass to avoid
+duplicating expensive solver calls.
+
+Can be run standalone:
+    python -m agent.train_scenarios.generation.generate --config config.json
+"""
+
+import os
+import sys
+import json
+import copy
+import random
+import warnings
+import argparse
+import multiprocessing as mp
+from datetime import datetime
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tqdm.auto import tqdm
+
+from env.table import Table
+from agent.resume import atomic_torch_save, atomic_json_dump
+from agent.mcts.game_state import GameState
+
+# B.6.3: per-process tally of betting loops that hit max_actions without the
+# hand terminating (truncated raise-wars). Logged via a warning so truncation
+# is never silent.
+_truncation_stats = {"hands": 0, "truncated": 0}
+
+# Add gto_utils to path for direct import
+_gto_utils_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "gto_utils")
+if _gto_utils_dir not in sys.path:
+    sys.path.insert(0, _gto_utils_dir)
+
+
+STREET_NAMES = ["preflop", "flop", "turn", "river"]
+
+
+def _get_raise_sizes(config):
+    """Extract and validate per-street raise sizes from config.
+
+    Returns list of 4 lists (indexed by street: 0=preflop..3=river).
+    All streets must have the same number of raise sizes.
+    """
+    rs = config.get("raise_sizes")
+    if rs is None:
+        raise ValueError("Config missing 'raise_sizes'. Expected dict with keys: preflop, flop, turn, river")
+
+    sizes = []
+    for street_name in STREET_NAMES:
+        if street_name not in rs:
+            raise ValueError(f"raise_sizes missing '{street_name}'")
+        sizes.append(list(rs[street_name]))
+
+    lengths = [len(s) for s in sizes]
+    if len(set(lengths)) != 1:
+        raise ValueError(
+            f"All streets must have equal number of raise sizes. "
+            f"Got: {dict(zip(STREET_NAMES, lengths))}"
+        )
+    if lengths[0] == 0:
+        raise ValueError("raise_sizes must have at least 1 raise size per street")
+
+    return sizes
+
+
+def _get_solver(solver_name):
+    """Import and return solver functions based on config choice.
+
+    Args:
+        solver_name: "v1" (random ranges), "v2" (range-aware)
+
+    Returns:
+        (gpu_equity_fn, compute_ev_fn, extra_modules_dict)
+    """
+    if solver_name == "v1":
+        from gpu_solver import gpu_equity, compute_ev
+        return gpu_equity, compute_ev, {}
+    elif solver_name == "v2":
+        from gpu_solver_v2 import gpu_equity_v2, compute_ev_v2, get_position_range, narrow_range, expand_range
+        return gpu_equity_v2, compute_ev_v2, {
+            "get_position_range": get_position_range,
+            "narrow_range": narrow_range,
+            "expand_range": expand_range,
+        }
+    elif solver_name == "v3":
+        from gpu_solver_v3 import (
+            gpu_equity_v3, compute_ev_v3,
+            _prepare_ev_state_v3, _compute_ev_v3_from_state,
+            get_position_range, narrow_range, expand_range,
+        )
+        return gpu_equity_v3, compute_ev_v3, {
+            "get_position_range": get_position_range,
+            "narrow_range": narrow_range,
+            "expand_range": expand_range,
+            "prepare_ev_state": _prepare_ev_state_v3,
+            "compute_ev_from_state": _compute_ev_v3_from_state,
+        }
+    elif solver_name == "v4":
+        from gpu_solver_v4 import (
+            gpu_equity_v3, compute_ev_v3,
+            get_position_range, narrow_range, expand_range,
+            compute_marginalized_action_probs, bayesian_range_update, filter_dead_combos,
+        )
+        from gpu_solver_v3 import _prepare_ev_state_v3, _compute_ev_v3_from_state
+        return gpu_equity_v3, compute_ev_v3, {
+            "get_position_range": get_position_range,
+            "narrow_range": narrow_range,
+            "expand_range": expand_range,
+            "compute_marginalized_action_probs": compute_marginalized_action_probs,
+            "bayesian_range_update": bayesian_range_update,
+            "filter_dead_combos": filter_dead_combos,
+            "prepare_ev_state": _prepare_ev_state_v3,
+            "compute_ev_from_state": _compute_ev_v3_from_state,
+        }
+    else:
+        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1', 'v2', 'v3', or 'v4'.")
+
+
+def _get_board_cards(table):
+    """Extract revealed board card IDs from table state."""
+    if table.turn == 0:
+        return []
+    elif table.turn == 1:
+        return table.deck[:3].tolist()
+    elif table.turn == 2:
+        return table.deck[:4].tolist()
+    else:
+        return table.deck[:5].tolist()
+
+
+def _get_table_display(table):
+    """Get 5-element board display with -1 for unrevealed cards."""
+    if table.turn == 0:
+        return [-1] * 5
+    elif table.turn == 1:
+        return list(table.deck[:3]) + [-1, -1]
+    elif table.turn == 2:
+        return list(table.deck[:4]) + [-1]
+    else:
+        return list(table.deck[:5])
+
+
+def _build_opponent_ranges(table, player_pos, action_history, solver_modules):
+    """Build opponent range hand types based on positions and past actions.
+
+    Args:
+        table: Table instance
+        player_pos: current player's position (excluded from opponents)
+        action_history: list of (position, action_type) tuples for the hand
+        solver_modules: dict with get_position_range, narrow_range (from v2 solver)
+
+    Returns:
+        (opponent_ranges, opponent_positions) where:
+        - opponent_ranges: list of lists of hand type strings, one per active opponent
+        - opponent_positions: list of int seat indices for each opponent
+    """
+    get_position_range = solver_modules["get_position_range"]
+    narrow_range = solver_modules["narrow_range"]
+
+    opponent_ranges = []
+    opponent_positions = []
+    for pos in range(table.num_players):
+        if pos == player_pos:
+            continue
+        if table.players_state[pos] < 0:
+            continue  # folded
+
+        hand_types = get_position_range(pos, table.num_players)
+        for act_pos, act_type in action_history:
+            if act_pos == pos:
+                hand_types = narrow_range(hand_types, act_type)
+
+        opponent_ranges.append(hand_types)
+        opponent_positions.append(pos)
+
+    return opponent_ranges, opponent_positions
+
+
+def _build_event(table, hero_pos, acting_pos, action, num_players, big_blind, small_blind):
+    """Build one event dict from current table state."""
+    hand = table.deck[5 + 2 * hero_pos: 7 + 2 * hero_pos].tolist()
+    hero_stack = float(table.credits[hero_pos])
+    table_cards = _get_table_display(table)
+    bets = np.copy(table.bets)
+
+    # Keep action as a plain Python list so the event dict can cross process
+    # boundaries via normal pickle (shared-memory tensor sharing exhausts
+    # `vm.max_map_count` after ~10k hands — see `_rebuild_events`).
+    if isinstance(action, torch.Tensor):
+        action = action.detach().cpu().tolist()
+
+    return {
+        "hand": hand,
+        "num_players": num_players,
+        "hero_pos": hero_pos,
+        "acting_pos": acting_pos,
+        "big_blind": float(big_blind),
+        "small_blind": float(small_blind),
+        "stack": hero_stack,
+        # B.6.2: per-position stacks vector (effective-stack signal).
+        "stacks": [float(c) for c in table.credits],
+        "table": table_cards,
+        "pot": float(table.pot),
+        "bets": bets,
+        "action": action,
+    }
+
+
+def _sample_gto_action(ev_result, n_actions, big_blind=10, temperature=1.0):
+    """Sample an action based on GTO EV distribution over all options.
+
+    ev_result: dict from _compute_player_ev with fold_ev, call_ev, raise_evs.
+    n_actions: size of the action space (table_bins + 3).
+    big_blind: big blind size for EV normalization.
+    temperature: softmax temperature for action sampling.
+    Returns one-hot action tensor (n_actions,).
+    """
+    options = []  # (action_bin, ev)
+    options.append((0, ev_result["fold_ev"]))
+    options.append((1, ev_result["call_ev"]))
+    for action_bin, _, ev in ev_result["raise_evs"]:
+        options.append((action_bin, ev))
+
+    evs = torch.tensor([ev for _, ev in options], dtype=torch.float)
+    probs = F.softmax(evs / (big_blind * temperature), dim=0)
+
+    choice_idx = torch.multinomial(probs, 1).item()
+    chosen_bin = options[choice_idx][0]
+
+    action = torch.zeros(n_actions, dtype=torch.float32)
+    action[chosen_bin] = 1.0
+    return action
+
+
+def _compute_player_ev(table, player_pos, action_history, solver_name="v2",
+                       device="mps", mc_iters=10000, n_raise_samples=3,
+                       mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10,
+                       eqr_enabled=True, combo_response_iters=30,
+                       reraise_threshold=0.75, weighted_sampling=True,
+                       threshold_smoothing=None,
+                       polarized_reraise=None):
+    """Compute EV for a player (sampled raise bins for GTO action sampling).
+
+    Returns dict with keys: equity, fold_ev, call_ev, raise_evs, etc.
+    Returns None on failure.
+    """
+    gpu_equity_fn, compute_ev_fn, solver_modules = _get_solver(solver_name)
+
+    hand = table.deck[5 + 2 * player_pos: 7 + 2 * player_pos]
+    board_ids = _get_board_cards(table)
+
+    hero_t = torch.tensor(hand.tolist(), dtype=torch.long)
+    board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
+
+    hero_invested = table.start_credits[player_pos] - table.credits[player_pos]
+    facing_bet = max(0, table.high_bet - table.bets[player_pos])
+    stack = table.credits[player_pos]
+    pot = table.pot
+
+    n_active = int((table.players_state >= 0).sum())
+    n_opponents = max(1, n_active - 1)
+
+    n_raise_bins = table.n_raise_bins
+    street_raises = table.raise_sizes[table.turn]
+    hero_bets = table.bets[player_pos]
+    effective_pot = max(pot - hero_bets, 1e-6)
+
+    def _raise_to_solver_frac(raise_pct):
+        return raise_pct * effective_pot / max(pot, 1e-6)
+
+    if solver_name == "v1":
+        try:
+            eq = gpu_equity_fn(hero_t, board_t, n_opponents, n_iters=mc_iters, device=device)
+            fold_ev, call_ev, _, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested)
+        except Exception:
+            return None
+
+        raise_evs = []
+        available_bins = list(range(2, n_raise_bins + 2))
+        n_samples = min(n_raise_samples, len(available_bins))
+        for b in random.sample(available_bins, n_samples):
+            raise_pct = street_raises[b - 2]
+            actual_bet = facing_bet + raise_pct * effective_pot
+            if actual_bet >= stack:
+                continue
+            solver_frac = _raise_to_solver_frac(raise_pct)
+            _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=solver_frac)
+            raise_evs.append((b, solver_frac, r_ev))
+
+        allin_frac = stack / max(pot + facing_bet, 1e-6)
+        _, _, allin_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=allin_frac)
+        allin_idx = n_raise_bins + 2
+        raise_evs.append((allin_idx, allin_frac, allin_ev))
+
+    else:
+        expand_range = solver_modules["expand_range"]
+        opp_range_types, opp_positions = _build_opponent_ranges(table, player_pos, action_history, solver_modules)
+
+        if not opp_range_types:
+            return {
+                "equity": 1.0, "fold_ev": -hero_invested,
+                "call_ev": pot - hero_invested,
+                "raise_evs": [], "hero_invested": hero_invested,
+                "facing_bet": facing_bet, "stack": stack, "pot": pot,
+            }
+
+        if solver_name == "v3":
+            ev_extra = {
+                "hero_position": player_pos,
+                "street": table.turn,
+                "n_players": table.num_players,
+                "eqr_enabled": eqr_enabled,
+                "combo_response_iters": combo_response_iters,
+                "reraise_threshold": reraise_threshold,
+                "weighted_sampling": weighted_sampling,
+                "action_history": action_history,
+                "opponent_positions": opp_positions,
+                "dynamic_reraise": True,
+                "threshold_smoothing": threshold_smoothing,
+                "polarized_reraise": polarized_reraise,
+            }
+        else:
+            ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
+
+        try:
+            fold_ev, call_ev, _, _ = compute_ev_fn(
+                hero_t, board_t, opp_range_types,
+                pot, facing_bet, stack, hero_invested,
+                raise_frac=1.0, n_iters=mc_iters, device=device, **ev_extra
+            )
+            dead = set(hero_t.tolist())
+            if len(board_t) > 0:
+                dead.update(board_t.tolist())
+            opp_combos = [expand_range(ht_list, dead) for ht_list in opp_range_types]
+            eq = gpu_equity_fn(hero_t, board_t, opp_combos, mc_iters, device)
+        except Exception:
+            return None
+
+        raise_evs = []
+        available_bins = list(range(2, n_raise_bins + 2))
+        n_samples = min(n_raise_samples, len(available_bins))
+        for b in random.sample(available_bins, n_samples):
+            raise_pct = street_raises[b - 2]
+            actual_bet = facing_bet + raise_pct * effective_pot
+            if actual_bet >= stack:
+                continue
+            try:
+                solver_frac = _raise_to_solver_frac(raise_pct)
+                _, _, r_ev, _ = compute_ev_fn(
+                    hero_t, board_t, opp_range_types,
+                    pot, facing_bet, stack, hero_invested,
+                    raise_frac=solver_frac, n_iters=mc_iters, device=device, **ev_extra
+                )
+                raise_evs.append((b, solver_frac, r_ev))
+            except Exception:
+                continue
+
+        allin_frac = stack / max(pot + facing_bet, 1e-6)
+        try:
+            _, _, allin_ev, _ = compute_ev_fn(
+                hero_t, board_t, opp_range_types,
+                pot, facing_bet, stack, hero_invested,
+                raise_frac=allin_frac, n_iters=mc_iters, device=device, **ev_extra
+            )
+            allin_idx = n_raise_bins + 2
+            raise_evs.append((allin_idx, allin_frac, allin_ev))
+        except Exception:
+            pass
+
+    return {
+        "equity": eq,
+        "fold_ev": fold_ev,
+        "call_ev": call_ev,
+        "raise_evs": raise_evs,
+        "hero_invested": hero_invested,
+        "facing_bet": facing_bet,
+        "stack": stack,
+        "pot": pot,
+    }
+
+
+def _compute_all_action_evs(table, player_pos, action_history, n_actions,
+                            solver_name="v2", device="mps", mc_iters=10000,
+                            mdf_max_fold=0.7, reraise_pct=0.15, reraise_cap=0.10,
+                            eqr_enabled=True, combo_response_iters=30,
+                            reraise_threshold=0.75, weighted_sampling=True,
+                            threshold_smoothing=None,
+                            polarized_reraise=None):
+    """Compute EV for ALL possible actions (fold, call, each raise bin, all-in).
+
+    Returns:
+        tensor of shape (n_actions,) with EV per action, or None on failure.
+        Also returns metadata dict with equity, pot, etc.
+    """
+    gpu_equity_fn, compute_ev_fn, solver_modules = _get_solver(solver_name)
+
+    hand = table.deck[5 + 2 * player_pos: 7 + 2 * player_pos]
+    board_ids = _get_board_cards(table)
+
+    hero_t = torch.tensor(hand.tolist(), dtype=torch.long)
+    board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
+
+    hero_invested = table.start_credits[player_pos] - table.credits[player_pos]
+    facing_bet = max(0, table.high_bet - table.bets[player_pos])
+    stack = table.credits[player_pos]
+    pot = table.pot
+
+    n_active = int((table.players_state >= 0).sum())
+    n_opponents = max(1, n_active - 1)
+
+    n_raise_bins = table.n_raise_bins
+    street_raises = table.raise_sizes[table.turn]
+    hero_bets = table.bets[player_pos]
+    effective_pot = max(pot - hero_bets, 1e-6)
+
+    # B.5.2/B.5.3: playable-action mask, identical to the one the MCTS / eval /
+    # opponent-data inference paths build via GameState. Used to mask the
+    # policy softmax (below) so the training target and the sampled action both
+    # respect the same action set the policy is sampled from at play time:
+    #   - fold is illegal when checking is free (facing_bet == 0);
+    #   - raise bins that collapse to a call or duplicate the all-in are dropped
+    #     (otherwise k capped bins each carry the all-in EV and multiply its
+    #     softmax mass by k).
+    legal_mask = GameState.from_table(table, player_pos).get_legal_action_mask(n_actions)
+
+    evs = torch.zeros(n_actions, dtype=torch.float)
+
+    # Fold EV
+    evs[0] = -hero_invested
+
+    def _raise_to_solver_frac(raise_pct):
+        """Convert per-street raise_pct (fraction of effective pot) to solver raise_frac.
+
+        B.5.1: the solver's raise increment above the call is
+        `raise_frac * (pot + facing_bet)` (gpu_solver_v3), whereas the table
+        executes `raise_pct * effective_pot` on top of the call (table.py:69).
+        Equating the two → the denominator must be `pot + facing_bet`, not
+        `pot`. With `/pot` the EV labels were computed for a raise up to ~2x
+        larger than the action the table actually plays when facing a pot bet.
+        """
+        return raise_pct * effective_pot / max(pot + facing_bet, 1e-6)
+
+    if solver_name == "v1":
+        try:
+            eq = gpu_equity_fn(hero_t, board_t, n_opponents, n_iters=mc_iters, device=device)
+            _, call_ev, _, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested)
+        except Exception:
+            return None, None
+        evs[1] = call_ev
+
+        for b in range(2, n_raise_bins + 2):
+            raise_pct = street_raises[b - 2]
+            actual_bet = facing_bet + raise_pct * effective_pot
+            if actual_bet >= stack:
+                allin_frac = stack / max(pot + facing_bet, 1e-6)
+                _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=allin_frac)
+            else:
+                solver_frac = _raise_to_solver_frac(raise_pct)
+                _, _, r_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=solver_frac)
+            evs[b] = r_ev
+
+        allin_frac = stack / max(pot + facing_bet, 1e-6)
+        _, _, allin_ev, _ = compute_ev_fn(eq, pot, facing_bet, stack, hero_invested, raise_frac=allin_frac)
+        evs[n_raise_bins + 2] = allin_ev
+
+    else:
+        expand_range = solver_modules["expand_range"]
+        opp_range_types, opp_positions = _build_opponent_ranges(table, player_pos, action_history, solver_modules)
+
+        if not opp_range_types:
+            evs[1] = pot - hero_invested
+            for b in range(2, n_actions):
+                evs[b] = pot - hero_invested
+            meta = {"equity": 1.0, "hero_invested": hero_invested,
+                    "facing_bet": facing_bet, "stack": stack, "pot": pot,
+                    "legal_mask": legal_mask}
+            return evs, meta
+
+        if solver_name == "v3":
+            # Optimized path: prepare per-decision MC state once, then run cheap
+            # arithmetic per raise_frac. Eliminates ~12× redundant equity calls.
+            prepare_ev_state = solver_modules["prepare_ev_state"]
+            compute_ev_from_state = solver_modules["compute_ev_from_state"]
+
+            try:
+                # R2: `dynamic_reraise=True` is stored on state so the
+                # per-raise_frac calls below derive the reraise threshold
+                # from (call_cost, pot_after_raise, street, stack, pot)
+                # instead of the static config value.
+                state = prepare_ev_state(
+                    hero_t, board_t, opp_range_types,
+                    n_iters=mc_iters, device=device,
+                    hero_position=player_pos,
+                    street=table.turn,
+                    n_players=table.num_players,
+                    eqr_enabled=eqr_enabled,
+                    combo_response_iters=combo_response_iters,
+                    reraise_threshold=reraise_threshold,
+                    weighted_sampling=weighted_sampling,
+                    action_history=action_history,
+                    opponent_positions=opp_positions,
+                    threshold_smoothing=threshold_smoothing,
+                    dynamic_reraise=True,
+                    polarized_reraise=polarized_reraise,
+                )
+            except Exception:
+                return None, None
+
+            eq = state["raw_equity"]
+
+            try:
+                _, call_ev, _, _ = compute_ev_from_state(
+                    state, pot, facing_bet, stack, hero_invested,
+                    raise_frac=1.0, dynamic_reraise=True,
+                )
+            except Exception:
+                return None, None
+            evs[1] = call_ev
+
+            allin_frac = stack / max(pot + facing_bet, 1e-6)
+            try:
+                _, _, allin_ev_val, _ = compute_ev_from_state(
+                    state, pot, facing_bet, stack, hero_invested,
+                    raise_frac=allin_frac, dynamic_reraise=True,
+                )
+                allin_ev = allin_ev_val
+            except Exception:
+                allin_ev = evs[0]
+
+            for b in range(2, n_raise_bins + 2):
+                raise_pct = street_raises[b - 2]
+                actual_bet = facing_bet + raise_pct * effective_pot
+                if actual_bet >= stack:
+                    evs[b] = allin_ev
+                else:
+                    try:
+                        solver_frac = _raise_to_solver_frac(raise_pct)
+                        _, _, r_ev, _ = compute_ev_from_state(
+                            state, pot, facing_bet, stack, hero_invested,
+                            raise_frac=solver_frac, dynamic_reraise=True,
+                        )
+                        evs[b] = r_ev
+                    except Exception:
+                        evs[b] = allin_ev
+
+            evs[n_raise_bins + 2] = allin_ev
+        else:
+            # v2 path: per-raise_frac compute_ev_fn (no state caching).
+            ev_extra = {"mdf_max_fold": mdf_max_fold, "reraise_pct": reraise_pct, "reraise_cap": reraise_cap}
+
+            try:
+                _, call_ev, _, _ = compute_ev_fn(
+                    hero_t, board_t, opp_range_types,
+                    pot, facing_bet, stack, hero_invested,
+                    raise_frac=1.0, n_iters=mc_iters, device=device, **ev_extra
+                )
+                dead = set(hero_t.tolist())
+                if len(board_t) > 0:
+                    dead.update(board_t.tolist())
+                opp_combos = [expand_range(ht_list, dead) for ht_list in opp_range_types]
+                eq = gpu_equity_fn(hero_t, board_t, opp_combos, mc_iters, device)
+            except Exception:
+                return None, None
+            evs[1] = call_ev
+
+            allin_frac = stack / max(pot + facing_bet, 1e-6)
+            try:
+                _, _, allin_ev_val, _ = compute_ev_fn(
+                    hero_t, board_t, opp_range_types,
+                    pot, facing_bet, stack, hero_invested,
+                    raise_frac=allin_frac, n_iters=mc_iters, device=device, **ev_extra
+                )
+                allin_ev = allin_ev_val
+            except Exception:
+                allin_ev = evs[0]
+
+            for b in range(2, n_raise_bins + 2):
+                raise_pct = street_raises[b - 2]
+                actual_bet = facing_bet + raise_pct * effective_pot
+                if actual_bet >= stack:
+                    evs[b] = allin_ev
+                else:
+                    try:
+                        solver_frac = _raise_to_solver_frac(raise_pct)
+                        _, _, r_ev, _ = compute_ev_fn(
+                            hero_t, board_t, opp_range_types,
+                            pot, facing_bet, stack, hero_invested,
+                            raise_frac=solver_frac, n_iters=mc_iters, device=device, **ev_extra
+                        )
+                        evs[b] = r_ev
+                    except Exception:
+                        evs[b] = allin_ev
+
+            evs[n_raise_bins + 2] = allin_ev
+
+    meta = {
+        "equity": eq,
+        "hero_invested": hero_invested,
+        "facing_bet": facing_bet,
+        "stack": stack,
+        "pot": pot,
+        "legal_mask": legal_mask,
+    }
+    return evs, meta
+
+
+def _get_table_display_from_turn(deck, turn):
+    """Get 5-element board display from deck and turn number."""
+    if turn == 0:
+        return [-1] * 5
+    elif turn == 1:
+        return list(deck[:3]) + [-1, -1]
+    elif turn == 2:
+        return list(deck[:4]) + [-1]
+    else:
+        return list(deck[:5])
+
+
+def _rebuild_events(snapshots, deck, hero_pos, num_players, big_blind, small_blind, n_actions, up_to):
+    """Rebuild event sequence from a specific player's perspective.
+
+    Args:
+        snapshots: list of dicts with table state at each step
+        deck: table deck (constant throughout hand)
+        hero_pos: the player whose perspective to use
+        num_players: number of players
+        big_blind, small_blind: blind sizes
+        n_actions: action space size
+        up_to: include snapshots[0..up_to] inclusive
+
+    Returns:
+        list of event dicts
+    """
+    hand = deck[5 + 2 * hero_pos: 7 + 2 * hero_pos].tolist()
+    events = []
+    for snap in snapshots[:up_to + 1]:
+        table_cards = _get_table_display_from_turn(deck, snap["turn"])
+        action = snap["action"]
+        if action is None:
+            action = [0.0] * n_actions
+        elif isinstance(action, torch.Tensor):
+            # Plain-Python action vector — torch.Tensor here would force IPC to
+            # use shared-memory tensor sharing (one mmap + one FD per event),
+            # exhausting `vm.max_map_count` / `ulimit -n` after ~10k hands when
+            # results stream back to the main process. Lists pickle inline.
+            action = action.detach().cpu().tolist()
+        events.append({
+            "hand": hand,
+            "num_players": num_players,
+            "hero_pos": hero_pos,
+            "acting_pos": snap["active_pos"],
+            "big_blind": float(big_blind),
+            "small_blind": float(small_blind),
+            "stack": float(snap["credits"][hero_pos]),
+            # B.6.2: per-position stacks vector (effective-stack signal).
+            "stacks": [float(c) for c in snap["credits"]],
+            "table": table_cards,
+            "pot": float(snap["pot"]),
+            "bets": np.copy(snap["bets"]),
+            "action": action,
+        })
+    return events
+
+
+def generate_scenario(config, device="mps"):
+    """Generate multiple samples from one poker hand.
+
+    Simulates a poker hand using Table with GTO-sampled actions.
+    At EVERY player's decision point, computes EV for all actions.
+    Each decision point becomes a separate training sample with:
+      - events: sequence from that player's perspective up to the decision
+      - ev_target: max(EVs)
+      - action_probs: softmax(EVs / (big_blind * gto_temperature))
+
+    Returns list of scenario dicts, or None on failure.
+    """
+    mc_iters = config.get("mc_iterations", 10000)
+    big_blind = config.get("big_blind", 10)
+    small_blind = big_blind // 2
+    max_stack = config.get("max_stack", 1000)
+    max_players = config.get("max_players", 9)
+    temperature = config.get("gto_temperature", 1.0)
+    raise_sizes = _get_raise_sizes(config)
+    n_raise_bins = len(raise_sizes[0])
+    n_actions = n_raise_bins + 3
+    solver_name = config.get("solver", "v2")
+    mdf_max_fold = config.get("mdf_max_fold", 0.7)
+    reraise_pct = config.get("reraise_pct", 0.15)
+    reraise_cap = config.get("reraise_cap", 0.10)
+
+    num_players = random.randint(2, max_players)
+    # B.6.1: independent per-seat starting stacks (U[min,max] per seat) so the
+    # model sees asymmetric effective stacks. Table stores them per-seat, so
+    # hero_invested = start_credits[pos] - credits[pos] stays correct.
+    start_stacks = [random.randint(big_blind * 2, max_stack) for _ in range(num_players)]
+
+    table = Table(
+        num_players=num_players,
+        raise_sizes=raise_sizes,
+        start_credits=start_stacks,
+        big_blind=big_blind,
+        small_blind=small_blind,
+    )
+    table.start_table()
+
+    # Save table state snapshots for rebuilding events from any player's perspective
+    snapshots = []  # list of {pot, bets, credits, turn, active_pos, action}
+    decisions = []  # list of (snapshot_index, player_pos, all_evs, meta)
+
+    # Initial snapshot (no action yet)
+    snapshots.append({
+        "pot": table.pot,
+        "bets": np.copy(table.bets),
+        "credits": list(table.credits),
+        "turn": table.turn,
+        "active_pos": table.active_player,
+        "action": None,
+    })
+
+    # B.6.3: cap high enough not to clip realistic raise-wars (was 4*N, which
+    # truncated multi-raise multiway pots). Truncations are logged below.
+    max_actions = 6 * num_players + 8
+    action_history = []
+
+    # B.5.6: number of raises made so far on the CURRENT street, used to
+    # classify a preflop raise as an open (first raise) vs a 3bet+ (raise over
+    # a raise). Reset whenever the street advances.
+    street_raise_count = 0
+    cur_street = table.turn
+
+    # V3/V4 solver params
+    eqr_enabled = config.get("eqr_enabled", True)
+    combo_response_iters = config.get("combo_response_iters", 30)
+    reraise_threshold = config.get("reraise_threshold", 0.75)
+    weighted_sampling = config.get("weighted_sampling", True)
+    threshold_smoothing = config.get("threshold_smoothing", None)
+    polarized_reraise = config.get("polarized_reraise", None)
+    marginal_mc_iters = config.get("marginal_mc_iters", 3000)
+    marginal_response_iters = config.get("marginal_response_iters", 30)
+
+    # For v4: use v3 solver for normal EV computation
+    ev_solver_name = "v3" if solver_name == "v4" else solver_name
+
+    ev_kwargs = {"device": device, "mc_iters": mc_iters}
+    if ev_solver_name == "v2":
+        ev_kwargs.update({
+            "mdf_max_fold": mdf_max_fold,
+            "reraise_pct": reraise_pct,
+            "reraise_cap": reraise_cap,
+        })
+    elif ev_solver_name in ("v3", "v4"):
+        ev_kwargs.update({
+            "eqr_enabled": eqr_enabled,
+            "combo_response_iters": combo_response_iters,
+            "reraise_threshold": reraise_threshold,
+            "weighted_sampling": weighted_sampling,
+            "threshold_smoothing": threshold_smoothing,
+            "polarized_reraise": polarized_reraise,
+        })
+
+    # V4: initialize Bayesian state for opponent modeling
+    bayesian_state = {}
+    modelling_decisions = []
+    if solver_name == "v4":
+        _, _, v4_modules = _get_solver("v4")
+        v4_get_position_range = v4_modules["get_position_range"]
+        v4_expand_range = v4_modules["expand_range"]
+        v4_compute_marg = v4_modules["compute_marginalized_action_probs"]
+        v4_bayes_update = v4_modules["bayesian_range_update"]
+        v4_filter_dead = v4_modules["filter_dead_combos"]
+
+        for pos in range(num_players):
+            ht = v4_get_position_range(pos, num_players)
+            combos = v4_expand_range(ht, set())
+            n_combos = combos.shape[0]
+            weights = torch.ones(n_combos, dtype=torch.float32) / max(n_combos, 1)
+            bayesian_state[pos] = {"hand_types": ht, "combos": combos, "weights": weights}
+
+    _truncation_stats["hands"] += 1
+    for _ in range(max_actions):
+        active_pos = table.active_player
+
+        if table.players_state[active_pos] != 1:
+            break
+
+        # B.5.6: reset the per-street raise counter when the street advances.
+        if table.turn != cur_street:
+            cur_street = table.turn
+            street_raise_count = 0
+
+        # Compute ALL action EVs for the active player
+        all_evs, meta = _compute_all_action_evs(
+            table, active_pos, action_history, n_actions,
+            solver_name=ev_solver_name, **ev_kwargs
+        )
+        if all_evs is None:
+            return None
+
+        # Record decision point (snapshot before action = current last snapshot)
+        # The decision snapshot is a new one showing the "decision moment"
+        decision_snap_idx = len(snapshots)
+        snapshots.append({
+            "pot": table.pot,
+            "bets": np.copy(table.bets),
+            "credits": list(table.credits),
+            "turn": table.turn,
+            "active_pos": active_pos,
+            "action": None,  # no action yet at decision point
+        })
+        decisions.append((decision_snap_idx, active_pos, all_evs, meta))
+
+        # V4: compute marginalized action probs for opponent modeling
+        v4_per_combo_probs = None
+        v4_valid_mask = None
+        if solver_name == "v4" and active_pos in bayesian_state:
+            try:
+                bs = bayesian_state[active_pos]
+                board_ids = _get_board_cards(table)
+                dead = set(board_ids)
+                valid_combos, valid_weights = v4_filter_dead(
+                    bs["combos"], bs["weights"], dead
+                )
+                if valid_combos.shape[0] > 0:
+                    # Build opponent ranges from acting player's perspective
+                    _, _, solver_mods = _get_solver("v4")
+                    opp_ranges, opp_positions = _build_opponent_ranges(
+                        table, active_pos, action_history, solver_mods
+                    )
+
+                    hero_invested = table.start_credits[active_pos] - table.credits[active_pos]
+                    facing_bet = max(0, table.high_bet - table.bets[active_pos])
+                    act_stack = table.credits[active_pos]
+                    act_pot = table.pot
+                    hero_bets = table.bets[active_pos]
+                    eff_pot = max(act_pot - hero_bets, 1e-6)
+
+                    board_t = torch.tensor(board_ids, dtype=torch.long) if board_ids else torch.tensor([], dtype=torch.long)
+
+                    marg_probs, per_combo_probs = v4_compute_marg(
+                        valid_combos, valid_weights, board_t, opp_ranges,
+                        act_pot, facing_bet, act_stack, hero_invested,
+                        n_actions, table.raise_sizes[table.turn], eff_pot,
+                        temperature, big_blind,
+                        n_iters=marginal_mc_iters, device=device,
+                        hero_position=active_pos, street=table.turn,
+                        n_players=num_players,
+                        eqr_enabled=eqr_enabled,
+                        combo_response_iters=marginal_response_iters,
+                        reraise_threshold=reraise_threshold,
+                        weighted_sampling=weighted_sampling,
+                        action_history=action_history,
+                        opponent_positions=opp_positions,
+                    )
+                    modelling_decisions.append({
+                        "snap_idx": decision_snap_idx,
+                        "acting_pos": active_pos,
+                        "marg_probs": marg_probs,
+                        "pot": act_pot,
+                        "facing_bet": facing_bet,
+                    })
+                    v4_per_combo_probs = per_combo_probs
+                    # Build mask mapping valid combos back to full combo tensor
+                    # (for Bayesian update after action is sampled)
+            except Exception:
+                pass  # marginalization failed, continue with normal generation
+
+        # Sample action from full EVs.
+        # Fix 5: normalize by pot size, not just big blind.
+        # B.5.2/B.5.3: mask illegal/dominated actions before the softmax so the
+        # sampled (played) action respects the same playable set as inference.
+        normalizer = max(meta["pot"] + meta["facing_bet"], big_blind) * temperature
+        legal_mask_t = torch.tensor(meta["legal_mask"], dtype=torch.bool)
+        masked_evs = all_evs.masked_fill(~legal_mask_t, float("-inf"))
+        probs = F.softmax(masked_evs / normalizer, dim=0)
+        choice_idx = torch.multinomial(probs, 1).item()
+        action = torch.zeros(n_actions, dtype=torch.float32)
+        action[choice_idx] = 1.0
+
+        # Classify action for range narrowing.
+        # B.5.6: classify preflop raises by the number of raises ALREADY made
+        # this street, not by all-in-vs-sized. The first voluntary preflop
+        # raise is an "open"; any raise over a raise is a "3bet" (narrows the
+        # opponent range to the very top — ACTION_NARROWING["3bet"]). The old
+        # code labeled every non-all-in preflop raise "open" (slice (0,1) → no
+        # narrowing), so 3bet/4bet ranges were never tightened.
+        if choice_idx == 0:
+            act_type = None
+        elif choice_idx == 1:
+            act_type = "call" if table.turn == 0 else "call_postflop"
+        else:
+            # Any raise (sized bin or all-in).
+            if table.turn == 0:
+                act_type = "3bet" if street_raise_count >= 1 else "open"
+            else:
+                act_type = "bet_postflop"
+
+        if act_type is not None:
+            action_history.append((active_pos, act_type))
+
+        # Count this raise toward the current street's raise tally (B.5.6).
+        if choice_idx >= 2:
+            street_raise_count += 1
+
+        # V4: Bayesian range update after observing action
+        if solver_name == "v4" and v4_per_combo_probs is not None:
+            bs = bayesian_state[active_pos]
+            board_ids_upd = _get_board_cards(table)
+            dead_upd = set(board_ids_upd)
+            _, valid_weights_upd = v4_filter_dead(bs["combos"], bs["weights"], dead_upd)
+            updated_valid_weights = v4_bayes_update(
+                valid_weights_upd, v4_per_combo_probs, choice_idx
+            )
+            # Remap back: zero out dead combos, set valid ones to updated weights
+            new_full_weights = torch.zeros_like(bs["weights"])
+            dead_t = torch.tensor(sorted(dead_upd), dtype=torch.long) if dead_upd else torch.tensor([], dtype=torch.long)
+            c0 = bs["combos"][:, 0]
+            c1 = bs["combos"][:, 1]
+            if len(dead_t) > 0:
+                c0_dead = (c0.unsqueeze(1) == dead_t.unsqueeze(0)).any(dim=1)
+                c1_dead = (c1.unsqueeze(1) == dead_t.unsqueeze(0)).any(dim=1)
+                valid_mask = ~(c0_dead | c1_dead)
+            else:
+                valid_mask = torch.ones(len(bs["combos"]), dtype=torch.bool)
+            new_full_weights[valid_mask] = updated_valid_weights
+            total_w = new_full_weights.sum()
+            if total_w > 0:
+                new_full_weights = new_full_weights / total_w
+            bs["weights"] = new_full_weights
+
+        # Execute action on table
+        end, several_all_in, state, bet = table.step(action)
+
+        # Save post-action snapshot
+        # Audit B.2: `acting_pos` in a post-action event uses the NEXT-player
+        # convention (who acts after this action) — consistent with collect.py,
+        # evaluate.py and generate_opponent.py. The decision snapshot above
+        # stores the actor (correct: that's who is on turn at the decision).
+        # Previously this stored `active_pos` (the actor who just moved),
+        # creating a train/inference event-schema mismatch.
+        snapshots.append({
+            "pot": table.pot,
+            "bets": np.copy(table.bets),
+            "credits": list(table.credits),
+            "turn": table.turn,
+            "active_pos": table.active_player,
+            "action": action,
+        })
+
+        if end or several_all_in:
+            break
+    else:
+        # B.6.3: betting loop exhausted max_actions without terminating — a
+        # truncated raise-war. Not silent: warn with the running fraction.
+        _truncation_stats["truncated"] += 1
+        warnings.warn(
+            f"generate_scenario: hand truncated at max_actions={max_actions} "
+            f"({_truncation_stats['truncated']}/{_truncation_stats['hands']} hands "
+            f"truncated this process)",
+            stacklevel=2,
+        )
+
+    if not decisions:
+        return None
+
+    # Build one sample per decision point
+    results = []
+    for snap_idx, player_pos, all_evs, meta in decisions:
+        # Rebuild events from this player's perspective, up to the decision
+        events = _rebuild_events(
+            snapshots, table.deck, player_pos,
+            num_players, big_blind, small_blind, n_actions,
+            up_to=snap_idx,
+        )
+
+        if len(events) < 2:
+            continue
+
+        best_ev = float(all_evs.max().item())
+        # Fix 5: normalize by pot size, not just big blind.
+        # B.5.2/B.5.3: mask illegal/dominated actions so the saved policy target
+        # matches the playable set (and the sampled action) — no train/inference
+        # gap, and the all-in mass is not multiplied by k capped raise bins.
+        normalizer = max(meta["pot"] + meta["facing_bet"], big_blind) * temperature
+        legal_mask_t = torch.tensor(meta["legal_mask"], dtype=torch.bool)
+        masked_evs = all_evs.masked_fill(~legal_mask_t, float("-inf"))
+        action_probs = F.softmax(masked_evs / normalizer, dim=0)
+
+        results.append({
+            "events": events,
+            "ev_target": best_ev,
+            "action_probs": action_probs.tolist(),
+            "action_evs": all_evs.tolist(),
+            # Persist the legal mask used for the policy softmax above so
+            # training-time modifiers (modifiers.py / sharded.py) can recompute
+            # action_probs from modified EVs with the SAME mask. Without it,
+            # fold regains probability when checking is free and capped raise
+            # bins duplicate the all-in mass. action_evs stay raw/unmasked.
+            "legal_mask": list(meta["legal_mask"]),
+            "equity": float(meta["equity"]),
+            "pot": float(meta["pot"]),
+            "facing_bet": float(meta["facing_bet"]),
+            "stack": float(meta["stack"]),
+            "hero_invested": float(meta["hero_invested"]),
+            "num_players": num_players,
+            "n_events": len(events),
+        })
+
+    # V4: build modelling scenarios from observer perspectives. Quarantined
+    # into a separate list and NOT returned: these dicts lack `action_evs`/
+    # `ev_target`/`legal_mask`, no loader filters `scenario_type`, and every
+    # GTO phase would KeyError on them. Re-wire when a consumer exists.
+    modelling_results = []
+    if solver_name == "v4" and modelling_decisions:
+        if not _truncation_stats.get("warned_v4_modelling"):
+            _truncation_stats["warned_v4_modelling"] = True
+            warnings.warn(
+                "solver v4 modelling scenarios are generated but quarantined "
+                "(no loader supports scenario_type='modelling'); they are "
+                "not added to the dataset.",
+                stacklevel=2,
+            )
+        for md in modelling_decisions:
+            snap_idx = md["snap_idx"]
+            acting_pos = md["acting_pos"]
+            marg_probs = md["marg_probs"]
+
+            for observer_pos in range(num_players):
+                if observer_pos == acting_pos:
+                    continue
+                # Skip folded players
+                if table.players_state[observer_pos] < 0:
+                    continue
+
+                events = _rebuild_events(
+                    snapshots, table.deck, observer_pos,
+                    num_players, big_blind, small_blind, n_actions,
+                    up_to=snap_idx,
+                )
+                if len(events) < 2:
+                    continue
+
+                modelling_results.append({
+                    "events": events,
+                    "scenario_type": "modelling",
+                    "marginalized_action_probs": marg_probs.cpu().tolist()
+                        if hasattr(marg_probs, 'cpu') else list(marg_probs),
+                    "acting_pos": acting_pos,
+                    "pot": float(md["pot"]),
+                    "facing_bet": float(md["facing_bet"]),
+                    "num_players": num_players,
+                    "n_events": len(events),
+                })
+
+    return results if results else None
+
+
+def _compute_norm_stats(scenarios):
+    """Compute mean/std for normalization across all scenarios.
+
+    EV targets are first scaled by (pot + facing_bet) to remove pot-size
+    dependence, then z-score stats are computed on the ratio.
+    """
+    evs, pots, stacks, all_bets, blinds = [], [], [], [], []
+    for s in tqdm(scenarios, desc="Computing norm stats", leave=False, smoothing=0):
+        # Scale EV by pot + facing_bet before computing stats
+        denom = max(s.get("pot", 0) + s.get("facing_bet", 0),
+                    s["events"][-1]["big_blind"])
+        evs.append(s["ev_target"] / denom)
+        for event in s["events"]:
+            pots.append(event["pot"])
+            stacks.append(event["stack"])
+            blinds.append(event["big_blind"])
+            raw_bets = event["bets"]
+            if isinstance(raw_bets, np.ndarray):
+                raw_bets = raw_bets.tolist()
+            all_bets.extend(float(b) for b in raw_bets)
+
+    def _stats(vals):
+        arr = np.array(vals, dtype=np.float64)
+        m, s = float(arr.mean()), float(arr.std())
+        if s < 1e-8:
+            s = 1.0
+        return m, s
+
+    return {
+        "ev_mean": _stats(evs)[0], "ev_std": _stats(evs)[1],
+        "pot_mean": _stats(pots)[0], "pot_std": _stats(pots)[1],
+        "stack_mean": _stats(stacks)[0], "stack_std": _stats(stacks)[1],
+        "bets_mean": _stats(all_bets)[0], "bets_std": _stats(all_bets)[1],
+        "blind_mean": _stats(blinds)[0], "blind_std": _stats(blinds)[1],
+    }
+
+
+def _shallow_copy_scenarios(scenarios):
+    """Shallow-copy scenarios for normalization: copies only the mutable fields
+    (ev_target, events, action_evs, action_probs) without a full deepcopy."""
+    out = []
+    for s in scenarios:
+        copy = {**s, "events": [{**e} for e in s["events"]]}
+        if "action_evs" in copy:
+            copy["action_evs"] = list(copy["action_evs"])
+        if "action_probs" in copy:
+            copy["action_probs"] = list(copy["action_probs"])
+        out.append(copy)
+    return out
+
+
+def _normalize_scenarios(scenarios, norm_stats):
+    """Normalize ev_target and event scalar inputs in-place.
+
+    EV is first scaled by (pot + facing_bet), then z-scored.
+    """
+    ev_m, ev_s = norm_stats["ev_mean"], norm_stats["ev_std"]
+    pot_m, pot_s = norm_stats["pot_mean"], norm_stats["pot_std"]
+    stack_m, stack_s = norm_stats["stack_mean"], norm_stats["stack_std"]
+    bets_m, bets_s = norm_stats["bets_mean"], norm_stats["bets_std"]
+    blind_m, blind_s = norm_stats["blind_mean"], norm_stats["blind_std"]
+
+    for s in tqdm(scenarios, desc="Normalizing scenarios", leave=False, smoothing=0):
+        denom = max(s.get("pot", 0) + s.get("facing_bet", 0),
+                    s["events"][-1]["big_blind"])
+        s["ev_target"] = (s["ev_target"] / denom - ev_m) / ev_s
+        for event in s["events"]:
+            event["pot"] = (event["pot"] - pot_m) / pot_s
+            event["stack"] = (event["stack"] - stack_m) / stack_s
+            event["big_blind"] = (event["big_blind"] - blind_m) / blind_s
+            event["small_blind"] = (event["small_blind"] - blind_m) / blind_s
+            if isinstance(event["bets"], np.ndarray):
+                event["bets"] = (event["bets"] - bets_m) / bets_s
+            else:
+                event["bets"] = [(b - bets_m) / bets_s for b in event["bets"]]
+            # B.6.2: normalize the per-position stacks vector on the same scale
+            # as the hero "stack" scalar (same units → reuse stack_mean/std).
+            if "stacks" in event:
+                if isinstance(event["stacks"], np.ndarray):
+                    event["stacks"] = (event["stacks"] - stack_m) / stack_s
+                else:
+                    event["stacks"] = [(c - stack_m) / stack_s for c in event["stacks"]]
+
+
+def _meta_path(dataset_dir):
+    return os.path.join(dataset_dir, "meta.json")
+
+
+def _read_meta(dataset_dir):
+    """Read meta.json sidecar, or return None if absent/unreadable."""
+    p = _meta_path(dataset_dir)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_meta(dataset_dir, meta):
+    """Atomically persist the meta.json sidecar."""
+    atomic_json_dump(meta, _meta_path(dataset_dir))
+
+
+def _convert_monolithic_to_shards(save_dir, dataset_path, log, shard_size=10000):
+    """One-time conversion: split dataset.pt into numbered shards."""
+    if log:
+        log("Converting monolithic dataset.pt to shards (one-time)...")
+    scenarios = torch.load(dataset_path, weights_only=False)
+    shard_dir = os.path.join(save_dir, "dataset_shards")
+    os.makedirs(shard_dir, exist_ok=True)
+    shard_counts = []
+    shard_idx = 0
+    for i in range(0, len(scenarios), shard_size):
+        chunk = scenarios[i:i + shard_size]
+        shard_path = os.path.join(shard_dir, f"shard_{shard_idx:06d}.pt")
+        atomic_torch_save(chunk, shard_path)
+        shard_counts.append(len(chunk))
+        shard_idx += 1
+    del scenarios
+    meta = _read_meta(save_dir) or {}
+    meta["storage"] = "sharded"
+    meta["shard_counts"] = shard_counts
+    meta["n_shards"] = shard_idx
+    _write_meta(save_dir, meta)
+    os.unlink(dataset_path)
+    if log:
+        log(f"  Converted to {shard_idx} shards, removed dataset.pt")
+
+
+def dataset_exists(dataset_dir):
+    """Lightweight on-disk presence check — mirrors ``load_dataset``'s
+    found/not-found logic without loading any shard into memory."""
+    shard_dir = os.path.join(dataset_dir, "dataset_shards")
+    if os.path.isdir(shard_dir):
+        import glob as _glob
+        if _glob.glob(os.path.join(shard_dir, "shard_*.pt")):
+            return True
+    meta = _read_meta(dataset_dir)
+    if meta is not None and meta.get("storage") == "sharded":
+        # Meta says sharded but no shards found — nothing on disk.
+        return False
+    return os.path.exists(os.path.join(dataset_dir, "dataset.pt"))
+
+
+def load_dataset(dataset_dir, log=None, strict_done=False):
+    """Load a raw dataset from a directory.
+
+    Checks for shards in ``<dataset_dir>/dataset_shards/`` first, then
+    falls back to a legacy monolithic ``dataset.pt``.
+
+    Args:
+        dataset_dir: directory containing dataset shards or dataset.pt
+        log: optional logger
+        strict_done: if True, only return scenarios when meta.json marks the
+            dataset as fully generated (``done: true``). Resumable callers
+            use this to avoid loading a partial dataset as complete. Legacy
+            callers (no meta.json) keep the old behaviour: load whatever is
+            on disk.
+
+    Returns:
+        scenarios list, or None if missing / partial-when-strict
+    """
+    dataset_path = os.path.join(dataset_dir, "dataset.pt")
+    shard_dir = os.path.join(dataset_dir, "dataset_shards")
+
+    meta = _read_meta(dataset_dir)
+    if strict_done:
+        if meta is None or not meta.get("done"):
+            if log:
+                log(f"Dataset at {dataset_dir} present but not marked done; "
+                    f"will resume/regenerate")
+            return None
+
+    # --- Try shards first ---
+    if os.path.isdir(shard_dir):
+        import glob as _glob
+        shard_files = sorted(_glob.glob(
+            os.path.join(shard_dir, "shard_*.pt")))
+        if shard_files:
+            scenarios = []
+            for sf in shard_files:
+                chunk = torch.load(sf, weights_only=False)
+                scenarios.extend(chunk)
+                del chunk
+            if log:
+                log(f"Loaded dataset from {dataset_dir} "
+                    f"({len(scenarios)} samples, {len(shard_files)} shards)")
+            return scenarios
+
+    # --- Legacy monolithic dataset.pt ---
+    if meta is not None and meta.get("storage") == "sharded":
+        # Meta says sharded but no shards found — nothing to load.
+        return None
+
+    if not os.path.exists(dataset_path):
+        return None
+
+    scenarios = torch.load(dataset_path, weights_only=False)
+    if log:
+        log(f"Loaded dataset from {dataset_dir} ({len(scenarios)} samples)")
+
+    return scenarios
+
+
+def _get_generation_device(config_device=None):
+    """Determine the best device for solver-heavy data generation.
+
+    For MC-based solvers, CPU is faster than MPS due to overhead of many
+    small GPU transfers. CUDA is used when available (large batch MC is
+    efficient on CUDA). MPS workers always use CPU.
+
+    Args:
+        config_device: explicit device override from config, or None for auto.
+
+    Returns:
+        device string
+    """
+    if config_device and config_device != "auto":
+        return config_device
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+_shared_counter = None
+_worker_config = None
+_worker_device = None
+
+
+def _init_worker(counter, config=None, device=None):
+    """Initializer for pool workers — stores shared counter and config."""
+    global _shared_counter, _worker_config, _worker_device
+    _shared_counter = counter
+    _worker_config = config
+    _worker_device = device
+    torch.set_num_threads(1)
+
+
+def _generate_worker(args):
+    """Worker function for multiprocessing dataset generation.
+
+    Args:
+        args: tuple of (n_hands, worker_id). Config and device are passed
+              via initargs to avoid pickling them per task.
+
+    Returns:
+        list of scenario dicts (flat)
+    """
+    n_hands, worker_id = args
+    config = _worker_config
+    device = _worker_device
+    scenarios = []
+    failed = 0
+    for h in range(n_hands):
+        result = generate_scenario(config, device=device)
+        if result is not None:
+            for s in result:
+                s["hand_id"] = worker_id + h
+            scenarios.extend(result)
+        else:
+            failed += 1
+        if _shared_counter is not None:
+            with _shared_counter.get_lock():
+                _shared_counter.value += 1
+    return scenarios, n_hands - failed, failed
+
+
+def generate_dataset(config, save_dir, log=None, resume=False, config_hash=None):
+    """Generate full dataset of scenarios with both EV and action prob labels.
+
+    Saves raw (unnormalized) data. Normalization is done at training time
+    per-agent so each agent can have its own norm_stats.
+
+    Supports multiprocessing via config key 'n_workers':
+        0 = auto (min(cpu_count, 8))
+        1 = sequential (no multiprocessing)
+        N = use N worker processes
+
+    CUDA workers use GPU (via spawn). MPS workers use CPU (MPS not MP-safe).
+
+    Args:
+        config: merged config dict (game + solver + scenario-specific)
+        save_dir: directory to save dataset.pt
+        log: optional logger
+        resume: if True, look at meta.json and continue from where a prior
+            interrupted run left off. Supported in both sequential and
+            parallel modes; in parallel mode resume granularity is
+            `save_every_hands` (tasks dispatched but not yet incrementally
+            persisted before the kill are regenerated). Verifies
+            `meta.config_hash == config_hash`; on mismatch the existing
+            dataset is renamed to `dataset.pt.stale.<ts>` and generation
+            starts from scratch.
+        config_hash: hash of game.* + solver.* (see `agent.resume.compute_config_hash`).
+            Stored in meta.json so subsequent resumes know whether the
+            dataset is still compatible. Required when `resume=True`.
+
+    Returns:
+        save_dir (str) — path to the directory containing the dataset shards.
+            Callers use ``load_dataset(save_dir)`` to materialise the list.
+    """
+    n_scenarios = config.get("n_scenarios", 50000)
+    n_workers = config.get("n_workers", 0)
+    if n_workers <= 0:
+        n_workers = min(os.cpu_count() or 1, 8)
+
+    device = _get_generation_device(config.get("device"))
+    # E.3.5: cap CUDA workers to avoid OOM from multiple CUDA contexts. Each
+    # spawn'd worker creates its own CUDA context (~300-500 MB overhead) plus
+    # solver tensors. With the solver on GPU, limit to 2 workers (one active +
+    # one queuing) and let per-hand GPU work fill the device. CPU workers are
+    # uncapped (they use the GPU only via the solver's device arg).
+    if n_workers > 1 and str(device).startswith("cuda"):
+        max_cuda_workers = int(config.get("max_cuda_workers", 2))
+        if n_workers > max_cuda_workers:
+            if log:
+                log(f"Capping n_workers {n_workers} → {max_cuda_workers} "
+                    f"(CUDA device {device}, max_cuda_workers={max_cuda_workers})")
+            n_workers = max_cuda_workers
+    dataset_path = os.path.join(save_dir, "dataset.pt")
+    os.makedirs(save_dir, exist_ok=True)
+    save_every_hands = config.get("save_every_hands", 1000)
+
+    # -----------------------------------------------------------------
+    # Resume bookkeeping
+    # -----------------------------------------------------------------
+    # `start_attempts` = how many hands the prior run already attempted
+    # (good + failed). `start_hand_id` = the next monotonic hand_id to
+    # assign. Carried over via meta.json. When not resuming or no usable
+    # meta exists, both stay zero and behaviour matches the legacy path.
+    scenarios = []
+    start_attempts = 0
+    start_hand_id = 0
+    initial_failed = 0
+
+    if resume:
+        meta = _read_meta(save_dir)
+        if meta is not None:
+            # Config-hash mismatch invalidates the on-disk dataset entirely.
+            if config_hash is not None \
+                    and meta.get("config_hash") != config_hash:
+                stale = (f"{dataset_path}.stale."
+                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                if log:
+                    log(f"Dataset config_hash mismatch (was "
+                        f"{meta.get('config_hash')!r}, now {config_hash!r}). "
+                        f"Renaming existing to {os.path.basename(stale)} "
+                        f"and starting fresh.")
+                if os.path.exists(dataset_path):
+                    os.replace(dataset_path, stale)
+                # also drop the stale meta — it would otherwise confuse
+                # the next resume.
+                try:
+                    os.unlink(_meta_path(save_dir))
+                except OSError:
+                    pass
+            elif meta.get("done") and meta.get("target", 0) >= n_scenarios:
+                # Fully generated previously with at least as many attempts
+                # as we want now — return save_dir.
+                if log:
+                    log(f"Dataset already complete at {save_dir} "
+                        f"(target={meta['target']} >= {n_scenarios})")
+                if meta.get("storage") != "sharded" and os.path.exists(dataset_path):
+                    _convert_monolithic_to_shards(save_dir, dataset_path, log)
+                return save_dir
+            elif meta.get("completed_attempts", 0) > 0:
+                # Zero-memory resume: do NOT load prior data into RAM.
+                # Prior shards stay on disk; new generation appends new
+                # shards. `_shard_idx` is set below to continue numbering.
+                start_attempts = int(meta.get("completed_attempts", 0))
+                start_hand_id = int(meta.get("completed_hands", 0))
+                initial_failed = max(0, start_attempts - start_hand_id)
+                # Count existing shards for shard_idx continuation
+                _shard_resume_dir = os.path.join(save_dir, "dataset_shards")
+                _existing_shards = 0
+                if os.path.isdir(_shard_resume_dir):
+                    import glob as _glob
+                    _existing_shards = len(_glob.glob(
+                        os.path.join(_shard_resume_dir, "shard_*.pt")))
+                # Include legacy dataset.pt as shard 0 equivalent
+                if _existing_shards == 0 and os.path.exists(dataset_path):
+                    _existing_shards = 1  # dataset.pt counts as shard 0
+                if log:
+                    log(f"Resuming dataset at {save_dir}: "
+                        f"{start_attempts}/{n_scenarios} attempts done, "
+                        f"{_existing_shards} shard(s) on disk "
+                        f"(zero-memory resume — prior data NOT loaded)")
+
+    # If we reach here without a partial-resume and the dataset is already
+    # present (legacy non-resume usage), short-circuit. Existence check only —
+    # the data stays on disk.
+    if not resume and start_attempts == 0 and dataset_exists(save_dir):
+        if log:
+            log(f"Dataset already present at {save_dir} (not loaded)")
+        return save_dir
+
+    # Shard-based incremental saving. `scenarios` is a bounded buffer: each
+    # _persist() writes it as a new shard and clears it, so peak RAM is one
+    # shard (~save_every_hands worth), never the whole dataset.
+    shard_dir = os.path.join(save_dir, "dataset_shards")
+    # Continue shard numbering from existing shards
+    if os.path.isdir(shard_dir):
+        import glob as _gl
+        _shard_idx = len(_gl.glob(os.path.join(shard_dir, "shard_*.pt")))
+    else:
+        _shard_idx = 0
+    # Track shard counts for meta
+    if resume:
+        _resume_meta = _read_meta(save_dir)
+        _shard_counts = list((_resume_meta or {}).get("shard_counts", []))
+    else:
+        _shard_counts = []
+    _new_samples = 0  # samples generated (and persisted) this run
+    _len_min, _len_max, _len_sum = None, None, 0  # n_events stats, streamed
+
+    def _persist(meta_done):
+        nonlocal _shard_idx, _new_samples, _len_min, _len_max, _len_sum
+        if scenarios:
+            os.makedirs(shard_dir, exist_ok=True)
+            for s in scenarios:
+                n = s["n_events"]
+                _len_sum += n
+                _len_min = n if _len_min is None else min(_len_min, n)
+                _len_max = n if _len_max is None else max(_len_max, n)
+            shard_path = os.path.join(shard_dir, f"shard_{_shard_idx:06d}.pt")
+            atomic_torch_save(scenarios, shard_path)
+            _shard_counts.append(len(scenarios))
+            _shard_idx += 1
+            _new_samples += len(scenarios)
+            scenarios.clear()
+        if config_hash is not None or resume:
+            _write_meta(save_dir, {
+                "version":            1,
+                "target":             n_scenarios,
+                "completed_attempts": completed_attempts,
+                "completed_hands":    completed_hands,
+                "done":               bool(meta_done),
+                "config_hash":        config_hash,
+                "n_workers":          n_workers,
+                "storage":            "sharded",
+                "shard_counts":       _shard_counts,
+                "n_shards":           _shard_idx,
+            })
+
+    if n_workers > 1 and n_scenarios >= n_workers * 2:
+        # --- Multiprocessing path with zero-memory resume ---
+        # Worker tasks are 1 hand each, dispatched by `worker_id` =
+        # `start_attempts..n_scenarios-1`. Prior data stays on disk as
+        # shards (NOT loaded into RAM); new results accumulate in
+        # `scenarios` and are persisted as new shard files. Resume
+        # granularity is `save_every_hands`.
+        worker_device = _get_generation_device(config.get("device"))
+        if log:
+            if start_attempts > 0:
+                log(f"Resuming parallel generation on {worker_device}: "
+                    f"{n_scenarios - start_attempts} attempts remaining of "
+                    f"{n_scenarios} (prior: {start_attempts} attempts, "
+                    f"zero-memory resume)")
+            else:
+                log(f"Generating {n_scenarios} hands with {n_workers} workers on {worker_device}...")
+            log(f"Incremental save every {save_every_hands} hands")
+
+        chunk_size = max(1, min(50, (n_scenarios - start_attempts) // max(1, n_workers * 4)))
+        worker_args = []
+        worker_id = start_attempts
+        while worker_id < n_scenarios:
+            n_hands = min(chunk_size, n_scenarios - worker_id)
+            worker_args.append((n_hands, worker_id))
+            worker_id += n_hands
+
+        ctx = mp.get_context("spawn")
+        counter = ctx.Value("i", start_attempts)
+        total_ok = start_hand_id
+        total_failed = initial_failed
+        completed_attempts = start_attempts
+        completed_hands = start_hand_id
+        last_save_count = start_attempts
+
+        pbar = tqdm(total=n_scenarios, desc="Generating hands",
+                    initial=start_attempts)
+
+        if worker_args:
+            import threading
+
+            _pbar_stop = threading.Event()
+
+            def _pbar_poller():
+                while not _pbar_stop.wait(0.3):
+                    pbar.n = counter.value
+                    pbar.refresh()
+
+            pbar_thread = threading.Thread(target=_pbar_poller, daemon=True)
+            pbar_thread.start()
+
+            with ctx.Pool(n_workers, initializer=_init_worker,
+                          initargs=(counter, config, worker_device)) as pool:
+                for worker_scenarios, ok, failed in pool.imap_unordered(
+                        _generate_worker, worker_args, chunksize=1):
+                    scenarios.extend(worker_scenarios)
+                    total_ok += ok
+                    total_failed += failed
+                    completed_attempts = counter.value
+                    completed_hands = total_ok
+
+                    if counter.value - last_save_count >= save_every_hands:
+                        _persist(meta_done=False)
+                        last_save_count = counter.value
+                        if log:
+                            log(f"  Incremental save: {_new_samples} samples ({counter.value} hands)")
+
+            _pbar_stop.set()
+            pbar_thread.join(timeout=1.0)
+
+        pbar.n = n_scenarios
+        pbar.refresh()
+        pbar.close()
+
+        if log:
+            log(f"Generated {_new_samples + len(scenarios)} samples total "
+                f"({total_ok} successful hands, {total_failed} failed)")
+
+    else:
+        # --- Sequential path (n_workers=1 or very few scenarios) ---
+        # Supports partial-resume: continues attempts counter and hand_id
+        # from where the prior run stopped.
+        remaining_attempts = n_scenarios - start_attempts
+        if log:
+            if start_attempts > 0:
+                log(f"Resuming sequential generation on {device}: "
+                    f"{remaining_attempts} attempts remaining "
+                    f"(saving every {save_every_hands} hands)")
+            else:
+                log(f"Generating {n_scenarios} hands on {device} "
+                    f"(saving every {save_every_hands} hands)...")
+
+        failed = initial_failed
+        completed_attempts = start_attempts
+        completed_hands = start_hand_id
+        hand_id = start_hand_id
+        last_save_at = start_attempts
+        for _ in tqdm(range(remaining_attempts), desc="Generating hands"):
+            result = generate_scenario(config, device=device)
+            if result is not None:
+                for s in result:
+                    s["hand_id"] = hand_id
+                scenarios.extend(result)
+                hand_id += 1
+                completed_hands = hand_id
+            else:
+                failed += 1
+            completed_attempts += 1
+
+            if completed_attempts - last_save_at >= save_every_hands:
+                _persist(meta_done=False)
+                last_save_at = completed_attempts
+                if log:
+                    log(f"  Incremental save: {_new_samples} samples "
+                        f"({completed_attempts} hands)")
+
+        if log:
+            log(f"Generated {_new_samples + len(scenarios)} samples from "
+                f"{completed_attempts - failed} hands ({failed} failed)")
+
+    _persist(meta_done=True)
+    if log and _new_samples:
+        log(f"Sequence lengths: min={_len_min}, max={_len_max}, "
+            f"avg={_len_sum / _new_samples:.1f}")
+    if log:
+        log(f"Dataset saved to {save_dir} ({_shard_idx} shards)")
+
+    return save_dir
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate unified GTO training dataset")
+    parser.add_argument("--config", default="config.json", help="Path to config.json")
+    parser.add_argument("--save-dir", default="data/standalone", help="Directory to save dataset")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        config = json.load(f)
+
+    # Merge config sections for standalone use
+    train_cfg = {}
+    train_cfg.update(config.get("game", {}))
+    solver_cfg = dict(config.get("solver", {}))
+    train_cfg["solver"] = solver_cfg.pop("type", "v2")
+    train_cfg.update(solver_cfg)
+    train_cfg.update(config.get("dataset", {}))
+    train_cfg.update(config.get("gto_ev_train", {}))
+
+    dataset_dir = generate_dataset(train_cfg, args.save_dir, log=print)
+    # Stream stats shard-by-shard — the full dataset is never held in RAM.
+    from agent.train_scenarios.sharded import ShardedScenarios
+    shards = ShardedScenarios(dataset_dir)
+    if len(shards):
+        ev_min, ev_max = float("inf"), float("-inf")
+        for path, _ in shards.shard_info:
+            chunk = torch.load(path, weights_only=False)
+            for s in chunk:
+                ev_min = min(ev_min, s["ev_target"])
+                ev_max = max(ev_max, s["ev_target"])
+            del chunk
+        print(f"Total scenarios: {len(shards)}")
+        print(f"EV range: [{ev_min:.2f}, {ev_max:.2f}]")
+        print(f"Action probs sample: {shards[0]['action_probs']}")
+    else:
+        print("No scenarios generated.")

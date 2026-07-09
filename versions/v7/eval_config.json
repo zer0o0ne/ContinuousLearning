@@ -1,0 +1,117 @@
+{
+    "name": "eval",
+    "architecture": {
+        "d_model": 384,
+        "n_heads": 8,
+        "n_kv_heads": 2,
+        "d_ff": 1536,
+        "n_encoder_layers": 6,
+        "n_decoder_layers": 6,
+        "n_value_layers": 6,
+        "n_action_layers": 6,
+        "n_opponent_action_layers": 8,
+        "n_modelling_layers": 4,
+        "max_seq_len": 1536,
+        "max_players": 9,
+        "memory": {
+            "n_levels": 2,
+            "max_cluster_size": 128,
+            "max_cluster_size_after": 64,
+            "beam_width": 8
+        },
+        "opponent_embedding": {
+            "enabled": true
+        }
+    },
+    "game": {
+        "raise_sizes": {
+            "preflop": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0],
+            "flop":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+            "turn":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+            "river":   [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0]
+        },
+        "max_players": 9,
+        "max_stack": 3000,
+        "big_blind": 10
+    },
+    "mcts": {
+        "n_simulations": 3000,
+        "c_puct": 1.5,
+        "dirichlet_alpha": 0.3,
+        "dirichlet_epsilon": 0.25,
+        "dirichlet_alpha_inner": 0.3,
+        "dirichlet_epsilon_inner": 0.05,
+        "temperature": 1.0,
+        "n_equity_iters": 5000,
+        "batch_size": 64,
+        "virtual_loss": 0.5,
+        "opp_prior_smoothing": 0.15,
+        "opp_pessimism_alpha": 0.5,
+        "terminal_eval_prob_floor": 0.05,
+        "strange_traversal_C_start": 0.2
+    },
+
+    "solver": {
+        "type": "v3",
+        "mc_iterations": 125000,
+        "n_raise_samples": 10,
+        "gto_temperature": 0.05,
+        "eqr_enabled": true,
+        "combo_response_iters": 1500,
+        "reraise_threshold": 0.685,
+        "weighted_sampling": true,
+        "marginal_mc_iters": 0,
+        "marginal_response_iters": 0,
+        "threshold_smoothing": {
+            "enabled": true,
+            "beta_fold": 0.07,
+            "beta_reraise": 0.07
+        },
+        "polarized_reraise": {
+            "enabled": true,
+            "bluff_threshold": 0.25,
+            "beta_bluff": 0.10,
+            "bluff_frequency": 0.30
+        }
+    },
+
+    "internal_evaluation": {
+        "enabled": false,
+        "n_hands": 100000,
+        "num_players": 6,
+        "big_blind": 10,
+        "start_stack": 1000,
+        "min_rebuy_stack": 500,
+        "max_rebuy_stack": 1500,
+        "max_stack_cap": 3000,
+        "log_every": 1000,
+        "n_tables": 8,
+        "player_swap_prob": 0.02,
+        "n_player_pool": 6,
+        "action_temperature": 0.3,
+        "agents": [
+            
+        ]
+    },
+
+    "slumbot_evaluation": {
+        "enabled": true,
+        "host": "slumbot.com",
+        "username": "",
+        "password": "",
+        "request_timeout": 30,
+        "log_every": 5000,
+        "n_hands": 10000,
+        "n_workers": 4,
+        "max_consecutive_failures": 20,
+        "retries": 4,
+        "backoff": 1.0,
+        "action_temperature": 0.3,
+        "agents": [
+            {
+                "name": "detalized_solver",
+                "type": "solver"
+            }
+        ]
+    }
+}

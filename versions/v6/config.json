@@ -106,7 +106,7 @@
         "dataset_dir": "",
         "save_dir": "",
         "n_scenarios": 250000,
-        "val_split": 0.02,
+        "val_split": 0.002,
         "n_workers": 12,
         "max_cuda_workers": 4,
         "save_every_hands": 5000,
@@ -133,7 +133,7 @@
         "scheduler_eta_min": 3e-6
     },
     "modelling_train": {
-        "lr": 2e-5,
+        "lr": 5e-5,
         "batch_size": 256,
         "epochs": 3,
         "max_grad_norm": 1.0,
@@ -146,7 +146,7 @@
         "infonce_temperature": 0.1
     },
     "gto_train": {
-        "lr": 2e-5,
+        "lr": 5e-5,
         "batch_size": 256,
         "epochs": 3,
         "max_grad_norm": 1.0,
@@ -157,7 +157,7 @@
         "action_loss_weight": 0.7
     },
     "opponent_data": {
-        "agents_dir": "5_agents",
+        "agents_dir": "5_agents_more_epochs_new_modelling_speedup",
         "n_hands": 25000,
         "n_workers": 1,
         "server_max_batch": 768,
@@ -177,7 +177,7 @@
         }
     },
     "opponent_action_train": {
-        "lr": 2e-5,
+        "lr": 5e-5,
         "batch_size": 128,
         "epochs": 1,
         "max_grad_norm": 1.0,
@@ -185,7 +185,7 @@
         "val_every": 200,
         "interrupt_after_fails": 10,
         "scheduler_eta_min": 5e-7,
-        "val_split": 0.02,
+        "val_split": 0.004,
         "gru_window": 32
     },
     "mcts": {
@@ -218,7 +218,7 @@
         "min_stack": 100,
         "max_stack": 3000,
         "examples_dir": "",
-        "lr": 1e-5,
+        "lr": 2e-5,
         "batch_size": 64,
         "epochs": 1,
         "max_grad_norm": 1.0,

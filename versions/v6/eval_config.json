@@ -53,12 +53,12 @@
 
     "solver": {
         "type": "v3",
-        "mc_iterations": 25000,
-        "n_raise_samples": 5,
-        "gto_temperature": 0.2,
+        "mc_iterations": 125000,
+        "n_raise_samples": 10,
+        "gto_temperature": 0.05,
         "eqr_enabled": true,
-        "combo_response_iters": 200,
-        "reraise_threshold": 0.65,
+        "combo_response_iters": 1500,
+        "reraise_threshold": 0.685,
         "weighted_sampling": true,
         "marginal_mc_iters": 0,
         "marginal_response_iters": 0,
@@ -109,11 +109,8 @@
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "gto_pure_gto",
-                "type": "model",
-                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents_more_epochs_new_modelling/gto_pure/gto_predict/2026_07_03_16_26_49/best.pt",
-                "use_opponent_embedding": false,
-                "use_mcts": false
+                "name": "detalized_solver",
+                "type": "solver"
             }
         ]
     }

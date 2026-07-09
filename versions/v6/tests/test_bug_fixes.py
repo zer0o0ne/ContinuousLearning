@@ -159,14 +159,21 @@ def test_bug6_compute_equity_outcome_uses_start_stacks():
     assert "start_stacks is not None" in source
 
 
-def test_bug6_dead_money_in_source():
-    """terminal_eval._capped_showdown_chips must have dead_money parameter."""
+def test_bug6_whole_hand_contributions_no_dead_money():
+    """2026-07 math-audit fix superseding the old dead_money design: side-pot
+    caps use WHOLE-HAND contributions (start_stacks baseline), so no separate
+    dead_money term may exist — computing caps from-root with dead_money
+    misclassified hero's call of an outstanding bet as uncalled excess
+    (systematic pro-call bias)."""
     src_path = os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "agent/mcts/terminal_eval.py")
     with open(src_path) as f:
         source = f.read()
-    assert "dead_money=0.0" in source
-    assert "dead_money=root_pot" in source or "dead_money = root_pot" in source
+    assert "dead_money" not in source.replace(
+        "no dead-money term", "").replace("no separate dead-money", ""), \
+        "dead_money must not reappear in terminal_eval.py"
+    # Whole-hand baseline plumbed from hand_record
+    assert 'hand_record.get("start_stacks")' in source
 
 
 # ── Bug 7: Solver call_cost = raise_amount (missing - facing_bet) ────────────

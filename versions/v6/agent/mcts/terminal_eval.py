@@ -72,6 +72,14 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
     hero_hands = hand_record["hero_hands"]
     num_players = hand_record["num_players"]
 
+    # Whole-hand contribution baseline for side-pot caps (C.5): pre-blind
+    # start stacks when available, else hand-start credits (post-blind —
+    # misses blind money in the caps, acceptable backward-compat fallback;
+    # same chain as compute_equity_outcome).
+    base_stacks = hand_record.get("start_stacks")
+    if base_stacks is None:
+        base_stacks = hand_record.get("initial_credits")
+
     if combo_probs_cache is None:
         combo_probs_cache = _precompute_combo_probs(
             decisions, hero_hands, agents_by_position, num_players, device,
@@ -91,7 +99,9 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
         hero_hand = hero_hands[hero_pos]
         board_cards = _board_at_turn(deck, root_turn)
         initial_stacks = list(root_gs.credits)
-        root_pot = float(root_gs.pot)
+        # Legacy hand_records without stack snapshots: degrade to from-root
+        # contributions (old behavior) rather than crash.
+        bs = base_stacks if base_stacks is not None else initial_stacks
 
         if value_scales_by_position is not None:
             scale = float(value_scales_by_position.get(hero_pos, 1.0))
@@ -109,8 +119,15 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                     gs.step(node.action_idx)
 
             active = [i for i in range(num_players) if gs.players_state[i] >= 0]
+            # Cost baseline: chips hero put in FROM THE MCTS ROOT onward
+            # (Q is measured from the decision point).
             hero_invested = initial_stacks[hero_pos] - gs.credits[hero_pos]
-            contributions = [initial_stacks[p] - gs.credits[p]
+            # Side-pot caps need WHOLE-HAND contributions: the pot at the
+            # root (blinds + prior streets + outstanding bets) belongs to
+            # specific players and is subject to the same caps. Computing
+            # caps from-root misclassified hero's call of an outstanding
+            # bet as uncalled excess (pro-call bias).
+            contributions = [float(bs[p]) - float(gs.credits[p])
                              for p in range(num_players)]
 
             if len(active) <= 1:
@@ -125,7 +142,7 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
             elif hero_pos not in active:
                 q_chips = -hero_invested
             else:
-                q_chips = _equity_terminal_chips(
+                gross = _equity_terminal_chips(
                     hero_pos=hero_pos,
                     hero_hand=hero_hand,
                     board_cards=board_cards,
@@ -142,12 +159,20 @@ def evaluate_all_terminals(hand_record, agents_by_position, device, config=None,
                     prob_floor=prob_floor,
                     narrow_cache=narrow_cache,
                     equity_cache=equity_cache,
-                    dead_money=root_pot,
                 )
+                # Same convention as the fold-win branch (`pot − invested`):
+                # everything hero receives from the pot — including his own
+                # pre-root chips coming back — counts as winnings, and only
+                # from-root chips count as cost (pre-root money is sunk at
+                # decision time).
+                q_chips = gross - hero_invested
 
             terminal.Q = q_chips / scale
 
-        opp_alpha = float(cfg.get("opp_pessimism_alpha", 1.0))
+        # Default must match MCTS.__init__ (0.5) so search-time blending and
+        # the post-hand re-backup walk stay on one convention when the config
+        # key is absent.
+        opp_alpha = float(cfg.get("opp_pessimism_alpha", 0.5))
         re_backup_terminals(root, opp_pessimism_alpha=opp_alpha)
 
     return combo_probs_cache
@@ -307,19 +332,12 @@ def compute_equity_outcome(hand_record, agents_by_position, device,
 
         equity = equity_by_hero[hero_pos]
 
-        # C.5: side-pot-correct chip delta. hero_base = excess + equity *
-        # hero_share_pot (same for all decisions by this hero); only
+        # C.5: side-pot-correct chip delta. hero_base = expected gross
+        # return from the pot (same for all decisions by this hero); only
         # invested_from_t varies per decision.
         if contributions is not None and hero_pos not in _hero_base_cache:
-            invested_hero_total = float(contributions[hero_pos])
-            opp_contribs = [float(contributions[p]) for p in final_active
-                            if p != hero_pos]
-            max_opp = max(opp_contribs) if opp_contribs else 0.0
-            effective_hero = min(invested_hero_total, max_opp)
-            excess = invested_hero_total - effective_hero
-            hero_share_pot = sum(min(float(c), effective_hero)
-                                 for c in contributions)
-            _hero_base_cache[hero_pos] = excess + equity * hero_share_pot
+            _hero_base_cache[hero_pos] = _capped_showdown_chips(
+                equity, contributions, hero_pos, final_active)
 
         if contributions is not None:
             realized_by_decision[dec_idx] = _hero_base_cache[hero_pos] - invested
@@ -345,40 +363,49 @@ def _board_at_turn(deck, turn):
         return torch.tensor(deck[:5].tolist(), dtype=torch.long)
 
 
-def _capped_showdown_chips(equity, contributions, hero_pos, active_players,
-                           dead_money=0.0):
-    """Side-pot-correct hero chip delta at a showdown (C.5).
+def _capped_showdown_chips(equity, contributions, hero_pos, active_players):
+    """Side-pot-correct hero expected GROSS return from the pot (C.5).
 
-    `contributions[p]` = chips player `p` put in the pot from the reference
-    point onward. `dead_money` = pot that existed before the reference point
-    (e.g. blinds, or the pot at the MCTS root) — contested by all active
-    players at equal equity but not subject to side-pot caps.
+    `contributions[p]` = chips player `p` put in the pot over the WHOLE hand
+    (blinds included), so the pot is fully covered by `sum(contributions)`
+    and no separate dead-money term exists. Callers subtract their own cost
+    baseline (from-root invested for tree terminals, whole-hand invested for
+    realized outcomes).
 
-    Net = ``excess + equity · (hero_share_pot + dead_money) − invested_hero``.
+    Layer decomposition:
+      - layers up to ``effective_hero`` (hero's level matched by the best
+        ACTIVE opponent) are contested → won at `equity`;
+      - layers above ``effective_hero`` up to hero's own level have no active
+        opponent → hero's own chips return and any folded player's chips in
+        those layers are won outright (deterministic).
     """
     invested_hero = float(contributions[hero_pos])
     opp_contribs = [float(contributions[p]) for p in active_players
                     if p != hero_pos]
     max_opp = max(opp_contribs) if opp_contribs else 0.0
     effective_hero = min(invested_hero, max_opp)
-    excess = invested_hero - effective_hero
-    hero_share_pot = sum(min(float(c), effective_hero) for c in contributions)
-    return excess + equity * (hero_share_pot + dead_money) - invested_hero
+    deterministic = invested_hero - effective_hero
+    for p, c in enumerate(contributions):
+        if p == hero_pos:
+            continue
+        deterministic += max(0.0, min(float(c), invested_hero) - effective_hero)
+    contested = sum(min(float(c), effective_hero) for c in contributions)
+    return deterministic + equity * contested
 
 
 def _equity_terminal_chips(hero_pos, hero_hand, board_cards, contributions,
                            active_players, num_players, dec_idx, decisions,
                            combo_probs_cache, path, root_gs, n_equity_iters,
                            device, prob_floor=0.05,
-                           narrow_cache=None, equity_cache=None,
-                           dead_money=0.0):
-    """Compute hero's chip-units terminal Q via equity vs narrowed ranges.
+                           narrow_cache=None, equity_cache=None):
+    """Hero's expected GROSS return from the pot via equity vs narrowed ranges.
 
     Used inside :func:`evaluate_all_terminals` for showdown terminals. Shared
     with :func:`_hero_equity_at_showdown` via the helpers below — only the
     "what counts as active" and "where to apply path-narrowing" differ. The
     equity is converted to chips with the side-pot-correct
-    :func:`_capped_showdown_chips` (C.5).
+    :func:`_capped_showdown_chips` (C.5); `contributions` must be WHOLE-HAND
+    per-player totals and the caller subtracts its own cost baseline.
     """
     hero_cards_t = torch.tensor(hero_hand, dtype=torch.long)
     dead_cards = set(hero_hand)
@@ -410,9 +437,13 @@ def _equity_terminal_chips(hero_pos, hero_hand, board_cards, contributions,
 
     if not opponent_combos:
         return _capped_showdown_chips(1.0, contributions, hero_pos,
-                                      active_players, dead_money=dead_money)
+                                      active_players)
 
-    eq_key = (hero_pos, frozenset(active_players), tuple(range_key_parts))
+    # `root_gs.turn` keys the board street: the cache is shared across all
+    # decisions of the hand, and identical narrowed ranges on different
+    # boards must NOT collide.
+    eq_key = (hero_pos, int(root_gs.turn), frozenset(active_players),
+              tuple(range_key_parts))
     if equity_cache is not None and eq_key in equity_cache:
         equity = equity_cache[eq_key]
     else:
@@ -422,7 +453,7 @@ def _equity_terminal_chips(hero_pos, hero_hand, board_cards, contributions,
         if equity_cache is not None:
             equity_cache[eq_key] = equity
     return _capped_showdown_chips(equity, contributions, hero_pos,
-                                  active_players, dead_money=dead_money)
+                                  active_players)
 
 
 def _hero_equity_at_showdown(hero_pos, hero_hand, board_cards, final_active,

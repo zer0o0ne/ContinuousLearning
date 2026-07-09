@@ -125,6 +125,26 @@ def _mcts_forward(agent, event_sequences, chains, device,
     lm_target_parts = []
     lm_bi, lm_src, lm_act, lm_tgt = build_lm_pairs(event_sequences)
     if lm_bi.numel() > 0:
+        # Same-hand examples in one batch share their event-prefix DICT
+        # OBJECTS (collect.py stores `decision["events_at_root"]` slices of
+        # one running list; pickle preserves the aliasing), so the same
+        # (source, action, target) transition is emitted once per example
+        # that contains it — oversampling early-street transitions and
+        # feeding InfoNCE identical rows as negatives. Key each pair by the
+        # identity of its target event and keep the first occurrence.
+        seen_tgt = set()
+        keep = []
+        for j in range(lm_bi.numel()):
+            key = id(event_sequences[int(lm_bi[j])][int(lm_tgt[j])])
+            if key not in seen_tgt:
+                seen_tgt.add(key)
+                keep.append(j)
+        if len(keep) < lm_bi.numel():
+            keep_idx = torch.tensor(keep, dtype=torch.long)
+            lm_bi = lm_bi[keep_idx]
+            lm_src = lm_src[keep_idx]
+            lm_act = lm_act[keep_idx]
+            lm_tgt = lm_tgt[keep_idx]
         root_lm_pred = agent.modelling_head.forward_positions(
             perception_out, mask, lm_bi, lm_src, lm_act)
         root_lm_target = perception_out[
@@ -345,8 +365,14 @@ def _mcts_forward(agent, event_sequences, chains, device,
 
         b_t_preds = []
         b_t_tgts = []
-        ctx_init = perception_out[b:b+1]
-        mask_init = mask[b:b+1]
+        # A.5.1 (same as the chain loop): trim to the true length so appended
+        # modelling embeddings sit contiguously after the last true token —
+        # with the padded width, `last_pos = mask.sum()−1` lands inside the
+        # padding region from the second rollout step on, and RoPE positions
+        # of appended tokens are shifted by the pad width.
+        L_b = int(mask[b].sum().item())
+        ctx_init = perception_out[b:b+1, :L_b]
+        mask_init = mask[b:b+1, :L_b]
         for action_path, equity_Q in t_list:
             ctx = ctx_init
             ctx_mask = mask_init

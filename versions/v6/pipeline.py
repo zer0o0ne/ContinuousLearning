@@ -1082,6 +1082,18 @@ def main():
                             a["agent_log"](
                                 f"  [resume] loaded {len(per_agent_examples[a['name']])} "
                                 f"examples from {os.path.basename(p)}")
+                            # Restore the norm_stats snapshot taken when these
+                            # examples were finalized (post-EMA scale), so the
+                            # value head trains and re-checkpoints on the same
+                            # axis as the baked targets. In-place update: the
+                            # dict is shared with agent._checkpoint_norm_stats.
+                            np_ = os.path.splitext(p)[0] + "_norm.pt"
+                            if os.path.exists(np_):
+                                a["norm_stats"].update(torch.load(
+                                    np_, weights_only=False))
+                                a["agent_log"](
+                                    "  [resume] restored finalized norm_stats "
+                                    f"from {os.path.basename(np_)}")
                         else:
                             all_loaded = False
                             a["agent_log"](
@@ -1129,6 +1141,13 @@ def main():
 
                     # Persist examples atomically BEFORE training so a crash
                     # during train_mcts can resume the SAME data on next start.
+                    # norm_stats is saved alongside: `_finalize_value_targets`
+                    # EMA-updated `mcts_value_scale` in memory and baked
+                    # NEW-scale targets into these examples, but the updated
+                    # scale only reaches a checkpoint at `_save_best`. A crash
+                    # before that would resume with the OLD scale in the
+                    # checkpoint while training on NEW-scale targets → the
+                    # next cycle's search would mix two axes in one tree.
                     new_examples_paths = {}
                     for a in trained_agents:
                         exs = per_agent_examples.get(a["name"], [])
@@ -1138,6 +1157,10 @@ def main():
                         os.makedirs(ex_dir, exist_ok=True)
                         p = os.path.join(ex_dir, f"cycle_{cycle:04d}.pt")
                         atomic_torch_save(exs, p)
+                        atomic_torch_save(
+                            dict(a["norm_stats"]),
+                            os.path.join(ex_dir,
+                                         f"cycle_{cycle:04d}_norm.pt"))
                         new_examples_paths[a["name"]] = p
                     state.set_mcts(stage="training",
                                    examples_paths=new_examples_paths)

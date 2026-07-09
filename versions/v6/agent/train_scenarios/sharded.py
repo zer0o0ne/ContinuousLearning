@@ -242,6 +242,7 @@ def compute_opponent_norm_stats_from_shards(shards):
     bld_s, bld_sq = 0.0, 0.0
     n_evt = 0
     n_bets = 0
+    n_stk = 0
 
     for path, _ in shards.shard_info:
         data = torch.load(path, weights_only=False)
@@ -253,6 +254,7 @@ def compute_opponent_norm_stats_from_shards(shards):
                 for pos_stacks in (event.get("stacks") or []):
                     stk_s += float(pos_stacks)
                     stk_sq += float(pos_stacks) ** 2
+                    n_stk += 1
                 bld_s += event["big_blind"]
                 bld_sq += event["big_blind"] ** 2
                 raw = event["bets"]
@@ -272,7 +274,6 @@ def compute_opponent_norm_stats_from_shards(shards):
         std = max(sq / n - m * m, 0.0) ** 0.5
         return m, (std if std > 1e-8 else 1.0)
 
-    n_stk = n_evt  # one stack per event per position, but we summed per-position
     return {
         "pot_mean": _st(pot_s, pot_sq, n_evt)[0], "pot_std": _st(pot_s, pot_sq, n_evt)[1],
         "stack_mean": _st(stk_s, stk_sq, n_stk)[0], "stack_std": _st(stk_s, stk_sq, n_stk)[1],

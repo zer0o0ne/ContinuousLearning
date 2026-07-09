@@ -422,6 +422,13 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                               total=n_batches, desc="Caching perception", smoothing=0):
                 end = min(start + batch_size, len(full_dataset))
                 items = [full_dataset[j] for j in range(start, end)]
+                # A.5.2 alignment: perception caps to the most recent
+                # `max_events` events; LM pairs must be built in the SAME
+                # index space, so cap here before both.
+                _cap = getattr(agent.perception, "max_events", None)
+                if _cap:
+                    items = [(ev[-_cap:], tg) if len(ev) > _cap else (ev, tg)
+                             for ev, tg in items]
                 batch_events = [it[0] for it in items]
                 p_out, _, m = agent.perception.forward_batch(
                     batch_events, device=device, skip_memory=True)
@@ -501,6 +508,12 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                               total=n_batches, desc="Caching perception", smoothing=0):
                 end = min(start + batch_size, len(dataset))
                 items = [dataset[j] for j in range(start, end)]
+                # A.5.2 alignment: same event cap as perception applies, so
+                # LM pair indices live in the capped token space.
+                _cap = getattr(agent.perception, "max_events", None)
+                if _cap:
+                    items = [(ev[-_cap:], tg) if len(ev) > _cap else (ev, tg)
+                             for ev, tg in items]
                 batch_events = [it[0] for it in items]
                 p_out, _, m = agent.perception.forward_batch(
                     batch_events, device=device, skip_memory=True)

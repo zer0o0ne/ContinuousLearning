@@ -9,6 +9,11 @@ from agent.perception.decoder import Decoder
 from agent.perception.memory import HierarchicalMemory
 from agent.perception.opponent_embeddings import OpponentGRUUpdater
 
+# A.4.5: "no group" marker for the GRU sample-group rewind in forward_batch.
+# A unique object so ANY caller-provided group id (including None-able ints)
+# can never collide with it.
+_GROUP_SENTINEL = object()
+
 
 def extract_event_tensors(event_sequences, max_players):
     """Extract raw numeric fields from event dicts into CPU tensors.
@@ -526,7 +531,7 @@ class Perception(nn.Module):
 
     def forward_batch(self, event_sequences, device="cpu", skip_memory=True,
                       skip_opponent_emb=True, opponent_emb_table=None,
-                      gru_window=1, precomputed=None):
+                      gru_window=1, precomputed=None, gru_sample_groups=None):
         """
         Batch-parallel forward over event sequences.
 
@@ -538,6 +543,12 @@ class Perception(nn.Module):
             opponent_emb_table: optional OpponentEmbeddingTable instance.
             gru_window: truncated-BPTT depth (A.4).
             precomputed: dict from extract_event_tensors() — skips dict extraction
+            gru_sample_groups: optional list (len B) of hashable group ids,
+                aligned with event_sequences. Consecutive samples with the
+                same id are treated as observer copies of ONE scenario: each
+                copy's GRU pass rewinds to the state as of the group start so
+                the shared table advances once per scenario (A.4.5). None →
+                every sample advances (legacy behavior).
 
         Returns: tuple (output, encoded, mask)
             output: (B, seq_len, d_model)
@@ -555,9 +566,15 @@ class Perception(nn.Module):
             # event has no opponent_id). Must match flat order used by
             # _build_batch_tensors (sample-major, event-major).
             opp_event_map = []
-            for seq in event_sequences:
+            flat_sample_of = []
+            for b_i, seq in enumerate(event_sequences):
                 for event in seq:
                     opp_event_map.append(event.get("opponent_id"))
+                    flat_sample_of.append(b_i)
+            if gru_sample_groups is not None:
+                assert len(gru_sample_groups) == len(event_sequences), (
+                    f"gru_sample_groups length {len(gru_sample_groups)} != "
+                    f"batch size {len(event_sequences)}")
 
             # Stage 1: embedder pre-injection features for every event.
             # out_pre: (T, 7, d_model). Used both as GRU signal source AND as
@@ -583,7 +600,43 @@ class Perception(nn.Module):
                 # (k=1 → depth-1 BPTT, matching the legacy default).
                 running = {}              # opp_id -> hidden state (value carries)
                 steps_since_detach = {}   # opp_id -> GRU steps in current graph
+                # A.4.5: consecutive samples sharing a group id are observer
+                # copies of the SAME scenario (phase 5 expands each decision
+                # into per-observer samples). Without a rewind, the shared
+                # table advances once per copy — O(observers)× more GRU steps
+                # per decision than deployment ever performs, so the head
+                # trains against systematically over-saturated states. Rewind
+                # each duplicate copy to the state as of the group start; the
+                # table then advances once per scenario (the last copy's end
+                # state persists).
+                prev_sample = None
+                prev_group = _GROUP_SENTINEL
+                group_start_running = {}
+                group_start_steps = {}
+                group_start_table = None
                 for flat_idx, opp_id in enumerate(opp_event_map):
+                    b_i = flat_sample_of[flat_idx]
+                    if b_i != prev_sample:
+                        prev_sample = b_i
+                        g = (gru_sample_groups[b_i]
+                             if gru_sample_groups is not None
+                             else _GROUP_SENTINEL)
+                        if (g is not _GROUP_SENTINEL and g == prev_group):
+                            # Rewind the running state AND the table: the
+                            # per-event write-back below advanced the table
+                            # during the previous copy, and a fresh opp_id
+                            # falls back to the table.
+                            running = dict(group_start_running)
+                            steps_since_detach = dict(group_start_steps)
+                            opponent_emb_table.embeddings = dict(
+                                group_start_table)
+                        else:
+                            group_start_running = dict(running)
+                            group_start_steps = dict(steps_since_detach)
+                            if gru_sample_groups is not None:
+                                group_start_table = dict(
+                                    opponent_emb_table.embeddings)
+                            prev_group = g
                     if opp_id is None:
                         continue
                     h = running.get(opp_id)

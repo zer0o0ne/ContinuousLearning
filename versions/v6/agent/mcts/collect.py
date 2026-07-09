@@ -518,6 +518,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
     from agent.train_scenarios.generation.generate import _get_raise_sizes
     from agent.mcts.terminal_eval import (
         evaluate_all_terminals, compute_equity_outcome,
+        _capped_showdown_chips,
     )
 
     game_cfg = config.get("game", {})
@@ -693,6 +694,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     from agent.train_scenarios.generation.generate import _get_raise_sizes
     from agent.mcts.terminal_eval import (
         evaluate_all_terminals, compute_equity_outcome,
+        _capped_showdown_chips,
     )
 
     game_cfg = config.get("game", {})
@@ -1046,14 +1048,8 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
                 return -invested
             # C.5: side-pot-correct chip delta
             if hero_pos not in _chain_hero_base:
-                inv_total = float(contributions[hero_pos])
-                opp_c = [float(contributions[p]) for p in final_active
-                         if p != hero_pos]
-                max_opp = max(opp_c) if opp_c else 0.0
-                eff = min(inv_total, max_opp)
-                excess = inv_total - eff
-                share_pot = sum(min(float(c), eff) for c in contributions)
-                _chain_hero_base[hero_pos] = excess + equity * share_pot
+                _chain_hero_base[hero_pos] = _capped_showdown_chips(
+                    equity, contributions, hero_pos, final_active)
             return _chain_hero_base[hero_pos] - invested
 
         examples = collect_training_data(

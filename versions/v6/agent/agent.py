@@ -81,7 +81,7 @@ class ASI(nn.Module):
 
     def forward_batch(self, event_sequences, skip_memory=True, heads=None,
                       skip_opponent_emb=True, opponent_emb_table=None,
-                      gru_window=1, precomputed=None):
+                      gru_window=1, precomputed=None, gru_sample_groups=None):
         """
         Batch-parallel forward pass over event sequences.
 
@@ -93,6 +93,8 @@ class ASI(nn.Module):
             opponent_emb_table: OpponentEmbeddingTable instance
             gru_window: BPTT window length for opponent GRU updates
             precomputed: dict from extract_event_tensors() — skips dict extraction
+            gru_sample_groups: optional per-sample group ids for the GRU
+                observer-copy rewind (A.4.5, see Perception.forward_batch)
         Returns: dict with computed head outputs
         """
         perception_frozen = not any(p.requires_grad for p in self.perception.parameters())
@@ -103,6 +105,7 @@ class ASI(nn.Module):
                     skip_opponent_emb=skip_opponent_emb,
                     opponent_emb_table=opponent_emb_table,
                     gru_window=gru_window, precomputed=precomputed,
+                    gru_sample_groups=gru_sample_groups,
                 )
             perception_out = perception_out.detach()
         else:
@@ -111,6 +114,7 @@ class ASI(nn.Module):
                 skip_opponent_emb=skip_opponent_emb,
                 opponent_emb_table=opponent_emb_table,
                 gru_window=gru_window, precomputed=precomputed,
+                gru_sample_groups=gru_sample_groups,
             )
 
         result = {}

@@ -129,7 +129,7 @@ def _kl_loss(logits, target_probs):
 
 def _run_validation(agent, val_loader, device, amp_config=None,
                     opponent_emb_table=None, gru_window=1,
-                    use_perception_cache=False):
+                    use_perception_cache=False, val_group_seq=None):
     """Run validation. Returns (avg_loss, top1_accuracy)."""
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     skip_opp = (opponent_emb_table is None)
@@ -139,6 +139,7 @@ def _run_validation(agent, val_loader, device, amp_config=None,
     loss_sum = 0.0
     correct = 0
     count = 0
+    _grp_offset = 0
     with torch.no_grad():
         for batch in val_loader:
             if use_perception_cache:
@@ -154,13 +155,21 @@ def _run_validation(agent, val_loader, device, amp_config=None,
                 event_sequences, precomputed, target_probs = batch
                 target_probs = target_probs.to(device)
                 n_samples = precomputed["B"] if precomputed is not None else 0
+                # A.4.5: val loader is sequential (shuffle=False), so the
+                # aligned group sequence advances by batch length.
+                _groups = None
+                if val_group_seq is not None:
+                    _groups = val_group_seq[
+                        _grp_offset:_grp_offset + len(event_sequences)]
+                _grp_offset += len(event_sequences)
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=amp_enabled):
                     out = agent.forward_batch(event_sequences, skip_memory=True,
                                               heads={"opponent_action"},
                                               skip_opponent_emb=skip_opp,
                                               opponent_emb_table=opponent_emb_table,
                                               gru_window=gru_window,
-                                              precomputed=precomputed)
+                                              precomputed=precomputed,
+                                              gru_sample_groups=_groups)
                     logits = out["opponent_action_logits"]
                     batch_loss = _kl_loss(logits, target_probs)
             loss_sum += batch_loss.item() * n_samples
@@ -356,6 +365,7 @@ def train_opponent_action(agent, train_cfg, device, log,
     log(f"Expanded samples: {len(dataset)} (train: {len(train_dataset)}, val: {len(val_dataset)})")
 
     opp_table = None
+    val_group_seq = None
     if use_opp_emb:
         from agent.perception.opponent_embeddings import OpponentEmbeddingTable
         opp_table = OpponentEmbeddingTable(agent.perception.d_model)
@@ -371,7 +381,9 @@ def train_opponent_action(agent, train_cfg, device, log,
             for pos, exp_idx in enumerate(train_exp_idx):
                 s_idx = expanded_indices[exp_idx][0]
                 hid = hand_ids[s_idx] if s_idx < len(hand_ids) else s_idx
-                keyed.append((hid, exp_idx, pos))
+                keyed.append((hid, exp_idx, pos, s_idx))
+            val_group_seq = [expanded_indices[exp_idx][0]
+                             for exp_idx in val_exp_idx]
         else:
             base_ds = train_dataset.dataset
             expanded = base_ds.indices
@@ -380,10 +392,18 @@ def train_opponent_action(agent, train_cfg, device, log,
             for pos, exp_idx in enumerate(train_dataset.indices):
                 s_idx = expanded[exp_idx][0]
                 hid = scens[s_idx].get("hand_id", s_idx)
-                keyed.append((hid, exp_idx, pos))
+                keyed.append((hid, exp_idx, pos, s_idx))
+            val_group_seq = [expanded[exp_idx][0]
+                             for exp_idx in val_dataset.indices]
 
         keyed.sort(key=lambda t: (t[0], t[1]))
-        order = [pos for _, _, pos in keyed]
+        order = [pos for _, _, pos, _ in keyed]
+        # A.4.5: scenario id per yielded sample, aligned with `order` — the
+        # sampler batches `order` consecutively, so batch b covers
+        # train_group_seq[b*batch_size : b*batch_size + len(batch)]. Observer
+        # copies of one scenario share an id; the GRU pass advances the table
+        # once per scenario instead of once per copy (train/deploy cadence).
+        train_group_seq = [s_idx for _, _, _, s_idx in keyed]
         train_sampler = OrderedBatchSampler(order, batch_size)
         log("Opponent GRU active → chronological (hand_id) batch order")
         from agent.train_scenarios.opponent_action_predict.dataset import make_tensor_collate
@@ -521,6 +541,11 @@ def train_opponent_action(agent, train_cfg, device, log,
                 event_sequences, precomputed, target_probs = batch
                 target_probs = target_probs.to(device)
                 n_samples = precomputed["B"] if precomputed is not None else 0
+                # A.4.5: scenario ids for this batch — OrderedBatchSampler
+                # yields consecutive slices of `order`, so the aligned
+                # group sequence slices the same way.
+                _b0 = batch_idx * batch_size
+                _groups = train_group_seq[_b0:_b0 + len(event_sequences)]
                 with torch.autocast(device_type=device_type, dtype=amp_dtype,
                                     enabled=amp_enabled):
                     out = agent.forward_batch(event_sequences, skip_memory=True,
@@ -528,7 +553,8 @@ def train_opponent_action(agent, train_cfg, device, log,
                                               skip_opponent_emb=(opp_table is None),
                                               opponent_emb_table=opp_table,
                                               gru_window=gru_window,
-                                              precomputed=precomputed)
+                                              precomputed=precomputed,
+                                              gru_sample_groups=_groups)
                     logits = out["opponent_action_logits"]
                     batch_loss = _kl_loss(logits, target_probs)
 
@@ -562,7 +588,8 @@ def train_opponent_action(agent, train_cfg, device, log,
                 val_loss, val_acc = _run_validation(
                     agent, val_loader, device, amp_config=amp_cfg,
                     opponent_emb_table=opp_table, gru_window=gru_window,
-                    use_perception_cache=_use_perception_cache)
+                    use_perception_cache=_use_perception_cache,
+                    val_group_seq=val_group_seq)
                 history["val_loss"].append((global_step, val_loss))
                 history["val_accuracy"].append((global_step, val_acc))
                 _save_history(hist)
@@ -592,7 +619,8 @@ def train_opponent_action(agent, train_cfg, device, log,
         val_loss, val_acc = _run_validation(
             agent, val_loader, device, amp_config=amp_cfg,
             opponent_emb_table=opp_table, gru_window=gru_window,
-            use_perception_cache=_use_perception_cache)
+            use_perception_cache=_use_perception_cache,
+            val_group_seq=val_group_seq)
         history["val_loss"].append((global_step, val_loss))
         history["val_accuracy"].append((global_step, val_acc))
         history["epoch_train_loss"].append(train_loss_avg)

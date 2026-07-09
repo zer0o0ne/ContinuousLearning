@@ -6,7 +6,7 @@ Covers:
 - Equity=1.0 wins full capped pot
 - Equity=0.0 loses only invested (excess returned)
 - Side pot correctness (hero short-stacked vs bigger opponent)
-- Dead money inclusion in contested pot
+- Folded/blind money as whole-hand contributions (2026-07: no dead_money term)
 - Fold terminal deterministic Q values
 - re_backup_terminals delta propagation, hero max-Q, opp W/N, idempotency
 - Scale division of terminal Q values
@@ -41,6 +41,20 @@ if _V6_ROOT not in sys.path:
 
 from agent.mcts.terminal_eval import _capped_showdown_chips
 from agent.mcts.mcts import MCTSNode, re_backup_terminals, _collect_terminals
+
+
+def _net_showdown(equity, contributions, hero_pos, active_players):
+    """Net chip delta vs hero's own contribution.
+
+    2026-07 math-audit fix: `_capped_showdown_chips` now returns hero's
+    expected GROSS return from the pot (whole-hand contributions, no
+    dead_money — the pot is fully covered by contributions). The original
+    net-vs-own-contribution semantics these tests were written against is
+    recovered by subtracting hero's contribution.
+    """
+    gross = _capped_showdown_chips(equity, contributions, hero_pos,
+                                   active_players)
+    return gross - float(contributions[hero_pos])
 
 
 # ---------------------------------------------------------------------------
@@ -78,15 +92,8 @@ def _attach_child(parent, child):
 class TestCappedShowdownChipsFormula(unittest.TestCase):
     """Verify the _capped_showdown_chips formula step by step."""
 
-    def _call(self, equity, contributions, hero_pos, active_players,
-              dead_money=0.0):
-        return _capped_showdown_chips(
-            equity=equity,
-            contributions=contributions,
-            hero_pos=hero_pos,
-            active_players=active_players,
-            dead_money=dead_money,
-        )
+    def _call(self, equity, contributions, hero_pos, active_players):
+        return _net_showdown(equity, contributions, hero_pos, active_players)
 
     # ------------------------------------------------------------------
     # Basic 2-player heads-up, equal stacks
@@ -186,7 +193,7 @@ class TestEquityOne(unittest.TestCase):
     def test_equal_stacks_wins_full_pot(self):
         """Equal stacks, equity=1.0 → wins opponent's chips."""
         c = [200.0, 200.0]
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0, 1])
         self.assertAlmostEqual(net, 200.0, places=6)
 
@@ -194,7 +201,7 @@ class TestEquityOne(unittest.TestCase):
         """Short-stacked hero with equity=1.0 wins only the side pot, not the full pot."""
         # Hero 300, opp 700
         c = [300.0, 700.0]
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0, 1])
         # effective_hero=300, hero_share_pot=300+300=600, excess=0
         # net = 0 + 1.0*600 - 300 = 300
@@ -204,7 +211,7 @@ class TestEquityOne(unittest.TestCase):
         """Big-stacked hero with equity=1.0: wins capped pot and gets excess back."""
         # Hero 700, opp 300
         c = [700.0, 300.0]
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0, 1])
         # effective_hero=300, excess=400
         # hero_share_pot = min(700,300) + min(300,300) = 300+300 = 600
@@ -221,14 +228,14 @@ class TestEquityZero(unittest.TestCase):
 
     def test_equal_stacks_loses_full_investment(self):
         c = [150.0, 150.0]
-        net = _capped_showdown_chips(0.0, c, hero_pos=0,
+        net = _net_showdown(0.0, c, hero_pos=0,
                                      active_players=[0, 1])
         self.assertAlmostEqual(net, -150.0, places=6)
 
     def test_short_stack_hero_loses_only_invested(self):
         """Short hero (300 vs 700 opp): equity=0 → net = -300 (no excess)."""
         c = [300.0, 700.0]
-        net = _capped_showdown_chips(0.0, c, hero_pos=0,
+        net = _net_showdown(0.0, c, hero_pos=0,
                                      active_players=[0, 1])
         self.assertAlmostEqual(net, -300.0, places=6)
 
@@ -236,7 +243,7 @@ class TestEquityZero(unittest.TestCase):
         """Big hero (700 vs 300 opp): equity=0 → net = excess - invested = -300."""
         # excess = 700 - 300 = 400; loses the capped 300; net = 400 + 0 - 700 = -300
         c = [700.0, 300.0]
-        net = _capped_showdown_chips(0.0, c, hero_pos=0,
+        net = _net_showdown(0.0, c, hero_pos=0,
                                      active_players=[0, 1])
         self.assertAlmostEqual(net, -300.0, places=6)
 
@@ -248,7 +255,7 @@ class TestEquityZero(unittest.TestCase):
         effective_hero = min(1000.0, 400.0)  # 400
         excess = 1000.0 - 400.0              # 600
         expected = excess + 0.0 - invested_hero  # 600 - 1000 = -400
-        net = _capped_showdown_chips(0.0, c, hero_pos=0,
+        net = _net_showdown(0.0, c, hero_pos=0,
                                      active_players=[0, 1])
         self.assertAlmostEqual(net, expected, places=6)
         self.assertAlmostEqual(net, -400.0, places=6)
@@ -264,7 +271,7 @@ class TestSidePot(unittest.TestCase):
     def test_hero_500_vs_opp_1000_cannot_win_full_pot(self):
         c = [500.0, 1000.0]
         # Even with equity=1, hero can only win the capped side pot
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0, 1])
         # effective_hero=500, hero_share_pot=500+500=1000, excess=0
         # net = 0 + 1.0*1000 - 500 = 500
@@ -274,7 +281,7 @@ class TestSidePot(unittest.TestCase):
 
     def test_hero_500_vs_opp_1000_equity_half(self):
         c = [500.0, 1000.0]
-        net = _capped_showdown_chips(0.5, c, hero_pos=0,
+        net = _net_showdown(0.5, c, hero_pos=0,
                                      active_players=[0, 1])
         # net = 0 + 0.5*1000 - 500 = 0
         self.assertAlmostEqual(net, 0.0, places=6)
@@ -282,7 +289,7 @@ class TestSidePot(unittest.TestCase):
     def test_opp_500_vs_hero_1000_equity_one(self):
         """Opp is the short stack; hero can win full opp contribution."""
         c = [1000.0, 500.0]
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0, 1])
         # effective_hero = min(1000, 500) = 500, excess = 500
         # hero_share_pot = min(1000,500) + min(500,500) = 500 + 500 = 1000
@@ -301,13 +308,13 @@ class TestSidePot(unittest.TestCase):
         # excess = 0
         # hero_share_pot = min(300,300) + min(600,300) + min(800,300) = 300+300+300 = 900
         # net = 0 + 1.0*900 - 300 = 600
-        net = _capped_showdown_chips(equity, contributions, hero_pos, active_players)
+        net = _net_showdown(equity, contributions, hero_pos, active_players)
         self.assertAlmostEqual(net, 600.0, places=6)
 
     def test_three_way_hero_short_stack_equity_zero(self):
         contributions = [300.0, 600.0, 800.0]
         active_players = [0, 1, 2]
-        net = _capped_showdown_chips(0.0, contributions, hero_pos=0,
+        net = _net_showdown(0.0, contributions, hero_pos=0,
                                      active_players=active_players)
         # net = 0 + 0 - 300 = -300
         self.assertAlmostEqual(net, -300.0, places=6)
@@ -317,57 +324,50 @@ class TestSidePot(unittest.TestCase):
 # 5. Dead money inclusion
 # ---------------------------------------------------------------------------
 
-class TestDeadMoney(unittest.TestCase):
-    """dead_money is added to the contestable pot regardless of contributions."""
+class TestDeadMoneyAsContributions(unittest.TestCase):
+    """2026-07 fix: there is no separate dead_money — the pot is fully
+    covered by whole-hand contributions. Money folded players left behind
+    enters `contributions` at their positions and is contested (or won
+    outright) via the layer decomposition."""
 
-    def test_dead_money_with_equity_one(self):
-        """Equity=1 hero claims all contributions + dead_money."""
-        c = [100.0, 100.0]
-        dead = 50.0
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
-                                     active_players=[0, 1], dead_money=dead)
-        # effective_hero=100, hero_share_pot=200, dead=50
-        # net = 0 + 1.0*(200+50) - 100 = 150
+    def test_folded_blind_contested_at_equity(self):
+        """A folded player's 50 sits below both active levels → contested."""
+        # hero 100, opp 100 (both active), folded player left 50
+        c = [100.0, 100.0, 50.0]
+        net = _net_showdown(1.0, c, hero_pos=0, active_players=[0, 1])
+        # contested = min(100,100)+min(100,100)+min(50,100) = 250
+        # net = 1.0*250 - 100 = 150 — same as the old dead_money=50 case
         self.assertAlmostEqual(net, 150.0, places=6)
 
-    def test_dead_money_with_equity_zero(self):
-        """Equity=0: hero loses investment; dead money goes to opponent."""
-        c = [100.0, 100.0]
-        dead = 50.0
-        net = _capped_showdown_chips(0.0, c, hero_pos=0,
-                                     active_players=[0, 1], dead_money=dead)
-        # net = 0 + 0*(200+50) - 100 = -100
+    def test_folded_money_lost_at_equity_zero(self):
+        c = [100.0, 100.0, 50.0]
+        net = _net_showdown(0.0, c, hero_pos=0, active_players=[0, 1])
         self.assertAlmostEqual(net, -100.0, places=6)
 
-    def test_dead_money_with_equity_half(self):
-        """Equity=0.5, dead money split evenly."""
-        c = [100.0, 100.0]
-        dead = 60.0
-        net = _capped_showdown_chips(0.5, c, hero_pos=0,
-                                     active_players=[0, 1], dead_money=dead)
-        # hero_share_pot=200, net = 0 + 0.5*(200+60) - 100 = 0.5*260 - 100 = 30
+    def test_folded_money_split_at_equity_half(self):
+        c = [100.0, 100.0, 60.0]
+        net = _net_showdown(0.5, c, hero_pos=0, active_players=[0, 1])
+        # contested = 100+100+60 = 260 → net = 130 - 100 = 30
         self.assertAlmostEqual(net, 30.0, places=6)
 
-    def test_dead_money_zero_same_as_no_dead(self):
-        """dead_money=0 is identical to no dead_money argument."""
-        c = [150.0, 200.0]
-        net_no_dead = _capped_showdown_chips(0.4, c, hero_pos=0,
-                                              active_players=[0, 1])
-        net_zero_dead = _capped_showdown_chips(0.4, c, hero_pos=0,
-                                               active_players=[0, 1],
-                                               dead_money=0.0)
-        self.assertAlmostEqual(net_no_dead, net_zero_dead, places=9)
-
-    def test_dead_money_short_stack_hero(self):
-        """dead_money + side-pot: hero 300, opp 700, dead 100."""
-        c = [300.0, 700.0]
-        dead = 100.0
-        # effective_hero=300, excess=0
-        # hero_share_pot = min(300,300)+min(700,300) = 300+300 = 600
-        # net = 0 + 0.7*(600+100) - 300 = 0.7*700 - 300 = 490-300 = 190
-        net = _capped_showdown_chips(0.7, c, hero_pos=0,
-                                     active_players=[0, 1], dead_money=dead)
+    def test_folded_money_short_stack_hero(self):
+        """Side pot + folded money below hero's level: hero 300, opp 700,
+        folded 100 — the folded 100 is fully inside the contested layers."""
+        c = [300.0, 700.0, 100.0]
+        net = _net_showdown(0.7, c, hero_pos=0, active_players=[0, 1])
+        # contested = min(300,300)+min(700,300)+min(100,300) = 700
+        # net = 0.7*700 - 300 = 190
         self.assertAlmostEqual(net, 190.0, places=6)
+
+    def test_folded_money_above_effective_won_outright(self):
+        """2026-07 fix (audit finding 3): folded chips in hero's uncontested
+        layers are won outright, not dropped."""
+        # hero 500, active opp 200, folded player left 300
+        c = [500.0, 300.0, 200.0]
+        net = _net_showdown(0.0, c, hero_pos=0, active_players=[0, 2])
+        # det = (500-200) own + (min(300,500)-200) folded = 400
+        # contested = 200*3 = 600 at eq 0 → net = 400 - 500 = -100
+        self.assertAlmostEqual(net, -100.0, places=6)
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +689,7 @@ class TestScaleDivision(unittest.TestCase):
         equity = 0.7
         scale = 50.0
         # net chips = 0 + 0.7*200 - 100 = 40
-        net = _capped_showdown_chips(equity, c, hero_pos=0,
+        net = _net_showdown(equity, c, hero_pos=0,
                                      active_players=[0, 1])
         q = net / scale  # = 40 / 50 = 0.8
         self.assertAlmostEqual(net, 40.0, places=6)
@@ -730,7 +730,7 @@ class TestContributionsVsInvestments(unittest.TestCase):
         # bets (per-street, reset each street): river bets only = {hero: 300}
         # contributions (cumulative): hero = 600
         contributions = [600.0, 600.0]
-        net = _capped_showdown_chips(1.0, contributions, hero_pos=0,
+        net = _net_showdown(1.0, contributions, hero_pos=0,
                                      active_players=[0, 1])
         # effective_hero=600, hero_share_pot=1200, net=0+1200-600=600
         self.assertAlmostEqual(net, 600.0, places=6)
@@ -740,7 +740,7 @@ class TestContributionsVsInvestments(unittest.TestCase):
         # Heads-up: hero SB posts 5, later raises to 100 total. Opp BB calls 100.
         # contributions = [100, 100] (includes the 5 blind)
         contributions = [100.0, 100.0]
-        net = _capped_showdown_chips(1.0, contributions, hero_pos=0,
+        net = _net_showdown(1.0, contributions, hero_pos=0,
                                      active_players=[0, 1])
         # Pot = 200, hero wins all = 100 profit
         self.assertAlmostEqual(net, 100.0, places=6)
@@ -773,7 +773,7 @@ class TestMultiOpponentEquity(unittest.TestCase):
     def test_three_way_equal_stacks_equity_third(self):
         """3-way equal stacks, equity=1/3 → break-even."""
         c = [100.0, 100.0, 100.0]
-        net = _capped_showdown_chips(1.0/3.0, c, hero_pos=0,
+        net = _net_showdown(1.0/3.0, c, hero_pos=0,
                                      active_players=[0, 1, 2])
         # effective_hero=100, hero_share_pot=300, excess=0
         # net = 0 + (1/3)*300 - 100 = 0
@@ -782,7 +782,7 @@ class TestMultiOpponentEquity(unittest.TestCase):
     def test_three_way_equal_stacks_equity_one(self):
         """3-way equal stacks, equity=1.0 → wins all three stacks minus own."""
         c = [100.0, 100.0, 100.0]
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0, 1, 2])
         # net = 0 + 1.0*300 - 100 = 200
         self.assertAlmostEqual(net, 200.0, places=6)
@@ -790,7 +790,7 @@ class TestMultiOpponentEquity(unittest.TestCase):
     def test_three_way_hero_short_equity_one(self):
         """3-way: hero 200, two opps 400 each, equity=1.0."""
         c = [200.0, 400.0, 400.0]
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0, 1, 2])
         # max_opp = max(400,400) = 400
         # effective_hero = min(200, 400) = 200
@@ -803,7 +803,7 @@ class TestMultiOpponentEquity(unittest.TestCase):
     def test_three_way_hero_big_stack_equity_zero(self):
         """3-way: hero over-invested, equity=0 → loses only capped portion."""
         c = [500.0, 200.0, 300.0]
-        net = _capped_showdown_chips(0.0, c, hero_pos=0,
+        net = _net_showdown(0.0, c, hero_pos=0,
                                      active_players=[0, 1, 2])
         # max_opp = max(200, 300) = 300
         # effective_hero = min(500, 300) = 300
@@ -811,13 +811,12 @@ class TestMultiOpponentEquity(unittest.TestCase):
         # net = 200 + 0 - 500 = -300
         self.assertAlmostEqual(net, -300.0, places=6)
 
-    def test_three_way_with_dead_money(self):
-        """3-way with dead money included in contestable pot."""
-        c = [200.0, 200.0, 200.0]
-        dead = 90.0
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
-                                     active_players=[0, 1, 2], dead_money=dead)
-        # hero_share_pot=600, net = 0 + 1.0*(600+90) - 200 = 490
+    def test_three_way_with_folded_money(self):
+        """3-way + a folded player's 90 below all active levels: contested."""
+        c = [200.0, 200.0, 200.0, 90.0]
+        net = _net_showdown(1.0, c, hero_pos=0,
+                            active_players=[0, 1, 2])
+        # contested = 200*3 + 90 = 690, net = 1.0*690 - 200 = 490
         self.assertAlmostEqual(net, 490.0, places=6)
 
     def test_single_opponent_no_others_active(self):
@@ -827,7 +826,7 @@ class TestMultiOpponentEquity(unittest.TestCase):
         # effective_hero=min(300,0)=0, excess=300
         # hero_share_pot = min(300,0)+min(0,0)+min(0,0) = 0
         # net = 300 + equity*0 - 300 = 0
-        net = _capped_showdown_chips(1.0, c, hero_pos=0,
+        net = _net_showdown(1.0, c, hero_pos=0,
                                      active_players=[0])
         self.assertAlmostEqual(net, 0.0, places=6)
 

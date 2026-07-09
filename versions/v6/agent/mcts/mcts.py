@@ -701,7 +701,7 @@ def action_path_from_root(node):
     return path
 
 
-def re_backup_terminals(root, opp_pessimism_alpha=1.0):
+def re_backup_terminals(root, opp_pessimism_alpha=0.5):
     """Propagate equity-based terminal Q values up to ancestors after search.
 
     During search each terminal already backs up a value (fold = deterministic,

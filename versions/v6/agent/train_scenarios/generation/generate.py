@@ -1018,8 +1018,20 @@ def generate_scenario(config, device="mps"):
             "n_events": len(events),
         })
 
-    # V4: build modelling scenarios from observer perspectives
+    # V4: build modelling scenarios from observer perspectives. Quarantined
+    # into a separate list and NOT returned: these dicts lack `action_evs`/
+    # `ev_target`/`legal_mask`, no loader filters `scenario_type`, and every
+    # GTO phase would KeyError on them. Re-wire when a consumer exists.
+    modelling_results = []
     if solver_name == "v4" and modelling_decisions:
+        if not _truncation_stats.get("warned_v4_modelling"):
+            _truncation_stats["warned_v4_modelling"] = True
+            warnings.warn(
+                "solver v4 modelling scenarios are generated but quarantined "
+                "(no loader supports scenario_type='modelling'); they are "
+                "not added to the dataset.",
+                stacklevel=2,
+            )
         for md in modelling_decisions:
             snap_idx = md["snap_idx"]
             acting_pos = md["acting_pos"]
@@ -1040,7 +1052,7 @@ def generate_scenario(config, device="mps"):
                 if len(events) < 2:
                     continue
 
-                results.append({
+                modelling_results.append({
                     "events": events,
                     "scenario_type": "modelling",
                     "marginalized_action_probs": marg_probs.cpu().tolist()

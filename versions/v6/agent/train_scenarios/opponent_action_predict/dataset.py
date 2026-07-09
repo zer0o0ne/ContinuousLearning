@@ -48,7 +48,7 @@ class OpponentActionDataset(Dataset):
         if self.norm_stats is not None:
             _normalize_events_inplace(events, self.norm_stats)
         target = self._observer_target(scenario, hero_hand)
-        return events, target
+        return events, target, _scenario_aux(scenario)
 
     def _resolve_hero_hand(self, shared_events, hero_pos, seed=None):
         """Hero's hand: the fixed hand if known, else a random board/hand-free one."""
@@ -138,6 +138,19 @@ class OpponentActionDataset(Dataset):
         return result
 
 
+def _scenario_aux(scenario):
+    """Probe supervision fields (PLAN_OPPONENT_ADAPTATION §2/§4).
+
+    Both are optional in the scenario (D4): legacy datasets yield
+    None / NaN and the training losses mask those samples out.
+    """
+    sd = scenario.get("actor_showdown_strength")
+    return {
+        "acting_agent": scenario.get("acting_agent"),
+        "showdown_target": float(sd) if sd is not None else float("nan"),
+    }
+
+
 def _normalize_events_inplace(events, norm_stats):
     """Apply z-score normalization to standard events in-place."""
     pot_m, pot_s = norm_stats["pot_mean"], norm_stats["pot_std"]
@@ -163,10 +176,11 @@ def _normalize_events_inplace(events, norm_stats):
 
 
 def batch_collate(batch):
-    """Collate: separate event sequences and stack target tensors."""
+    """Collate: separate event sequences, stack targets, pass aux through."""
     event_sequences = [item[0] for item in batch]
     targets = torch.stack([item[1] for item in batch])  # (B, n_actions)
-    return event_sequences, targets
+    aux = [item[2] for item in batch]
+    return event_sequences, targets, aux
 
 
 class _TensorCollate:
@@ -177,8 +191,9 @@ class _TensorCollate:
         from agent.perception.perception import extract_event_tensors
         event_sequences = [item[0] for item in batch]
         targets = torch.stack([item[1] for item in batch])
+        aux = [item[2] for item in batch]
         precomputed = extract_event_tensors(event_sequences, self.max_players)
-        return event_sequences, precomputed, targets
+        return event_sequences, precomputed, targets, aux
 
 
 def make_tensor_collate(max_players):

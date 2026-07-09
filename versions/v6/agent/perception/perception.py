@@ -7,12 +7,52 @@ import numpy as np
 from agent.perception.encoder import Encoder
 from agent.perception.decoder import Decoder
 from agent.perception.memory import HierarchicalMemory
-from agent.perception.opponent_embeddings import OpponentGRUUpdater
+from agent.perception.opponent_embeddings import (
+    OpponentGRUUpdater, stats_features, action_category,
+)
 
 # A.4.5: "no group" marker for the GRU sample-group rewind in forward_batch.
 # A unique object so ANY caller-provided group id (including None-able ints)
 # can never collide with it.
 _GROUP_SENTINEL = object()
+
+
+def _event_stat_key(event, n_actions):
+    """(bucket, category|None) of one event for HUD stats (§3).
+
+    bucket = street * 2 + facing, both measured at THIS event's state: street
+    from the number of revealed table cards (0/3/4/5), facing from whether
+    the acting player has a bet to call. Bets may be z-scored — the scoring
+    is affine with one shared mean/std, so bet DIFFERENCES keep their sign.
+
+    category comes from this event's one-hot `action` (None when the event
+    carries no action, e.g. decision snapshots). NOTE: by the B.2 next-player
+    convention the action belongs to the PREVIOUS event's acting player —
+    attribution is the caller's job; this function only classifies.
+    """
+    n_rev = sum(1 for c in event["table"] if int(c) >= 0)
+    street = 0 if n_rev < 3 else (1 if n_rev == 3 else (2 if n_rev == 4 else 3))
+
+    bets = event["bets"]
+    if isinstance(bets, np.ndarray):
+        bets = bets.tolist()
+    else:
+        bets = [float(b) for b in bets]
+    acting = int(event["acting_pos"])
+    facing = 0
+    if bets:
+        b_act = bets[acting] if acting < len(bets) else 0.0
+        facing = 1 if (max(bets) - b_act) > 1e-6 else 0
+
+    action = event["action"]
+    if isinstance(action, torch.Tensor):
+        m = float(action.max())
+        idx = int(action.argmax())
+    else:
+        m = max(action)
+        idx = list(action).index(m)
+    cat = action_category(idx, n_actions) if m >= 0.5 else None
+    return street * 2 + facing, cat
 
 
 def extract_event_tensors(event_sequences, max_players):
@@ -523,6 +563,12 @@ class Perception(nn.Module):
         self.opp_emb_enabled = opp_cfg.get("enabled", False)
         if self.opp_emb_enabled:
             self.opponent_gru = OpponentGRUUpdater(d_model)
+        # §3 (PLAN_OPPONENT_ADAPTATION): count-based HUD stats vector injected
+        # alongside the GRU state. Off by default — bit-for-bit legacy path.
+        self.opp_stats_enabled = bool(opp_cfg.get("stats_enabled", False))
+        if self.opp_emb_enabled and self.opp_stats_enabled:
+            from agent.perception.opponent_embeddings import N_STAT_FEATURES
+            self.opp_stats_proj = nn.Linear(N_STAT_FEATURES, d_model)
         self.d_model = d_model
 
     def set_gradient_checkpointing(self, enabled: bool):
@@ -531,7 +577,8 @@ class Perception(nn.Module):
 
     def forward_batch(self, event_sequences, device="cpu", skip_memory=True,
                       skip_opponent_emb=True, opponent_emb_table=None,
-                      gru_window=1, precomputed=None, gru_sample_groups=None):
+                      gru_window=1, precomputed=None, gru_sample_groups=None,
+                      collect_opp_states=False):
         """
         Batch-parallel forward over event sequences.
 
@@ -549,11 +596,13 @@ class Perception(nn.Module):
                 copy's GRU pass rewinds to the state as of the group start so
                 the shared table advances once per scenario (A.4.5). None →
                 every sample advances (legacy behavior).
+            collect_opp_states: §2 — when True, also return per-sample GRU
+                states at each sample's LAST opponent-id event (the acting
+                player's post-update hidden at the decision point) for the
+                phase-5 probes.
 
-        Returns: tuple (output, encoded, mask)
-            output: (B, seq_len, d_model)
-            encoded: (B, seq_len, d_model)
-            mask: (B, seq_len)
+        Returns: tuple (output, encoded, mask), plus (opp_last_states (B, d),
+            opp_states_mask (B,)) appended when collect_opp_states=True.
         """
         C = EventSequenceEmbedder.CARDS_PER_EVENT
         if precomputed is None:
@@ -561,16 +610,26 @@ class Perception(nn.Module):
         use_opp_emb = (not skip_opponent_emb and self.opp_emb_enabled
                        and opponent_emb_table is not None)
 
+        use_stats = use_opp_emb and self.opp_stats_enabled
+        opp_last_state_by_sample = {}   # §2: b_i -> h at sample's last opp event
+
         if use_opp_emb:
             # Flat parallel list of opponent_ids (one entry per event, None if
             # event has no opponent_id). Must match flat order used by
             # _build_batch_tensors (sample-major, event-major).
             opp_event_map = []
             flat_sample_of = []
+            flat_stat_buckets = []  # per-event street×facing bucket (§3)
+            flat_stat_cats = []     # per-event action category or None (§3)
+            n_act = self.embedder.n_actions
             for b_i, seq in enumerate(event_sequences):
                 for event in seq:
                     opp_event_map.append(event.get("opponent_id"))
                     flat_sample_of.append(b_i)
+                    if use_stats:
+                        bucket, cat = _event_stat_key(event, n_act)
+                        flat_stat_buckets.append(bucket)
+                        flat_stat_cats.append(cat)
             if gru_sample_groups is not None:
                 assert len(gru_sample_groups) == len(event_sequences), (
                     f"gru_sample_groups length {len(gru_sample_groups)} != "
@@ -585,6 +644,7 @@ class Perception(nn.Module):
 
             k = max(1, int(gru_window))
             opponent_embs_per_event = [None] * len(opp_event_map)
+            stat_feats_per_event = [None] * len(opp_event_map)
             if out_pre is not None:
                 # A.4.2: a single causal pass over the flat event list. Flat
                 # order is sample-major then event-major (see
@@ -614,6 +674,7 @@ class Perception(nn.Module):
                 group_start_running = {}
                 group_start_steps = {}
                 group_start_table = None
+                group_start_stats = None
                 for flat_idx, opp_id in enumerate(opp_event_map):
                     b_i = flat_sample_of[flat_idx]
                     if b_i != prev_sample:
@@ -625,18 +686,43 @@ class Perception(nn.Module):
                             # Rewind the running state AND the table: the
                             # per-event write-back below advanced the table
                             # during the previous copy, and a fresh opp_id
-                            # falls back to the table.
+                            # falls back to the table. Stats rewind with the
+                            # same shallow copy — safe because updates below
+                            # REPLACE count arrays (copy-on-write), never
+                            # mutate them in place.
                             running = dict(group_start_running)
                             steps_since_detach = dict(group_start_steps)
                             opponent_emb_table.embeddings = dict(
                                 group_start_table)
+                            if use_stats:
+                                opponent_emb_table.stats = dict(
+                                    group_start_stats)
                         else:
                             group_start_running = dict(running)
                             group_start_steps = dict(steps_since_detach)
                             if gru_sample_groups is not None:
                                 group_start_table = dict(
                                     opponent_emb_table.embeddings)
+                                if use_stats:
+                                    group_start_stats = dict(
+                                        opponent_emb_table.stats)
                             prev_group = g
+                    if use_stats:
+                        # §3 attribution: an event's one-hot `action` was
+                        # taken by the PREVIOUS event's acting player (B.2
+                        # next-player convention), in the PREVIOUS event's
+                        # street/facing context. Copy-on-write replacement
+                        # keeps group-rewind / clone snapshots valid.
+                        cat_j = flat_stat_cats[flat_idx]
+                        if (cat_j is not None and flat_idx > 0
+                                and flat_sample_of[flat_idx - 1] == b_i):
+                            actor_id = opp_event_map[flat_idx - 1]
+                            if actor_id is not None:
+                                bucket = flat_stat_buckets[flat_idx - 1]
+                                counts = opponent_emb_table.get_stats(
+                                    actor_id).copy()
+                                counts[bucket, cat_j] += 1.0
+                                opponent_emb_table.stats[actor_id] = counts
                     if opp_id is None:
                         continue
                     h = running.get(opp_id)
@@ -655,6 +741,29 @@ class Perception(nn.Module):
                     running[opp_id] = h
                     opponent_embs_per_event[flat_idx] = h
                     opponent_emb_table.embeddings[opp_id] = h
+                    if collect_opp_states:
+                        opp_last_state_by_sample[b_i] = h
+                    if use_stats:
+                        # §3: this event's injected features are the CURRENT
+                        # counts of its own opponent_id (post-update: the
+                        # attribution step above already counted this event's
+                        # action for its true actor).
+                        stat_feats_per_event[flat_idx] = stats_features(
+                            opponent_emb_table.get_stats(opp_id))
+
+            if use_stats:
+                # Batched projection of the HUD features, added to the GRU
+                # state at the same injection slots (5, 6).
+                idxs = [i for i, f in enumerate(stat_feats_per_event)
+                        if f is not None]
+                if idxs:
+                    feats = torch.from_numpy(
+                        np.stack([stat_feats_per_event[i] for i in idxs])
+                    ).to(device)
+                    proj = self.opp_stats_proj(feats)                # (K, d_model)
+                    for row, i in enumerate(idxs):
+                        opponent_embs_per_event[i] = (
+                            opponent_embs_per_event[i] + proj[row])
 
             embedded, mask = self.embedder._apply_post_inject(
                 out_pre, meta, opponent_embs_per_event, device=device,
@@ -686,4 +795,18 @@ class Perception(nn.Module):
             decoder_mask = torch.cat([mem_mask, mask], dim=1)
 
         output = self.decoder(decoder_input, mask=decoder_mask)
+        if collect_opp_states:
+            B = output.shape[0]
+            per_sample = [opp_last_state_by_sample.get(b_i) for b_i in range(B)]
+            ref = next((s for s in per_sample if s is not None), None)
+            if ref is None:
+                opp_states = torch.zeros(B, self.d_model, device=output.device)
+            else:
+                zeros = torch.zeros_like(ref)
+                opp_states = torch.stack(
+                    [s if s is not None else zeros for s in per_sample])
+            opp_states_mask = torch.tensor(
+                [0.0 if s is None else 1.0 for s in per_sample],
+                device=output.device)
+            return output, encoded, mask, (opp_states, opp_states_mask)
         return output, encoded, mask

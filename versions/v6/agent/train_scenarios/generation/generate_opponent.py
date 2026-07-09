@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from env.table import Table
+from env.judger import Judger
 from evaluation.evaluate import _normalize_events_inplace
 from agent.train_scenarios.generation.generate import (
     _get_raise_sizes, _read_meta, _write_meta, _meta_path,
@@ -512,11 +513,49 @@ def _compute_range_probs(agent, shared_events, combos, active_pos,
 
 
 # ---------------------------------------------------------------------------
+# Showdown strength (PLAN_OPPONENT_ADAPTATION §4)
+# ---------------------------------------------------------------------------
+
+_JUDGER = None
+
+SHOWDOWN_MC_COMBOS = 256
+
+
+def _showdown_strength(board5, hand, seed, n_samples=SHOWDOWN_MC_COMBOS):
+    """P(hand beats a uniform random opponent combo) on the full board.
+
+    Ties count 0.5. Deterministic: combos are sampled without replacement
+    with an RNG seeded by `seed`. Board/own-hand cards are excluded from the
+    opponent combo space. CPU-only (engine Judger) — safe in actors.
+    """
+    global _JUDGER
+    if _JUDGER is None:
+        _JUDGER = Judger()
+    dead = set(int(c) for c in board5) | {int(hand[0]), int(hand[1])}
+    avail = [c for c in range(52) if c not in dead]
+    combos = [(avail[i], avail[j])
+              for i in range(len(avail)) for j in range(i + 1, len(avail))]
+    rng = random.Random(seed)
+    if len(combos) > n_samples:
+        combos = rng.sample(combos, n_samples)
+    my = np.array(list(board5) + [int(hand[0]), int(hand[1])])
+    score = 0.0
+    for c1, c2 in combos:
+        opp = np.array(list(board5) + [c1, c2])
+        r1, r2 = _JUDGER.compare_hands(my.copy(), opp)
+        if r1 == 1 and r2 == 0:
+            score += 1.0
+        elif r1 == 1 and r2 == 1:
+            score += 0.5
+    return score / len(combos)
+
+
+# ---------------------------------------------------------------------------
 # Hand generation
 # ---------------------------------------------------------------------------
 
 def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=None,
-                           proxy=None):
+                           proxy=None, pool_binding=None, hand_seed=None):
     """Generate training scenarios from one poker hand with range tracking.
 
     Args:
@@ -525,6 +564,14 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         device: torch device string
         amp_config: (amp_enabled, device_type, amp_dtype)
         player_ids: optional list of persistent player IDs (length >= max_players)
+        pool_binding: optional dict {persistent_id: agent_name} (P0). When
+            provided (with player_ids), each persistent ID is ALWAYS played
+            by its bound agent — one ID = one consistent style across hands,
+            matching deployment where opponent_id is the agent name. Without
+            it, seats fall back to the legacy per-hand random draw (anon /
+            benchmark path only; cross-hand style accumulation is noise).
+        hand_seed: optional per-hand int for the showdown-strength MC (§4) —
+            makes labels reproducible in both sequential and parallel modes.
 
     Returns:
         list of scenario dicts, or None on failure
@@ -571,8 +618,20 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
     )
     table.start_table()
 
-    # Select agents for each seat WITH REPLACEMENT
-    seated = random.choices(agents_list, k=num_players)
+    # Select agents for each seat. P0: with a pool binding, the persistent ID
+    # determines the agent — one ID = one style across hands. Legacy fallback
+    # (no binding / anon ids): random per hand WITH REPLACEMENT.
+    if pool_binding is not None and player_ids is not None:
+        agent_by_name = {a["name"]: a for a in agents_list}
+        seated = [agent_by_name[pool_binding[opponent_ids[pos]]]
+                  for pos in range(num_players)]
+    else:
+        seated = random.choices(agents_list, k=num_players)
+
+    # Style labels (§2 of PLAN_OPPONENT_ADAPTATION): index into the sorted
+    # agent-name list — the order `_load_agents` produces from directories.
+    _sorted_agent_names = sorted(a["name"] for a in agents_list)
+    _agent_idx_by_name = {n: i for i, n in enumerate(_sorted_agent_names)}
 
     # Per-player state: soft belief = float32 weight per combo (uniform prior).
     n_combos = 1326
@@ -598,6 +657,7 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
     max_actions = 6 * num_players + 8
 
     _opp_truncation_stats["hands"] += 1
+    hand_ended = False  # §4: True only when the engine reported hand end
     for _ in range(max_actions):
         active_pos = table.active_player
 
@@ -830,6 +890,9 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             "range_ess": ess,
             "range_top_mass_size": top_mass_size,
             "opponent_ids": dict(opponent_ids),
+            # P0 / §2: which agent generated the acting player's actions.
+            "acting_agent": agent_name,
+            "acting_agent_idx": _agent_idx_by_name[agent_name],
         })
 
         # Execute action on table
@@ -880,6 +943,7 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
         player_weights[active_pos] = new_w_full
 
         if end or several_all_in:
+            hand_ended = True
             break
     else:
         # B.6.3: betting loop exhausted max_actions without terminating.
@@ -891,7 +955,41 @@ def generate_opponent_hand(config, agents_list, device, amp_config, player_ids=N
             stacklevel=2,
         )
 
+    # §4: showdown strength labels — only when the engine reported hand end.
+    if hand_ended and scenarios:
+        _label_showdown_strengths(scenarios, table.deck, table.players_state,
+                                  fixed_hands, num_players, hand_seed)
+
     return scenarios if scenarios else None
+
+
+def _label_showdown_strengths(scenarios, deck, players_state, fixed_hands,
+                              num_players, hand_seed):
+    """Attach `actor_showdown_strength` labels (§4 PLAN_OPPONENT_ADAPTATION).
+
+    Only for hands that ENDED at a showdown (>= 2 live players). Each live
+    player's fixed hand — the hand whose action distribution drove their
+    decisions — gets a strength percentile on the full board, attached to
+    that player's LAST decision scenario of the hand. Players without a
+    fixed hand, and fixed hands colliding with the runout board (B.4.2),
+    are skipped (no physically consistent reveal exists).
+    """
+    live = [pos for pos in range(num_players) if players_state[pos] >= 0]
+    if len(live) < 2:
+        return
+    board = [int(c) for c in deck[:5]]
+    board_set = set(board)
+    for pos in live:
+        fh = fixed_hands.get(pos)
+        if fh is None:
+            continue
+        if int(fh[0]) in board_set or int(fh[1]) in board_set:
+            continue
+        strength = _showdown_strength(board, fh, seed=f"{hand_seed}:{pos}")
+        for s in reversed(scenarios):
+            if s["acting_pos"] == pos:
+                s["actor_showdown_strength"] = float(strength)
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -1106,7 +1204,19 @@ def generate_opponent_dataset(config, save_dir, device, log,
     swap_prob = opp_cfg.get("player_swap_prob", 0.05)
     player_pool = [f"p_{i}" for i in range(n_player_pool)]
     table_roster = list(player_pool[:max_players])
+    # P0: deterministic round-robin binding pool ID -> agent name. One
+    # persistent ID is ALWAYS played by the same agent, so cross-hand GRU /
+    # stats accumulation per ID sees one consistent style (train/deploy
+    # parity — at deployment opponent_id IS the agent name).
+    pool_binding = {
+        player_pool[i]: agents_list[i % len(agents_list)]["name"]
+        for i in range(n_player_pool)
+    }
     log(f"Player pool: {n_player_pool} IDs, swap_prob={swap_prob}")
+    log(f"Pool binding (round-robin): "
+        + ", ".join(f"{pid}->{aname}" for pid, aname in
+                    list(pool_binding.items())[:len(agents_list)])
+        + (" ..." if n_player_pool > len(agents_list) else ""))
 
     shard_idx = start_shard_idx
     total_scenarios_on_disk = 0
@@ -1127,6 +1237,7 @@ def generate_opponent_dataset(config, save_dir, device, log,
                 "done":               bool(meta_done),
                 "config_hash":        config_hash,
                 "n_workers":          n_workers_cfg,
+                "pool_binding":       pool_binding,
             })
 
     n_workers = n_workers_cfg
@@ -1142,7 +1253,7 @@ def generate_opponent_dataset(config, save_dir, device, log,
         _run_parallel_opponent(
             agents_list, config, gen_cfg, device, log, n_hands, n_workers,
             max_players, n_player_pool, swap_prob, player_pool,
-            on_partial=_flush_partial)
+            on_partial=_flush_partial, pool_binding=pool_binding)
         log(f"Generated {total_scenarios_on_disk} scenarios "
             f"(parallel, {n_workers} actors)")
     else:
@@ -1162,7 +1273,9 @@ def generate_opponent_dataset(config, save_dir, device, log,
                     table_roster[pos] = random.choice(player_pool)
 
             result = generate_opponent_hand(gen_cfg, agents_list, device, amp_config,
-                                            player_ids=table_roster)
+                                            player_ids=table_roster,
+                                            pool_binding=pool_binding,
+                                            hand_seed=hand_i)
             if result is not None:
                 for s in result:
                     s["hand_id"] = hand_i
@@ -1193,6 +1306,7 @@ def generate_opponent_dataset(config, save_dir, device, log,
         "done":               True,
         "config_hash":        config_hash,
         "n_workers":          n_workers_cfg,
+        "pool_binding":       pool_binding,
     })
 
     log(f"Dataset saved to {save_dir} ({shard_idx} shards)")
@@ -1206,7 +1320,7 @@ def generate_opponent_dataset(config, save_dir, device, log,
 def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
                     seed, max_players, player_pool, swap_prob,
                     req_q, resp_q, result_q, progress, output_dir,
-                    progress_counter=None):
+                    progress_counter=None, pool_binding=None):
     """Actor process: play `n_hands` opponent hands with an EvalProxy (action
     inference offloaded to the server), write scenarios to a per-actor pickle
     file on disk, then signal completion via `result_q` (path only, no payload).
@@ -1251,7 +1365,9 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
                     table_roster[pos] = random.choice(player_pool)
             result = generate_opponent_hand(
                 gen_cfg, agents_meta, "cpu", amp_config,
-                player_ids=table_roster, proxy=proxy)
+                player_ids=table_roster, proxy=proxy,
+                pool_binding=pool_binding,
+                hand_seed=hand_id_offset + hand_i)
             if result is not None:
                 hid = hand_id_offset + hand_i
                 for s in result:
@@ -1299,7 +1415,7 @@ def _opp_actor_main(worker_id, agents_meta, gen_cfg, n_hands, hand_id_offset,
 
 def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
                            n_workers, max_players, n_player_pool, swap_prob,
-                           player_pool, on_partial=None):
+                           player_pool, on_partial=None, pool_binding=None):
     """Spawn the inference server + `n_workers` CPU actors, gather and merge
     their scenarios. Hand ids are contiguous across actors (offset per actor).
 
@@ -1401,7 +1517,7 @@ def _run_parallel_opponent(agents_list, config, gen_cfg, device, log, n_hands,
             args=(wid, agents_meta, gen_cfg, hands_per[wid], offsets[wid],
                   1000 + wid, max_players, player_pool, swap_prob,
                   req_q, resp_qs[wid], result_q, False, payload_dir,
-                  progress_counter),
+                  progress_counter, pool_binding),
             daemon=True)
         p.start()
         actors.append(p)

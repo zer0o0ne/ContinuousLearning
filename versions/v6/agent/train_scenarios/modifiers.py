@@ -102,6 +102,79 @@ def _check_condition(scenario, field, op, threshold):
     return val > threshold
 
 
+STYLE_DIMS = 16
+
+
+def build_style_vector(modifiers, n_actions, base_temperature, max_players=9):
+    """Canonical real-valued style encoding of a modifier list (§2.1 of
+    PLAN_OPPONENT_ADAPTATION). Deterministic — one vector per agent config.
+
+    Layout (STYLE_DIMS = 16):
+      [0:5]   unconditional category biases (fold, call, small raise,
+              big raise, all-in — same split as resolve_actions)
+      [5:10]  low-equity conditional biases ("equity < t"), scaled by the
+              region measure t
+      [10:15] high-equity conditional biases ("equity > t"), scaled by 1 - t
+      [15]    log(effective temperature)
+
+    Every bias modifier distributes its factor over categories
+    coverage-weighted: contribution to category c =
+    factor * |resolved_actions ∩ c| / |c|; multiple modifiers accumulate
+    additively (mirrors apply_modifiers).  `pos` conditions fold into the
+    UNCONDITIONAL block weighted by the fraction of positions
+    (0..max_players-1) satisfying the condition.
+    """
+    import math
+
+    bins = n_actions - 3
+    mid = bins // 2
+    cat_members = [
+        [0],                                   # fold
+        [1],                                   # call
+        list(range(2, 2 + mid)),               # small raises
+        list(range(2 + mid, n_actions - 1)),   # big raises
+        [n_actions - 1],                       # all-in
+    ]
+
+    vec = [0.0] * STYLE_DIMS
+    temp = float(base_temperature)
+
+    for mod in modifiers or []:
+        if mod["type"] == "temperature":
+            temp = float(mod["value"])
+            continue
+
+        actions = set(resolve_actions(mod["actions"], n_actions))
+        factor = float(mod["factor"])
+
+        block = 0
+        region = 1.0
+        if mod["type"] == "conditional_bias":
+            field, op, thresh = _parse_condition(mod["condition"])
+            if field == "equity":
+                if op == "<":
+                    block, region = 1, thresh
+                else:
+                    block, region = 2, 1.0 - thresh
+            else:  # pos — fold into the unconditional block, region-weighted
+                if op == "<":
+                    n_sat = sum(1 for p in range(max_players) if p < thresh)
+                else:
+                    n_sat = sum(1 for p in range(max_players) if p > thresh)
+                block, region = 0, n_sat / max_players
+
+        for c in range(5):
+            members = cat_members[c]
+            if not members:
+                continue
+            coverage = len(actions.intersection(members)) / len(members)
+            if coverage:
+                vec[block * 5 + c] += factor * region * coverage
+
+    vec[15] = math.log(temp)
+    return vec
+
+
 def apply_modifiers(scenarios, modifiers, n_actions, big_blind, temperature):
     """Apply modifiers to scenarios, returning a modified deepcopy.
 

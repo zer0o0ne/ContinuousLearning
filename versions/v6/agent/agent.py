@@ -72,6 +72,19 @@ class ASI(nn.Module):
             dropout=arch.get("modelling_dropout", 0.1),
         )
 
+        # Phase-5 training-only probes on the opponent GRU state
+        # (PLAN_OPPONENT_ADAPTATION §2/§4). None when disabled — old configs
+        # and checkpoints are unaffected (strict=False loading).
+        opp_emb_cfg = arch.get("opponent_embedding", {}) or {}
+        self.style_probe = None
+        self.showdown_probe = None
+        if opp_emb_cfg.get("style_probe", False):
+            from agent.opponent_action.probes import StyleProbe
+            self.style_probe = StyleProbe(d_model)
+        if opp_emb_cfg.get("showdown_probe", False):
+            from agent.opponent_action.probes import ShowdownStrengthProbe
+            self.showdown_probe = ShowdownStrengthProbe(d_model)
+
         self.device_ = "cpu"
         self.n_actions = n_actions
         self.optimizer = None
@@ -81,7 +94,8 @@ class ASI(nn.Module):
 
     def forward_batch(self, event_sequences, skip_memory=True, heads=None,
                       skip_opponent_emb=True, opponent_emb_table=None,
-                      gru_window=1, precomputed=None, gru_sample_groups=None):
+                      gru_window=1, precomputed=None, gru_sample_groups=None,
+                      collect_opp_states=False):
         """
         Batch-parallel forward pass over event sequences.
 
@@ -95,29 +109,46 @@ class ASI(nn.Module):
             precomputed: dict from extract_event_tensors() — skips dict extraction
             gru_sample_groups: optional per-sample group ids for the GRU
                 observer-copy rewind (A.4.5, see Perception.forward_batch)
+            collect_opp_states: §2 — also return per-sample acting-opponent
+                GRU states ("opp_last_states" (B, d), "opp_states_mask" (B,))
+                for the phase-5 probes.
         Returns: dict with computed head outputs
         """
         perception_frozen = not any(p.requires_grad for p in self.perception.parameters())
+        # NOTE: the phase-5 probes need gradient THROUGH the GRU states even
+        # though perception's encoder/decoder are frozen — the opponent_gru's
+        # own requires_grad decides. Keep no_grad only when NOTHING in
+        # perception (incl. the GRU / stats proj) is trainable.
         if perception_frozen:
             with torch.no_grad():
-                perception_out, encoded, mask = self.perception.forward_batch(
+                p_out = self.perception.forward_batch(
                     event_sequences, device=self.device_, skip_memory=skip_memory,
                     skip_opponent_emb=skip_opponent_emb,
                     opponent_emb_table=opponent_emb_table,
                     gru_window=gru_window, precomputed=precomputed,
                     gru_sample_groups=gru_sample_groups,
+                    collect_opp_states=collect_opp_states,
                 )
-            perception_out = perception_out.detach()
+            p_out = list(p_out)
+            p_out[0] = p_out[0].detach()
         else:
-            perception_out, encoded, mask = self.perception.forward_batch(
+            p_out = self.perception.forward_batch(
                 event_sequences, device=self.device_, skip_memory=skip_memory,
                 skip_opponent_emb=skip_opponent_emb,
                 opponent_emb_table=opponent_emb_table,
                 gru_window=gru_window, precomputed=precomputed,
                 gru_sample_groups=gru_sample_groups,
+                collect_opp_states=collect_opp_states,
             )
+        if collect_opp_states:
+            perception_out, encoded, mask, (opp_states, opp_states_mask) = p_out
+        else:
+            perception_out, encoded, mask = p_out
 
         result = {}
+        if collect_opp_states:
+            result["opp_last_states"] = opp_states
+            result["opp_states_mask"] = opp_states_mask
         if heads is None or "action" in heads:
             result["action_logits"] = self.action_head(perception_out, mask=mask)
         if heads is None or "opponent_action" in heads:

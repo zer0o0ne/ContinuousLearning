@@ -127,10 +127,113 @@ def _kl_loss(logits, target_probs):
     return F.kl_div(log_probs, target_probs, reduction="batchmean")
 
 
+def _build_probe_ctx(agent, train_cfg, use_opp_emb, log):
+    """Probe supervision context (PLAN_OPPONENT_ADAPTATION §2/§4).
+
+    Returns None when neither probe is active. Style targets are z-scored
+    per dim across the pool; pool-constant dims are masked out of the loss.
+    """
+    style_w = float(train_cfg.get("style_probe_weight", 0.0) or 0.0)
+    sd_w = float(train_cfg.get("showdown_probe_weight", 0.0) or 0.0)
+    style_targets_raw = train_cfg.get("style_targets") or {}
+
+    use_style = (use_opp_emb and style_w > 0
+                 and getattr(agent, "style_probe", None) is not None
+                 and len(style_targets_raw) >= 2)
+    use_showdown = (use_opp_emb and sd_w > 0
+                    and getattr(agent, "showdown_probe", None) is not None)
+
+    ctx = {"use_style": False, "use_showdown": use_showdown,
+           "style_w": style_w, "sd_w": sd_w}
+    if use_style:
+        names = sorted(style_targets_raw)
+        t = torch.tensor([style_targets_raw[n] for n in names],
+                         dtype=torch.float32)                    # (K, 16)
+        mean = t.mean(dim=0)
+        std = t.std(dim=0, unbiased=False)
+        dim_mask = std >= 1e-8
+        if bool(dim_mask.any()):
+            tz = (t - mean) / std.clamp(min=1e-8)
+            tz[:, ~dim_mask] = 0.0
+            ctx.update(use_style=True,
+                       style_names=names,
+                       style_targets_z=tz,
+                       style_by_name={n: i for i, n in enumerate(names)},
+                       dim_mask=dim_mask)
+            log(f"Style probe: {len(names)} pool styles, "
+                f"{int(dim_mask.sum())}/{dim_mask.numel()} informative dims, "
+                f"weight={style_w}")
+        else:
+            log("Style probe: all target dims constant across pool — disabled")
+    if use_showdown:
+        log(f"Showdown probe: enabled, weight={sd_w}")
+
+    if not ctx["use_style"] and not ctx["use_showdown"]:
+        return None
+    return ctx
+
+
+def _probe_losses(agent, out, aux, ctx, device):
+    """Weighted probe losses for one batch.
+
+    Returns (weighted_loss, style_loss_float, sd_loss_float,
+    nn_correct, nn_total). Samples without a target / without opponent
+    events are masked out; empty selections contribute exactly 0.
+    """
+    states = out["opp_last_states"]
+    smask = out["opp_states_mask"] >= 0.5
+    loss = states.sum() * 0.0  # scalar zero, right device/dtype, in-graph
+    style_loss_val = None
+    sd_loss_val = None
+    nn_correct = 0
+    nn_total = 0
+
+    if ctx["use_style"]:
+        rows, tgt_rows = [], []
+        for i, a in enumerate(aux):
+            r = ctx["style_by_name"].get(a.get("acting_agent"))
+            if r is not None and bool(smask[i]):
+                rows.append(i)
+                tgt_rows.append(r)
+        if rows:
+            dm = ctx["dim_mask"].to(device)
+            pred = agent.style_probe(states[rows])
+            tgt = ctx["style_targets_z"].to(device)[tgt_rows]
+            style_loss = F.mse_loss(pred[:, dm], tgt[:, dm])
+            loss = loss + ctx["style_w"] * style_loss
+            style_loss_val = float(style_loss.detach())
+            with torch.no_grad():
+                pool = ctx["style_targets_z"].to(device)[:, dm].float()
+                d2 = torch.cdist(pred[:, dm].float(), pool)
+                nn_idx = d2.argmin(dim=1)
+                nn_correct = int((nn_idx == torch.tensor(
+                    tgt_rows, device=device)).sum())
+                nn_total = len(rows)
+
+    if ctx["use_showdown"]:
+        sd_t = torch.tensor([a.get("showdown_target", float("nan"))
+                             for a in aux],
+                            dtype=torch.float32, device=device)
+        valid = (~torch.isnan(sd_t)) & smask
+        if bool(valid.any()):
+            pred = agent.showdown_probe(states[valid]).squeeze(-1)
+            sd_loss = F.mse_loss(pred.float(), sd_t[valid])
+            loss = loss + ctx["sd_w"] * sd_loss
+            sd_loss_val = float(sd_loss.detach())
+
+    return loss, style_loss_val, sd_loss_val, nn_correct, nn_total
+
+
 def _run_validation(agent, val_loader, device, amp_config=None,
                     opponent_emb_table=None, gru_window=1,
-                    use_perception_cache=False, val_group_seq=None):
-    """Run validation. Returns (avg_loss, top1_accuracy)."""
+                    use_perception_cache=False, val_group_seq=None,
+                    probe_ctx=None):
+    """Run validation. Returns (avg_loss, top1_accuracy, style_nn_acc).
+
+    avg_loss includes the weighted probe losses when probe_ctx is set, so
+    best-model selection optimizes the same objective as training.
+    style_nn_acc is None when the style probe is inactive.
+    """
     amp_enabled, device_type, amp_dtype = amp_config or (False, "cpu", torch.float32)
     skip_opp = (opponent_emb_table is None)
     if opponent_emb_table is not None:
@@ -139,6 +242,8 @@ def _run_validation(agent, val_loader, device, amp_config=None,
     loss_sum = 0.0
     correct = 0
     count = 0
+    nn_correct_sum = 0
+    nn_total_sum = 0
     _grp_offset = 0
     with torch.no_grad():
         for batch in val_loader:
@@ -152,7 +257,7 @@ def _run_validation(agent, val_loader, device, amp_config=None,
                     batch_loss = _kl_loss(logits, target_probs)
                 n_samples = cached_p.shape[0]
             else:
-                event_sequences, precomputed, target_probs = batch
+                event_sequences, precomputed, target_probs, aux = batch
                 target_probs = target_probs.to(device)
                 n_samples = precomputed["B"] if precomputed is not None else 0
                 # A.4.5: val loader is sequential (shuffle=False), so the
@@ -169,15 +274,23 @@ def _run_validation(agent, val_loader, device, amp_config=None,
                                               opponent_emb_table=opponent_emb_table,
                                               gru_window=gru_window,
                                               precomputed=precomputed,
-                                              gru_sample_groups=_groups)
+                                              gru_sample_groups=_groups,
+                                              collect_opp_states=(probe_ctx is not None))
                     logits = out["opponent_action_logits"]
                     batch_loss = _kl_loss(logits, target_probs)
+                    if probe_ctx is not None:
+                        aux_loss, _, _, nn_c, nn_t = _probe_losses(
+                            agent, out, aux, probe_ctx, device)
+                        batch_loss = batch_loss + aux_loss
+                        nn_correct_sum += nn_c
+                        nn_total_sum += nn_t
             loss_sum += batch_loss.item() * n_samples
             correct += (logits.argmax(dim=-1) == target_probs.argmax(dim=-1)).sum().item()
             count += n_samples
     agent.train()
     n = max(count, 1)
-    return loss_sum / n, correct / n
+    nn_acc = (nn_correct_sum / nn_total_sum) if nn_total_sum else None
+    return loss_sum / n, correct / n, nn_acc
 
 
 def _save_best(agent, optimizer, scheduler, norm_stats, ckpt_dir,
@@ -277,9 +390,36 @@ def train_opponent_action(agent, train_cfg, device, log,
     if use_opp_emb:
         trainable_params += list(agent.perception.opponent_gru.parameters())
 
+    # §3: HUD stats projection trains alongside the GRU (it was frozen by the
+    # blanket perception freeze above).
+    _stats_proj = getattr(agent.perception, "opp_stats_proj", None)
+    if use_opp_emb and _stats_proj is not None:
+        for param in _stats_proj.parameters():
+            param.requires_grad = True
+        trainable_params += list(_stats_proj.parameters())
+
+    # §2/§4: probe supervision. Probes train only here; requires_grad is set
+    # explicitly either way so no stale grads accumulate in other phases.
+    probe_ctx = _build_probe_ctx(agent, train_cfg, use_opp_emb, log)
+    _use_style = bool(probe_ctx and probe_ctx["use_style"])
+    _use_showdown = bool(probe_ctx and probe_ctx["use_showdown"])
+    if getattr(agent, "style_probe", None) is not None:
+        for param in agent.style_probe.parameters():
+            param.requires_grad = _use_style
+        if _use_style:
+            trainable_params += list(agent.style_probe.parameters())
+    if getattr(agent, "showdown_probe", None) is not None:
+        for param in agent.showdown_probe.parameters():
+            param.requires_grad = _use_showdown
+        if _use_showdown:
+            trainable_params += list(agent.showdown_probe.parameters())
+
     log("Frozen: perception (encoder/decoder/embedder), value_head, action_head, modelling_head")
     log(f"Training: opponent_action_head" +
-        (", opponent_gru" if use_opp_emb else ""))
+        (", opponent_gru" if use_opp_emb else "") +
+        (", opp_stats_proj" if (use_opp_emb and _stats_proj is not None) else "") +
+        (", style_probe" if _use_style else "") +
+        (", showdown_probe" if _use_showdown else ""))
     if use_opp_emb:
         log(f"GRU window: {gru_window} step(s)")
 
@@ -496,7 +636,9 @@ def train_opponent_action(agent, train_cfg, device, log,
 
     hist = IncrementalHistory(run_dir,
                               keys=["step_loss", "val_loss", "val_accuracy",
-                                    "epoch_train_loss", "epoch_val_loss"])
+                                    "epoch_train_loss", "epoch_val_loss",
+                                    "style_loss", "showdown_loss",
+                                    "val_style_nn_acc"])
     history = hist.data
     log(f"Loaded history (step_loss n={len(history['step_loss'])})")
 
@@ -538,7 +680,7 @@ def train_opponent_action(agent, train_cfg, device, log,
                     batch_loss = _kl_loss(logits, target_probs)
                 n_samples = cached_p.shape[0]
             else:
-                event_sequences, precomputed, target_probs = batch
+                event_sequences, precomputed, target_probs, aux = batch
                 target_probs = target_probs.to(device)
                 n_samples = precomputed["B"] if precomputed is not None else 0
                 # A.4.5: scenario ids for this batch — OrderedBatchSampler
@@ -554,9 +696,18 @@ def train_opponent_action(agent, train_cfg, device, log,
                                               opponent_emb_table=opp_table,
                                               gru_window=gru_window,
                                               precomputed=precomputed,
-                                              gru_sample_groups=_groups)
+                                              gru_sample_groups=_groups,
+                                              collect_opp_states=(probe_ctx is not None))
                     logits = out["opponent_action_logits"]
                     batch_loss = _kl_loss(logits, target_probs)
+                    if probe_ctx is not None:
+                        aux_loss, _style_l, _sd_l, _, _ = _probe_losses(
+                            agent, out, aux, probe_ctx, device)
+                        batch_loss = batch_loss + aux_loss
+                        if _style_l is not None:
+                            history["style_loss"].append((global_step, _style_l))
+                        if _sd_l is not None:
+                            history["showdown_loss"].append((global_step, _sd_l))
 
             optimizer.zero_grad()
             scaler.scale(batch_loss).backward()
@@ -585,16 +736,20 @@ def train_opponent_action(agent, train_cfg, device, log,
 
             # Intra-epoch validation
             if val_every and (global_step % val_every == 0):
-                val_loss, val_acc = _run_validation(
+                val_loss, val_acc, val_nn_acc = _run_validation(
                     agent, val_loader, device, amp_config=amp_cfg,
                     opponent_emb_table=opp_table, gru_window=gru_window,
                     use_perception_cache=_use_perception_cache,
-                    val_group_seq=val_group_seq)
+                    val_group_seq=val_group_seq, probe_ctx=probe_ctx)
                 history["val_loss"].append((global_step, val_loss))
                 history["val_accuracy"].append((global_step, val_acc))
+                if val_nn_acc is not None:
+                    history["val_style_nn_acc"].append((global_step, val_nn_acc))
                 _save_history(hist)
                 log(f"  [Step {global_step}] Val Loss: {val_loss:.6f}, "
-                    f"Acc: {val_acc:.4f}")
+                    f"Acc: {val_acc:.4f}"
+                    + (f", StyleNN: {val_nn_acc:.4f}"
+                       if val_nn_acc is not None else ""))
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -616,19 +771,22 @@ def train_opponent_action(agent, train_cfg, device, log,
         train_loss_avg = train_loss_sum / max(train_count, 1)
 
         # End-of-epoch validation
-        val_loss, val_acc = _run_validation(
+        val_loss, val_acc, val_nn_acc = _run_validation(
             agent, val_loader, device, amp_config=amp_cfg,
             opponent_emb_table=opp_table, gru_window=gru_window,
             use_perception_cache=_use_perception_cache,
-            val_group_seq=val_group_seq)
+            val_group_seq=val_group_seq, probe_ctx=probe_ctx)
         history["val_loss"].append((global_step, val_loss))
         history["val_accuracy"].append((global_step, val_acc))
+        if val_nn_acc is not None:
+            history["val_style_nn_acc"].append((global_step, val_nn_acc))
         history["epoch_train_loss"].append(train_loss_avg)
         history["epoch_val_loss"].append(val_loss)
         _save_history(hist)
 
         log(f"Epoch {epoch + 1}/{epochs} — Train: {train_loss_avg:.6f}, "
-            f"Val: {val_loss:.6f}, Acc: {val_acc:.4f}")
+            f"Val: {val_loss:.6f}, Acc: {val_acc:.4f}"
+            + (f", StyleNN: {val_nn_acc:.4f}" if val_nn_acc is not None else ""))
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss

@@ -92,7 +92,7 @@ def test_generation_persists_per_combo_and_valid_targets():
     ds = OpponentActionDataset(scenarios, norm_stats=None)
     n_targets = 0
     for i in range(min(len(ds), 300)):
-        events, target = ds[i]
+        events, target, _aux = ds[i]
         assert abs(float(target.sum()) - 1.0) < 1e-4, f"target must sum to 1: {target.sum()}"
         assert torch.all(target >= -1e-6) and not torch.any(torch.isnan(target))
         n_targets += 1

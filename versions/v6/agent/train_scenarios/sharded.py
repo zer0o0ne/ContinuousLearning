@@ -502,7 +502,10 @@ class ShardedOpponentDataset(Dataset):
             )
             _normalize_events_inplace(events, self.norm_stats)
         target = dummy._observer_target(scenario, hero_hand)
-        return events, target
+        from agent.train_scenarios.opponent_action_predict.dataset import (
+            _scenario_aux,
+        )
+        return events, target, _scenario_aux(scenario)
 
 
 # ---------------------------------------------------------------------------

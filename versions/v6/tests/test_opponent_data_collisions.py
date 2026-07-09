@@ -126,7 +126,7 @@ def test_dataset_samples_board_consistent():
     assert len(ds) > 50
     n_checked = 0
     for i in range(len(ds)):
-        events, _target = ds[i]
+        events, _target, _aux = ds[i]
         hero_hand = set(events[0]["hand"])
         board = _revealed_board(events[-1])
         assert hero_hand.isdisjoint(board), (

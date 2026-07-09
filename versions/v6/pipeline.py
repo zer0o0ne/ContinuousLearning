@@ -670,6 +670,26 @@ def main():
 
                 opp_train_cfg = config.get("opponent_action_train", {})
 
+                # §2 (PLAN_OPPONENT_ADAPTATION): canonical style-vector
+                # targets for the style probe, keyed by agent NAME (matching
+                # by name — not index — sidesteps config-order vs sorted-dir
+                # order mismatches).
+                if multi_agent:
+                    from agent.train_scenarios.modifiers import build_style_vector
+                    _game_cfg = config.get("game", {})
+                    _rs = _game_cfg.get("raise_sizes") or {}
+                    _n_bins = (len(next(iter(_rs.values()))) if _rs
+                               else _game_cfg.get("table_bins", 10))
+                    _base_temp = config.get("solver", {}).get(
+                        "gto_temperature", 1.0)
+                    opp_train_cfg = dict(opp_train_cfg)
+                    opp_train_cfg["style_targets"] = {
+                        a["name"]: build_style_vector(
+                            a.get("modifiers", []), _n_bins + 3, _base_temp,
+                            max_players=_game_cfg.get("max_players", 9))
+                        for a in multi_agent["agents"]
+                    }
+
                 if multi_agent:
                     save_dir_cfg = multi_agent.get("save_dir", "")
                     if save_dir_cfg and os.path.isabs(save_dir_cfg):

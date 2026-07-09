@@ -21,7 +21,10 @@
             "beam_width": 8
         },
         "opponent_embedding": {
-            "enabled": true
+            "enabled": true,
+            "stats_enabled": true,
+            "style_probe": true,
+            "showdown_probe": true
         }
     },
     "multi_agent": {
@@ -158,7 +161,7 @@
     },
     "opponent_data": {
         "agents_dir": "5_agents_more_epochs_new_modelling_speedup",
-        "n_hands": 25000,
+        "n_hands": 125000,
         "n_workers": 1,
         "server_max_batch": 768,
         "server_linger_ms": 2,
@@ -179,14 +182,16 @@
     "opponent_action_train": {
         "lr": 5e-5,
         "batch_size": 128,
-        "epochs": 1,
+        "epochs": 3,
         "max_grad_norm": 1.0,
         "log_every": 20,
         "val_every": 200,
         "interrupt_after_fails": 10,
-        "scheduler_eta_min": 5e-7,
+        "scheduler_eta_min": 1e-6,
         "val_split": 0.004,
-        "gru_window": 32
+        "gru_window": 32,
+        "style_probe_weight": 0.3,
+        "showdown_probe_weight": 0.3
     },
     "mcts": {
         "n_simulations": 3000,
@@ -225,7 +230,7 @@
         "log_every": 1,
         "val_every": 50,
         "interrupt_after_fails": 100,
-        "scheduler_eta_min": 5e-7,
+        "scheduler_eta_min": 1e-6,
         "estimated_steps_per_cycle": 20,
         "val_split": 0.1,
         "value_weight": 1.0,
@@ -244,8 +249,7 @@
         "action_label_smoothing": 0.04,
         "entropy_weight": 0.05,
         "terminal_value_weight": 1.0,
-        "terminal_value_k_worst": 4,
-        "terminal_value_k_best": 4,
+        "n_terminal_values": 8,
         "gradient_checkpointing": true,
         "teacher_forcing": {
             "p_start": 0.7,

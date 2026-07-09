@@ -256,47 +256,41 @@ class MCTSTrainingExample:
     # the list of `action_idx` to walk from root to that terminal, and
     # `equity_Q` is the equity-based terminal value (in `mcts_value_scale`
     # units, matching the rest of the value-target axis). Selected at
-    # collection time as K_worst lowest-Q + K_best highest-Q terminals from
-    # the tree — sampling at both tails avoids biasing the value head toward
-    # only "good" outcomes. Empty when k_worst+k_best=0 (disabled).
+    # collection time as `n_terminal_values` UNIFORMLY RANDOM terminals from
+    # the tree — random sampling covers the whole Q range (the earlier
+    # K_worst/K_best tails-only scheme trained the value head well on extreme
+    # outcomes but poorly on middling ones). Empty when n_terminal_values=0.
     terminal_targets: list = field(default_factory=list)
 
 
-def _select_terminal_targets(root, k_worst, k_best, clip_val=None):
-    """Pick `k_worst` lowest-Q + `k_best` highest-Q terminals from the tree.
+def _select_terminal_targets(root, n_targets, clip_val=None):
+    """Pick `n_targets` uniformly random terminals from the tree.
 
     Returns a list of `(action_path_from_root, equity_Q)` tuples ready to
-    drop into `MCTSTrainingExample.terminal_targets`. Terminals are sorted
-    by `terminal.Q` (which `evaluate_all_terminals` has set to the
-    equity-based value in `mcts_value_scale` units). Both tails are taken
-    to avoid biasing value-head training toward only successful outcomes;
-    overlap (small trees) is handled by union of indices.
+    drop into `MCTSTrainingExample.terminal_targets` (`terminal.Q` has been
+    set by `evaluate_all_terminals` to the equity-based value in
+    `mcts_value_scale` units). Uniform sampling (without replacement, module
+    `random` — seeded per run/actor like the rest of collection) covers the
+    whole outcome range instead of only the Q tails, so value-head
+    supervision is not biased toward very winning / very losing situations.
 
     `clip_val`: if not None, each `equity_Q` is clamped to `[-clip_val,
     clip_val]` — matches the `value_target_clip` applied to root/chain
-    value targets in `_finalize_value_targets`, so the value head's tail
+    value targets in `_finalize_value_targets`, so the value head's terminal
     supervision lives on the same bounded axis as its other targets.
 
-    Returns `[]` when `k_worst + k_best == 0`.
+    Returns `[]` when `n_targets == 0`.
     """
-    k_worst = max(0, int(k_worst))
-    k_best = max(0, int(k_best))
-    if k_worst + k_best == 0:
+    n_targets = max(0, int(n_targets))
+    if n_targets == 0:
         return []
     terminals = _collect_terminals(root)
     if not terminals:
         return []
-    # Stable sort: ascending Q. Tail K_best are the highest.
-    sorted_terms = sorted(terminals, key=lambda t: float(t.Q))
-    n = len(sorted_terms)
-    picked = set()
-    for i in range(min(k_worst, n)):
-        picked.add(i)
-    for i in range(max(0, n - k_best), n):
-        picked.add(i)
+    if len(terminals) > n_targets:
+        terminals = random.sample(terminals, n_targets)
     out = []
-    for i in sorted(picked):
-        t = sorted_terms[i]
+    for t in terminals:
         q = float(t.Q)
         if clip_val is not None:
             q = max(-float(clip_val), min(float(clip_val), q))
@@ -307,7 +301,7 @@ def _select_terminal_targets(root, k_worst, k_best, clip_val=None):
 def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                           final_credits=None, big_blind=None,
                           action_label_smoothing=0.0,
-                          terminal_k_worst=0, terminal_k_best=0,
+                          n_terminal_values=0,
                           terminal_clip_val=None):
     """Extract training examples from all MCTS trees in a completed hand.
 
@@ -448,8 +442,7 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
         # pipeline therefore passes `terminal_clip_val=None` here (no
         # collection-time clip); the param stays for explicit callers/tests.
         terminal_targets = _select_terminal_targets(
-            root, terminal_k_worst, terminal_k_best,
-            clip_val=terminal_clip_val)
+            root, n_terminal_values, clip_val=terminal_clip_val)
 
         # Tuple keeps the original decision index `t` so callers can map back
         # into `decisions` / `realized_by_dec` even when past-opponent
@@ -540,8 +533,7 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
     max_chain_depth = None if not raw_max_chain_depth else int(raw_max_chain_depth)
     action_label_smoothing = float(
         mcts_train_cfg.get("action_label_smoothing", 0.0))
-    terminal_k_worst = int(mcts_train_cfg.get("terminal_value_k_worst", 0))
-    terminal_k_best = int(mcts_train_cfg.get("terminal_value_k_best", 0))
+    n_terminal_values = int(mcts_train_cfg.get("n_terminal_values", 0))
 
     per_agent_examples = {a["name"]: [] for a in agents_list}
     MAX_ACTIONS = 10000
@@ -716,8 +708,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     max_chain_depth = None if not raw_max_chain_depth else int(raw_max_chain_depth)
     action_label_smoothing = float(
         mcts_train_cfg.get("action_label_smoothing", 0.0))
-    terminal_k_worst = int(mcts_train_cfg.get("terminal_value_k_worst", 0))
-    terminal_k_best = int(mcts_train_cfg.get("terminal_value_k_best", 0))
+    n_terminal_values = int(mcts_train_cfg.get("n_terminal_values", 0))
 
     per_agent_examples = {a["name"]: [] for a in agents_list}
     MAX_ACTIONS = 10000
@@ -1058,8 +1049,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             final_credits=None,  # equity-realized supersedes raw final_credits
             big_blind=big_blind,
             action_label_smoothing=action_label_smoothing,
-            terminal_k_worst=terminal_k_worst,
-            terminal_k_best=terminal_k_best,
+            n_terminal_values=n_terminal_values,
             # C.3: do NOT clip terminal Q at collection — _finalize_value_targets
             # rescales to the fresh value axis and clips there.
             terminal_clip_val=None,

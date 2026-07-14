@@ -101,7 +101,7 @@
         "password": "",
         "request_timeout": 30,
         "log_every": 5000,
-        "n_hands": 10000,
+        "n_hands": 50000,
         "n_workers": 4,
         "max_consecutive_failures": 20,
         "retries": 4,
@@ -109,8 +109,18 @@
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "detalized_solver",
-                "type": "solver"
+                "name": "gto_pure_20_wo_emb",
+                "type": "model",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents_more_epochs_new_modelling_speedup/gto_pure/mcts_predict/2026_07_12_12_40_30/cycles/cycle_0020.pt",
+                "use_opponent_embedding": false,
+                "use_mcts": true
+            },
+            {
+                "name": "gto_pure_20_w_emb",
+                "type": "model",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents_more_epochs_new_modelling_speedup/gto_pure/mcts_predict/2026_07_12_12_40_30/cycles/cycle_0020.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
             }
         ]
     }

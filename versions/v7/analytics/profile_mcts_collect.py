@@ -1,6 +1,6 @@
 """Profile MCTS data collection to find bottlenecks.
 
-Usage (from versions/v6):
+Usage (from versions/v7):
     python analytics/profile_mcts_collect.py [--n_hands 3] [--device cuda]
 
 Profiles the sequential (n_workers=1) collection path: MCTS search per
@@ -62,12 +62,14 @@ def main():
     agent.set_device(device)
     agent.eval()
 
+    big_blind = cfg["game"].get("big_blind", 10)
     norm_stats = {
         "pot_mean": 50.0, "pot_std": 30.0,
         "stack_mean": 500.0, "stack_std": 200.0,
         "bets_mean": 5.0, "bets_std": 10.0,
         "blind_mean": 10.0, "blind_std": 1.0,
         "ev_mean": 0.0, "ev_std": 1.0,
+        "mcts_value_scale": float(big_blind),
     }
 
     agents_list = [{
@@ -128,11 +130,14 @@ def main():
         "run_mcts_collection",
         "_play_hands",
         "search",
+        "_simulate",
         "_select_to_leaf",
         "_flush_pending",
         "_evaluate_root",
         "_build_context",
         "_pad_and_stack",
+        "_apply_virtual_loss",
+        "_recompute_node_after_backup",
         "evaluate_leaves",
         "evaluate_root",
         "forward_batch",
@@ -142,10 +147,13 @@ def main():
         "compute_equity_outcome",
         "gpu_equity_v2",
         "_finalize_value_targets",
+        "_robust_scale",
         "collect_training_data",
+        "_select_terminal_targets",
         "_expand_node",
         "_backup_cached_terminal",
         "_deterministic_terminal_value",
+        "re_backup_terminals",
     ]:
         stats.print_stats(fn_name)
 

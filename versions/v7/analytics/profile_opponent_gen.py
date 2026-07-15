@@ -1,6 +1,6 @@
 """Profile opponent-data generation to find the real bottleneck.
 
-Usage (from versions/v6):
+Usage (from versions/v7):
     python analytics/profile_opponent_gen.py [--n_hands 5] [--device cuda]
 
 Prints per-function timing breakdown (cProfile) and a per-section wall-clock
@@ -110,6 +110,7 @@ def main():
     for fn_name in [
         "generate_opponent_hand",
         "_compute_range_probs",
+        "_compute_range_probs_templated",
         "_tile_template_precomputed",
         "extract_event_tensors",
         "_build_batch_tensors",
@@ -119,6 +120,9 @@ def main():
         "forward_batch",
         "_apply_joint_card_removal",
         "_dead_mask_array",
+        "_filter_dead",
+        "_showdown_strength",
+        "_label_showdown_strengths",
     ]:
         stats.print_stats(fn_name)
 

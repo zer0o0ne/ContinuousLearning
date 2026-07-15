@@ -116,45 +116,42 @@ def _format_internal(internal: dict) -> list[str]:
         lines.append("_No per-agent records._")
         return lines
 
-    # Sort by BB/100 descending
     rows = []
     for name, a in agents.items():
-        rows.append((
-            name,
-            a.get("hands_played", 0),
-            a.get("bb_per_100"),
-            a.get("bb_per_100_raw"),       # uncorrected (may show env leak)
-            a.get("stderr_bb_per_100"),
-            a.get("decisions_made", 0),
-            a.get("fold_rate"),
-            a.get("allin_rate"),
-            a.get("temperature"),
-            a.get("use_opponent_embedding", False),
-            a.get("use_mcts", False),
-            a.get("action_distribution", []),
-        ))
-    rows.sort(key=lambda r: r[2] if r[2] is not None else -float("inf"),
+        rows.append({
+            "name": name,
+            "hands": a.get("hands_played", 0),
+            "bb100": a.get("bb_per_100"),
+            "bb100_raw": a.get("bb_per_100_raw"),
+            "stderr": a.get("stderr_bb_per_100"),
+            "dec": a.get("decisions_made", 0),
+            "fold": a.get("fold_rate"),
+            "allin": a.get("allin_rate"),
+            "temp": a.get("temperature"),
+            "opp_emb": a.get("use_opponent_embedding", False),
+            "mcts": a.get("use_mcts", False),
+            "dist": a.get("action_distribution", []),
+            "dist_by_street": a.get("action_distribution_by_street", []),
+        })
+    rows.sort(key=lambda r: r["bb100"] if r["bb100"] is not None else -float("inf"),
               reverse=True)
 
-    header = ["Agent", "Hands", "BB/100", "BB/100 raw", "± stderr",
-              "Decisions", "Fold", "All-in", "Temp", "OppEmb", "MCTS",
-              "Action mix"]
+    header = ["Agent", "Hands", "BB/100", "BB/100 raw", "+-stderr",
+              "Decisions", "Fold", "All-in", "Temp", "OppEmb", "MCTS"]
     table_rows = [header]
-    for (name, hands, bb100, bb100_raw, stderr, dec, fold, allin, temp,
-         opp_emb, mcts, dist) in rows:
+    for r in rows:
         table_rows.append([
-            str(name),
-            str(hands),
-            _fmt_num(bb100),
-            _fmt_num(bb100_raw),
-            _fmt_num(stderr, "{:.2f}"),
-            str(dec),
-            _fmt_num(fold, "{:.3f}"),
-            _fmt_num(allin, "{:.3f}"),
-            _fmt_num(temp, "{:.2f}"),
-            "✓" if opp_emb else " ",
-            "✓" if mcts else " ",
-            _action_index_summary(dist),
+            str(r["name"]),
+            str(r["hands"]),
+            _fmt_num(r["bb100"]),
+            _fmt_num(r["bb100_raw"]),
+            _fmt_num(r["stderr"], "{:.2f}"),
+            str(r["dec"]),
+            _fmt_num(r["fold"], "{:.3f}"),
+            _fmt_num(r["allin"], "{:.3f}"),
+            _fmt_num(r["temp"], "{:.2f}"),
+            "Y" if r["opp_emb"] else " ",
+            "Y" if r["mcts"] else " ",
         ])
     lines.extend(_render_table(table_rows))
     lines.append("")
@@ -162,6 +159,21 @@ def _format_internal(internal: dict) -> list[str]:
         "_BB/100 = leak-corrected (per-hand zero-sum). "
         "BB/100 raw = uncorrected; large gap signals env chip-leakage._"
     )
+    lines.append("")
+
+    # Per-agent action distributions
+    street_names = ["preflop", "flop", "turn", "river"]
+    has_streets = any(r["dist_by_street"] for r in rows)
+    if has_streets:
+        lines.append("### Action distributions")
+        lines.append("")
+        for r in rows:
+            lines.append(f"**{r['name']}**: {_action_index_summary(r['dist'])}")
+            if r["dist_by_street"]:
+                for si, srow in enumerate(r["dist_by_street"]):
+                    sname = street_names[si] if si < len(street_names) else f"street{si}"
+                    lines.append(f"  {sname:>8}: {_action_index_summary(srow)}")
+            lines.append("")
     return lines
 
 
@@ -189,52 +201,69 @@ def _format_slumbot(slumbot: dict) -> list[str]:
 
     rows = []
     for name, a in agents.items():
-        rows.append((
-            name,
-            a.get("hands_played", 0),
-            a.get("hands_failed", 0),
-            a.get("bb_per_100_raw"),
-            a.get("bb_per_100_baseline_corrected"),
-            a.get("stderr_bb_per_100"),
-            a.get("decisions_made", 0),
-            a.get("fold_rate"),
-            a.get("allin_rate"),
-            a.get("temperature"),
-            a.get("use_opponent_embedding", False),
-            a.get("use_mcts", False),
-            a.get("clamps", {}),
-            a.get("action_distribution", []),
-        ))
-    # Sort by baseline-corrected (best variance reduction estimator)
+        rows.append({
+            "name": name,
+            "hands": a.get("hands_played", 0),
+            "failed": a.get("hands_failed", 0),
+            "raw": a.get("bb_per_100_raw"),
+            "base": a.get("bb_per_100_baseline_corrected"),
+            "residual": a.get("bb_per_100_aivat_residual"),
+            "stderr": a.get("stderr_bb_per_100"),
+            "stderr_base": a.get("stderr_bb_per_100_baseline_corrected"),
+            "dec": a.get("decisions_made", 0),
+            "fold": a.get("fold_rate"),
+            "allin": a.get("allin_rate"),
+            "temp": a.get("temperature"),
+            "opp_emb": a.get("use_opponent_embedding", False),
+            "mcts": a.get("use_mcts", False),
+            "agent_type": a.get("type", "model"),
+            "clamps": a.get("clamps", {}),
+            "dist": a.get("action_distribution", []),
+            "dist_by_street": a.get("action_distribution_by_street", []),
+        })
     rows.sort(
-        key=lambda r: r[4] if r[4] is not None else -float("inf"),
+        key=lambda r: r["raw"] if r["raw"] is not None else -float("inf"),
         reverse=True,
     )
 
-    header = ["Agent", "Hands", "Fail", "BB/100 raw", "BB/100 base",
-              "± stderr", "Decisions", "Fold", "All-in",
-              "Temp", "OppEmb", "MCTS", "Clamps", "Action mix"]
+    header = ["Agent", "Type", "Hands", "Fail", "BB/100 raw", "+-stderr",
+              "BB/100 base", "+-stderr(b)", "Residual",
+              "Fold", "All-in", "Temp", "OppEmb", "MCTS", "Clamps"]
     table_rows = [header]
-    for (name, hands, failed, raw, base, stderr, dec, fold, allin,
-         temp, opp_emb, mcts, clamps, dist) in rows:
-        clamp_str = ",".join(f"{k[:1]}{v}" for k, v in (clamps or {}).items()) or "-"
+    for r in rows:
+        clamp_str = ",".join(
+            f"{k[:1]}{v}" for k, v in (r["clamps"] or {}).items()) or "-"
         table_rows.append([
-            str(name),
-            str(hands),
-            str(failed),
-            _fmt_num(raw),
-            _fmt_num(base),
-            _fmt_num(stderr, "{:.2f}"),
-            str(dec),
-            _fmt_num(fold, "{:.3f}"),
-            _fmt_num(allin, "{:.3f}"),
-            _fmt_num(temp, "{:.2f}"),
-            "✓" if opp_emb else " ",
-            "✓" if mcts else " ",
+            str(r["name"]),
+            str(r["agent_type"]),
+            str(r["hands"]),
+            str(r["failed"]),
+            _fmt_num(r["raw"]),
+            _fmt_num(r["stderr"], "{:.2f}"),
+            _fmt_num(r["base"]),
+            _fmt_num(r["stderr_base"], "{:.2f}"),
+            _fmt_num(r["residual"]),
+            _fmt_num(r["fold"], "{:.3f}"),
+            _fmt_num(r["allin"], "{:.3f}"),
+            _fmt_num(r["temp"], "{:.2f}"),
+            "Y" if r["opp_emb"] else " ",
+            "Y" if r["mcts"] else " ",
             clamp_str,
-            _action_index_summary(dist),
         ])
     lines.extend(_render_table(table_rows))
+    lines.append("")
+
+    # Per-agent action mix + per-street breakdown
+    lines.append("### Action distributions")
+    lines.append("")
+    street_names = ["preflop", "flop", "turn", "river"]
+    for r in rows:
+        lines.append(f"**{r['name']}**: {_action_index_summary(r['dist'])}")
+        if r["dist_by_street"]:
+            for si, srow in enumerate(r["dist_by_street"]):
+                sname = street_names[si] if si < len(street_names) else f"street{si}"
+                lines.append(f"  {sname:>8}: {_action_index_summary(srow)}")
+        lines.append("")
     return lines
 
 

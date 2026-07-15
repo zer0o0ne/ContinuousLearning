@@ -20,7 +20,7 @@ Outputs:
   * head_distributions.txt — formatted tables identical to the printout
 
 Usage:
-    # Default: takes config.json next to versions/v5, walks every agent under
+    # Default: takes config.json next to versions/v7, walks every agent under
     # config.multi_agent.save_dir, writes the report under <save_dir>/analysis.
     python analytics/head_distributions.py
 
@@ -54,7 +54,7 @@ import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Path bootstrap so this file works both as `python -m analytics.head_distributions`
-# and as `python versions/v5/analytics/head_distributions.py`.
+# and as `python versions/v7/analytics/head_distributions.py`.
 # ---------------------------------------------------------------------------
 
 _HERE = os.path.dirname(os.path.abspath(__file__))

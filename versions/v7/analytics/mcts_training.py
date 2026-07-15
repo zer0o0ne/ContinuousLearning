@@ -8,16 +8,17 @@ Usage:
     python -m analytics.mcts_training --agent_dir <path>
     # or directly:
     python analytics/mcts_training.py \
-        --agent_dir /Users/.../data/v5/5_final_agents/gto_pure/mcts_predict
+        --agent_dir /path/to/data/v7/<save_dir>/<agent>/mcts_predict
 
 `agent_dir` must point to the `mcts_predict` scenario folder (the one that
 contains `history.pt` and per-run `<timestamp>/best.pt`). Output PNGs are
 written to `<agent_dir>/analysis/` by default.
 
 Plots produced:
-    1. mcts_training_overview.png   — 2x3 panel: train/val components, best val
-                                       per cycle, LR schedule, dataset sizes,
-                                       train-vs-val gap per epoch.
+    1. mcts_training_overview.png   — 3x3 panel: train/val components (primary
+                                       + auxiliary), best val per cycle, LR
+                                       schedule, dataset sizes, train-vs-val
+                                       gap, teacher-forcing probability.
     2. mcts_component_balance.png   — stacked train components + val component
                                        shares (where each loss term dominates).
     3. mcts_cycle_progression.png   — train losses colour-coded by cycle id +
@@ -30,6 +31,8 @@ import sys
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,10 +43,29 @@ if _VERSION_DIR not in sys.path:
 from agent.train_scenarios._history import IncrementalHistory  # noqa: E402
 
 
+# ---------- Loss component definitions ----------
+
+_PRIMARY_COMPONENTS = ["value", "action", "chain"]
+_AUX_COMPONENTS = ["chain_value", "recon", "terminal_value", "action_entropy"]
+_RECON_SUB = ["recon_mse", "recon_infonce"]
+_ALL_COMPONENTS = _PRIMARY_COMPONENTS + _AUX_COMPONENTS
+
+_COMPONENT_COLORS = {
+    "value": "C0",
+    "action": "C1",
+    "chain": "C2",
+    "chain_value": "C3",
+    "recon": "C4",
+    "terminal_value": "C5",
+    "action_entropy": "C6",
+    "recon_mse": "C4",
+    "recon_infonce": "C7",
+}
+
 # ---------- Loading helpers ----------
 
-def _column(records, key):
-    return np.asarray([r[key] for r in records], dtype=float)
+def _column(records, key, default=0.0):
+    return np.asarray([r.get(key, default) for r in records], dtype=float)
 
 
 def _smooth(x, w):
@@ -69,7 +91,16 @@ def load_history(agent_dir):
     return hist.data
 
 
-# ---------- Plot 1: 2x3 overview ----------
+def _has_component(records, key):
+    """Check if any record has a non-zero value for key."""
+    for r in records:
+        v = r.get(key)
+        if v is not None and v != 0:
+            return True
+    return False
+
+
+# ---------- Plot 1: 3x3 overview ----------
 
 def plot_overview(hist, out_path, agent_name, smooth_window=11):
     step_loss = hist["step_loss"]
@@ -80,16 +111,11 @@ def plot_overview(hist, out_path, agent_name, smooth_window=11):
 
     s_step = _column(step_loss, "step")
     s_total = _column(step_loss, "total")
-    s_value = _column(step_loss, "value")
-    s_action = _column(step_loss, "action")
-    s_chain = _column(step_loss, "chain")
     s_lr = _column(step_loss, "lr")
+    s_p_tf = _column(step_loss, "p_tf", default=np.nan)
 
     v_step = _column(val_loss, "step")
     v_total = _column(val_loss, "total")
-    v_value = _column(val_loss, "value")
-    v_action = _column(val_loss, "action")
-    v_chain = _column(val_loss, "chain")
 
     c_id = np.asarray([c["cycle_id"] for c in cycles], dtype=int)
     c_train = np.asarray([c["train_size"] for c in cycles], dtype=int)
@@ -104,45 +130,79 @@ def plot_overview(hist, out_path, agent_name, smooth_window=11):
     e_train = _column(epoch_train, "total") if epoch_train else np.array([])
     e_val = _column(epoch_val, "total") if epoch_val else np.array([])
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    has_p_tf = not np.all(np.isnan(s_p_tf))
+    active_aux = [c for c in _AUX_COMPONENTS if _has_component(step_loss, c)]
+    has_aux = len(active_aux) > 0
+    has_recon_sub = _has_component(step_loss, "recon_mse")
+
+    n_rows = 3
+    n_cols = 3
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 14))
     fig.suptitle(
         f"MCTS training analytics — {agent_name} "
         f"({len(cycles)} cycles, {len(step_loss)} training steps)",
         fontsize=14,
     )
-
-    # (0,0) Train loss components
-    ax = axes[0, 0]
     W = smooth_window
+
+    # (0,0) Train primary loss components
+    ax = axes[0, 0]
     ax.plot(s_step, _smooth(s_total, W), label="total", color="black", lw=1.5)
-    ax.plot(s_step, _smooth(s_value, W), label="value", color="C0", alpha=0.8)
-    ax.plot(s_step, _smooth(s_action, W), label="action", color="C1", alpha=0.8)
-    ax.plot(s_step, _smooth(s_chain, W), label="chain", color="C2", alpha=0.8)
+    for comp in _PRIMARY_COMPONENTS:
+        ax.plot(s_step, _smooth(_column(step_loss, comp), W),
+                label=comp, color=_COMPONENT_COLORS[comp], alpha=0.8)
     for b in cycle_boundaries:
         ax.axvline(b, color="gray", lw=0.3, alpha=0.5)
-    ax.set_xlabel("training step (cumulative)")
+    ax.set_xlabel("training step")
     ax.set_ylabel("loss")
-    ax.set_title(f"Train loss components (smooth window={W})")
-    ax.legend(loc="upper right", fontsize=9)
+    ax.set_title(f"Train: primary components (smooth={W})")
+    ax.legend(loc="upper right", fontsize=8)
     ax.grid(alpha=0.3)
 
-    # (0,1) Validation loss components
+    # (0,1) Train auxiliary loss components
     ax = axes[0, 1]
+    if has_aux:
+        for comp in active_aux:
+            ax.plot(s_step, _smooth(_column(step_loss, comp), W),
+                    label=comp, color=_COMPONENT_COLORS[comp], alpha=0.8)
+        if has_recon_sub:
+            for sub in _RECON_SUB:
+                ax.plot(s_step, _smooth(_column(step_loss, sub), W),
+                        label=sub, color=_COMPONENT_COLORS[sub],
+                        alpha=0.5, ls="--", lw=0.8)
+        for b in cycle_boundaries:
+            ax.axvline(b, color="gray", lw=0.3, alpha=0.5)
+        ax.set_title(f"Train: auxiliary components (smooth={W})")
+        ax.legend(loc="upper right", fontsize=8)
+    else:
+        ax.set_title("Train: auxiliary components (none active)")
+        ax.text(0.5, 0.5, "No auxiliary losses recorded",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+    ax.set_xlabel("training step")
+    ax.set_ylabel("loss")
+    ax.grid(alpha=0.3)
+
+    # (0,2) Validation loss components
+    ax = axes[0, 2]
     if len(v_step) > 0:
         ax.plot(v_step, v_total, "o-", label="total", color="black", lw=1.5, ms=4)
-        ax.plot(v_step, v_value, "o-", label="value", color="C0", alpha=0.8, ms=3)
-        ax.plot(v_step, v_action, "o-", label="action", color="C1", alpha=0.8, ms=3)
-        ax.plot(v_step, v_chain, "o-", label="chain", color="C2", alpha=0.8, ms=3)
+        for comp in _PRIMARY_COMPONENTS:
+            ax.plot(v_step, _column(val_loss, comp), "o-",
+                    label=comp, color=_COMPONENT_COLORS[comp], alpha=0.8, ms=3)
+        active_val_aux = [c for c in _AUX_COMPONENTS if _has_component(val_loss, c)]
+        for comp in active_val_aux:
+            ax.plot(v_step, _column(val_loss, comp), "s-",
+                    label=comp, color=_COMPONENT_COLORS[comp], alpha=0.6, ms=2)
     for b in cycle_boundaries:
         ax.axvline(b, color="gray", lw=0.3, alpha=0.5)
     ax.set_xlabel("training step")
     ax.set_ylabel("validation loss")
     ax.set_title("Validation loss components")
-    ax.legend(loc="upper right", fontsize=9)
+    ax.legend(loc="upper right", fontsize=7)
     ax.grid(alpha=0.3)
 
-    # (0,2) Best val per cycle
-    ax = axes[0, 2]
+    # (1,0) Best val per cycle
+    ax = axes[1, 0]
     ax.plot(c_id, c_best_val, "o-", color="darkblue", lw=1.2, ms=5,
             label="best val in cycle")
     saved_idx = np.where(c_saved)[0]
@@ -156,8 +216,8 @@ def plot_overview(hist, out_path, agent_name, smooth_window=11):
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(alpha=0.3)
 
-    # (1,0) LR schedule
-    ax = axes[1, 0]
+    # (1,1) LR schedule
+    ax = axes[1, 1]
     ax.plot(s_step, s_lr, color="purple", lw=0.7)
     for b in cycle_boundaries:
         ax.axvline(b, color="gray", lw=0.3, alpha=0.5)
@@ -167,8 +227,24 @@ def plot_overview(hist, out_path, agent_name, smooth_window=11):
     ax.set_yscale("log")
     ax.grid(alpha=0.3, which="both")
 
-    # (1,1) Examples per cycle
-    ax = axes[1, 1]
+    # (1,2) Teacher-forcing probability
+    ax = axes[1, 2]
+    if has_p_tf:
+        ax.plot(s_step, s_p_tf, color="teal", lw=0.7)
+        for b in cycle_boundaries:
+            ax.axvline(b, color="gray", lw=0.3, alpha=0.5)
+        ax.set_title("Teacher-forcing probability")
+        ax.set_ylim(-0.05, 1.05)
+    else:
+        ax.set_title("Teacher-forcing probability (not recorded)")
+        ax.text(0.5, 0.5, "p_tf not in history",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+    ax.set_xlabel("training step")
+    ax.set_ylabel("p_tf")
+    ax.grid(alpha=0.3)
+
+    # (2,0) Examples per cycle
+    ax = axes[2, 0]
     width = 0.35
     ax.bar(c_id - width / 2, c_train, width, label="train", color="C0")
     ax.bar(c_id + width / 2, c_val, width, label="val", color="C1")
@@ -180,13 +256,12 @@ def plot_overview(hist, out_path, agent_name, smooth_window=11):
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(alpha=0.3, axis="y")
 
-    # (1,2) Train vs Val per epoch
-    ax = axes[1, 2]
+    # (2,1) Train vs Val per epoch
+    ax = axes[2, 1]
     if len(e_train) > 0 and len(e_train) == len(e_val):
         epoch_idx = np.arange(len(e_train))
         ax.plot(epoch_idx, e_train, "o-", label="train", color="C0", lw=1.2, ms=4)
         ax.plot(epoch_idx, e_val, "o-", label="val", color="C3", lw=1.2, ms=4)
-        # Cycle boundaries (each cycle has epochs_run epochs)
         ep_cumulative = 0
         for cyc in cycles:
             n_eps = cyc.get("epochs_run") or 1
@@ -197,6 +272,27 @@ def plot_overview(hist, out_path, agent_name, smooth_window=11):
         ax.set_ylabel("loss")
         ax.set_title("Train vs Val per epoch (gap = overfitting signal)")
         ax.legend(loc="upper right", fontsize=9)
+        ax.grid(alpha=0.3)
+
+    # (2,2) Val component breakdown per cycle
+    ax = axes[2, 2]
+    if len(cycles) > 0 and len(val_loss) > 0:
+        cycle_ids_val = _column(val_loss, "cycle_id")
+        for comp in _PRIMARY_COMPONENTS + active_aux:
+            comp_vals = _column(val_loss, comp)
+            per_cycle_means = []
+            for cid in c_id:
+                mask = cycle_ids_val == cid
+                if mask.any():
+                    per_cycle_means.append(comp_vals[mask].mean())
+                else:
+                    per_cycle_means.append(np.nan)
+            ax.plot(c_id, per_cycle_means, "o-", label=comp,
+                    color=_COMPONENT_COLORS[comp], ms=3, alpha=0.8)
+        ax.set_xlabel("cycle id")
+        ax.set_ylabel("mean val loss")
+        ax.set_title("Val components per cycle (mean)")
+        ax.legend(loc="upper right", fontsize=7)
         ax.grid(alpha=0.3)
 
     plt.tight_layout()
@@ -211,52 +307,46 @@ def plot_component_balance(hist, out_path, smooth_window=11):
     val_loss = hist["val_loss"]
 
     s_step = _column(step_loss, "step")
-    s_value = _column(step_loss, "value")
-    s_action = _column(step_loss, "action")
-    s_chain = _column(step_loss, "chain")
-
     v_step = _column(val_loss, "step")
     v_total = _column(val_loss, "total")
-    v_value = _column(val_loss, "value")
-    v_action = _column(val_loss, "action")
-    v_chain = _column(val_loss, "chain")
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    active_components = [c for c in _ALL_COMPONENTS if _has_component(step_loss, c)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
     fig.suptitle("Loss component balance over training", fontsize=14)
+    W = smooth_window
 
     # Train: stacked area
     ax = axes[0]
-    W = smooth_window
-    v_smooth = _smooth(s_value, W)
-    a_smooth = _smooth(s_action, W)
-    c_smooth = _smooth(s_chain, W)
-    ax.fill_between(s_step, 0, v_smooth, color="C0", alpha=0.6, label="value")
-    ax.fill_between(s_step, v_smooth, v_smooth + a_smooth,
-                    color="C1", alpha=0.6, label="action")
-    ax.fill_between(s_step, v_smooth + a_smooth,
-                    v_smooth + a_smooth + c_smooth,
-                    color="C2", alpha=0.6, label="chain")
+    smoothed = {}
+    for comp in active_components:
+        smoothed[comp] = np.abs(_smooth(_column(step_loss, comp), W))
+
+    bottom = np.zeros_like(s_step)
+    for comp in active_components:
+        ax.fill_between(s_step, bottom, bottom + smoothed[comp],
+                        color=_COMPONENT_COLORS[comp], alpha=0.6, label=comp)
+        bottom = bottom + smoothed[comp]
     ax.set_xlabel("training step")
     ax.set_ylabel("contribution to total loss (smoothed)")
     ax.set_title(f"Train: components stacked (window={W})")
-    ax.legend(loc="upper right", fontsize=9)
+    ax.legend(loc="upper right", fontsize=8)
     ax.grid(alpha=0.3)
 
     # Val: relative shares
     ax = axes[1]
     if len(v_step) > 0:
-        v_share = v_value / np.maximum(v_total, 1e-9)
-        a_share = v_action / np.maximum(v_total, 1e-9)
-        c_share = v_chain / np.maximum(v_total, 1e-9)
-        ax.plot(v_step, v_share, "o-", color="C0", label="value", ms=3)
-        ax.plot(v_step, a_share, "o-", color="C1", label="action", ms=3)
-        ax.plot(v_step, c_share, "o-", color="C2", label="chain", ms=3)
+        active_val = [c for c in _ALL_COMPONENTS if _has_component(val_loss, c)]
+        for comp in active_val:
+            share = np.abs(_column(val_loss, comp)) / np.maximum(np.abs(v_total), 1e-9)
+            ax.plot(v_step, share, "o-", color=_COMPONENT_COLORS[comp],
+                    label=comp, ms=3)
     ax.set_xlabel("training step")
     ax.set_ylabel("share of total val loss")
     ax.set_title("Val: relative weight of each component")
-    ax.legend(loc="upper right", fontsize=9)
+    ax.legend(loc="upper right", fontsize=8)
     ax.grid(alpha=0.3)
-    ax.set_ylim(0, 1)
+    ax.set_ylim(0, 1.1)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=110, bbox_inches="tight")
@@ -271,7 +361,7 @@ def plot_cycle_progression(hist, out_path):
 
     s_step = _column(step_loss, "step")
     s_total = _column(step_loss, "total")
-    s_cycle = np.asarray([r["cycle_id"] for r in step_loss], dtype=int)
+    s_cycle = np.asarray([r.get("cycle_id", 0) for r in step_loss], dtype=int)
 
     c_step_end = np.asarray([c["step_end"] for c in cycles], dtype=int)
     c_best_val = np.asarray(
@@ -323,14 +413,6 @@ def print_summary(hist, log=print):
                if epoch_train else np.array([], dtype=int))
 
     s_total = _column(step_loss, "total")
-    s_value = _column(step_loss, "value")
-    s_action = _column(step_loss, "action")
-    s_chain = _column(step_loss, "chain")
-
-    v_total = _column(val_loss, "total")
-    v_value = _column(val_loss, "value")
-    v_action = _column(val_loss, "action")
-    v_chain = _column(val_loss, "chain")
 
     c_id = np.asarray([c["cycle_id"] for c in cycles], dtype=int)
     c_best_val = np.asarray(
@@ -338,13 +420,13 @@ def print_summary(hist, log=print):
          else np.nan for c in cycles], dtype=float)
     c_saved = np.asarray([c["saved_checkpoint"] for c in cycles], dtype=bool)
 
-    log("=" * 75)
+    log("=" * 90)
     log(f"{'Cycle':>5}  {'Saved':>5}  {'Examples':>8}  {'Train':>5}  {'Val':>4}  "
-        f"{'Train→':>9}  {'Val→':>9}  {'Best val':>9}")
-    log("=" * 75)
+        f"{'Train->':>9}  {'Val->':>9}  {'Best val':>9}")
+    log("=" * 90)
     for cyc in cycles:
         cid = cyc["cycle_id"]
-        saved = "✓" if cyc["saved_checkpoint"] else " "
+        saved = "Y" if cyc["saved_checkpoint"] else " "
         ep_mask = e_cycle == cid
         if ep_mask.any():
             train_str = f"{e_train[ep_mask][-1]:.4f}"
@@ -357,7 +439,7 @@ def print_summary(hist, log=print):
         log(f"{cid:>5}  {saved:>5}  {cyc['examples_count']:>8}  "
             f"{cyc['train_size']:>5}  {cyc['val_size']:>4}  "
             f"{train_str:>9}  {val_str:>9}  {bv_str:>9}")
-    log("=" * 75)
+    log("=" * 90)
     log(f"Saved checkpoints: {c_saved.sum()}/{len(cycles)} cycles")
     if len(c_best_val) and not np.all(np.isnan(c_best_val)):
         best_idx = int(np.nanargmin(c_best_val))
@@ -371,13 +453,25 @@ def print_summary(hist, log=print):
         log("")
         log(f"Train loss: first={s_total[0]:.4f}, last={s_total[-1]:.4f}, "
             f"mean={s_total.mean():.4f}")
-        log(f"  Component means: value={s_value.mean():.4f}, "
-            f"action={s_action.mean():.4f}, chain={s_chain.mean():.4f}")
-    if len(v_total):
-        log(f"Val loss: first={v_total[0]:.4f}, last={v_total[-1]:.4f}, "
-            f"mean={v_total.mean():.4f}")
-        log(f"  Component means: value={v_value.mean():.4f}, "
-            f"action={v_action.mean():.4f}, chain={v_chain.mean():.4f}")
+        active = [c for c in _ALL_COMPONENTS if _has_component(step_loss, c)]
+        means_str = ", ".join(
+            f"{c}={_column(step_loss, c).mean():.4f}" for c in active)
+        log(f"  Component means: {means_str}")
+
+        active_sub = [c for c in _RECON_SUB if _has_component(step_loss, c)]
+        if active_sub:
+            sub_str = ", ".join(
+                f"{c}={_column(step_loss, c).mean():.4f}" for c in active_sub)
+            log(f"  Recon sub-components: {sub_str}")
+
+    v_total_arr = _column(val_loss, "total") if val_loss else np.array([])
+    if len(v_total_arr):
+        log(f"Val loss: first={v_total_arr[0]:.4f}, last={v_total_arr[-1]:.4f}, "
+            f"mean={v_total_arr.mean():.4f}")
+        active_val = [c for c in _ALL_COMPONENTS if _has_component(val_loss, c)]
+        val_means_str = ", ".join(
+            f"{c}={_column(val_loss, c).mean():.4f}" for c in active_val)
+        log(f"  Component means: {val_means_str}")
 
 
 # ---------- Main entrypoint ----------
@@ -390,7 +484,6 @@ def analyze(agent_dir, out_dir=None, smooth_window=11):
     os.makedirs(out_dir, exist_ok=True)
 
     hist = load_history(agent_dir)
-    # Agent name = the directory two levels up (mcts_predict / agent_name / ...)
     agent_name = os.path.basename(os.path.dirname(agent_dir)) or "agent"
 
     paths = {

@@ -3,7 +3,7 @@ Tests for MCTS PUCT formula, action selection, and visit distribution.
 
 Covers:
   - PUCT formula correctness
-  - Hero Q = max(child.Q) backup
+  - Hero Q = W/N backup (visit-weighted average)
   - Opponent Q = W/N backup
   - Opponent pessimism blend
   - Dirichlet noise at root
@@ -27,8 +27,8 @@ import numpy as np
 import torch
 
 # Make sure the project root is on the path when running from
-# versions/v6/tests/ or from versions/v6/ directly.
-sys.path.insert(0, "/home/dev/ContinuousLearning/versions/v6")
+# versions/v7/tests/ or from versions/v7/ directly.
+sys.path.insert(0, "/home/dev/ContinuousLearning/versions/v7")
 
 from agent.mcts.mcts import (
     MCTS,
@@ -101,7 +101,8 @@ def _make_hero_root_with_children(priors, child_Qs, child_Ns, c_puct=1.5,
         child.Q = q
         root.children[i] = child
 
-    root.Q = max(c.Q for c in root.children.values() if c.N > 0) if root.N > 0 else 0.0
+    root.W = sum(c.W for c in root.children.values())
+    root.Q = root.W / root.N if root.N > 0 else 0.0
     return mcts, root
 
 
@@ -190,16 +191,17 @@ class TestPUCTFormula(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 2. Hero Q = max(child.Q)
+# 2. Hero Q = W/N (visit-weighted average)
 # ---------------------------------------------------------------------------
 
 class TestHeroQBackup(unittest.TestCase):
-    """Hero node Q should equal max(visited child.Q)."""
+    """Hero node Q should equal W/N (visit-weighted average)."""
 
-    def test_hero_q_is_max_child_q(self):
+    def test_hero_q_is_visit_weighted_avg(self):
         mcts = _make_mcts()
         root = MCTSNode(is_hero=True)
         root.N = 3
+        root.W = 0.0
 
         child_qs = [0.1, 0.7, 0.3]
         for i, q in enumerate(child_qs):
@@ -207,32 +209,32 @@ class TestHeroQBackup(unittest.TestCase):
             c.N = 1
             c.W = q
             c.Q = q
+            root.W += q
             root.children[i] = c
 
         mcts._recompute_node_after_backup(root)
-        self.assertAlmostEqual(root.Q, max(child_qs))
+        expected = sum(child_qs) / 3
+        self.assertAlmostEqual(root.Q, expected)
 
-    def test_hero_q_ignores_unvisited_children(self):
-        """Only visited children (N > 0) count for hero Q."""
+    def test_hero_q_is_w_over_n(self):
+        """Hero Q = W/N regardless of children distribution."""
         mcts = _make_mcts()
         root = MCTSNode(is_hero=True)
         root.N = 2
+        root.W = -0.4
 
-        # child 0: visited with negative Q
         c0 = MCTSNode(action_idx=0, parent=root, is_hero=False, P=0.5)
         c0.N = 2
         c0.W = -0.4
         c0.Q = -0.2
         root.children[0] = c0
 
-        # child 1: unvisited with high Q (should be ignored)
         c1 = MCTSNode(action_idx=1, parent=root, is_hero=False, P=0.5)
         c1.N = 0
-        c1.Q = 1.0  # would be best if considered
+        c1.Q = 1.0
         root.children[1] = c1
 
         mcts._recompute_node_after_backup(root)
-        # Only c0 is visited, so Q = c0.Q
         self.assertAlmostEqual(root.Q, -0.2)
 
     def test_hero_q_falls_back_to_w_over_n_when_no_visited_children(self):
@@ -252,10 +254,11 @@ class TestHeroQBackup(unittest.TestCase):
         self.assertAlmostEqual(node.Q, 0.42)
 
     def test_hero_q_updates_after_new_child_visit(self):
-        """Hero Q reflects the new best child after an additional backup."""
+        """Hero Q = W/N reflects visit-weighted average after backup."""
         mcts = _make_mcts()
         root = MCTSNode(is_hero=True)
         root.N = 2
+        root.W = 1.1  # 0.3 + 0.8
 
         c0 = MCTSNode(action_idx=0, parent=root, is_hero=False, P=0.5)
         c0.N = 1
@@ -270,7 +273,7 @@ class TestHeroQBackup(unittest.TestCase):
         root.children[1] = c1
 
         mcts._recompute_node_after_backup(root)
-        self.assertAlmostEqual(root.Q, 0.8)
+        self.assertAlmostEqual(root.Q, 1.1 / 2)
 
 
 # ---------------------------------------------------------------------------
@@ -979,14 +982,14 @@ class TestReBackupTerminals(unittest.TestCase):
         self.assertAlmostEqual(child.W, child_w_before + delta, places=8)
         self.assertAlmostEqual(root.W, root_w_before + delta, places=8)
 
-    def test_hero_q_updated_to_max_child_q(self):
-        """After backup, hero root.Q = max(visited child.Q)."""
+    def test_hero_q_updated_to_w_over_n(self):
+        """After backup, hero root.Q = W/N."""
         initial_q, new_q, n = 0.2, 0.9, 4
         root, child, terminal = self._make_tree_with_terminal(
             initial_term_q=initial_q, new_term_q=new_q, n_visits=n)
         re_backup_terminals(root, opp_pessimism_alpha=1.0)
-        # child.Q should be new_q (W/N after delta propagation)
-        # root.Q = max(child.Q) = new_q
+        # child.Q = new_q (W/N after delta propagation), root has one child
+        # root.Q = W/N = child.Q (single child, same W/N)
         self.assertAlmostEqual(root.Q, new_q, places=8)
 
     def test_idempotent(self):
@@ -1035,7 +1038,7 @@ class TestRecomputeNodeIntegrated(unittest.TestCase):
               action 0 → leaf (terminal, Q=0.8)
               action 1 → leaf (terminal, Q=0.3)
         opp node gets W/N (no pessimism).
-        root.Q = max(opp_node.Q) = opp_node.Q.
+        root.Q = W/N = opp_node.Q (single child).
         """
         mcts = _make_mcts(opp_pessimism_alpha=1.0)
 
@@ -1067,8 +1070,8 @@ class TestRecomputeNodeIntegrated(unittest.TestCase):
         self.assertAlmostEqual(opp_node.Q, 1.9 / 3, places=8)
         self.assertAlmostEqual(root.Q, opp_node.Q, places=8)
 
-    def test_hero_q_not_contaminated_by_strange_path(self):
-        """A bad child Q does not lower hero Q when other children are better."""
+    def test_hero_q_is_visit_weighted_with_strange_path(self):
+        """Hero Q = W/N: bad children contribute proportionally to their visits."""
         mcts = _make_mcts()
         root = MCTSNode(is_hero=True)
         root.N = 12
@@ -1087,8 +1090,8 @@ class TestRecomputeNodeIntegrated(unittest.TestCase):
         root.W = good_child.W + bad_child.W  # 8.0
 
         mcts._recompute_node_after_backup(root)
-        # Hero Q = max(0.9, -0.5) = 0.9
-        self.assertAlmostEqual(root.Q, 0.9, places=8)
+        # Hero Q = W/N = 8.0 / 12
+        self.assertAlmostEqual(root.Q, 8.0 / 12, places=8)
 
 
 # ---------------------------------------------------------------------------

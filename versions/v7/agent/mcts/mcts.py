@@ -81,8 +81,8 @@ class MCTS:
         # Probability per simulation of doing a "strange" traversal: at every
         # hero node along the descent we sample action with weight 1/(N+1)
         # (inverse visit count) instead of PUCT. Opp selection stays the same.
-        # Combined with hero max-Q backup (Q = max child.Q), bad strange paths
-        # do not poison hero ancestors' value. Set externally by `collect.py` as
+        # Bad strange paths get few visits (PUCT won't revisit them), so their
+        # contribution to hero W/N is diluted. Set externally by `collect.py` as
         # `C(cycle) * exp(-last_action_loss)` so search broadens when the
         # action head has already converged. Default 0 disables it.
         self.strange_p = float(strange_p)
@@ -267,9 +267,8 @@ class MCTS:
         `_flush_pending` for showdown terminals or in `search` for fold
         terminals); no virtual loss applied (nothing is in flight).
 
-        C.1 — every node's `W` is a plain sum of the leaf values backed up
-        through it (uniform across hero / opp / terminal). The decision
-        statistic differs: opp/terminal `Q = W/N`; hero `Q = max(child.Q)`
+        Every node's `W` is a plain sum of the leaf values backed up through
+        it (uniform across hero / opp / terminal). `Q = W/N` for all nodes
         (recomputed bottom-up in `_recompute_node_after_backup`). W stays the
         accounting ledger that `re_backup_terminals` propagates deltas through.
         """
@@ -286,10 +285,9 @@ class MCTS:
           - All nodes: `N += 1` (PUCT exploration term shrinks for this child
             in concurrent sims) and `W -= vl` (the ledger drops the tentative
             loss; resolved with `+vl + leaf_value` in `_flush_pending`).
-          - Q is recomputed bottom-up: opp/terminal `Q = W/N` (so the
-            sample-mean drops), hero `Q = max(child.Q)`. For an opp the
-            pessimism blend is re-applied inline so any hero further up reads
-            the right Q in PUCT.
+          - Q is recomputed bottom-up: `Q = W/N` for all nodes (so the
+            sample-mean drops). For an opp the pessimism blend is re-applied
+            inline so any hero further up reads the right Q in PUCT.
         """
         vl = self.virtual_loss
         for n in path:
@@ -362,44 +360,25 @@ class MCTS:
             # gets `+vl + leaf_value` → net `+leaf_value` on the W ledger.
             for n in path:
                 n.W += vl + leaf_value
-            # Bottom-up Q recompute: hero Q ← max(child.Q) [or W/N == leaf_value
-            # at a freshly-expanded leaf with no visited children], opp Q ← W/N
-            # (then pessimism if any), terminal Q ← W/N.
+            # Bottom-up Q recompute: Q = W/N for all nodes; opp pessimism
+            # applied on top when enabled.
             for n in reversed(path):
                 self._recompute_node_after_backup(n, leaf_value=leaf_value)
 
     def _recompute_node_after_backup(self, n, leaf_value=None):
-        """Recompute `n.Q` under C.1 uniform-sum-W backup.
+        """Recompute `n.Q` under uniform-sum-W backup.
 
         Called bottom-up after `N`/`W` bookkeeping along a path. `W` is a plain
-        sum of leaf values for EVERY node (updated additively by the caller);
-        only the decision statistic `Q` differs:
-          - **terminal** (`is_terminal=True`, regardless of `is_hero`):
-            `Q = W/N`. `is_hero` at a terminal is semantically void (no acting
-            player at hand end).
-          - **hero non-terminal**: `Q = max(c.Q for c in children if c.N > 0)`
-            — the hero plays the best reply, so its node value is the max over
-            visited children's Q, NOT a visit-weighted average of W sums (the
-            old `max(child.W)` compared sums with different N, compressing
-            root.Q toward 0 and, with negative Q, picking the least-visited
-            child — C.1). With no visited children (a hero leaf just expanded)
-            fall back to `W/N` (== `leaf_value` at N=1, the value-head estimate
-            — the only signal available for the fresh node).
-          - **opp non-terminal**: `Q = W/N`, then opp pessimism if enabled.
+        sum of leaf values for EVERY node (updated additively by the caller).
+        `Q = W/N` for ALL node types (hero, opp, terminal) — the standard
+        AlphaZero visit-weighted average. PUCT naturally concentrates visits on
+        the best actions, so the visit distribution converges to the optimal
+        policy without needing a max operator. Opp pessimism is applied on top
+        for opp nodes when enabled.
         """
-        if n.is_terminal:
-            n.Q = n.W / n.N if n.N > 0 else 0.0
-            return
-        if n.is_hero:
-            visited = [c for c in n.children.values() if c.N > 0]
-            if visited:
-                n.Q = max(c.Q for c in visited)
-            else:
-                n.Q = n.W / n.N if n.N > 0 else 0.0
-        else:
-            n.Q = n.W / n.N if n.N > 0 else 0.0
-            if self.opp_pessimism_alpha < 1.0:
-                self._refresh_opp_q(n)
+        n.Q = n.W / n.N if n.N > 0 else 0.0
+        if not n.is_terminal and not n.is_hero and self.opp_pessimism_alpha < 1.0:
+            self._refresh_opp_q(n)
 
     def _evaluate_root(self, event_sequences):
         """Run perception + all heads on the real event sequences (via evaluator)."""
@@ -414,9 +393,8 @@ class MCTS:
         `strange`: when True, hero selection uses inverse-N sampling instead
         of PUCT (opp selection is unchanged). Triggered by `self.strange_p`
         in `search()` to broaden exploration once the action head has mostly
-        converged. Under hero max-Q backup, a strange path that lands in a
-        worse leaf does not depress hero ancestors' Q (max ignores it), so
-        these explorations cost only the budget, not the value estimate.
+        converged. Bad strange paths get few follow-up visits from PUCT, so
+        their contribution to W/N is diluted and costs mainly search budget.
 
         Returns:
             path: list[MCTSNode] from root to leaf (length >= 1)
@@ -469,7 +447,7 @@ class MCTS:
                 self._evaluate_node(context, mask)
             self._expand_node(node, gs, act_logits, opp_logits, act_embs)
 
-        # BACKUP (C.1 uniform sum-W; hero Q = max child.Q in recompute).
+        # BACKUP (uniform sum-W; Q = W/N for all nodes).
         for n in path:
             n.N += 1
             n.W += leaf_value
@@ -708,7 +686,7 @@ def re_backup_terminals(root, opp_pessimism_alpha=0.5):
     showdown = value-head; C.4), so `terminal.W` is a non-zero sum on the
     ledger. `evaluate_all_terminals` overrides every `terminal.Q` with the
     equity-based value; here we set `terminal.W = terminal.Q * terminal.N`
-    (delta = new − old) and propagate the change upward under C.1 uniform-sum-W
+    (delta = new − old) and propagate the change upward under uniform-sum-W
     semantics:
 
       - **W (every ancestor): `W += delta`.** Each of the terminal's `N` visits
@@ -716,15 +694,13 @@ def re_backup_terminals(root, opp_pessimism_alpha=0.5):
         leaf value to each, so the total correction `delta = N·(equity − old
         per-visit)` applies identically to every ancestor's sum. `delta` is
         therefore constant along the whole walk to the root.
-      - **Q recompute**: opp ancestor `Q = W/N`; hero ancestor
-        `Q = max(child.Q for visited)` — read from children already updated
-        below in the bottom-up walk. Opp ancestor Q is pessimism-blended
-        (matching search-time ``_refresh_opp_q``) when
-        ``opp_pessimism_alpha < 1.0``.
+      - **Q recompute**: `Q = W/N` for all nodes (hero and opp alike). Opp
+        ancestor Q is pessimism-blended (matching search-time
+        ``_refresh_opp_q``) when ``opp_pessimism_alpha < 1.0``.
 
-    Multiple terminals are processed sequentially; the per-node W sums and the
-    hero `max(child.Q)` recomputation are both order-independent. Idempotent:
-    a second run finds `delta == 0` at every terminal and changes nothing.
+    Multiple terminals are processed sequentially; the per-node W sums are
+    order-independent. Idempotent: a second run finds `delta == 0` at every
+    terminal and changes nothing.
     """
     for terminal in _collect_terminals(root):
         if terminal.N == 0:
@@ -737,25 +713,18 @@ def re_backup_terminals(root, opp_pessimism_alpha=0.5):
             continue
         node = terminal.parent
         while node is not None:
-            node.W += delta  # uniform sum ledger
-            if node.is_hero:
+            node.W += delta
+            node.Q = node.W / node.N if node.N > 0 else 0.0
+            if not node.is_hero and opp_pessimism_alpha < 1.0:
                 visited = [c for c in node.children.values() if c.N > 0]
                 if visited:
-                    node.Q = max(c.Q for c in visited)
-                else:
-                    node.Q = node.W / node.N if node.N > 0 else 0.0
-            else:
-                node.Q = node.W / node.N if node.N > 0 else 0.0
-                if opp_pessimism_alpha < 1.0:
-                    visited = [c for c in node.children.values() if c.N > 0]
-                    if visited:
-                        total_p = sum(c.P for c in visited)
-                        if total_p < 1e-12:
-                            expected_q = sum(c.Q for c in visited) / float(len(visited))
-                        else:
-                            expected_q = sum(c.P * c.Q for c in visited) / total_p
-                        min_q = min(c.Q for c in visited)
-                        node.Q = opp_pessimism_alpha * expected_q + (1.0 - opp_pessimism_alpha) * min_q
+                    total_p = sum(c.P for c in visited)
+                    if total_p < 1e-12:
+                        expected_q = sum(c.Q for c in visited) / float(len(visited))
+                    else:
+                        expected_q = sum(c.P * c.Q for c in visited) / total_p
+                    min_q = min(c.Q for c in visited)
+                    node.Q = opp_pessimism_alpha * expected_q + (1.0 - opp_pessimism_alpha) * min_q
             node = node.parent
 
 

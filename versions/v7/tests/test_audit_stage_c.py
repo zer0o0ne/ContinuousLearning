@@ -1,6 +1,6 @@
 """Stage C audit tests: MCTS fixes.
 
-C.1: Hero backup uses max(child.Q), not max(child.W).
+C.1: Hero backup uses W/N (visit-weighted average), same as opp nodes.
 C.4: Fold terminal deterministic (no NN).
 C.5: Side-pot capping + no raises when all opponents all-in.
 C.7.5: NLHE min-raise rules in GameState.
@@ -29,12 +29,12 @@ def _capped_showdown_chips(equity, contributions, hero_pos, active_players,
     return excess + equity * (hero_share_pot + dead_money) - invested_hero
 
 
-# ── C.1: Hero backup Q = max(child.Q) ───────────────────────────────────────
+# ── C.1: Hero backup Q = W/N (visit-weighted average) ──────────────────────
 
 def _build_simple_tree(child_values, child_visits=None):
     """Build root → children with given Q values. All hero.
 
-    Returns root after re_backup.
+    Returns root with Q = W/N.
     """
     root = MCTSNode(action_idx=None, parent=None, is_hero=True, is_terminal=False)
     root.N = 0
@@ -50,12 +50,7 @@ def _build_simple_tree(child_values, child_visits=None):
         root.children[i] = child
         root.N += n
         root.W += v * n
-    # Hero Q should be max(child.Q)
-    visited = [c for c in root.children.values() if c.N > 0]
-    if visited:
-        root.Q = max(c.Q for c in visited)
-    else:
-        root.Q = root.W / root.N if root.N > 0 else 0.0
+    root.Q = root.W / root.N if root.N > 0 else 0.0
     return root
 
 
@@ -66,22 +61,23 @@ def test_c1_equal_leaves_root_q_equals_value():
     assert abs(root.Q - v) < 1e-6, f"root.Q={root.Q}, expected {v}"
 
 
-def test_c1_root_q_is_max_child_q():
-    """root.Q must be max over children's Q, not affected by visit counts."""
+def test_c1_root_q_is_visit_weighted_avg():
+    """root.Q must be visit-weighted average of children's Q."""
     root = _build_simple_tree([0.3, 0.8, -0.2], child_visits=[100, 1, 50])
-    assert abs(root.Q - 0.8) < 1e-6, f"root.Q={root.Q}, expected 0.8"
+    expected = (0.3 * 100 + 0.8 * 1 + (-0.2) * 50) / 151
+    assert abs(root.Q - expected) < 1e-6, f"root.Q={root.Q}, expected {expected}"
 
 
-def test_c1_negative_values_max_not_least_visited():
-    """With negative Q's, hero should pick the BEST (least negative), not
-    the least-visited child (old max(W) bug)."""
+def test_c1_negative_values_visit_weighted():
+    """With negative Q's, hero Q = W/N (not max, not least-visited)."""
     root = _build_simple_tree([-0.1, -0.5, -0.3], child_visits=[10, 1, 5])
-    assert abs(root.Q - (-0.1)) < 1e-6, f"root.Q={root.Q}, expected -0.1"
+    expected = (-0.1 * 10 + (-0.5) * 1 + (-0.3) * 5) / 16
+    assert abs(root.Q - expected) < 1e-6, f"root.Q={root.Q}, expected {expected}"
 
 
 def test_c1_re_backup_terminals_hero():
     """re_backup_terminals should propagate equity-based Q values and recompute
-    hero ancestor Q as max(child.Q)."""
+    hero ancestor Q as W/N."""
     root = MCTSNode(action_idx=None, parent=None, is_hero=True, is_terminal=False)
     root.N = 3
     root.W = 0.0
@@ -98,14 +94,17 @@ def test_c1_re_backup_terminals_hero():
 
     root.children = {0: c1, 1: c2}
     root.W = c1.W + c2.W
-    root.Q = max(c1.Q, c2.Q)
+    root.Q = root.W / root.N
 
     # Now equity override: c1.Q → 0.9, c2.Q → 0.1
     c1.Q = 0.9
     c2.Q = 0.1
     re_backup_terminals(root)
 
-    assert abs(root.Q - 0.9) < 1e-6, f"After re_backup, root.Q={root.Q}, expected 0.9"
+    # After re_backup: c1.W = 0.9*2=1.8, c2.W = 0.1*1=0.1
+    # root.W = 1.8 + 0.1 = 1.9, root.Q = 1.9/3
+    expected = (0.9 * 2 + 0.1 * 1) / 3
+    assert abs(root.Q - expected) < 1e-6, f"After re_backup, root.Q={root.Q}, expected {expected}"
 
 
 # ── C.4: Fold terminal deterministic ────────────────────────────────────────

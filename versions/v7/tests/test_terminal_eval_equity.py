@@ -8,7 +8,7 @@ Covers:
 - Side pot correctness (hero short-stacked vs bigger opponent)
 - Folded/blind money as whole-hand contributions (2026-07: no dead_money term)
 - Fold terminal deterministic Q values
-- re_backup_terminals delta propagation, hero max-Q, opp W/N, idempotency
+- re_backup_terminals delta propagation, hero W/N, opp W/N, idempotency
 - Scale division of terminal Q values
 - Contributions vs investments semantics
 - Multi-opponent equity handling (single-opponent path through _capped_showdown_chips)
@@ -432,7 +432,7 @@ class TestFoldTerminalDeterministicQ(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestReBackupTerminals(unittest.TestCase):
-    """Verify delta propagation, hero max-Q, opp W/N, and idempotency."""
+    """Verify delta propagation, hero W/N, opp W/N, and idempotency."""
 
     # ------------------------------------------------------------------
     # Helper: build a minimal 3-level tree
@@ -476,7 +476,7 @@ class TestReBackupTerminals(unittest.TestCase):
 
         root.N = na + nb
         root.W = qa * na + qb * nb
-        root.Q = max(child_a.Q, child_b.Q)  # hero: max child Q
+        root.Q = root.W / root.N if root.N > 0 else 0.0  # hero: W/N
 
         return root, child_a, child_b, term_a, term_b
 
@@ -516,37 +516,33 @@ class TestReBackupTerminals(unittest.TestCase):
         self.assertAlmostEqual(child_b.W, W_child_b_before, places=9)
 
     # ------------------------------------------------------------------
-    # 7b. Hero max-Q after update
+    # 7b. Hero W/N after update
     # ------------------------------------------------------------------
 
-    def test_hero_q_is_max_of_children_after_update(self):
-        """After re_backup_terminals, root.Q == max(child_a.Q, child_b.Q)."""
+    def test_hero_q_is_w_over_n_after_update(self):
+        """After re_backup_terminals, root.Q == W/N."""
         root, child_a, child_b, term_a, term_b = self._build_tree(
             qa=0.2, na=10, qb=0.5, nb=12)
 
-        # Change terminal_a to a very high value → child_a.Q should become high
         term_a.Q = 1.0
         re_backup_terminals(root)
 
-        expected_root_q = max(child_a.Q, child_b.Q)
+        expected_root_q = root.W / root.N
         self.assertAlmostEqual(root.Q, expected_root_q, places=9)
-        # Verify it's the max of actual children Q values
-        self.assertAlmostEqual(root.Q, max(child_a.Q, child_b.Q), places=9)
 
-    def test_hero_q_max_selects_higher_branch(self):
-        """root Q picks the branch with higher Q even after terminal update."""
+    def test_hero_q_w_over_n_after_flip(self):
+        """root Q = W/N reflects weighted contribution of all branches."""
         root, child_a, child_b, term_a, term_b = self._build_tree(
             qa=0.5, na=5, qb=0.1, nb=5)
 
-        # Initially child_a has higher Q; confirm root picks it
-        self.assertAlmostEqual(root.Q, max(child_a.Q, child_b.Q), places=9)
+        # Initially root.Q = W/N
+        self.assertAlmostEqual(root.Q, root.W / root.N, places=9)
 
-        # Flip: drive terminal_b to a higher value
+        # Drive terminal_b to a higher value
         term_b.Q = 2.0
         re_backup_terminals(root)
-        # Now child_b should have higher Q and root should reflect that
-        self.assertAlmostEqual(root.Q, max(child_a.Q, child_b.Q), places=9)
-        self.assertGreaterEqual(root.Q, child_b.Q - 1e-9)
+        # root.Q = W/N still holds
+        self.assertAlmostEqual(root.Q, root.W / root.N, places=9)
 
     # ------------------------------------------------------------------
     # 7c. Opp node Q = W/N
@@ -863,7 +859,7 @@ class TestReBackupWithOppPessimism(unittest.TestCase):
 
         root.N = opp.N
         root.W = opp.W
-        root.Q = opp.Q  # hero max-Q; only one opp child so max = opp.Q
+        root.Q = root.W / root.N if root.N > 0 else 0.0  # hero: W/N
 
         return root, opp, t1, t2
 

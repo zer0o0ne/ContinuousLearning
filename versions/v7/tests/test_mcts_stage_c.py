@@ -1,7 +1,7 @@
 """Stage C MCTS audit-fix tests.
 
 Covers:
-  C.1  hero max(Q) backup: root.Q == v when all leaves equal
+  C.1  hero Q = W/N (visit-weighted average, same as all other nodes)
   C.2  chain value-target: opp steps get pure MC (NaN root_q_ratio)
   C.3  terminal_targets + root on same axis after rescale
   C.4  fold terminal independent of value_head weights
@@ -9,7 +9,7 @@ Covers:
   C.7.5  min-raise rules: short all-in doesn't reopen; below-min-raise filtered
 
 Run:
-    python -m tests.test_mcts_stage_c        # from versions/v6
+    python -m tests.test_mcts_stage_c        # from versions/v7
 """
 
 import math
@@ -47,7 +47,7 @@ def _capped_showdown_chips(equity, contributions, hero_pos, active_players):
     return excess + equity * hero_share_pot - invested_hero
 
 
-# ── C.1: hero max(Q) backup ──────────────────────────────────────────
+# ── C.1: hero Q = W/N (visit-weighted average) ─────────────────────
 
 def test_c1_uniform_leaves_root_q():
     """When all leaves return the same value v, root.Q must equal v exactly."""
@@ -68,12 +68,12 @@ def test_c1_uniform_leaves_root_q():
         root.children[a] = child
     root.N = 30
     root.W = v * 30
-    root.Q = max(c.Q for c in root.children.values() if c.N > 0)
+    root.Q = root.W / root.N
     assert abs(root.Q - v) < TOL, f"root.Q={root.Q}, expected {v}"
 
 
-def test_c1_negative_values_max_q():
-    """With negative leaf values, root.Q = max(child.Q) regardless of visit distribution."""
+def test_c1_negative_values_visit_weighted():
+    """With negative leaf values, root.Q = W/N (visit-weighted average)."""
     root = MCTSNode(is_hero=True)
     root.children = {}
     a = MCTSNode(action_idx=0, parent=root, is_hero=False)
@@ -83,8 +83,9 @@ def test_c1_negative_values_max_q():
     b.N = 2; b.W = -0.2; b.Q = -0.1
     root.children[1] = b
     root.N = 102; root.W = -50.2
-    root.Q = max(c.Q for c in root.children.values() if c.N > 0)
-    assert abs(root.Q - (-0.1)) < TOL, f"root.Q={root.Q}, expected -0.1"
+    root.Q = root.W / root.N
+    expected = -50.2 / 102
+    assert abs(root.Q - expected) < TOL, f"root.Q={root.Q}, expected {expected}"
 
 
 # ── C.2: chain value-target perspective guard ────────────────────────
@@ -334,10 +335,10 @@ def test_c75_table_min_raise_tracking():
     )
 
 
-# ── re_backup_terminals: hero max(child.Q) ──────────────────────────
+# ── re_backup_terminals: hero W/N ────────────────────────────────────
 
-def test_re_backup_hero_max_q():
-    """re_backup_terminals must set hero root Q = max(child.Q) after delta propagation."""
+def test_re_backup_hero_visit_weighted():
+    """re_backup_terminals must set hero root Q = W/N after delta propagation."""
     root = MCTSNode(is_hero=True)
     c0 = MCTSNode(action_idx=0, parent=root, is_hero=False)
     c0.N = 5; c0.W = 2.0; c0.Q = 0.4
@@ -348,16 +349,18 @@ def test_re_backup_hero_max_q():
     root.children = {0: c0, 1: c1}
     root.N = 10; root.W = 7.0; root.Q = 0.7
 
-    new_q = {0: 0.3, 1: 0.8}
-    terminals = _collect_terminals(root)
-    for t in terminals:
-        old = t.Q
-        t.Q = new_q[t.action_idx]
-        delta = (t.Q - old) * t.N
-        t.W += delta
+    # Only set new Q on terminals — re_backup_terminals derives delta from
+    # (Q*N - W) and propagates W changes upward.
+    c0.Q = 0.3
+    c1.Q = 0.8
 
     re_backup_terminals(root)
-    assert abs(root.Q - 0.8) < TOL, f"root.Q={root.Q}, expected 0.8"
+    # c0: new_W = 0.3*5=1.5, delta = 1.5-2.0=-0.5
+    # c1: new_W = 0.8*5=4.0, delta = 4.0-5.0=-1.0
+    # root.W = 7.0 + (-0.5) + (-1.0) = 5.5
+    # root.Q = 5.5 / 10 = 0.55
+    expected = (0.3 * 5 + 0.8 * 5) / 10
+    assert abs(root.Q - expected) < TOL, f"root.Q={root.Q}, expected {expected}"
 
 
 # ── run ──────────────────────────────────────────────────────────────

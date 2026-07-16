@@ -111,6 +111,36 @@ def _discover_past_snapshots(trained_agents, max_per_agent, log):
     return snapshots
 
 
+_EVENT_NORM_KEYS = ("pot_mean", "pot_std", "stack_mean", "stack_std",
+                    "bets_mean", "bets_std", "blind_mean", "blind_std",
+                    "ev_mean", "ev_std")
+
+
+def _blank_agent_cfgs(n_blank_agents):
+    """Agent-config stubs for `mcts_train.n_blank_agents` randomly-initialized
+    TRAINABLE agents joining the cyclic-MCTS pool as equals of the agents that
+    went through phases 1-5: own save dir (<save_dir>/blank_<i>/), own
+    optimizer/run_dir/history, cycle snapshots feeding the past-opponents
+    pool. On the first run `load_checkpoint` finds nothing → random init; on
+    resume they pick up their own mcts_predict/best.pt like everyone else."""
+    return [{"name": f"blank_{i}", "modifiers": [], "is_blank": True}
+            for i in range(max(0, int(n_blank_agents)))]
+
+
+def _copy_event_norm(dst_ns, donor_ns):
+    """Copy event-normalization stats (pot/stack/bets/blind/ev mean+std) from
+    a trained agent's norm_stats into a fresh blank agent's dict, IN PLACE.
+
+    Without this a blank agent would z-score events with the identity norm
+    and feed raw chip values (pot up to tens of thousands) into perception.
+    `mcts_value_scale` (and every other MCTS key) is intentionally NOT
+    copied — the value axis bootstraps per-agent on the first collection
+    cycle (`_finalize_value_targets`)."""
+    for k in _EVENT_NORM_KEYS:
+        if k in donor_ns:
+            dst_ns[k] = float(donor_ns[k])
+
+
 def _run_or_skip_phase(scenario_name, agent, agent_base, agent_log, train_fn):
     """Legacy non-resume helper: if scenario already has a best.pt, load it
     and skip. Otherwise run train_fn() and load its best.pt. Returns the
@@ -932,8 +962,19 @@ def main():
             # the agent has met many times accumulates instead of resetting
             # every cycle.
             mcts_collection_opp_tables = {}
+            n_blank_agents = int(mcts_train_cfg.get("n_blank_agents", 0) or 0)
             if multi_agent:
-                for agent_cfg in multi_agent["agents"]:
+                blank_cfgs = _blank_agent_cfgs(n_blank_agents)
+                if blank_cfgs:
+                    log(f"  n_blank_agents={len(blank_cfgs)}: adding randomly-"
+                        f"initialized trainable agent(s) "
+                        f"{[c['name'] for c in blank_cfgs]}")
+                # Event-norm donor for fresh blank agents: the first regular
+                # agent whose checkpoint carried norm_stats (blanks are
+                # appended after the regular list, so the donor is resolved
+                # before any blank is built).
+                donor_norm_stats = None
+                for agent_cfg in list(multi_agent["agents"]) + blank_cfgs:
                     agent_name = agent_cfg["name"]
                     agent_base = os.path.join(save_base_dir_mcts, agent_name)
                     agent_log = Logger(agent_base)
@@ -955,6 +996,28 @@ def main():
                     for mod in agent_cfg.get("modifiers", []):
                         if mod.get("type") == "temperature":
                             temp = mod["value"]
+
+                    ns_from_ckpt = getattr(
+                        agent_obj, "_checkpoint_norm_stats", None)
+                    if (donor_norm_stats is None and ns_from_ckpt
+                            and not agent_cfg.get("is_blank")):
+                        donor_norm_stats = ns_from_ckpt
+                    if agent_cfg.get("is_blank") and ckpt_path is None:
+                        # Fresh blank agent (first run, no checkpoint yet):
+                        # copy the pool's event-norm stats so its perception
+                        # sees z-scored events like everyone else's.
+                        if donor_norm_stats is not None:
+                            _copy_event_norm(
+                                _checkpoint_metadata(agent_obj),
+                                donor_norm_stats)
+                            agent_log(
+                                "  blank agent: fresh random init; copied "
+                                "event-norm stats from the trained pool")
+                        else:
+                            agent_log(
+                                "  WARNING: blank agent fresh but no trained "
+                                "agent with checkpoint norm_stats precedes "
+                                "it — falling back to identity event norm")
 
                     # Reuse run_dir from pipeline_state when resuming — keeps
                     # best.pt and history.pt in the same place across runs.
@@ -1003,6 +1066,9 @@ def main():
                         "scaler": agent_scaler,
                     })
             else:
+                if n_blank_agents > 0:
+                    log("  WARNING: n_blank_agents is only supported in "
+                        "multi-agent mode — ignored")
                 single_load_dir = save_base_dir_mcts or agent_dir
                 agent_obj = ASI(log, config)
                 agent_obj.set_device(device)

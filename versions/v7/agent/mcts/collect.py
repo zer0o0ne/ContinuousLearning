@@ -505,6 +505,11 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
             is frozen at startup, so on-demand past loading is not yet
             supported there.
 
+    ``mcts_train.n_random_agents`` (config) adds that many weightless
+    uniform-random opponents (names ``random_0..N-1``) to the same
+    non-trainable free-seat pool, independent of ``past_opponents.enabled``.
+    Sequential mode only (warning + disabled when ``n_workers > 1``).
+
     Returns:
         dict mapping agent_name -> list[MCTSTrainingExample]
     """
@@ -612,6 +617,38 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
 
     # ── Dispatch: sequential (n_workers<=1) vs parallel CPU actors + GPU server ──
     n_workers = int(mcts_train_cfg.get("n_workers", 1) or 1)
+
+    # ── Weightless uniform-random opponents (`mcts_train.n_random_agents`) ──
+    # Fully random agents join the NON-trainable seating pool alongside past
+    # snapshots (independent of `past_opponents.enabled`): no ASI, no MCTS —
+    # they sample uniformly among legal actions. Names are persistent
+    # identities (random_0..N-1) so heroes' opponent GRU/HUD stats can learn
+    # each of them as "plays random". Their events are normalized with the
+    # first active agent's norm_stats (all agents share the same event scale)
+    # because those events feed heroes' chain-step recon/TF targets.
+    # Sequential mode only — mirrors the past-snapshots restriction.
+    n_random_agents = int(mcts_train_cfg.get("n_random_agents", 0) or 0)
+    random_agent_infos = []
+    if n_random_agents > 0:
+        if n_workers > 1:
+            log(f"  WARNING: n_random_agents={n_random_agents} is disabled "
+                f"in parallel mode (n_workers={n_workers}) — random agents "
+                f"are seated only on the sequential path.")
+        else:
+            donor_ns = agents_list[0]["norm_stats"]
+            random_agent_infos = [
+                {"agent": None,
+                 "norm_stats": donor_ns,
+                 "name": f"random_{i}",
+                 "temperature": 1.0,
+                 "is_active": False,
+                 "is_past": True,
+                 "is_random": True}
+                for i in range(n_random_agents)
+            ]
+            log(f"  random opponents: {n_random_agents} uniform-random "
+                f"weightless agent(s) join the seating pool")
+
     if n_workers > 1:
         if past_snapshot_specs:
             log(f"  WARNING: past_opponents pool ({len(past_snapshot_specs)} "
@@ -636,7 +673,8 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
             terminal_proxy=None, equity_device=device,
             search_scales=search_scales, strange_p_by_agent=strange_p_by_agent,
             log=log, progress=True,
-            past_snapshot_specs=past_snapshot_specs)
+            past_snapshot_specs=past_snapshot_specs,
+            random_agent_infos=random_agent_infos)
 
     # Per-agent bootstrap + per-cycle EMA scale update + hybrid + clip. See
     # `versions/v5/PLAN_MCTS_VALUE_REDESIGN.md` §4 + §5 for math.
@@ -663,7 +701,8 @@ def run_mcts_collection(agents_list, config, device, log, n_hands,
 def _play_hands(agents_list, config, device, n_hands, make_mcts,
                 terminal_proxy, equity_device, search_scales,
                 strange_p_by_agent, log, progress=True,
-                progress_counter=None, past_snapshot_specs=None):
+                progress_counter=None, past_snapshot_specs=None,
+                random_agent_infos=None):
     """Play `n_hands` hands and return per-agent MCTSTrainingExamples.
 
     Value targets are RAW chip deltas at this stage — `_finalize_value_targets`
@@ -682,6 +721,13 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     softmax-sampling their `action_head` (no MCTS), and contribute to
     chain-step targets via that distribution; they produce no training
     examples themselves.
+
+    `random_agent_infos` (sequential mode only) are weightless uniform-random
+    opponents: ready agent_info dicts (``agent=None, is_random=True``) that
+    join the same free-seat pool as past snapshots but need no
+    materialization. They act by uniform sampling among legal actions and
+    contribute uniform-over-legal chain fallback targets; they produce no
+    training examples themselves.
     """
     from agent.train_scenarios.generation.generate import _get_raise_sizes
     from agent.mcts.terminal_eval import (
@@ -721,7 +767,12 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
         a.setdefault("is_active", True)
         a.setdefault("is_past", False)
 
-    past_pool = list(past_snapshot_specs or [])
+    # Random agents ride in the same free-seat pool as past-snapshot specs:
+    # `_reseat_with_past` seats anything without a "ckpt_path" directly, so
+    # ready agent_info dicts (agent=None, is_random=True) pass through it
+    # without materialization.
+    past_pool = (list(past_snapshot_specs or [])
+                 + list(random_agent_infos or []))
     # Registry of currently-materialised past snapshots: name → agent_info.
     # Updated only by `_reseat_with_past` (so creation cost is one-shot per
     # reshuffle, not per hand).
@@ -868,7 +919,18 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             # via `re_backup_terminals`, overriding the search-time estimate.
             gs = GameState.from_table(table, active_pos)
             is_past = bool(agent_info.get("is_past", False))
-            if is_past:
+            if agent_info.get("is_random", False):
+                # Weightless random agent: uniform sample among legal actions
+                # — no NN, no tree. Uniform-over-legal IS this agent's true
+                # policy, so it becomes the chain fallback target for any
+                # active hero's chain step referencing this state.
+                legal = sorted(gs.get_legal_actions())
+                action_idx = int(random.choice(legal))
+                fallback_dist = [0.0] * n_actions
+                for la in legal:
+                    fallback_dist[la] = 1.0 / len(legal)
+                last_root = None
+            elif is_past:
                 # Past snapshots act via `softmax(action_head)` sampling — no
                 # MCTS, no tree. The sampled distribution is stored on the
                 # decision as a fallback target for any active hero's chain

@@ -212,6 +212,8 @@
     "mcts_train": {
         "n_cycles": 1500,
         "n_hands_per_cycle": 500,
+        "n_blank_agents": 3,
+        "n_random_agents": 40,
         "n_workers": 1,
         "server_max_batch": 768,
         "server_linger_ms": 2,

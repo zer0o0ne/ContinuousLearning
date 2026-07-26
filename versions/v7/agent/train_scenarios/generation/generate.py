@@ -125,8 +125,22 @@ def _get_solver(solver_name):
             "prepare_ev_state": _prepare_ev_state_v3,
             "compute_ev_from_state": _compute_ev_v3_from_state,
         }
+    elif solver_name == "v5":
+        # chance-sampled vector CFR over the real betting tree (unbiased
+        # w.r.t. this game's GTO up to abstraction coarseness — no
+        # early-showdown assumption). gpu_equity/compute_ev slots are
+        # unused by the v5 path; solve_spot returns all action EVs at once.
+        from gpu_solver_v3 import gpu_equity_v3, compute_ev_v3
+        from gpu_solver_v2 import get_position_range, narrow_range, expand_range
+        from gpu_solver_v5 import solve_spot
+        return gpu_equity_v3, compute_ev_v3, {
+            "get_position_range": get_position_range,
+            "narrow_range": narrow_range,
+            "expand_range": expand_range,
+            "solve_spot": solve_spot,
+        }
     else:
-        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1', 'v2', 'v3', or 'v4'.")
+        raise ValueError(f"Unknown solver: {solver_name}. Use 'v1', 'v2', 'v3', 'v4', or 'v5'.")
 
 
 def _get_board_cards(table):
@@ -398,7 +412,8 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                             eqr_enabled=True, combo_response_iters=30,
                             reraise_threshold=0.75, weighted_sampling=True,
                             threshold_smoothing=None,
-                            polarized_reraise=None):
+                            polarized_reraise=None,
+                            v5_params=None):
     """Compute EV for ALL possible actions (fold, call, each raise bin, all-in).
 
     Returns:
@@ -489,7 +504,36 @@ def _compute_all_action_evs(table, player_pos, action_history, n_actions,
                     "legal_mask": legal_mask}
             return evs, meta
 
-        if solver_name == "v3":
+        if solver_name == "v5":
+            # Vector-CFR solve of the whole remaining game — one call
+            # returns EVs for every root action plus hero equity. Real
+            # per-opponent stacks/investments feed side-pot layering.
+            solve_spot = solver_modules["solve_spot"]
+            opp_stacks = [float(table.credits[pp]) for pp in opp_positions]
+            opp_invested = [
+                float(table.start_credits[pp]) - float(table.credits[pp])
+                for pp in opp_positions
+            ]
+            try:
+                v5_evs, eq = solve_spot(
+                    hero_t, board_t, opp_range_types,
+                    pot, facing_bet, stack, hero_invested,
+                    street_raises, effective_pot, n_actions,
+                    street=table.turn, hero_position=player_pos,
+                    n_players=table.num_players,
+                    action_history=action_history,
+                    opponent_positions=opp_positions,
+                    big_blind=table.big_blind,
+                    v5_params=v5_params,
+                    opponent_stacks=opp_stacks,
+                    opponent_invested=opp_invested,
+                )
+            except Exception:
+                return None, None
+            if v5_evs is None:
+                return None, None
+            evs = v5_evs
+        elif solver_name == "v3":
             # Optimized path: prepare per-decision MC state once, then run cheap
             # arithmetic per raise_frac. Eliminates ~12× redundant equity calls.
             prepare_ev_state = solver_modules["prepare_ev_state"]
@@ -770,6 +814,8 @@ def generate_scenario(config, device="mps"):
             "threshold_smoothing": threshold_smoothing,
             "polarized_reraise": polarized_reraise,
         })
+    elif ev_solver_name == "v5":
+        ev_kwargs.update({"v5_params": config.get("v5")})
 
     # V4: initialize Bayesian state for opponent modeling
     bayesian_state = {}

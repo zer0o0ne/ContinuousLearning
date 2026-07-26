@@ -107,7 +107,7 @@ Same architecture as ActionHead. Predicts range-averaged opponent action distrib
 
 ### GPU Solvers (`gto_utils/`)
 
-4 solver versions (v1–v4). Config param `solver.type` selects which. v3 adds EQR table + weighted combo sampling. v4 reserved.
+5 solver versions (v1–v5). Config param `solver.type` selects which. v3 adds EQR table + weighted combo sampling. v4 = batched marginalized opponent modeling (slow). **v5 (current)** = chance-sampled vector CFR over the real betting tree to hand end (`gpu_solver_v5.py`): no early-showdown assumption of v1–v4, opponents respond with converging strategies (not equity thresholds), per-combo card removal exact heads-up, real per-player stacks with layered main/side-pot terminal payoffs (uncalled bets refunded via singleton layers; short calls = all-in-for-less). Runs on CPU (numpy sweep + torch hand evals). Params in `solver.v5`: `iterations` (main accuracy↔speed knob, cost linear, more = less CFR noise, never less structural bias), `batch_runouts`, `future_bet_sizes`/`raise_cap` (non-root tree width; streets beyond the next are auto-capped at 1 raise), `allin_spr` (deep-stack shove gating), `max_root_sizes` (distinct root raise subtrees, other bins EV-interpolated over size), `max_opponents` (CFR players; others = dead money), `max_combos` (range subsample), `max_tree_nodes` (coarse-rebuild guard). Tests: `tests/test_solver_v5.py` (incl. analytic river-equilibrium check).
 
 ### HierarchicalMemory (`perception/memory.py`)
 

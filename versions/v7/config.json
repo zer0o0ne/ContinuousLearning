@@ -83,7 +83,18 @@
         "big_blind": 10
     },
     "solver": {
-        "type": "v3",
+        "type": "v5",
+        "v5": {
+            "iterations": 64,
+            "batch_runouts": 4,
+            "future_bet_sizes": [1.0],
+            "raise_cap": 2,
+            "allin_spr": 4.0,
+            "max_root_sizes": 5,
+            "max_opponents": 2,
+            "max_combos": 120,
+            "max_tree_nodes": 8000
+        },
         "mc_iterations": 25000,
         "n_raise_samples": 5,
         "gto_temperature": 0.2,

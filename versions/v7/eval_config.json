@@ -52,13 +52,24 @@
     },
 
     "solver": {
-        "type": "v3",
-        "mc_iterations": 125000,
-        "n_raise_samples": 10,
-        "gto_temperature": 0.05,
+        "type": "v5",
+        "v5": {
+            "iterations": 64,
+            "batch_runouts": 4,
+            "future_bet_sizes": [1.0],
+            "raise_cap": 2,
+            "allin_spr": 4.0,
+            "max_root_sizes": 5,
+            "max_opponents": 2,
+            "max_combos": 120,
+            "max_tree_nodes": 8000
+        },
+        "mc_iterations": 25000,
+        "n_raise_samples": 5,
+        "gto_temperature": 0.2,
         "eqr_enabled": true,
-        "combo_response_iters": 1500,
-        "reraise_threshold": 0.685,
+        "combo_response_iters": 200,
+        "reraise_threshold": 0.65,
         "weighted_sampling": true,
         "marginal_mc_iters": 0,
         "marginal_response_iters": 0,
@@ -109,11 +120,8 @@
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "gto_pure_14_w_emb",
-                "type": "model",
-                "path": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents_more_epochs_new_modelling_speedup/gto_pure/mcts_predict/2026_07_15_11_18_46/best.pt",
-                "use_opponent_embedding": true,
-                "use_mcts": true
+                "name": "v5_solver",
+                "type": "solver"
             }
         ]
     }

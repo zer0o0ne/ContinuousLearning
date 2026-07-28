@@ -90,15 +90,15 @@
     "solver": {
         "type": "v5",
         "v5": {
-            "iterations": 128,
+            "iterations": 32,
             "batch_runouts": 4,
             "future_bet_sizes": [1.0],
             "raise_cap": 2,
             "allin_spr": 4.0,
             "max_root_sizes": 5,
-            "max_opponents": 3,
+            "max_opponents": 2,
             "max_combos": 120,
-            "max_tree_nodes": 12000
+            "max_tree_nodes": 8000
         },
         "mc_iterations": 25000,
         "n_raise_samples": 5,

@@ -87,6 +87,11 @@ V5_DEFAULTS = {
 # filled by solve_spot for diagnostics/tests: {"nodes": int, "terminals": int}
 _last_stats = {}
 
+# process-wide counters: how often the coarsening ladder fired (see
+# solve_spot). The warning itself is emitted once per process — coarsening
+# is a normal bounded-cost mechanism, not an error worth spamming tqdm.
+_coarsen_stats = {"solves": 0, "coarsened": 0, "warned": False}
+
 
 class _TreeTooBig(Exception):
     pass
@@ -554,12 +559,18 @@ def solve_spot(hero_cards, board_cards, opponent_range_hand_types,
             stacklevel=2)
         return None, None
     att_idx, n_use, nodes, root_id = built
+    _coarsen_stats["solves"] += 1
     if att_idx > 0:
-        warnings.warn(
-            f"solver v5: tree exceeded {max_tree_nodes} nodes; coarsened "
-            f"(attempt {att_idx}: {n_use - 1} CFR opponents, cap 1). "
-            f"Frequent occurrences mean raise_cap/max_opponents/"
-            f"max_tree_nodes are set too wide.", stacklevel=2)
+        _coarsen_stats["coarsened"] += 1
+        if not _coarsen_stats["warned"]:
+            _coarsen_stats["warned"] = True
+            warnings.warn(
+                f"solver v5: tree exceeded {max_tree_nodes} nodes; coarsened "
+                f"(attempt {att_idx}: {n_use - 1} CFR opponents, cap 1). "
+                f"This is a normal bounded-cost fallback for deep-stack "
+                f"multiway spots; reported once per process "
+                f"(see gpu_solver_v5._coarsen_stats for counts).",
+                stacklevel=2)
     if n_use < n_solver_players:
         ranges = ranges[:n_use]
         n_solver_players = n_use

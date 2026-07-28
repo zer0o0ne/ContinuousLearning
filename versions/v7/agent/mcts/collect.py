@@ -302,7 +302,8 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
                           final_credits=None, big_blind=None,
                           action_label_smoothing=0.0,
                           n_terminal_values=0,
-                          terminal_clip_val=None):
+                          terminal_clip_val=None,
+                          chain_street_boundary=False):
     """Extract training examples from all MCTS trees in a completed hand.
 
     For each tree (one per decision point), produces an MCTSTrainingExample.
@@ -329,6 +330,13 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
         n_actions: int, action space size
         max_chain_depth: optional int — truncate chain to first N future
             decisions. None = full chain.
+        chain_street_boundary: bool — truncate the chain at the first future
+            decision on a DIFFERENT street than this example's root decision
+            (PLAN_COMPOUNDING_ERROR.md §2a). Cross-street LM/chain targets
+            contain newly dealt cards and are unpredictable in principle for
+            the deterministic modelling head (mean-regression). Streets come
+            from the `game_state_at_root` snapshots already stored on every
+            decision. Composes with `max_chain_depth` (min of the two).
         final_credits: optional list[float] of credits at hand end. Required
             to compute per-step chain value targets.
         big_blind: optional int. Constant scale factor for value_target.
@@ -369,10 +377,19 @@ def collect_training_data(hand_record, n_actions, max_chain_depth=None,
 
         # Modelling chain: chain[i] predicts distribution at decisions[t+1+i],
         # using the action taken at decisions[t+i] to advance context.
+        root_gs_snapshot = decision.get("game_state_at_root")
         chain = []
         for i, future_dec in enumerate(decisions[t + 1:]):
             if max_chain_depth is not None and i >= max_chain_depth:
                 break
+            if chain_street_boundary and root_gs_snapshot is not None:
+                fut_gs = future_dec.get("game_state_at_root")
+                if (fut_gs is not None
+                        and fut_gs.turn != root_gs_snapshot.turn):
+                    # First future decision beyond a chance event — the
+                    # modelling head is never rolled across it at search
+                    # time (street cap), so the chain stops here too.
+                    break
             future_root = future_dec["mcts_root"]
             # action that advances state(t+i) → state(t+i+1):
             action_taken = decisions[t + i]["action_idx"]
@@ -752,6 +769,8 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
     max_stack = mcts_train_cfg.get("max_stack", game_cfg.get("max_stack", 3000))
     raw_max_chain_depth = mcts_train_cfg.get("max_chain_depth", None)
     max_chain_depth = None if not raw_max_chain_depth else int(raw_max_chain_depth)
+    chain_street_boundary = bool(
+        mcts_train_cfg.get("chain_street_boundary", False))
     action_label_smoothing = float(
         mcts_train_cfg.get("action_label_smoothing", 0.0))
     n_terminal_values = int(mcts_train_cfg.get("n_terminal_values", 0))
@@ -1115,6 +1134,7 @@ def _play_hands(agents_list, config, device, n_hands, make_mcts,
             # C.3: do NOT clip terminal Q at collection — _finalize_value_targets
             # rescales to the fresh value axis and clips there.
             terminal_clip_val=None,
+            chain_street_boundary=chain_street_boundary,
         )
 
         # Overwrite raw realized targets with equity-based ones.

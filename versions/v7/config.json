@@ -25,6 +25,11 @@
             "stats_enabled": true,
             "style_probe": true,
             "showdown_probe": true
+        },
+        "modelling_spectral_clamp": {
+            "enabled": true,
+            "max_sigma": 1.0,
+            "n_power_iterations": 1
         }
     },
     "multi_agent": {
@@ -157,7 +162,8 @@
         "scheduler_eta_min": 5e-7,
         "recon_weight": 0.8,
         "infonce_weight": 0.5,
-        "infonce_temperature": 0.1
+        "infonce_temperature": 0.1,
+        "lm_street_boundary": true
     },
     "gto_train": {
         "lr": 5e-5,
@@ -218,7 +224,8 @@
         "opp_prior_smoothing": 0.15,
         "opp_pessimism_alpha": 0.5,
         "terminal_eval_prob_floor": 0.05,
-        "strange_traversal_C_start": 0.2
+        "strange_traversal_C_start": 0.2,
+        "street_boundary_leaf": true
     },
     "mcts_train": {
         "n_cycles": 1500,
@@ -250,6 +257,8 @@
         "action_weight": 1.0,
         "chain_weight": 1.0,
         "max_chain_depth": 5,
+        "chain_street_boundary": true,
+        "lm_street_boundary": true,
         "chain_depth_gamma": 0.9,
         "recon_weight": 0.5,
         "infonce_weight": 0.5,
@@ -259,6 +268,8 @@
         "value_target_alpha": 0.5,
         "value_target_clip": 5.0,
         "stop_grad_old_embs": true,
+        "bptt_depth": 2,
+        "bptt_grad_scale": 0.5,
         "action_label_smoothing": 0.04,
         "entropy_weight": 0.05,
         "terminal_value_weight": 1.0,
@@ -266,7 +277,7 @@
         "gradient_checkpointing": true,
         "teacher_forcing": {
             "p_start": 0.7,
-            "p_end": 0.7,
+            "p_end": 0.35,
             "decay_cycles": 50
         },
         "past_opponents": {

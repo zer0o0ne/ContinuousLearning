@@ -166,7 +166,7 @@ def _modelling_forward(agent, event_sequences, device, cached_perception=None):
 
 def _reconstruction_loss(agent, perception_out, mask, event_sequences=None,
                          infonce_weight=0.5, infonce_temperature=0.1,
-                         lm_pairs=None):
+                         lm_pairs=None, street_boundary=False):
     """LM-style next-decision-state loss (PLAN_MODELLING_HEAD_REDESIGN.md §3–4).
 
     Pairs via `build_lm_pairs`: for every post-action event q (one-hot max
@@ -185,6 +185,9 @@ def _reconstruction_loss(agent, perception_out, mask, event_sequences=None,
         infonce_temperature: τ for the cosine-similarity logits
         lm_pairs: optional pre-built (batch_idx, src_positions, actions,
             tgt_positions) long tensors — skips `build_lm_pairs`
+        street_boundary: drop pairs whose target crosses a street boundary
+            (PLAN_COMPOUNDING_ERROR.md §2b). Only used when `lm_pairs` is
+            None — pre-built pairs must be filtered at build time.
 
     Returns:
         (loss, components) — scalar loss and {"mse", "infonce"} floats for
@@ -194,7 +197,8 @@ def _reconstruction_loss(agent, perception_out, mask, event_sequences=None,
     if lm_pairs is not None:
         batch_idx, src_positions, actions, tgt_positions = lm_pairs
     else:
-        batch_idx, src_positions, actions, tgt_positions = build_lm_pairs(event_sequences)
+        batch_idx, src_positions, actions, tgt_positions = build_lm_pairs(
+            event_sequences, street_boundary=street_boundary)
 
     if batch_idx.numel() == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -338,6 +342,9 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
     recon_weight = train_cfg.get("recon_weight", 0.1)
     infonce_weight = train_cfg.get("infonce_weight", 0.5)
     infonce_temperature = train_cfg.get("infonce_temperature", 0.1)
+    # PLAN_COMPOUNDING_ERROR.md §2b: drop LM pairs whose target crosses a
+    # street boundary (unpredictable in principle — mean-regression pairs).
+    lm_street_boundary = bool(train_cfg.get("lm_street_boundary", False))
 
     log("=== Modelling Head Training (Step 3) ===")
     log("Memory: DISABLED (skip_memory=True)")
@@ -435,7 +442,8 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                 for k in range(p_out.shape[0]):
                     L = int(m[k].sum().item())
                     events_k, target_k = items[k]
-                    _, src, act, tgt = build_lm_pairs([events_k])
+                    _, src, act, tgt = build_lm_pairs(
+                        [events_k], street_boundary=lm_street_boundary)
                     _p_cache.append((p_out[k, :L].detach().cpu(),
                                      m[k, :L].detach().cpu(),
                                      (src, act, tgt),
@@ -522,7 +530,8 @@ def train_modelling(agent, train_cfg, device, log, scenarios_override=None,
                     _p_outs.append(p_out[k, :L].detach().cpu())
                     _p_masks.append(m[k, :L].detach().cpu())
                 for events_k, target_k in items:
-                    _, src, act, tgt = build_lm_pairs([events_k])
+                    _, src, act, tgt = build_lm_pairs(
+                        [events_k], street_boundary=lm_street_boundary)
                     _lm_pairs.append((src, act, tgt))
                     _targets.append(target_k)
         log(f"Cached {len(_p_outs)} perception outputs")

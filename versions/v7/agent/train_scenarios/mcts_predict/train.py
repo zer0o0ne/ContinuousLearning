@@ -49,10 +49,18 @@ class LengthGroupedBatchSampler(Sampler):
         return (self.n + self.batch_size - 1) // self.batch_size
 
 
+def _scale_grad(x, scale):
+    """MuZero-style gradient damping: forward value unchanged, backward
+    gradient multiplied by `scale`. A gradient path that traverses k
+    autoregressive hops is damped by scale^k."""
+    return x * scale + x.detach() * (1.0 - scale)
+
+
 def _mcts_forward(agent, event_sequences, chains, device,
                   opponent_emb_table=None, p_tf=0.0, stop_grad_old_embs=True,
                   examples_per_batch_terminals=None, precomputed=None,
-                  gru_window=1):
+                  gru_window=1, bptt_depth=0, bptt_grad_scale=0.5,
+                  lm_street_boundary=False):
     """Forward pass: perception → root predictions → modelling chain.
 
     Chain semantics (matches `collect.py:MCTSTrainingExample`):
@@ -73,6 +81,17 @@ def _mcts_forward(agent, event_sequences, chains, device,
         ctx_rolled for the next iteration, the appended emb is detached so the
         gradient at step i only updates modelling_head/perception via the
         CURRENT step's emb (and via the original root perception_out).
+      - Truncated BPTT (PLAN_COMPOUNDING_ERROR.md §3, revises the audit's
+        stop-grad decision): when `bptt_depth > 0`, the rolled context at
+        depth d keeps the last `bptt_depth` appended embeddings ATTACHED
+        (older ones detached), each stored through `_scale_grad(·,
+        bptt_grad_scale)` so a k-hop gradient path is damped by scale^k.
+        The composition h∘h enters the loss — the head is optimized to
+        produce embeddings that are good inputs to itself. `bptt_depth=0`
+        preserves the legacy `stop_grad_old_embs` semantics bit-for-bit.
+      - `lm_street_boundary`: root LM pairs whose target crosses a street
+        boundary are dropped (see `build_lm_pairs`) — they contain newly
+        dealt cards and are unpredictable for a deterministic head.
       - LM supervision (PLAN_MODELLING_HEAD_REDESIGN.md §6) and per-step
         value (point 11) targets are produced here and consumed by
         `_compute_loss`.
@@ -123,7 +142,8 @@ def _mcts_forward(agent, event_sequences, chains, device,
     # value/action losses anchor perception.
     lm_pred_parts = []
     lm_target_parts = []
-    lm_bi, lm_src, lm_act, lm_tgt = build_lm_pairs(event_sequences)
+    lm_bi, lm_src, lm_act, lm_tgt = build_lm_pairs(
+        event_sequences, street_boundary=lm_street_boundary)
     if lm_bi.numel() > 0:
         # Same-hand examples in one batch share their event-prefix DICT
         # OBJECTS (collect.py stores `decision["events_at_root"]` slices of
@@ -207,13 +227,20 @@ def _mcts_forward(agent, event_sequences, chains, device,
     chain_value_preds = [[] for _ in range(B)]
     chain_value_targets = [[] for _ in range(B)]
 
-    # A.5.1: trim each example to its true length
+    # A.5.1: trim each example to its true length. The rolled context is
+    # kept as base + a LIST of appended tokens and rebuilt each depth so
+    # the truncated-BPTT gradient policy (PLAN_COMPOUNDING_ERROR.md §3)
+    # can attach/detach tokens by AGE; values are identical to the legacy
+    # incremental cat on every path.
+    per_ex_base = [None] * B
     per_ex_ctx = [None] * B
     per_ex_mask = [None] * B
+    per_ex_toks = [[] for _ in range(B)]
     for b in range(B):
         if chains[b]:
             L_b = int(mask[b].sum().item())
-            per_ex_ctx[b] = perception_out[b:b+1, :L_b]
+            per_ex_base[b] = perception_out[b:b+1, :L_b]
+            per_ex_ctx[b] = per_ex_base[b]
             per_ex_mask[b] = mask[b:b+1, :L_b]
 
     max_depth = max((len(chains[b]) for b in range(B) if chains[b]), default=0)
@@ -223,6 +250,28 @@ def _mcts_forward(agent, event_sequences, chains, device,
         if not active_bs:
             continue
         N_act = len(active_bs)
+
+        # Rebuild rolled contexts with the age-based gradient policy:
+        #   bptt_depth > 0 → token j stays attached while its age d−j is
+        #     ≤ bptt_depth (stored pre-damped by _scale_grad), older ones
+        #     detach — the composition h∘h enters the loss up to K hops;
+        #   else stop_grad_old_embs → all detached (legacy default);
+        #   else → all attached (legacy full BPTT).
+        for b in active_bs:
+            toks = per_ex_toks[b]
+            if not toks:
+                per_ex_ctx[b] = per_ex_base[b]
+                continue
+            parts = [per_ex_base[b]]
+            for j, tok in enumerate(toks):
+                age = d - j
+                if bptt_depth > 0:
+                    parts.append(tok if age <= bptt_depth else tok.detach())
+                elif stop_grad_old_embs:
+                    parts.append(tok.detach())
+                else:
+                    parts.append(tok)
+            per_ex_ctx[b] = torch.cat(parts, dim=1)
 
         # --- Modelling head: batched across active examples ---
         ctxs = [per_ex_ctx[b] for b in active_bs]
@@ -337,12 +386,16 @@ def _mcts_forward(agent, event_sequences, chains, device,
                     chain_perception_out[tf_idx_val, L_true - 1]
                     .detach().unsqueeze(0))
 
-        # --- Update contexts for next depth ---
+        # --- Store this depth's rolled token (contexts are rebuilt at the
+        # top of the next depth with the age-based gradient policy). Under
+        # truncated BPTT the token is pre-damped once here: every future
+        # consumption inherits the scale, so a k-hop path is scale^k. ---
         for idx, b in enumerate(active_bs):
             ones = torch.ones(1, 1, dtype=per_ex_mask[b].dtype, device=device)
-            tok = new_emb_tokens[idx].detach() if stop_grad_old_embs \
-                else new_emb_tokens[idx]
-            per_ex_ctx[b] = torch.cat([per_ex_ctx[b], tok], dim=1)
+            tok = new_emb_tokens[idx]
+            if bptt_depth > 0:
+                tok = _scale_grad(tok, bptt_grad_scale)
+            per_ex_toks[b].append(tok)
             per_ex_mask[b] = torch.cat([per_ex_mask[b], ones], dim=1)
 
     # 5. Terminal value supervision: for each example, roll out the modelling
@@ -586,7 +639,8 @@ _LOSS_KEYS = ("total", "value", "action", "chain", "chain_value", "recon",
 
 def _run_validation(agent, val_loader, device, weights, amp_config=None,
                     opponent_emb_table=None, stop_grad_old_embs=True,
-                    gru_window=1):
+                    gru_window=1, bptt_depth=0, bptt_grad_scale=0.5,
+                    lm_street_boundary=False):
     """Run validation. Returns dict with total + component losses.
 
     Validation always uses p_tf=0 (fully rolled chain) so the metric stays
@@ -613,7 +667,10 @@ def _run_validation(agent, val_loader, device, weights, amp_config=None,
                     stop_grad_old_embs=stop_grad_old_embs,
                     examples_per_batch_terminals=term_tgts,
                     precomputed=precomputed,
-                    gru_window=gru_window)
+                    gru_window=gru_window,
+                    bptt_depth=bptt_depth,
+                    bptt_grad_scale=bptt_grad_scale,
+                    lm_street_boundary=lm_street_boundary)
                 _, ldict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
             n = precomputed["B"] if precomputed is not None else 0
@@ -675,6 +732,12 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
     value_chain_weight = train_cfg.get("value_chain_weight", 0.0)
     chain_depth_gamma = float(train_cfg.get("chain_depth_gamma", 1.0))
     stop_grad_old_embs = bool(train_cfg.get("stop_grad_old_embs", True))
+    # Truncated BPTT through the rolled chain (PLAN_COMPOUNDING_ERROR.md §3).
+    # 0 = legacy stop_grad_old_embs semantics; K>0 keeps the last K appended
+    # embeddings attached with MuZero-style per-hop gradient damping.
+    bptt_depth = max(0, int(train_cfg.get("bptt_depth", 0)))
+    bptt_grad_scale = float(train_cfg.get("bptt_grad_scale", 0.5))
+    lm_street_boundary = bool(train_cfg.get("lm_street_boundary", False))
     entropy_weight = float(train_cfg.get("entropy_weight", 0.0))
     terminal_value_weight = float(train_cfg.get("terminal_value_weight", 0.0))
     infonce_weight = float(train_cfg.get("infonce_weight", 0.5))
@@ -792,7 +855,9 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
         f"infonce_w={infonce_weight}, infonce_tau={infonce_temperature}")
     log(f"Chain extras: p_tf={p_tf:.3f} "
         f"(start={tf_p_start}, end={tf_p_end}, decay={tf_decay_cycles}), "
-        f"stop_grad_old_embs={stop_grad_old_embs}")
+        f"stop_grad_old_embs={stop_grad_old_embs}, "
+        f"bptt_depth={bptt_depth} (grad_scale={bptt_grad_scale}), "
+        f"lm_street_boundary={lm_street_boundary}")
     if external_optim:
         cur_lr = optimizer.param_groups[0]["lr"]
         log(f"Using external optimizer/scheduler (current lr={cur_lr:.2e})")
@@ -856,7 +921,10 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                     stop_grad_old_embs=stop_grad_old_embs,
                     examples_per_batch_terminals=term_tgts,
                     precomputed=precomputed,
-                    gru_window=gru_window)
+                    gru_window=gru_window,
+                    bptt_depth=bptt_depth,
+                    bptt_grad_scale=bptt_grad_scale,
+                    lm_street_boundary=lm_street_boundary)
                 loss, loss_dict = _compute_loss(
                     forward_out, val_targets, act_targets, **weights)
 
@@ -915,7 +983,10 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
                     agent, val_loader, device, weights, amp_cfg,
                     opponent_emb_table=opp_table,
                     stop_grad_old_embs=stop_grad_old_embs,
-                    gru_window=gru_window)
+                    gru_window=gru_window,
+                    bptt_depth=bptt_depth,
+                    bptt_grad_scale=bptt_grad_scale,
+                    lm_street_boundary=lm_street_boundary)
                 vl = val_dict["total"]
                 history["val_loss"].append({
                     "step": global_step,
@@ -951,7 +1022,10 @@ def train_mcts(agent, train_cfg, device, log, examples, temperature=None,
             agent, val_loader, device, weights, amp_cfg,
             opponent_emb_table=opp_table,
             stop_grad_old_embs=stop_grad_old_embs,
-            gru_window=gru_window)
+            gru_window=gru_window,
+            bptt_depth=bptt_depth,
+            bptt_grad_scale=bptt_grad_scale,
+            lm_street_boundary=lm_street_boundary)
         val_avg = val_dict["total"]
         history["epoch_train_loss"].append({
             "step": global_step, "cycle_id": cycle_id,

@@ -70,6 +70,7 @@ class ASI(nn.Module):
             d_ff=d_ff,
             max_seq_len=head_max_seq_len,
             dropout=arch.get("modelling_dropout", 0.1),
+            spectral_clamp=arch.get("modelling_spectral_clamp"),
         )
 
         # Phase-5 training-only probes on the opponent GRU state

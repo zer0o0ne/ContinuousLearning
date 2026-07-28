@@ -18,6 +18,7 @@ class MCTSNode:
     """Single node in the MCTS tree."""
     __slots__ = [
         "action_idx", "parent", "children", "is_hero", "is_terminal",
+        "is_street_leaf",
         "N", "W", "Q", "P", "action_embedding", "_term_value",
     ]
 
@@ -28,6 +29,15 @@ class MCTSNode:
         self.children = {}                 # action_idx -> MCTSNode
         self.is_hero = is_hero             # whose turn at this node
         self.is_terminal = is_terminal
+        # Street-boundary leaf (PLAN_COMPOUNDING_ERROR.md §1): the action
+        # into this node closed a street, so the true next state depends on
+        # dealt cards. When `mcts.street_boundary_leaf` is enabled the node
+        # is never expanded — the modelling head is not asked to predict
+        # across a chance event; a single cached value_head estimate
+        # (V(afterstate) = E_cards[V(next street)]) is backed up instead.
+        # NOT a terminal: excluded from `_collect_terminals`, so the
+        # post-hand equity override never touches it.
+        self.is_street_leaf = False
         self.N = 0                         # visit count
         self.W = 0.0                       # total backed-up value (hero perspective)
         self.Q = 0.0                       # mean value = W / N
@@ -117,6 +127,13 @@ class MCTS:
         # mistake. Only affects opp-node reads in PUCT and read-time
         # consumers; never modifies W (zero-sum semantics preserved).
         self.opp_pessimism_alpha = float(cfg.get("opp_pessimism_alpha", 0.5))
+        # Street-boundary leaf (PLAN_COMPOUNDING_ERROR.md §1): cap the tree
+        # at the current street. Any node whose replayed GameState is on a
+        # different street than the root becomes a value_head-evaluated
+        # leaf (see MCTSNode.is_street_leaf). Keeps the search inside the
+        # modelling head's trained support (chains are street-pure) and
+        # removes the deterministic-embedding-through-a-chance-event error.
+        self.street_boundary_leaf = bool(cfg.get("street_boundary_leaf", False))
 
     @torch.no_grad()
     def search(self, event_sequences, game_state):
@@ -176,10 +193,15 @@ class MCTS:
                            and random.random() < self.strange_p)
                 path, gs = self._select_to_leaf(root, game_state, strange=strange)
                 leaf = path[-1]
-                if leaf.is_terminal:
+                if leaf.is_terminal or leaf.is_street_leaf:
                     if leaf._term_value is None:
                         # First visit: fold terminals get a deterministic value
                         # (no NN); showdown terminals are queued for value_head.
+                        # Street leaves ride the same path: hero-folded ones
+                        # are deterministic (−invested, no NN), hero-live ones
+                        # get None from _deterministic_terminal_value and are
+                        # queued for ONE cached value_head forward — never
+                        # expanded.
                         # gs is None only on a repeat in-flight visit to a
                         # showdown terminal already queued this batch (fold
                         # terminals cache _term_value on the first visit, so
@@ -221,6 +243,11 @@ class MCTS:
         """Hero value for a terminal whose outcome is NN-independent, in
         `search_scale` units; ``None`` when the value needs equity (showdown
         with hero still live).
+
+        Also called for street-boundary leaves (street cap enabled): a
+        street leaf where hero already folded is locked at ``−invested``
+        (deterministic, no NN); hero-live street leaves return ``None`` →
+        the caller runs the value head on the afterstate context.
 
         C.4 — restores the structural anchor against fold-spirals removed when
         `_make_terminal_evaluator` was deleted. Mirrors the fold / hero-folded
@@ -408,13 +435,20 @@ class MCTS:
             node = node.children[action]
             path.append(node)
 
-        if node.is_terminal:
+        if node.is_terminal or node.is_street_leaf:
+            # Known terminal / street leaf — no replay, no expansion.
             return path, None
 
         gs = self._replay_game_state(root_gs, path)
         if node is not root:
             node.is_terminal = gs.is_terminal
             node.is_hero = gs.is_hero_turn()
+            # Street-boundary cap: the replayed state left the root's
+            # street via a chance event (new cards dealt) — freeze this
+            # node as a value_head leaf instead of expanding through it.
+            if (self.street_boundary_leaf and not gs.is_terminal
+                    and gs.turn != root_gs.turn):
+                node.is_street_leaf = True
         return path, gs
 
     def _simulate(self, root, root_ctx, root_mask, root_gs):
@@ -423,14 +457,20 @@ class MCTS:
         path, gs = self._select_to_leaf(root, root_gs)
         node = path[-1]
 
-        if node.is_terminal:
+        if node.is_terminal or node.is_street_leaf:
             if node._term_value is None:
-                # First terminal visit — evaluate value_head once and cache.
-                context, mask = self._build_context(root_ctx, root_mask, path)
-                values, _, _, _ = self.evaluator.evaluate_leaves(
-                    context, mask, needs_expansion=False)
-                leaf_value = values.item()
-                node._term_value = float(leaf_value)
+                # First visit — deterministic when possible (fold-family
+                # terminals; hero-folded street leaves), else ONE cached
+                # value_head forward.
+                det_v = (self._deterministic_terminal_value(gs)
+                         if gs is not None else None)
+                if det_v is not None:
+                    node._term_value = float(det_v)
+                else:
+                    context, mask = self._build_context(root_ctx, root_mask, path)
+                    values, _, _, _ = self.evaluator.evaluate_leaves(
+                        context, mask, needs_expansion=False)
+                    node._term_value = float(values.item())
             self._backup_cached_terminal(path, node._term_value)
             return
 

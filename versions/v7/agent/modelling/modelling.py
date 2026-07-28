@@ -9,7 +9,17 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from agent.attn_utils import build_causal_padding_mask
 
 
-def build_lm_pairs(event_sequences):
+def _event_street(event):
+    """Street of an event = number of revealed table cards (0/3/4/5).
+
+    Real cards are 0..51; both no-card encodings (−1 raw, 52 embedder token)
+    are excluded. Same idiom as perception.py's street derivation.
+    """
+    table = event.get("table") or []
+    return sum(1 for c in table if 0 <= int(c) <= 51)
+
+
+def build_lm_pairs(event_sequences, street_boundary=False):
     """LM-pair construction shared by phase 4 and phase 6
     (PLAN_MODELLING_HEAD_REDESIGN.md §3).
 
@@ -19,6 +29,13 @@ def build_lm_pairs(event_sequences):
     `action` one-hot has max ≥ 0.5:
       source = q−1, action = argmax(action_q), target = q+1 (skipped when
       q+1 does not exist — last decision of the sequence has no target).
+
+    ``street_boundary`` (PLAN_COMPOUNDING_ERROR.md §2b): drop pairs whose
+    target event sits on a different street than the source event. Those
+    targets contain newly dealt cards — a deterministic h(s, a) trained on
+    them with MSE regresses to the mean embedding over runouts, an
+    off-manifold point. With the street cap active at search time the head
+    is never queried across a chance event, so such pairs are pure noise.
 
     Returns four 1-D long tensors (batch_idx, src_positions, actions,
     tgt_positions), all length M (possibly 0).
@@ -31,6 +48,9 @@ def build_lm_pairs(event_sequences):
                 continue
             action_t = torch.as_tensor(action, dtype=torch.float32)
             if action_t.numel() == 0 or action_t.max().item() < 0.5:
+                continue
+            if street_boundary and (_event_street(seq[q + 1])
+                                    != _event_street(seq[q - 1])):
                 continue
             batch_idx.append(bi)
             src_pos.append(q - 1)
@@ -86,7 +106,8 @@ class ModellingHead(nn.Module):
     (position, action) pairs.
     """
 
-    def __init__(self, d_model, n_actions, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len, dropout=0.1):
+    def __init__(self, d_model, n_actions, n_heads, n_kv_heads, n_layers,
+                 d_ff, max_seq_len, dropout=0.1, spectral_clamp=None):
         super().__init__()
         assert d_model % n_heads == 0, (
             f"d_model {d_model} must be divisible by n_heads {n_heads}")
@@ -120,6 +141,49 @@ class ModellingHead(nn.Module):
         self.norm = Qwen3RMSNorm(d_model, eps=self.config.rms_norm_eps)
         self.resid_dropout = nn.Dropout(dropout)
         self.gradient_checkpointing = False
+
+        # Spectral clamp on the conditioning MLP (PLAN_COMPOUNDING_ERROR.md
+        # §5): Lipschitz control of the map that PRODUCES the appended
+        # rolled embedding, so autoregressive error growth stays at most
+        # linear instead of exponential. A CLAMP, not a normalization:
+        # W_eff = W · min(1, max_sigma/σ(W)) — exactly identity while
+        # σ ≤ max_sigma (zero expressiveness cost below the cap). σ is
+        # estimated by power iteration on persistent `u` buffers, updated
+        # under no_grad in training mode only; gradient flows through σ
+        # when the clamp is active (Miyato-style). Implemented manually
+        # (NOT torch spectral_norm parametrization) so the state_dict key
+        # stays `weight` — old checkpoints keep loading their pretrained
+        # MLP weights under strict=False; the new `u` buffers are simply
+        # missing there and re-converge in a few forwards.
+        sc_cfg = spectral_clamp or {}
+        self.spectral_clamp_enabled = bool(sc_cfg.get("enabled", False))
+        self.spectral_clamp_max_sigma = float(sc_cfg.get("max_sigma", 1.0))
+        self.spectral_clamp_n_iter = max(
+            1, int(sc_cfg.get("n_power_iterations", 1)))
+        if self.spectral_clamp_enabled:
+            self.register_buffer(
+                "sn_u_in", nn.functional.normalize(
+                    torch.randn(self.mlp_in.out_features), dim=0))
+            self.register_buffer(
+                "sn_u_out", nn.functional.normalize(
+                    torch.randn(self.mlp_out.out_features), dim=0))
+
+    def _clamped_weight(self, weight, u_buffer_name):
+        """Effective weight under the spectral clamp (see __init__)."""
+        u = getattr(self, u_buffer_name)
+        w = weight.float()
+        with torch.no_grad():
+            v = None
+            for _ in range(self.spectral_clamp_n_iter):
+                v = nn.functional.normalize(w.t() @ u, dim=0)
+                u = nn.functional.normalize(w @ v, dim=0)
+            if self.training:
+                getattr(self, u_buffer_name).copy_(u)
+        # σ = uᵀ W v with u, v fixed — differentiable w.r.t. weight.
+        sigma = torch.dot(u, weight.float() @ v)
+        scale = (self.spectral_clamp_max_sigma
+                 / sigma.clamp(min=1e-12)).clamp(max=1.0)
+        return weight * scale.to(weight.dtype)
 
     def _encode(self, context, mask=None):
         """Causal Qwen3 self-attn stack over the context.
@@ -164,8 +228,17 @@ class ModellingHead(nn.Module):
             e: (..., d_model) — action embeddings
         Returns: (..., d_model)
         """
-        h = self.mlp_in(torch.cat([s, e], dim=-1))
-        h = self.mlp_out(self.resid_dropout(nn.functional.gelu(h)))
+        x = torch.cat([s, e], dim=-1)
+        if self.spectral_clamp_enabled:
+            w_in = self._clamped_weight(self.mlp_in.weight, "sn_u_in")
+            w_out = self._clamped_weight(self.mlp_out.weight, "sn_u_out")
+            h = nn.functional.linear(x, w_in, self.mlp_in.bias)
+            h = nn.functional.linear(
+                self.resid_dropout(nn.functional.gelu(h)),
+                w_out, self.mlp_out.bias)
+        else:
+            h = self.mlp_in(x)
+            h = self.mlp_out(self.resid_dropout(nn.functional.gelu(h)))
         return self.norm(h)
 
     def forward(self, context, mask=None):

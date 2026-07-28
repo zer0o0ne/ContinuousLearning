@@ -1344,6 +1344,43 @@ _worker_config = None
 _worker_device = None
 
 
+def _limit_blas_threads():
+    """Cap numpy's BLAS pool at 1 thread inside pool workers.
+
+    `torch.set_num_threads(1)` below does NOT affect numpy's OpenBLAS —
+    without this cap, n_workers x BLAS-threads oversubscribe the CPU and
+    the v5 solver's numpy sweep (matmul-heavy) thrashes. Best-effort:
+    threadpoolctl when available, else the OpenBLAS C API via the shared
+    library numpy ships (symbol name varies across builds).
+    """
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(1)
+        return
+    except Exception:
+        pass
+    try:
+        import glob
+        import ctypes
+        libs = []
+        for base in np.__path__:
+            libs += glob.glob(os.path.join(
+                base, "..", "numpy.libs", "libscipy_openblas*.so*"))
+            libs += glob.glob(os.path.join(
+                base, ".libs", "libopenblas*.so*"))
+        for lib in libs:
+            handle = ctypes.CDLL(lib)
+            for name in ("openblas_set_num_threads",
+                         "scipy_openblas_set_num_threads64_",
+                         "openblas_set_num_threads64_"):
+                fn = getattr(handle, name, None)
+                if fn is not None:
+                    fn(1)
+                    return
+    except Exception:
+        pass
+
+
 def _init_worker(counter, config=None, device=None):
     """Initializer for pool workers — stores shared counter and config."""
     global _shared_counter, _worker_config, _worker_device
@@ -1351,6 +1388,7 @@ def _init_worker(counter, config=None, device=None):
     _worker_config = config
     _worker_device = device
     torch.set_num_threads(1)
+    _limit_blas_threads()
 
 
 def _generate_worker(args):

@@ -517,24 +517,52 @@ def solve_spot(hero_cards, board_cards, opponent_range_hand_types,
     else:
         allin_ci = CALL_CI  # facing an all-in: raising == calling all-in
 
-    invested0 = [float(hero_invested)] + kept_invested
-    stacks0 = {0: stack}
-    for j, s_j in enumerate(kept_stacks):
-        stacks0[j + 1] = s_j
+    # coarsening ladder: full width -> single size / cap 1 -> additionally
+    # drop CFR players down to 3 (dropped ranges stay in the pot as dead
+    # money). Guarantees any config yields a tractable tree instead of a
+    # wasted giant build or a dropped decision point.
+    all_stacks = [stack] + kept_stacks
+    all_invested = [float(hero_invested)] + kept_invested
+    attempts = []
+    for n_use, sizes_a, cap_a in (
+        (n_solver_players, future_bet_sizes, raise_cap),
+        (n_solver_players, future_bet_sizes[:1], 1),
+        (min(n_solver_players, 3), future_bet_sizes[:1], 1),
+    ):
+        if (n_use, tuple(sizes_a), cap_a) not in [
+                (n, tuple(s), c) for n, s, c in attempts]:
+            attempts.append((n_use, sizes_a, cap_a))
 
-    build_args = (n_solver_players, order, pot, facing_bet, stacks0,
-                  invested0, int(street), root_specs)
-    try:
-        nodes, root_id = _build_tree(
-            *build_args, future_bet_sizes, raise_cap, allin_spr,
-            float(big_blind), max_tree_nodes)
-    except _TreeTooBig:
+    built = None
+    for att_idx, (n_use, sizes_a, cap_a) in enumerate(attempts):
+        order_a = sorted(range(n_use), key=lambda j: positions[j])
+        stacks0 = {j: all_stacks[j] for j in range(n_use)}
+        invested0 = all_invested[:n_use]
+        try:
+            nodes, root_id = _build_tree(
+                n_use, order_a, pot, facing_bet, stacks0, invested0,
+                int(street), root_specs, sizes_a, cap_a, allin_spr,
+                float(big_blind), max_tree_nodes)
+            built = (att_idx, n_use, nodes, root_id)
+            break
+        except _TreeTooBig:
+            continue
+    if built is None:
         warnings.warn(
-            f"solver v5: tree exceeded {max_tree_nodes} nodes; "
-            f"rebuilding with raise_cap=1 and a single bet size", stacklevel=2)
-        nodes, root_id = _build_tree(
-            *build_args, future_bet_sizes[:1], 1, allin_spr,
-            float(big_blind), max_tree_nodes)
+            f"solver v5: betting tree exceeds max_tree_nodes="
+            f"{max_tree_nodes} even after coarsening — spot skipped",
+            stacklevel=2)
+        return None, None
+    att_idx, n_use, nodes, root_id = built
+    if att_idx > 0:
+        warnings.warn(
+            f"solver v5: tree exceeded {max_tree_nodes} nodes; coarsened "
+            f"(attempt {att_idx}: {n_use - 1} CFR opponents, cap 1). "
+            f"Frequent occurrences mean raise_cap/max_opponents/"
+            f"max_tree_nodes are set too wide.", stacklevel=2)
+    if n_use < n_solver_players:
+        ranges = ranges[:n_use]
+        n_solver_players = n_use
     root_children = nodes[root_id].children
 
     # ---- static pairwise disjointness masks ----

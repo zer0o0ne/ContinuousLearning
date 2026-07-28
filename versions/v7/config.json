@@ -91,14 +91,14 @@
         "type": "v5",
         "v5": {
             "iterations": 128,
-            "batch_runouts": 8,
+            "batch_runouts": 4,
             "future_bet_sizes": [1.0],
-            "raise_cap": 3,
+            "raise_cap": 2,
             "allin_spr": 4.0,
             "max_root_sizes": 5,
-            "max_opponents": 9,
+            "max_opponents": 3,
             "max_combos": 120,
-            "max_tree_nodes": 108000
+            "max_tree_nodes": 12000
         },
         "mc_iterations": 25000,
         "n_raise_samples": 5,

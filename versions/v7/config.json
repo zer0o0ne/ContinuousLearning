@@ -1,5 +1,5 @@
 {
-    "name": "more_epochs_new_modelling_speedup",
+    "name": "v5_solver_train",
     "agent_dir": "",
     "architecture": {
         "d_model": 384,
@@ -33,7 +33,7 @@
         }
     },
     "multi_agent": {
-        "save_dir": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents_more_epochs_new_modelling_speedup",
+        "save_dir": "v5_solver_agents",
         "agents": [
             {
                 "name": "gto_pure",
@@ -90,15 +90,15 @@
     "solver": {
         "type": "v5",
         "v5": {
-            "iterations": 64,
-            "batch_runouts": 4,
+            "iterations": 128,
+            "batch_runouts": 8,
             "future_bet_sizes": [1.0],
-            "raise_cap": 2,
+            "raise_cap": 3,
             "allin_spr": 4.0,
             "max_root_sizes": 5,
-            "max_opponents": 2,
+            "max_opponents": 9,
             "max_combos": 120,
-            "max_tree_nodes": 8000
+            "max_tree_nodes": 108000
         },
         "mc_iterations": 25000,
         "n_raise_samples": 5,
@@ -122,7 +122,7 @@
         }
     },
     "dataset": {
-        "dataset_dir": "/home/zer0o0ne/ContinuousLearning/data/v6/more_epochs_new_modelling_speedup/dataset",
+        "dataset_dir": "",
         "save_dir": "",
         "n_scenarios": 250000,
         "val_split": 0.002,
@@ -177,14 +177,14 @@
         "action_loss_weight": 0.7
     },
     "opponent_data": {
-        "agents_dir": "/home/zer0o0ne/ContinuousLearning/data/v6/5_agents_more_epochs_new_modelling_speedup",
+        "agents_dir": "v5_solver_agents",
         "n_hands": 25000,
         "n_workers": 1,
         "server_max_batch": 768,
         "server_linger_ms": 2,
         "action_temperature": 0.3,
         "max_batch_combos": 768,
-        "save_dir": "/home/zer0o0ne/ContinuousLearning/data/v6/more_epochs_new_modelling_speedup/opponent_dataset",
+        "save_dir": "",
         "save_every_hands": 1000,
         "player_swap_prob": 0.01,
         "n_player_pool": 27,

@@ -54,15 +54,15 @@
     "solver": {
         "type": "v5",
         "v5": {
-            "iterations": 64,
-            "batch_runouts": 4,
+            "iterations": 128,
+            "batch_runouts": 8,
             "future_bet_sizes": [1.0],
-            "raise_cap": 2,
+            "raise_cap": 3,
             "allin_spr": 4.0,
             "max_root_sizes": 5,
             "max_opponents": 2,
             "max_combos": 120,
-            "max_tree_nodes": 8000
+            "max_tree_nodes": 18000
         },
         "mc_iterations": 25000,
         "n_raise_samples": 5,
@@ -120,8 +120,11 @@
         "action_temperature": 0.3,
         "agents": [
             {
-                "name": "v5_solver",
-                "type": "solver"
+                "name": "gto_pure_mcts_90",
+                "type": "model",
+                "path": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_10_14_44_34/cycles/cycle_0090.pt",
+                "use_opponent_embedding": true,
+                "use_mcts": true
             }
         ]
     }

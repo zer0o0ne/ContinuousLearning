@@ -90,7 +90,7 @@
     "solver": {
         "type": "v5",
         "v5": {
-            "iterations": 32,
+            "iterations": 128,
             "batch_runouts": 4,
             "future_bet_sizes": [1.0],
             "raise_cap": 2,

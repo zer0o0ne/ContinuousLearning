@@ -20,7 +20,15 @@
             "beam_width": 8
         },
         "opponent_embedding": {
-            "enabled": true
+            "enabled": true,
+            "stats_enabled": true,
+            "style_probe": true,
+            "showdown_probe": true
+        },
+        "modelling_spectral_clamp": {
+            "enabled": true,
+            "max_sigma": 1.0,
+            "n_power_iterations": 1
         }
     },
     "game": {

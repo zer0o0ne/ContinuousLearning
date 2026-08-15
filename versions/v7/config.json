@@ -303,7 +303,7 @@
         "host": "slumbot.com",
         "username": "",
         "password": "",
-        "request_timeout": 30,
+        "request_timeout": 10,
         "log_every": 50,
         "n_hands": 1000,
         "n_workers": 1,

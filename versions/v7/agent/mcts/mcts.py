@@ -89,8 +89,11 @@ class MCTS:
         self.dirichlet_alpha = cfg.get("dirichlet_alpha", 0.3)
         self.dirichlet_epsilon = cfg.get("dirichlet_epsilon", 0.25)
         # Probability per simulation of doing a "strange" traversal: at every
-        # hero node along the descent we sample action with weight 1/(N+1)
-        # (inverse visit count) instead of PUCT. Opp selection stays the same.
+        # hero node BELOW THE ROOT along the descent we sample action with
+        # weight 1/(N+1) (inverse visit count) instead of PUCT. The root child
+        # is always PUCT-selected so the root visit counts — which are the
+        # training policy target and the played action — stay uncontaminated
+        # (see `_select_to_leaf`). Opp selection stays the same.
         # Bad strange paths get few visits (PUCT won't revisit them), so their
         # contribution to hero W/N is diluted. Set externally by `collect.py` as
         # `C(cycle) * exp(-last_action_loss)` so search broadens when the
@@ -423,6 +426,19 @@ class MCTS:
         converged. Bad strange paths get few follow-up visits from PUCT, so
         their contribution to W/N is diluted and costs mainly search budget.
 
+        **The ROOT node is exempt**: its child is always chosen by PUCT, even
+        on a strange simulation. `root.children[a].N` IS the training policy
+        target (`get_n_distribution` → `MCTSTrainingExample.action_target` and
+        every chain step's `target_distribution`) and also drives the actually
+        played action (`_best_action`), so inverse-N sampling at the root would
+        smear ~`strange_p` of the visit mass uniformly over legal actions and
+        corrupt the KL target. Root-level exploration is already covered by the
+        (much stronger) root Dirichlet noise, `dirichlet_epsilon`; strange
+        traversal's job is the deep tree, where inner noise is only
+        `dirichlet_epsilon_inner`. Values found down a strange path still reach
+        the root through `W` (uniform sum backup), so the Q-correction and
+        terminal-coverage benefits are unaffected.
+
         Returns:
             path: list[MCTSNode] from root to leaf (length >= 1)
             gs:   GameState at the leaf, or None if the leaf is an
@@ -431,7 +447,8 @@ class MCTS:
         node = root
         path = [node]
         while node.children and not node.is_terminal:
-            action = self._select_child(node, strange=strange)
+            action = self._select_child(node,
+                                        strange=strange and node is not root)
             node = node.children[action]
             path.append(node)
 
@@ -501,7 +518,8 @@ class MCTS:
         Strange (`strange=True`): inverse-N sampling at hero
             (`P(a) ∝ 1/(N(a)+1)`), opp unchanged. The opp branch is identical
             in both modes — opponents don't know we're exploring, so their
-            response distribution stays realistic.
+            response distribution stays realistic. The root-node exemption is
+            applied by the caller (`_select_to_leaf`), not here.
         """
         if node.is_hero:
             if strange:

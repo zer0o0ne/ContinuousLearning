@@ -969,31 +969,58 @@ def _build_game_state(state, hero_user_pos, raise_sizes, n_raise_bins, chip_scal
 class SlumbotClient:
     """Thin wrapper over Slumbot's HTTP API.
 
-    Retries transient network failures (ConnectTimeout / ReadTimeout /
-    ConnectionError) with exponential backoff. Uses a persistent
-    requests.Session so TCP+TLS handshakes are reused across requests
-    (significant speedup on long evals).
+    Retry policy is per-endpoint, because `act` is NOT idempotent:
+
+    - `login` / `new_hand` are idempotent (a replay just makes a fresh
+      session/hand), so they retry on ConnectTimeout / ReadTimeout /
+      ConnectionError with exponential backoff.
+    - `act` retries ONLY on ConnectTimeout, i.e. the connection was never
+      established and the request provably never reached the server. A
+      ReadTimeout means the request WAS sent and the response didn't arrive
+      in time — Slumbot has most likely already applied the action, so
+      replaying the same `incr` lands on an advanced state and comes back as
+      "Illegal call" / "Unexpected action", desyncing the hand. Those are
+      surfaced as a failed hand instead (one lost hand per timeout, no
+      desync, no failure cascade).
+
+    Connections are NOT kept alive (`Connection: close`): hero can think for
+    seconds between two `act` calls (MCTS), long enough for the server / a
+    NAT box to drop an idle keep-alive socket silently — the next request
+    then vanishes and only surfaces as a full-`timeout` ReadTimeout. One TLS
+    handshake per request (~100 ms) is negligible next to search time.
     """
 
     def __init__(self, host=SLUMBOT_HOST, username="", password="",
-                 timeout=30, retries=4, backoff=1.0, log=None):
+                 timeout=10, retries=4, backoff=1.0, log=None):
         self.host = host
         self.timeout = timeout
         self.retries = max(0, int(retries))
         self.backoff = float(backoff)
         self.log = log
         self.session = requests.Session()
+        self.session.headers["Connection"] = "close"
         self.token = None
         if username and password:
             self.token = self._login(username, password)
 
-    def _post(self, endpoint, data):
+    def _post(self, endpoint, data, idempotent=True):
         import time
         url = f"https://{self.host}/slumbot/api/{endpoint}"
         # Retry on transient network errors (timeout / connection reset).
         # Other errors (HTTP 4xx/5xx, error_msg in body) propagate immediately.
+        # For non-idempotent endpoints only ConnectTimeout is retried (see the
+        # class docstring): every other failure mode may have been applied
+        # server-side already.
+        if idempotent:
+            retryable = (requests.exceptions.ConnectTimeout,
+                         requests.exceptions.ReadTimeout,
+                         requests.exceptions.ConnectionError)
+        else:
+            retryable = (requests.exceptions.ConnectTimeout,)
         last_exc = None
+        attempts = 0
         for attempt in range(self.retries + 1):
+            attempts += 1
             try:
                 r = self.session.post(url, json=data, timeout=self.timeout)
                 if r.status_code != 200:
@@ -1007,9 +1034,7 @@ class SlumbotClient:
                 if new_tok:
                     self.token = new_tok
                 return body
-            except (requests.exceptions.ConnectTimeout,
-                    requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError) as e:
+            except retryable as e:
                 last_exc = e
                 if attempt >= self.retries:
                     break
@@ -1020,8 +1045,17 @@ class SlumbotClient:
                         f"retrying in {wait:.1f}s "
                         f"(attempt {attempt + 1}/{self.retries})")
                 time.sleep(wait)
+            except (requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                # Only reachable for non-idempotent endpoints. The request may
+                # have been applied server-side, so we must NOT replay it.
+                raise RuntimeError(
+                    f"Slumbot {endpoint} {type(e).__name__} after the request "
+                    f"was sent — not retried (non-idempotent), hand abandoned: "
+                    f"{e}"
+                ) from e
         raise RuntimeError(
-            f"Slumbot {endpoint} failed after {self.retries + 1} attempts: "
+            f"Slumbot {endpoint} failed after {attempts} attempts: "
             f"{type(last_exc).__name__}: {last_exc}"
         ) from last_exc
 
@@ -1041,7 +1075,9 @@ class SlumbotClient:
     def act(self, incr):
         if not self.token:
             raise RuntimeError("act() before token established (call new_hand first)")
-        return self._post("act", {"token": self.token, "incr": incr})
+        # Non-idempotent: a replayed action desyncs the hand (class docstring).
+        return self._post("act", {"token": self.token, "incr": incr},
+                          idempotent=False)
 
 
 # ============================================================================
@@ -2218,7 +2254,11 @@ def run_slumbot_evaluation(config, device, log, results_dir_override=None):
     host = cfg.get("host", SLUMBOT_HOST)
     username = cfg.get("username", "") or ""
     password = cfg.get("password", "") or ""
-    timeout = int(cfg.get("request_timeout", 30))
+    # 10 s, not 30: with Connection: close every request rides a fresh socket,
+    # so a slow/black-holed request is a dead request — waiting 30 s for it
+    # only stalls the worker (and, before the idempotency fix, invited the
+    # replay desync).
+    timeout = int(cfg.get("request_timeout", 10))
     retries = int(cfg.get("retries", 4))
     backoff = float(cfg.get("backoff", 1.0))
 

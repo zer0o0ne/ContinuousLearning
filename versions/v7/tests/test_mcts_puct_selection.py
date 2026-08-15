@@ -902,6 +902,94 @@ class TestStrangeTraversal(unittest.TestCase):
         selected = mcts._select_child(root, strange=False)
         self.assertEqual(selected, 1)
 
+
+# ---------------------------------------------------------------------------
+# 10b. Strange traversal — root exemption
+# ---------------------------------------------------------------------------
+
+def _make_two_level_hero_tree():
+    """root(hero) → 2 hero children → 2 terminal grandchildren each.
+
+    Stats are rigged so PUCT and inverse-N disagree at BOTH levels:
+      action 0: Q=1.0, N=90  → PUCT winner, inverse-N loser
+      action 1: Q=0.0, N=2   → inverse-N winner, PUCT loser
+    Same pattern for each hero child's grandchildren, so the depth-1 choice
+    is observable too. Tests below use a small `c_puct` so PUCT is
+    effectively Q-greedy here — the assertions are about WHICH RULE runs at
+    which depth, not about the exploration constant's magnitude.
+    """
+    root = MCTSNode(is_hero=True)
+    root.N = 92
+    for a, (q, n) in enumerate([(1.0, 90), (0.0, 2)]):
+        child = MCTSNode(action_idx=a, parent=root, is_hero=True, P=0.5)
+        child.N = n
+        child.W = q * n
+        child.Q = q
+        root.children[a] = child
+        # Grandchildren: terminal, so _select_to_leaf stops without replaying
+        # a GameState (no engine needed in this test).
+        for ga, (gq, gn) in enumerate([(1.0, n - 1), (0.0, 1)]):
+            g = MCTSNode(action_idx=ga, parent=child, is_hero=True, P=0.5)
+            g.N = max(gn, 0)
+            g.Q = gq
+            g.W = gq * g.N
+            g.is_terminal = True
+            child.children[ga] = g
+    return root
+
+
+class TestStrangeTraversalRootExemption(unittest.TestCase):
+    """A strange simulation must not alter the ROOT's child choice.
+
+    `root.children[a].N` is the KL policy target (`get_n_distribution`) and
+    the played action (`_best_action`); inverse-N sampling at the root would
+    smear ~strange_p of the visit mass over legal actions. Exploration still
+    happens below the root.
+    """
+
+    def test_root_child_is_puct_selected_under_strange(self):
+        """strange=True: depth-0 always takes the PUCT winner (action 0)."""
+        random.seed(20260813)
+        mcts = _make_mcts(c_puct=0.1, strange_p=1.0)
+        root = _make_two_level_hero_tree()
+
+        for _ in range(500):
+            path, gs = mcts._select_to_leaf(root, root_gs=None, strange=True)
+            self.assertIsNone(gs)              # terminal leaf → no replay
+            self.assertEqual(len(path), 3)
+            self.assertIs(path[0], root)
+            self.assertIs(path[1], root.children[0],
+                          "root child must be PUCT-selected on a strange sim")
+
+    def test_below_root_still_uses_inverse_n(self):
+        """strange=True: depth-1 prefers the least-visited grandchild."""
+        random.seed(20260813)
+        mcts = _make_mcts(c_puct=0.1, strange_p=1.0)
+        root = _make_two_level_hero_tree()
+        puct_child = root.children[0]          # N=90 → grandchildren N=89 / 1
+
+        counts = {0: 0, 1: 0}
+        for _ in range(500):
+            path, _gs = mcts._select_to_leaf(root, root_gs=None, strange=True)
+            counts[path[2].action_idx] += 1
+
+        # Grandchild 1 (N=1) must dominate grandchild 0 (N=89) under 1/(N+1),
+        # while plain PUCT would pick grandchild 0 (higher Q) every time.
+        self.assertGreater(counts[1], counts[0] * 5)
+        self.assertEqual(
+            mcts._select_child(puct_child, strange=False), 0,
+            "control: PUCT alone would always take grandchild 0")
+
+    def test_non_strange_traversal_is_unchanged(self):
+        """strange=False: pure PUCT at every level (deterministic path)."""
+        mcts = _make_mcts(c_puct=0.1, strange_p=0.0)
+        root = _make_two_level_hero_tree()
+
+        path, gs = mcts._select_to_leaf(root, root_gs=None, strange=False)
+        self.assertIsNone(gs)
+        self.assertIs(path[1], root.children[0])
+        self.assertIs(path[2], root.children[0].children[0])
+
     def test_strange_opp_node_uses_prior_sampling_unchanged(self):
         """At opp nodes, strange=True still uses prior-based sampling."""
         mcts = _make_mcts(strange_p=1.0)

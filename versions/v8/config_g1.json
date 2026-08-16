@@ -1,0 +1,86 @@
+{
+  "name": "g1",
+  "seed": 7,
+  "device": "auto",
+  "out_dir": "../../data/v8",
+
+  "game": {
+    "n_actions": 14,
+    "max_players": 9,
+    "big_blind": 10,
+    "small_blind": 5,
+    "players_range": [2, 9],
+    "stack_bb_range": [10, 300],
+    "raise_sizes": {
+      "preflop": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0],
+      "flop":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+      "turn":    [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0],
+      "river":   [0.1, 0.25, 0.33, 0.4, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0]
+    }
+  },
+
+  "style": {
+    "uncond_scale": 1.0,
+    "position_scale": 0.5,
+    "street_scale": 0.5,
+    "log_temperature_range": [-0.7, 0.7],
+    "uniform_mix_range": [0.0, 0.25]
+  },
+
+  "bootstrap": [
+    {"kind": "degenerate", "strategy": "always_fold",     "style": "identity"},
+    {"kind": "degenerate", "strategy": "always_call",     "style": "identity"},
+    {"kind": "degenerate", "strategy": "always_min_raise", "style": "identity"},
+    {"kind": "degenerate", "strategy": "maniac",          "style": "identity"},
+    {"kind": "degenerate", "strategy": "nit",             "style": "identity"},
+    {"kind": "degenerate", "strategy": "always_call",     "n_variants": 6, "label": "call_styles"},
+    {"kind": "degenerate", "strategy": "maniac",          "n_variants": 6, "label": "maniac_styles"},
+    {"kind": "degenerate", "strategy": "nit",             "n_variants": 6, "label": "nit_styles"},
+
+    {"kind": "v7",
+     "checkpoint": "../../data/v7/FILL_ME/best.pt",
+     "arch_config": "../../data/v7/FILL_ME/config.json",
+     "n_variants": 24,
+     "label": "v7"}
+  ],
+
+  "corpus": {
+    "train_sessions": 3000,
+    "train_hands_per_session": 32,
+    "eval_sessions": 150,
+    "eval_hands_per_session": 200,
+    "observed_hand_counts": [0, 1, 2, 5, 10, 25, 50, 100, 200],
+    "n_unseen_members": 24,
+    "driver_batch_size": 512
+  },
+
+  "embedding_net": {
+    "d_model": 384,
+    "d_emb": 32,
+    "n_heads": 8,
+    "n_kv_heads": 2,
+    "n_layers": 6,
+    "d_ff": 1536,
+    "d_card": 32,
+    "d_index": 32,
+    "max_decisions": 80,
+    "emb_init_std": 0.02,
+
+    "K": 50,
+    "fit_lr": 0.05,
+    "fit_reg": 0.01
+  },
+
+  "train": {
+    "steps": 20000,
+    "batch_hands": 128,
+    "lr": 0.0003,
+    "eta_min": 0.00001,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "amortised_weight": 1.0,
+    "showdown_strength_weight": 0.3,
+    "showdown_class_weight": 0.1,
+    "log_every": 250
+  }
+}

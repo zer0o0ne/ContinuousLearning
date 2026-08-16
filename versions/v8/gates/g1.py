@@ -49,9 +49,9 @@ from env.showdown import label_showdowns
 from nets.embedding_net import (
     OpponentEmbeddingNet, evaluate_ce, fit_embeddings,
 )
-from nets.features import collate, hand_tokens
+from nets.features import TOKEN_DECISION, TOKEN_SHOWDOWN, collate, hand_tokens
 from pool.build import build_pool, fresh_style_variants
-from utils import Logger, resolve_device
+from utils import Logger, progress, resolve_device
 
 STREETS = ("preflop", "flop", "turn", "river")
 
@@ -132,7 +132,7 @@ def play(driver, sessions, batch_size, log, tag):
     """Play every hand of every session in lock-step, then hand them back."""
     specs = [spec for s in sessions for spec in s.specs]
     log(f"[{tag}] playing {len(specs)} hands over {len(sessions)} sessions")
-    records = driver.run(specs, batch_size=batch_size)
+    records = driver.run(specs, batch_size=batch_size, desc=f"play:{tag}")
 
     cursor = 0
     n_decisions = 0
@@ -144,7 +144,7 @@ def play(driver, sessions, batch_size, log, tag):
         truncated += sum(1 for r in s.records if r.truncated)
     # §5.1a: the showdown labels are cards-only, so they are computed once here
     # over the whole set and never again inside a training or fitting loop.
-    n_reveals = label_showdowns(records)
+    n_reveals = label_showdowns(records, desc=f"showdown:{tag}")
     n_showdown_hands = sum(1 for r in records if r.showdown)
     log(f"[{tag}] {n_decisions} decisions, {n_reveals} reveals over "
         f"{n_showdown_hands} showdown hands, {truncated} hands hit the "
@@ -177,8 +177,10 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed):
     corpus = []
     for s in sessions:
         corpus.extend(t for t in s.tokens(max_players, n_actions) if len(t) > 0)
-    log(f"[train] corpus: {len(corpus)} hands, "
-        f"{sum(len(t) for t in corpus)} decision tokens")
+    n_decision = sum(int((t.token_type == TOKEN_DECISION).sum()) for t in corpus)
+    n_showdown = sum(int((t.token_type == TOKEN_SHOWDOWN).sum()) for t in corpus)
+    log(f"[train] corpus: {len(corpus)} hands, {n_decision} decision tokens, "
+        f"{n_showdown} showdown tokens")
 
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["lr"],
                             weight_decay=cfg.get("weight_decay", 0.0))
@@ -190,7 +192,7 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed):
 
     net.train()
     history = []
-    for step in range(1, cfg["steps"] + 1):
+    for step in progress(range(1, cfg["steps"] + 1), desc="train", unit="step"):
         pick = rng.choice(len(corpus), size=batch_hands, replace=False)
         batch = collate([corpus[i] for i in pick], device=device)
         total, parts = net.loss_terms(batch, weights)
@@ -239,11 +241,21 @@ def evaluate_sessions(net, sessions, cfg, game, device, log, tag):
     weights = loss_weights(cfg)
 
     rows = []
+    # One global bar over sessions × observation windows, not a bar per session
+    # (`CLAUDE.md` §5). A fit is the unit because it is the expensive step, and
+    # its cost varies by two orders of magnitude across the window lengths —
+    # which is exactly why the ETA has to average over everything done so far
+    # rather than over the last few fits.
+    bar = progress(total=len(sessions) * len(counts), desc=f"eval:{tag}",
+                   unit="fit")
     for s in sessions:
         tokens = s.tokens(max_players, n_actions)
         window = tokens[:max(counts)]
         tail = [t for t in tokens[max(counts):] if len(t) > 0]
         if not tail:
+            # Skipped sessions still advance the bar by the fits they would
+            # have contributed, so it reaches its total.
+            bar.update(len(counts))
             continue
         assert len(tail) >= 1
         eval_batch = collate(tail, device=device)
@@ -294,6 +306,8 @@ def evaluate_sessions(net, sessions, cfg, game, device, log, tag):
                     "ce_ablation": ce_abl,
                     "ce_fit": ce_fit,
                 })
+            bar.update(1)
+    bar.close()
     log(f"[eval:{tag}] {len(rows)} measurement rows over {len(sessions)} sessions")
     return rows
 

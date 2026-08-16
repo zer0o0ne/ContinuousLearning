@@ -131,21 +131,35 @@ def fresh_style_variants(members, descriptors, n, rng, style_cfg, tag):
     "Because styles are procedural, these cost nothing to generate and restrict
     nothing: this is not a held-out opponent pool, it is a fresh draw."
 
-    Bases are cycled in order so every base contributes, and the draws come from
-    the same `style` distribution the training pool was drawn from — the only
-    difference is that the embedding network never saw a hand played by these
-    settings.
+    **Cycling is over distinct bases, not over members.** A base that expanded
+    into many style variants occupies many consecutive slots in `members`, so
+    cycling over members would draw the first few bases over and over and reach
+    the later ones only if `n` exceeded the whole pool. In the first pilot that
+    silently produced an unseen set containing no v7 network at all — the one
+    base that conditions on cards — which made §14.2 a comparison between a
+    mixed set and an all-degenerate one rather than a test of style
+    generalisation. Cycling over bases guarantees every base contributes as soon
+    as `n` reaches the number of bases.
+
+    The draws come from the same `style` distribution the training pool was drawn
+    from; the only difference is that the embedding network never saw a hand
+    played by these settings.
     """
+    by_base = {}
+    for member, desc in zip(members, descriptors):
+        by_base.setdefault(desc["base"], (member, desc))
+    bases = list(by_base)
+
     out_members, out_descriptors = [], []
     for i in range(n):
-        src = members[i % len(members)]
+        src, desc = by_base[bases[i % len(bases)]]
         style = sample_style(rng, style_cfg)
-        name = f"{tag}{i}:{descriptors[i % len(descriptors)]['base']}"
+        name = f"{tag}{i}:{desc['base']}"
         out_members.append(src.with_style(name, style))
         out_descriptors.append({
             "name": name,
-            "kind": descriptors[i % len(descriptors)]["kind"],
-            "base": descriptors[i % len(descriptors)]["base"],
+            "kind": desc["kind"],
+            "base": desc["base"],
             "style": style.to_list(),
         })
     return out_members, out_descriptors

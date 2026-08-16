@@ -34,6 +34,7 @@ import numpy as np
 import torch
 
 from gto_utils.gpu_solver import evaluate_hands
+from utils import progress
 
 N_HAND_CLASSES = 169
 
@@ -114,14 +115,19 @@ def strength_percentiles(board, holes, device="cpu"):
     return out
 
 
-def label_showdowns(records, device="cpu"):
+def label_showdowns(records, device="cpu", desc=None):
     """Fill `record.showdown_strength` / `record.showdown_class` in place.
 
     Called once over a corpus, outside any inner loop: the labels depend only on
     the cards, so they never have to be recomputed.
+
+    `desc` labels the progress bar (`CLAUDE.md` §5); omitting it runs silently.
+    The unit is the hand, not the reveal, so the bar reaches its total even
+    though most hands carry no label.
     """
     labelled = 0
-    for record in records:
+    for record in progress(records, desc=desc, unit="hand",
+                           disable=desc is None):
         if not record.showdown:
             continue
         holes = np.array([record.hole_cards(p) for p in record.showdown],

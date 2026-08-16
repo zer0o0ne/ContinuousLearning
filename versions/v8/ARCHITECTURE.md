@@ -49,7 +49,7 @@ versions/v8/
     events.py           the v7 event format
 
   attn_utils.py         causal+padding mask helper, inherited from v7
-  utils.py              Logger, get_amp_config, resolve_device
+  utils.py              Logger, get_amp_config, resolve_device, progress
   gto_utils/            hand evaluation, equity, CFR solvers v1–v5, from v7
   evaluation/
     slumbot_eval.py     from v7, verbatim — does not import yet (§5)
@@ -67,7 +67,7 @@ is not inheritance but vendoring: see §3.
 |---|---|---|
 | `env/table.py`, `judger.py`, `dealers.py` | `v7/env/` verbatim | `Table`, `Judger`, dealers. Game rules do not change with the agent architecture. Untouched by v8 — the driver wraps them from outside. |
 | `gto_utils/` | `v7/agent/gto_utils/` | Hand evaluation, equity, range utilities, CFR solvers v1–v5. Not on the G1 path at all; needed later by the oracle. Requires `eval7`. |
-| `utils.py` | `v7/utils.py` + `resolve_device` | `Logger`, `get_amp_config`, and the CUDA → MPS → CPU device resolution `CLAUDE.md` §3 requires. |
+| `utils.py` | `v7/utils.py` + `resolve_device`, `progress` | `Logger`, `get_amp_config`, the CUDA → MPS → CPU device resolution `CLAUDE.md` §3 requires, and the single `tqdm` wrapper §5 requires long loops to use. |
 | `attn_utils.py` | `v7/agent/attn_utils.py` verbatim | Causal + padding attention mask. Architecture-independent. |
 | `evaluation/slumbot_eval.py` | `v7/evaluation/slumbot_eval.py` verbatim | **Does not import yet** — see §5. |
 
@@ -203,6 +203,19 @@ output with no gradient fit, §5.4), and the fit (`K` gradient steps from that i
 
 Output is `data/v8/g1/<timestamp>/g1_report.json` plus the trained network, and a printed table
 covering all four §14 measurements. The run log goes to `data/v8/logs/<timestamp>.txt`.
+
+**Progress.** Every long loop carries a bar, as `CLAUDE.md` §5 requires: corpus generation
+(`play:<tag>`, per hand), showdown labelling (`showdown:<tag>`, per hand), training (`train`, per
+step) and evaluation (`eval:<tag>`, per fit). The evaluation one is the case the rule is written
+for — it is a **single global bar over sessions × observation windows**, not a bar per session,
+and a skipped session advances it by the fits it would have contributed so it still reaches its
+total. All of them go through `utils.progress`, which pins `smoothing=0` so the ETA is the
+average over every completed iteration rather than tqdm's default moving average; that matters
+most in the evaluation loop, where a fit over a 1-hand window and one over a 200-hand window
+differ in cost by two orders of magnitude.
+
+Bars are written to **stderr**, so they never enter the `Logger` file — which means a run under
+`nohup` should redirect stderr somewhere it can be watched, not to `/dev/null`.
 
 `config_g1_pilot.json` is the same experiment shrunk to a throughput probe: same pool shape and
 same model, 3 200 corpus hands instead of 96 000 and 500 training steps instead of 20 000. Its

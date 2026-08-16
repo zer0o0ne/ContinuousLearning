@@ -191,3 +191,52 @@ def test_a_single_session_reports_no_standard_error_rather_than_zero():
     point = aggregate(rows)["curves"]["seen"][1]
     assert point["ce_fit"]["n"] == 1
     assert math.isnan(point["ce_fit"]["se"])
+
+
+def test_the_unseen_set_draws_from_every_base_not_just_the_first_few():
+    """§14.2 compares fresh style draws against the trained ones, so the two
+    sets have to be built from the same bases.
+
+    `fresh_style_variants` used to cycle over *members*. A base that expanded
+    into many style variants occupies many consecutive member slots, so the
+    later bases were never reached — in the first pilot the unseen set ended up
+    with no network member at all, and §14.2 was comparing a mixed set against
+    an all-degenerate one.
+    """
+    from collections import Counter
+
+    import numpy as np
+
+    from pool.build import build_pool, fresh_style_variants
+
+    config = _config()
+    rng = np.random.default_rng(0)
+    members, descriptors = build_pool(config, rng)
+    bases = {d["base"] for d in descriptors}
+    assert len(bases) < len(members), "the fixture must have expanded bases"
+
+    _fresh, fresh_desc = fresh_style_variants(
+        members, descriptors, len(bases), rng, config["style"], tag="fresh")
+    drawn = Counter(d["base"] for d in fresh_desc)
+    assert set(drawn) == bases, (
+        f"bases missing from the unseen set: {sorted(bases - set(drawn))}")
+    assert set(drawn.values()) == {1}, "one draw per base when n == n_bases"
+
+
+def test_every_fresh_draw_is_a_new_style_on_a_shared_base():
+    import numpy as np
+
+    from pool.build import build_pool, fresh_style_variants
+
+    config = _config()
+    rng = np.random.default_rng(1)
+    members, descriptors = build_pool(config, rng)
+    fresh, fresh_desc = fresh_style_variants(
+        members, descriptors, 12, rng, config["style"], tag="fresh")
+
+    trained_styles = {tuple(d["style"]) for d in descriptors}
+    for d in fresh_desc:
+        assert tuple(d["style"]) not in trained_styles, (
+            "a fresh draw reproduced a style the network was trained on")
+    assert len({tuple(d["style"]) for d in fresh_desc}) == len(fresh)
+    assert len(fresh) == 12

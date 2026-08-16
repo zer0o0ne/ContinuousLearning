@@ -48,6 +48,7 @@ import torch
 from env.table import Table
 from env.legal import legal_action_mask
 from env.showdown import showdown_positions
+from utils import progress
 
 
 @dataclass
@@ -168,11 +169,16 @@ class LockstepDriver:
         self.pool = pool
         self.n_actions = n_actions
 
-    def run(self, specs, batch_size=None):
+    def run(self, specs, batch_size=None, desc=None):
         """Play every spec. Returns `HandRecord`s in spec order.
 
         `batch_size` caps how many hands are in flight at once; `1` is the
         sequential path. The result must not depend on it.
+
+        `desc` labels the progress bar (`CLAUDE.md` §5). The unit is the
+        completed hand — the internal loop is over lock-step rounds, which is
+        not a quantity anybody wants an ETA in. Omitting `desc` runs silently,
+        which is what the tests want.
         """
         if batch_size is None:
             batch_size = len(specs)
@@ -182,6 +188,8 @@ class LockstepDriver:
         pending_specs = list(enumerate(specs))
         cursor = 0
         live = []
+        bar = progress(total=len(specs), desc=desc, unit="hand",
+                       disable=desc is None)
 
         while cursor < len(pending_specs) or live:
             while len(live) < batch_size and cursor < len(pending_specs):
@@ -198,6 +206,7 @@ class LockstepDriver:
             finished = [s for s in live if s["done"]]
             for state in finished:
                 records[state["idx"]] = self._finish(state)
+            bar.update(len(finished))
             live = [s for s in live if not s["done"]]
 
             if not queries:
@@ -218,6 +227,7 @@ class LockstepDriver:
                 for row, (state, ctx) in enumerate(group):
                     self._apply(state, ctx, probs[row], member_idx)
 
+        bar.close()
         return records
 
     # ---------------------------------------------------------------- internals

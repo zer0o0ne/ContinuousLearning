@@ -263,6 +263,39 @@ fallbacks, or "while I was there" improvements. If something extra seems necessa
 and ask — especially in search, training, and numerical code, where an unrequested addition
 can silently change results.
 
+### Long loops report progress — mandatory
+
+**Every loop that can run for more than about a minute carries a `tqdm` bar.** No exceptions:
+corpus generation, training steps, evaluation sweeps, labelling passes, rollouts. Runs happen on
+a remote box, usually under `nohup`, and a loop with no bar is indistinguishable from a hung one —
+the only way to tell is to kill it, which is exactly the wrong experiment to run on hardware that
+is being paid for by the hour.
+
+Three requirements, and each of them is the reason a bar is worth having at all:
+
+1. **One global bar, never nested bars.** When a loop has sub-iterations, the bar's `total` is
+   the total number of units of work across the whole job and it advances once per unit. A bar
+   that resets on every outer iteration answers "how far into this one item am I", which is
+   never the question; the question is "when does the job finish". If an outer item is skipped,
+   advance the bar by the units it would have contributed, so the bar still reaches its total.
+
+2. **The ETA averages over every completed iteration** — `smoothing=0`. tqdm's default is an
+   exponential moving average weighted toward the last few iterations. When iteration cost
+   varies (a fit over a 1-hand window, then over a 200-hand one) that ETA swings by an order of
+   magnitude and is wrong nearly all the time. The overall average `n / elapsed` is the estimate
+   that actually converges.
+
+3. **The unit is the thing being counted** — hands, decisions, gradient steps, labels — and it is
+   named in `desc`, so a log from an unattended run says what was running.
+
+The bar goes to stderr, so it never contaminates the `Logger` file. It does not replace logging:
+phase boundaries, counts and losses are still logged as text, because a progress bar is not a
+record of what happened.
+
+Each version provides this as a single helper (`utils.progress` in v8) that fixes the settings in
+one place. Call sites pass `total`, `desc` and `unit` — they do not construct `tqdm` directly,
+because the defaults are the part that is easy to get wrong.
+
 ---
 
 ## 6. Working method: critical thinking and literature

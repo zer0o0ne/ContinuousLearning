@@ -1,7 +1,35 @@
 import os
+import sys
 from datetime import datetime
 
 import torch
+from tqdm import tqdm
+
+
+def progress(iterable=None, *, total=None, desc=None, unit="it", disable=False):
+    """A `tqdm` bar with the settings `CLAUDE.md` §5 requires of long loops.
+
+    Two of them are not tqdm's defaults and both matter:
+
+    * ``smoothing=0`` — tqdm's default ETA is an exponential moving average over
+      recent iterations, so a loop whose iterations vary in cost (a fit over a
+      1-hand window then a 200-hand one) shows an ETA that swings wildly and is
+      wrong most of the time. With 0 the rate is ``n / elapsed`` — the average
+      over **every** completed iteration, which is the only estimate that
+      converges.
+    * ``mininterval=1.0`` — runs happen under `nohup` on the execution box with
+      stderr redirected to a file, and tqdm's 0.1 s default would write tens of
+      thousands of lines into it.
+
+    The bar goes to stderr so it never lands in the `Logger` file.
+
+    Nesting is deliberately not supported: when a loop has sub-iterations, the
+    caller passes the **total number of units** and advances once per unit, so
+    there is one bar covering the whole job (`CLAUDE.md` §5).
+    """
+    return tqdm(iterable, total=total, desc=desc, unit=unit,
+                smoothing=0.0, mininterval=1.0, file=sys.stderr,
+                disable=disable)
 
 
 def get_amp_config(device):

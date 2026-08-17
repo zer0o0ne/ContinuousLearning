@@ -329,6 +329,33 @@ def fit_embeddings(net, batch, n_slots, steps, lr, reg, init=None,
 
 
 @torch.no_grad()
+def evaluate_ce_by_member(net, batch, emb, members):
+    """Mean action-prediction CE in nats for each of `members`, in one forward.
+
+    `evaluate_ce` runs the trunk once per member it is asked about. Scoring
+    every seat of a 9-handed table under every measured condition then costs
+    nine identical passes over the same batch, and the evaluation loop is where
+    G1 spends most of its time. The per-token losses do not depend on which
+    member is being scored, so one forward answers for all of them and only the
+    masked average is repeated.
+
+    Returns ``{member: (ce, n_tokens)}``; a member with no scored token gets
+    ``(nan, 0)``, exactly as `evaluate_ce` does.
+    """
+    per_token = net.action_ce(net(batch, emb), batch, per_token=True)
+    mask = batch["decision_mask"]
+    out = {}
+    for m in members:
+        weight = mask * (batch["member"] == m).to(mask.dtype)
+        total = weight.sum()
+        if float(total) == 0.0:
+            out[m] = (float("nan"), 0)
+        else:
+            out[m] = (float((per_token * weight).sum() / total), int(total))
+    return out
+
+
+@torch.no_grad()
 def evaluate_ce(net, batch, emb, member_filter=None):
     """Mean action-prediction CE in nats, optionally over one player's tokens.
 

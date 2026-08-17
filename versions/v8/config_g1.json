@@ -37,11 +37,55 @@
     {"kind": "degenerate", "strategy": "maniac",          "n_variants": 6, "label": "maniac_styles"},
     {"kind": "degenerate", "strategy": "nit",             "n_variants": 6, "label": "nit_styles"},
 
-    {"kind": "v7",
-     "checkpoint": "../../data/v7/FILL_ME/best.pt",
-     "arch_config": "../../data/v7/FILL_ME/config.json",
-     "n_variants": 24,
-     "label": "v7"}
+    {
+      "kind": "v7",
+      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/gto_predict/2026_08_06_19_10_02/best.pt",
+      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+      "n_variants": 8,
+      "label": "v7_pure"
+    },
+    {
+      "kind": "v7",
+      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/lag_bluffer/gto_predict/2026_08_07_04_04_21/best.pt",
+      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+      "n_variants": 8,
+      "label": "v7_bluff"
+    },
+    {
+      "kind": "v7",
+      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/value_heavy/gto_predict/2026_08_07_21_58_41/best.pt",
+      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+      "n_variants": 8,
+      "label": "v7_value"
+    },
+    {
+      "kind": "v7",
+      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_14_11_40_25/cycles/cycle_0010.pt",
+      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+      "n_variants": 8,
+      "label": "v7_pure_mcts_10"
+    },
+    {
+      "kind": "v7",
+      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/lag_bluffer/mcts_predict/2026_08_14_11_40_26/cycles/cycle_0020.pt",
+      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+      "n_variants": 8,
+      "label": "v7_bluff_mcts_20"
+    },
+    {
+      "kind": "v7",
+      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/value_heavy/mcts_predict/2026_08_14_11_40_28/cycles/cycle_0030.pt",
+      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+      "n_variants": 8,
+      "label": "v7_value_mcts_30"
+    },
+    {
+      "kind": "v7",
+      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_14_11_40_25/cycles/cycle_0050.pt",
+      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+      "n_variants": 8,
+      "label": "v7_pure_mcts_50"
+    }
   ],
 
   "corpus": {
@@ -51,7 +95,20 @@
     "eval_hands_per_session": 200,
     "observed_hand_counts": [0, 1, 2, 5, 10, 25, 50, 100, 200],
     "n_unseen_members": 24,
-    "driver_batch_size": 512
+    "driver_batch_size": 512,
+
+    "holdout_bases": ["v7_bluff", "v7_bluff_mcts_20", "nit", "nit_styles"],
+    "save_eval_corpus": true
+  },
+
+  "eval_conditions": {
+    "oracle_embedding": true,
+    "zero_init_fit": true,
+    "no_showdown_fit": true,
+    "fit_steps_sweep": [10, 200],
+    "condition_windows": [1, 10, 200],
+    "showdown_holdout": true,
+    "save_fitted_vectors": true
   },
 
   "embedding_net": {

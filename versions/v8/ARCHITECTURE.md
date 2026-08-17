@@ -43,6 +43,7 @@ versions/v8/
     embedding_net.py    entity 4 — the opponent-embedding network (§5)
   gates/
     g1.py               the G1 experiment (§14)                         NEW
+    g1_analysis.py      section A — regrouping a finished g1_report.json NEW
   vendor/v7/            frozen snapshot of v7's agent code (§4.3)       NEW
     attn_utils.py, perception/*, action/*, modifiers.py   copied verbatim
     agent.py            perception + action-head subset of v7's ASI
@@ -223,6 +224,77 @@ numbers are not results — it exists because every cost figure for the real run
 until it has been run on the Spark (`CLAUDE.md` §3), and this is the cheapest way to replace them
 with measurements.
 
+**Three evaluation sets.** `seen` are members the network trained on; `unseen` are fresh style
+draws over the same bases (measurement 2); `heldout` are members of bases named in
+`corpus.holdout_bases`, which no training session seats at all. The three are a ladder of
+distance from the training distribution, and only the third asks the question B1(b) is actually
+about: measurement 2 re-draws 32 style scalars over a base the network knows, which is
+interpolation inside one parametric family, and Slumbot is not a point in that family.
+`split_bases` refuses a partition whose either half cannot seat a 9-handed table — narrowing the
+table-size range to make a holdout fit is not an option (`CLAUDE.md` §1) — and refuses a base
+name that is not in the pool. The fresh draws are taken off trainable bases only, so §14.2 and
+the holdout do not confound each other. Held-out members still occupy rows of the embedding
+table; those rows never receive a gradient, which is what makes the `oracle` condition below a
+leak check on that set.
+
+**`eval_conditions`.** Measurements that ride along on the same evaluation sessions. Each is a
+question the baseline report cannot answer, and each is a switch because each costs another fit:
+
+| switch | what it answers |
+|---|---|
+| `oracle_embedding` | the trained table row as the fit's **ceiling** — separates "the fit is weak" from "the trunk cannot do better". On a set whose members were never trained it must read ≈ `e = 0`, which makes it a leak check |
+| `fit_steps_sweep` | `K`, `fit_lr` and `fit_reg` have never been measured, and §14.1 shows the fit *losing* to the ablation on a one-hand window — the regime hero is in when it sits down |
+| `zero_init_fit` | the reverse of §14.3: if fitting from zero ties fitting from the amortised head, the head comes out and takes the second trunk pass of `loss_terms` with it |
+| `no_showdown_fit` | whether the §5.1a terms help or hurt the *inference* fit. They are a third the size of the action term in that objective, and their heads may have memorised boards |
+| `showdown_holdout` | those heads scored on hands never trained on. A hand's final board is five specific cards and so very nearly a unique key; a training loss far below a held-out loss near `ln 169` means the head answered from the key |
+| `save_fitted_vectors` | the vectors themselves, to `fitted_vectors.npz`. With the descriptors' true 32-scalar styles they are what a style-decoding probe reads — the direct form of "does the vector carry style or identity" that CE curves cannot give |
+| `condition_windows` | **the cost lever.** Outside it only the §5.5 baseline fit runs |
+
+Cost is linear in window length and in gradient steps, so it concentrates hard: with
+`observed_hand_counts` summing to 393 hands, the `n = 200` window alone is 51 % of all fitting,
+and any condition measured there roughly doubles the evaluation. The delivered `config_g1.json`
+(`condition_windows` = 1, 10, 200; sweep 10 and 200) costs **4.3×** the baseline evaluation per
+session and **6.5×** once the third set is counted. `evaluate_sessions` logs the projected fits
+and hand-steps per session before it starts, so the bill is visible before it is paid.
+
+`corpus.save_eval_corpus` writes the tokenised evaluation sessions to `eval_corpus.pkl`
+(≈ 2.6 KB per hand, so ≈ 0.5 GB at the delivered scale). Everything measured after training is a
+function of those tokens and the checkpoint, so with them a changed switch costs an evaluation
+rather than a full replay — and replay is only *probably* exact, since pool members are sampled
+through GPU forwards whose bitwise reproducibility nobody has promised.
+
+`report["timings"]` carries wall clock per phase. G3 wants those numbers and the gate is where
+they are free.
+
+### 2.6 `gates/g1_analysis.py` — section A, reading the report back
+
+`g1.py` writes every measurement row it took into `g1_report.json`, and three questions its
+printed tables leave open need no further compute — only a different grouping of those rows.
+This module is that grouping, and it runs from the JSON alone: no checkpoint, no pool, not one
+replayed hand.
+
+* **A1 — is §14.2's gap composition?** The seen set draws *members*, the unseen set is
+  `fresh_style_variants` cycling over *bases*, so a pool whose network bases carry eight style
+  variants each and whose degenerate bases carry one to six is mostly networks in one set and
+  mostly degenerates in the other. `gain_fit` is broken out per base, and the gap is recomputed
+  with the seen set's base mix.
+* **A2 — style, or degenerate-vs-network?** The same curve split by base kind. `CONCEPT.md` §11.3
+  is the risk that the pool spans fewer styles than members; the network bases are the only ones
+  that condition on cards, so their curve is the one that answers it.
+* **A3 — is §14.4's table-size skew a skew or a data budget?** The printed breakdown fixes the
+  number of observed *hands*, which is a different number of observed tokens per opponent at every
+  table size. The same rows re-plotted against tokens per player separate the two.
+
+A2 and A3 report gain on two scales, absolute and as a fraction of each row's own `e = 0` loss,
+because the groups being compared differ in headroom as well as in what is being asked about —
+a 9-handed table starts near 1.9 nats where a heads-up one starts near 2.9, and on the absolute
+scale that difference alone looks like a finding.
+
+Two helpers (`_curve_over`, `_relative`) re-key rows so that `g1._curve` — the single
+implementation of §14's aggregation rule, average a session's rows then take the standard error
+over sessions — can be reused for a different x-axis and a derived metric. There is deliberately
+no second aggregator here.
+
 ---
 
 ## 3. `vendor/v7/` — the frozen v7 snapshot
@@ -367,6 +439,8 @@ All data lives outside `versions/` under `data/v8/…` (gitignored). v8 never wr
 
 ```bash
 cd versions/v8 && python3 -m gates.g1 --config config_g1.json   # gate G1 (§14)
+cd versions/v8 && python3 -m gates.g1_analysis \
+    --report ../../data/v8/g1/<run>/g1_report.json              # G1 section A
 
 ./run.sh      --version=v8   # → python3 pipeline.py       (does not exist yet)
 ./evaluate.sh --version=v8   # → python3 eval_pipeline.py  (does not exist yet)

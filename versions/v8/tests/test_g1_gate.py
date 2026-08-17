@@ -10,11 +10,15 @@ they are supposed to have.
 
 import json
 import math
+import pickle
 
 import numpy as np
 import pytest
 
-from gates.g1 import Session, aggregate, build_sessions, run
+from gates.g1 import (
+    Session, _decisions_by_slot, aggregate, build_sessions, fit_variants,
+    metrics_of, run, split_bases,
+)
 from tests.g1_fixtures import RAISE_SIZES
 
 GAME = {
@@ -240,3 +244,269 @@ def test_every_fresh_draw_is_a_new_style_on_a_shared_base():
             "a fresh draw reproduced a style the network was trained on")
     assert len({tuple(d["style"]) for d in fresh_desc}) == len(fresh)
     assert len(fresh) == 12
+
+
+# ---------------------------------------------------- C1: held-out base sets
+
+
+HOLDOUT = ["nit", "nit_styles"]
+
+
+def _c1_config():
+    """The §14 fixture plus a base partition and every extra condition on.
+
+    The bases are widened first: `split_bases` refuses a partition whose either
+    half cannot seat a 9-handed table, and `CLAUDE.md` §1 does not allow
+    narrowing the table-size range to get around that.
+    """
+    config = _config()
+    config["bootstrap"] = [
+        {"kind": "degenerate", "strategy": s, "style": "identity"}
+        for s in ("always_fold", "always_call", "always_min_raise", "maniac",
+                  "nit")
+    ] + [
+        {"kind": "degenerate", "strategy": "always_call", "n_variants": 6,
+         "label": "call_styles"},
+        {"kind": "degenerate", "strategy": "maniac", "n_variants": 6,
+         "label": "maniac_styles"},
+        {"kind": "degenerate", "strategy": "nit", "n_variants": 10,
+         "label": "nit_styles"},
+    ]
+    config["corpus"].update({"holdout_bases": list(HOLDOUT),
+                             "save_eval_corpus": True})
+    config["eval_conditions"] = {
+        "oracle_embedding": True, "zero_init_fit": True,
+        "no_showdown_fit": True, "fit_steps_sweep": [1, 8],
+        "showdown_holdout": True, "save_fitted_vectors": True,
+    }
+    config["train"].update({"showdown_strength_weight": 0.3,
+                            "showdown_class_weight": 0.1})
+    return config
+
+
+@pytest.fixture(scope="module")
+def c1_run(tmp_path_factory):
+    """One toy run with C1 and every B condition on, shared by the tests below.
+
+    Toy scale, so no number here means anything — what is pinned is that the
+    partition holds, that every switched-on condition reaches the report, and
+    that the side files are written.
+    """
+    out = tmp_path_factory.mktemp("c1")
+    report = run(_c1_config(), lambda _m: None, str(out))
+    payload = json.loads((out / "g1_report.json").read_text())
+    return report, payload, out
+
+
+def test_a_held_out_base_is_partitioned_out_of_the_trainable_members():
+    from pool.build import build_pool
+
+    config = _c1_config()
+    members, descriptors = build_pool(config, np.random.default_rng(0))
+    train_ids, holdout_ids = split_bases(descriptors, HOLDOUT, 9,
+                                         lambda _m: None)
+
+    assert set(train_ids) & set(holdout_ids) == set()
+    assert sorted(train_ids + holdout_ids) == list(range(len(members)))
+    assert {descriptors[i]["base"] for i in holdout_ids} == set(HOLDOUT)
+    assert not {descriptors[i]["base"] for i in train_ids} & set(HOLDOUT)
+
+
+def test_a_partition_that_cannot_seat_a_full_table_is_refused_loudly():
+    from pool.build import build_pool
+
+    config = _c1_config()
+    _members, descriptors = build_pool(config, np.random.default_rng(0))
+    # Everything but the five identity degenerates: five members cannot seat a
+    # 9-handed session, and narrowing the table range is not an option.
+    everything = ["call_styles", "maniac_styles", "nit_styles"]
+    with pytest.raises(AssertionError, match="distinct ones"):
+        split_bases(descriptors, everything, 9, lambda _m: None)
+
+
+def test_a_holdout_base_that_is_not_a_base_is_refused_loudly():
+    from pool.build import build_pool
+
+    _members, descriptors = build_pool(_c1_config(), np.random.default_rng(0))
+    with pytest.raises(AssertionError, match="not bases of this pool"):
+        split_bases(descriptors, ["v7_typo"], 9, lambda _m: None)
+
+
+def test_the_held_out_set_is_scored_and_is_made_only_of_held_out_members(c1_run):
+    report, payload, _out = c1_run
+    assert set(report["curves"]) == {"seen", "unseen", "heldout"}
+    assert payload["holdout_bases"] == HOLDOUT
+
+    desc = payload["pool"] + payload["fresh_style_draws"]
+    by_set = {}
+    for row in payload["rows"]:
+        by_set.setdefault(row["set"], set()).add(desc[row["member"]]["base"])
+    assert by_set["heldout"] <= set(HOLDOUT)
+    assert not by_set["seen"] & set(HOLDOUT)
+    assert not by_set["unseen"] & set(HOLDOUT), (
+        "a fresh style draw was taken off a held-out base, which confounds "
+        "§14.2 with C1")
+
+
+def test_every_other_set_is_compared_against_seen(c1_run):
+    report, _payload, _out = c1_run
+    gaps = report["style_generalisation_gap"]
+    assert set(gaps) == {"unseen", "heldout"}
+    for gap in gaps.values():
+        for point in gap.values():
+            assert {"ce_fit", "gain_fit"} <= set(point)
+
+
+# -------------------------------------------------- B: the extra conditions
+
+
+def test_the_metric_list_follows_the_rows_not_a_constant():
+    rows = [{"set": "seen", "session": 0, "num_players": 2, "stack_bb": 100,
+             "observed_hands": 1, "ce_zero": 2.0, "ce_ablation": 1.8,
+             "ce_fit": 1.5, "ce_oracle": 1.0}]
+    assert metrics_of(rows) == (
+        "ce_zero", "ce_ablation", "ce_fit", "ce_oracle",
+        "gain_ablation", "gain_fit", "gain_oracle")
+    point = aggregate(rows)["curves"]["seen"][1]
+    assert point["gain_oracle"]["mean"] == pytest.approx(1.0)
+    assert point["gain_fit"]["mean"] == pytest.approx(0.5)
+
+
+def test_the_named_fit_variants_follow_the_switches():
+    assert fit_variants({"K": 50}) == ["fit"]
+    cfg = {"K": 50, "eval_conditions": {
+        "fit_steps_sweep": [10, 50, 200], "zero_init_fit": True,
+        "no_showdown_fit": True}}
+    # 50 is the baseline `K` and is already measured as `fit`; it must not be
+    # measured a second time under another name.
+    assert fit_variants(cfg) == ["fit", "fit_k10", "fit_k200",
+                                 "fit_zero_init", "fit_no_showdown"]
+
+
+def test_every_switched_on_condition_reaches_the_report(c1_run):
+    report, payload, _out = c1_run
+    expected = {"ce_zero", "ce_ablation", "ce_fit", "ce_fit_k1", "ce_fit_k8",
+                "ce_fit_zero_init", "ce_fit_no_showdown", "ce_oracle"}
+    assert expected <= set(payload["rows"][0])
+    assert expected <= set(report["metrics"])
+    for curve in report["curves"].values():
+        for point in curve.values():
+            for metric in expected:
+                assert set(point[metric]) == {"n", "mean", "se"}
+
+
+def test_the_extra_conditions_are_confined_to_their_windows(tmp_path):
+    """Each extra condition is another fit at every window, and that is the
+    whole cost of the gate. Outside `condition_windows` only the §5.5 baseline
+    runs, and the report has to say "not measured" rather than quietly average
+    over the windows where it was."""
+    config = _c1_config()
+    config["corpus"]["save_eval_corpus"] = False
+    config["eval_conditions"]["condition_windows"] = [4]
+    report = run(config, lambda _m: None, str(tmp_path))
+    payload = json.loads((tmp_path / "g1_report.json").read_text())
+
+    for row in payload["rows"]:
+        assert ("ce_fit_k8" in row) == (row["observed_hands"] == 4)
+        assert "ce_fit" in row, "the baseline fit runs at every window"
+        assert "ce_oracle" in row, "the oracle is free of the window"
+
+    curve = report["curves"]["seen"]
+    assert curve[2]["gain_fit_k8"]["n"] == 0
+    assert curve[2]["gain_fit"]["n"] > 0
+    assert curve[4]["gain_fit_k8"]["n"] > 0
+
+
+def test_the_oracle_condition_does_not_move_with_the_observation_window(c1_run):
+    """It is the trained table row, which no amount of observation changes. If
+    it ever varied with `n`, the fit would be leaking into it."""
+    report, _payload, _out = c1_run
+    for curve in report["curves"].values():
+        means = {round(point["ce_oracle"]["mean"], 10) for point in
+                 curve.values()}
+        assert len(means) == 1
+
+
+def test_the_cold_start_leaves_every_fitted_condition_at_the_baseline(c1_run):
+    """§5.5: with no history there is no vector, so every fit — whatever its
+    step count or its initialisation — must be exactly `e = 0`."""
+    report, _payload, _out = c1_run
+    for curve in report["curves"].values():
+        point = curve[0]
+        for metric in ("ce_ablation", "ce_fit", "ce_fit_k1", "ce_fit_k8",
+                       "ce_fit_zero_init", "ce_fit_no_showdown"):
+            assert point[metric]["mean"] == pytest.approx(
+                point["ce_zero"]["mean"])
+
+
+def test_the_per_slot_observation_budget_counts_only_that_slots_decisions():
+    """§14.4's table-size breakdown is confounded by how much of each opponent
+    the fit saw, and the table-wide count cannot say."""
+    from nets.features import TOKEN_DECISION, TOKEN_SHOWDOWN
+
+    class _Tokens:
+        def __init__(self, slots, kinds):
+            self.slot = np.array(slots, dtype=np.int64)
+            self.token_type = np.array(kinds, dtype=np.int64)
+
+    observed = [
+        _Tokens([0, 1, 1, 2], [TOKEN_DECISION] * 4),
+        _Tokens([1, 2, 2], [TOKEN_DECISION, TOKEN_DECISION, TOKEN_SHOWDOWN]),
+    ]
+    assert _decisions_by_slot(observed, 3) == [1, 3, 2]
+    assert _decisions_by_slot([], 3) == [0, 0, 0]
+
+
+def test_the_showdown_heads_are_scored_on_held_out_hands(c1_run):
+    """The training curve is printed on the corpus being fitted, where a final
+    board is very nearly a unique key; the held-out number is what says whether
+    the head found a signal or a lookup."""
+    report, _payload, _out = c1_run
+    holdout = report["showdown_holdout"]
+    assert set(holdout) == {"seen", "unseen", "heldout"}
+    for v in holdout.values():
+        assert v["n_tokens"] > 0 and v["sessions"] > 0
+        assert v["showdown_class_ce"] > 0.0
+        assert v["showdown_strength_mse"] >= 0.0
+
+
+def test_the_fitted_vectors_are_written_for_every_seat(c1_run):
+    """Hero included: hero's vector is the control for "does a fitted vector
+    say who this is", and the descriptors carry every member's true style."""
+    _report, payload, out = c1_run
+    saved = np.load(out / "fitted_vectors.npz")
+    assert saved["vector"].shape[1] == _c1_config()["embedding_net"]["d_emb"]
+    assert set(np.unique(saved["set"])) == {"seen", "unseen", "heldout"}
+    assert 0 in set(np.unique(saved["slot"])), "hero's vector is not saved"
+    assert set(np.unique(saved["observed_hands"])) == \
+        set(payload["config"]["corpus"]["observed_hand_counts"])
+
+
+def test_the_saved_eval_corpus_is_enough_to_re_evaluate_without_replay(c1_run):
+    """Everything measured after training is a function of these tokens and the
+    checkpoint, so a changed `eval_conditions` switch must not need the pool."""
+    _report, payload, out = c1_run
+    with open(out / "eval_corpus.pkl", "rb") as fh:
+        corpus = pickle.load(fh)
+
+    corpus_cfg = payload["config"]["corpus"]
+    n_hands = max(corpus_cfg["observed_hand_counts"]) + \
+        corpus_cfg["eval_hands_per_session"]
+    assert set(corpus) == {"seen", "unseen", "heldout"}
+    for tag, sessions in corpus.items():
+        assert len(sessions) == corpus_cfg["eval_sessions"]
+        for s in sessions:
+            assert len(s["tokens"]) == n_hands
+            assert len(s["members"]) == s["num_players"]
+            seen_members = {int(m) for t in s["tokens"] for m in t.member}
+            assert seen_members <= set(s["members"])
+
+
+def test_the_timings_cover_every_phase_of_the_run(c1_run):
+    """Every cost figure for the Spark is a hypothesis until it has been run
+    there (`CLAUDE.md` §3), and the run is where the measurement is free."""
+    report, _payload, _out = c1_run
+    assert set(report["timings"]) == {
+        "play:train", "play:eval", "train",
+        "eval:seen", "eval:unseen", "eval:heldout"}
+    assert all(v >= 0.0 for v in report["timings"].values())

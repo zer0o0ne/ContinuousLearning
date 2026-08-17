@@ -148,7 +148,30 @@
       32
     ],
     "n_unseen_members": 12,
-    "driver_batch_size": 512
+    "driver_batch_size": 512,
+    "holdout_bases": [
+      "maniac",
+      "maniac_styles",
+      "nit",
+      "nit_styles"
+    ],
+    "save_eval_corpus": true
+  },
+  "eval_conditions": {
+    "oracle_embedding": true,
+    "zero_init_fit": true,
+    "no_showdown_fit": true,
+    "fit_steps_sweep": [
+      10,
+      200
+    ],
+    "condition_windows": [
+      2,
+      8,
+      32
+    ],
+    "showdown_holdout": true,
+    "save_fitted_vectors": true
   },
   "embedding_net": {
     "d_model": 384,

@@ -17,7 +17,7 @@ determinism here is exact, not statistical.
 import torch
 
 from nets.embedding_net import (
-    OpponentEmbeddingNet, evaluate_ce, fit_embeddings,
+    OpponentEmbeddingNet, evaluate_ce, evaluate_ce_by_member, fit_embeddings,
 )
 from nets.features import collate, hand_tokens
 from tests.g1_fixtures import (
@@ -50,6 +50,29 @@ def _synthetic_case(n_hands=16, seed=0):
                                     torch.finfo(logits.dtype).min)
         batch["action"] = masked.argmax(dim=-1)
     return net, batch, true_vectors
+
+
+def test_scoring_every_member_at_once_gives_the_per_member_answer():
+    """`evaluate_ce_by_member` exists only to save forwards, so its numbers must
+    be the ones `evaluate_ce` gives one member at a time — bit for bit, since
+    both average the same per-token losses over the same mask.
+
+    The evaluation loop scores every seat under every condition, so getting this
+    wrong would be a silent scale error across the whole report rather than a
+    crash.
+    """
+    net, batch, true_vectors = _synthetic_case()
+    emb = net.slot_emb(batch, true_vectors)
+    members = sorted({int(m) for m in batch["member"].reshape(-1)})
+
+    batched = evaluate_ce_by_member(net, batch, emb, members)
+    for m in members:
+        one_at_a_time = evaluate_ce(net, batch, emb, member_filter=m)
+        assert batched[m] == one_at_a_time
+
+    # A member nobody at this table is gets the same "nothing scored" answer.
+    absent = max(members) + 1
+    assert evaluate_ce_by_member(net, batch, emb, [absent])[absent][1] == 0
 
 
 def test_the_joint_fit_reaches_the_loss_of_the_generating_vectors():

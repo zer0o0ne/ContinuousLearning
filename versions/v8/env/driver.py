@@ -38,6 +38,14 @@ vendored v7 checkpoint sees the event stream it was trained on:
 A hand that ends up with several players all-in is run out to the river with the
 engine's own no-op steps, so final credits are correct; those steps carry no
 decision and are not recorded.
+
+**Rollout plumbing.** A `HandSpec` may additionally pin the deck and force a
+prefix of the decisions (`HandSpec.deck`, `HandSpec.forced_actions`). Together
+they express "this hand, these cards, this prefix, then free play", which is
+what the BR oracle's rollouts are. A forced decision is recorded and stepped by
+exactly the same code as a sampled one — only the choice of the action index
+differs — and it costs no policy call, which is where the oracle's saving comes
+from.
 """
 
 from dataclasses import dataclass, field
@@ -62,6 +70,9 @@ class HandSpec:
     small_blind: float
     raise_sizes: list             # 4 lists (one per street) of raise fractions
     meta: dict = field(default_factory=dict)
+    # Rollout plumbing (PLAN_PIPELINE.md S1). Both are None for an ordinary hand.
+    deck: np.ndarray = None       # 52 ints; overrides the dealt deck
+    forced_actions: list = None   # action indices, consumed in decision order
 
 
 @dataclass
@@ -92,14 +103,19 @@ class DecisionContext:
     building one per decision per hand costs nothing.
     """
 
-    __slots__ = ("record", "snap_idx", "acting_pos", "legal_mask", "turn")
+    __slots__ = ("record", "snap_idx", "acting_pos", "legal_mask", "turn",
+                 "hole_override")
 
-    def __init__(self, record, snap_idx, acting_pos, legal_mask, turn):
+    def __init__(self, record, snap_idx, acting_pos, legal_mask, turn,
+                 hole_override=None):
         self.record = record
         self.snap_idx = snap_idx
         self.acting_pos = acting_pos
         self.legal_mask = legal_mask
         self.turn = turn
+        # PLAN_PIPELINE.md S2: the posterior asks a member "what would you have
+        # done holding *this*", which is the same situation with other cards.
+        self.hole_override = hole_override
 
     @property
     def snapshot(self):
@@ -136,7 +152,14 @@ class DecisionContext:
 
     @property
     def hole_cards(self):
-        """The **acting player's** own hole cards — never anybody else's."""
+        """The **acting player's** own hole cards — never anybody else's.
+
+        `hole_override` replaces them with a hypothetical holding; the rest of
+        the situation is untouched, so a member answers about the same decision
+        under different cards (§7.2).
+        """
+        if self.hole_override is not None:
+            return [int(c) for c in self.hole_override]
         return self.record.hole_cards(self.acting_pos)
 
     @property
@@ -212,8 +235,26 @@ class LockstepDriver:
             if not queries:
                 continue
 
-            by_member = {}
+            # A decision whose index is still inside `forced_actions` is played
+            # from the spec, not from a policy. Splitting here — before the
+            # grouping — is what keeps forced decisions out of every batch.
+            forced, free = [], []
             for state, ctx in queries:
+                fa = ctx.record.spec.forced_actions
+                k = len(ctx.record.decisions)
+                (forced if fa is not None and k < len(fa) else free).append(
+                    (state, ctx))
+            for state, ctx in forced:
+                fa = ctx.record.spec.forced_actions
+                self._apply(state, ctx, None,
+                            ctx.record.spec.seat_members[ctx.acting_pos],
+                            action_idx=fa[len(ctx.record.decisions)])
+
+            if not free:
+                continue
+
+            by_member = {}
+            for state, ctx in free:
                 by_member.setdefault(ctx.record.spec.seat_members[ctx.acting_pos],
                                      []).append((state, ctx))
 
@@ -244,6 +285,11 @@ class LockstepDriver:
         # lock-step and sequential runs deal the same cards (§15).
         np.random.seed(spec.seed % (2 ** 32))
         table.start_table()
+        if spec.deck is not None:
+            deck = np.asarray(spec.deck, dtype=table.deck.dtype)
+            assert sorted(deck.tolist()) == list(range(52)), (
+                "deck must be a permutation of 0..51")
+            table.deck = deck
 
         record = HandRecord(
             spec=spec,
@@ -289,23 +335,37 @@ class LockstepDriver:
         mask = legal_action_mask(table, self.n_actions)
         return DecisionContext(record, snap_idx, acting_pos, mask, int(table.turn))
 
-    def _apply(self, state, ctx, probs, member_idx):
+    def _apply(self, state, ctx, probs, member_idx, action_idx=None):
+        """Record one decision and step the table.
+
+        Two ways of choosing the action, one way of recording it: `action_idx`
+        given plays it verbatim (a forced prefix, no policy call, no draw from
+        the hand's generator), `action_idx=None` samples it from `probs`.
+        """
         table = state["table"]
         record = state["record"]
 
         legal = ctx.legal_mask
-        p = np.where(legal, probs, 0.0)
-        total = p.sum()
-        assert total > 0, (
-            f"pool member {member_idx} put zero mass on every legal action "
-            f"(legal={np.flatnonzero(legal).tolist()})")
-        p = p / total
+        if action_idx is None:
+            p = np.where(legal, probs, 0.0)
+            total = p.sum()
+            assert total > 0, (
+                f"pool member {member_idx} put zero mass on every legal action "
+                f"(legal={np.flatnonzero(legal).tolist()})")
+            p = p / total
 
-        # Inverse-CDF from this hand's own generator: independent of batching.
-        u = float(state["rng"].random())
-        action_idx = int(np.searchsorted(np.cumsum(p), u, side="right"))
-        action_idx = min(action_idx, self.n_actions - 1)
-        assert legal[action_idx], "sampled an illegal action"
+            # Inverse-CDF from this hand's own generator: independent of batching.
+            u = float(state["rng"].random())
+            action_idx = int(np.searchsorted(np.cumsum(p), u, side="right"))
+            action_idx = min(action_idx, self.n_actions - 1)
+            assert legal[action_idx], "sampled an illegal action"
+        else:
+            assert probs is None, "a forced action takes no policy distribution"
+            action_idx = int(action_idx)
+            assert 0 <= action_idx < self.n_actions and legal[action_idx], (
+                f"forced action {action_idx} is illegal for seat "
+                f"{ctx.acting_pos} at decision {len(record.decisions)} "
+                f"(legal={np.flatnonzero(legal).tolist()})")
 
         onehot = np.zeros(self.n_actions, dtype=np.float32)
         onehot[action_idx] = 1.0

@@ -573,6 +573,19 @@ iteration 0, where the agent does not exist yet and a v7 pool member sits in her
 that buys a competent state distribution instead of the random-walk coverage a fresh network
 would give, at the cost of one off-policy iteration.
 
+**Each iteration continues the last one** (owner decision 2026-08-18). The agent trained at
+iteration *k* is the network iteration *k−1* produced, not a fresh initialisation: the loop is
+policy iteration, and restarting from scratch each cycle would discard every best response
+already found. Only iteration 0 starts from random weights (§6.1).
+
+**Iteration 0 is the hardest cycle and is budgeted separately** (owner decision 2026-08-18). It
+is the only one that starts from a random network, the only one whose labels come from a hero
+seat the agent did not occupy, and the only one with no policy to inherit — so it needs the most
+gradient steps. That count is therefore its own config key rather than a multiplier on the
+per-cycle count: the later cycles are refinements of an existing policy against a slowly
+changing pool, and tying their length to the first one's would either waste the compute the
+first cycle needs or starve it.
+
 ### 8.1 Config sections
 
 Sketch only — names and defaults settle when the code is written. The point of listing them here
@@ -588,7 +601,7 @@ to be separable actually are.
 | `oracle` | samples per action, `max_combos`, variant (A / C), EV normalisation divisor, temperature `T` |
 | `pool_sampling` | PFSP exponent, uniform floor fraction, dedup cluster count |
 | `game` | `raise_sizes` per street, players range (2–9), stack range (10–300 BB) |
-| `agent_train` | optimiser, embedding-dropout probability, schedule |
+| `agent_train` | optimiser, embedding-dropout probability, schedule, and the gradient steps per cycle — with **iteration 0's count a key of its own** (`first_iteration_steps`, owner decision 2026-08-18), see §8 |
 | `evaluation` | Slumbot hands, cold/warm switch, frozen-pool-slice screen (§16, OI-7) |
 
 ---

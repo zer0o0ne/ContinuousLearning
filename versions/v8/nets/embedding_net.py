@@ -53,14 +53,9 @@ are finished, and their showdowns are public.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import (
-    Qwen3DecoderLayer, Qwen3RotaryEmbedding, Qwen3RMSNorm,
-)
 
-from attn_utils import build_causal_padding_mask
 from env.showdown import N_HAND_CLASSES
-from nets.tokeniser import SituationTokeniser
+from nets.trunk import HandEncoder
 
 
 def pool_by_key(hidden, key, mask, n_keys):
@@ -89,11 +84,6 @@ class OpponentEmbeddingNet(nn.Module):
         super().__init__()
         d_model = cfg["d_model"]
         d_emb = cfg["d_emb"]
-        n_heads = cfg["n_heads"]
-        n_kv_heads = cfg.get("n_kv_heads", max(1, n_heads // 2))
-        n_layers = cfg["n_layers"]
-        d_ff = cfg["d_ff"]
-        max_decisions = cfg.get("max_decisions", 64)
 
         self.d_model = d_model
         self.d_emb = d_emb
@@ -101,28 +91,8 @@ class OpponentEmbeddingNet(nn.Module):
         self.max_players = max_players
         self.n_members = n_members
 
-        self.tokeniser = SituationTokeniser(
-            d_model=d_model, d_emb=d_emb, n_actions=n_actions,
-            max_players=max_players,
-            d_card=cfg.get("d_card", 32), d_index=cfg.get("d_index", 32),
-            max_decisions=max_decisions,
-        )
-
-        qwen = Qwen3Config(
-            hidden_size=d_model,
-            num_attention_heads=n_heads,
-            num_key_value_heads=n_kv_heads,
-            head_dim=d_model // n_heads,
-            intermediate_size=d_ff,
-            num_hidden_layers=n_layers,
-            max_position_embeddings=max_decisions,
-        )
-        qwen._attn_implementation = "sdpa"
-        self.qwen_config = qwen
-        self.rope = Qwen3RotaryEmbedding(config=qwen)
-        self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(qwen, layer_idx=i) for i in range(n_layers)])
-        self.norm = Qwen3RMSNorm(d_model, eps=qwen.rms_norm_eps)
+        # §5.1/§5.2 trunk, shared as code with the agent (OI-4, `nets/trunk.py`).
+        self.encoder = HandEncoder(cfg, n_actions, max_players)
         self.action_out = nn.Linear(d_model, n_actions)
         # §5.1a — the two showdown heads. Read only on terminal tokens.
         self.showdown_strength_out = nn.Linear(d_model, 1)
@@ -157,18 +127,7 @@ class OpponentEmbeddingNet(nn.Module):
 
     def hidden(self, batch, emb):
         """(B, T, d_model) — one causal pass over each hand independently."""
-        x = self.tokeniser(batch, emb)
-        B, T, _ = x.shape
-        position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
-        position_embeddings = self.rope(x, position_ids)
-        attn_mask = build_causal_padding_mask(batch["mask"], T, x.dtype, x.device)
-
-        for layer in self.layers:
-            out = layer(x, position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                        attention_mask=attn_mask)
-            x = out[0] if isinstance(out, tuple) else out
-        return self.norm(x)
+        return self.encoder(batch, emb)
 
     def forward(self, batch, emb):
         """(B, T, n_actions) — the action predicted at each decision token."""
@@ -279,6 +238,20 @@ class OpponentEmbeddingNet(nn.Module):
             init = self.amortised(pooled)
             # Cold start (§5.5): a slot with no observed decision gets zero.
             return init * (counts > 0).unsqueeze(-1).to(init.dtype)
+
+
+def loss_weights(cfg):
+    """The §5.1a / §5.4 auxiliary-loss weights, from one place.
+
+    `showdown_strength` and `showdown_class` weight the two showdown heads and
+    are used **both** in training and in the inference-time fit — setting either
+    to 0 is the ablation that answers "does the showdown anchor earn its keep".
+    """
+    return {
+        "amortised": cfg.get("amortised_weight", 1.0),
+        "showdown_strength": cfg.get("showdown_strength_weight", 0.0),
+        "showdown_class": cfg.get("showdown_class_weight", 0.0),
+    }
 
 
 def fit_embeddings(net, batch, n_slots, steps, lr, reg, init=None,

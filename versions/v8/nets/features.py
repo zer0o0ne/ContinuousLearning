@@ -88,7 +88,8 @@ def _board_as_of(deck, turn):
     return [int(c) for c in deck[:5]]
 
 
-def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions):
+def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
+                pending=None):
     """Tokenise one `HandRecord` from `observer_pos`'s point of view.
 
     Args:
@@ -100,6 +101,11 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions):
             even as the button rotates.
         max_players: width of the per-seat stack vector.
         n_actions: size of the action set.
+        pending: a `DecisionContext` for a decision that has not been taken yet.
+            Appends one extra decision token with `action = -1` and `legal` from
+            the context — the moment the *agent* observes (§9), as opposed to
+            the completed hand the embedding network observes. A hand with a
+            pending decision has no showdown, and passing both is refused.
     """
     assert 0 <= observer_pos < record.num_players, (
         f"observer seat {observer_pos} is not at this {record.num_players}-handed "
@@ -115,7 +121,10 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions):
         assert record.showdown_strength and record.showdown_class, (
             "this hand reached showdown but carries no labels — call "
             "`env.showdown.label_showdowns` over the corpus first (§5.1a)")
-    T = n_dec + len(revealed)
+    assert pending is None or not revealed, (
+        "a hand with a pending decision has not reached showdown — passing "
+        "both means the caller has confused the two moments of §9")
+    T = n_dec + len(revealed) + (1 if pending is not None else 0)
 
     cards = np.full((T, 7), UNKNOWN_CARD, dtype=np.int64)
     decision_idx = np.arange(T, dtype=np.int64)
@@ -132,9 +141,10 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions):
     sd_strength = np.zeros(T, dtype=np.float32)
     sd_class = np.zeros(T, dtype=np.int64)
 
-    for t, dec in enumerate(decisions):
-        snap = record.snapshots[dec["snap_idx"]]
-        pos = int(dec["acting_pos"])
+    def _fill_decision(t, snap_idx, pos):
+        """The public part of a decision token — identical for a decision that
+        was taken and one that is pending."""
+        snap = record.snapshots[snap_idx]
         bets = np.asarray(snap["bets"], dtype=np.float64)
         credits = np.asarray(snap["credits"], dtype=np.float64)
 
@@ -151,8 +161,18 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions):
             prev_action[t, decisions[t - 1]["action_idx"]] = 1.0
         member[t] = record.spec.seat_members[pos]
         slot[t] = slot_of_seat[pos]
+
+    for t, dec in enumerate(decisions):
+        _fill_decision(t, dec["snap_idx"], int(dec["acting_pos"]))
         action[t] = dec["action_idx"]
         legal[t] = dec["legal_mask"]
+
+    # The moment before an action is chosen: same token, no action yet.
+    if pending is not None:
+        t = n_dec
+        _fill_decision(t, pending.snap_idx, int(pending.acting_pos))
+        action[t] = -1
+        legal[t] = pending.legal_mask
 
     # §5.1a — one terminal token per revealed player, after every decision.
     # The revealed cards are the target, so the hole-card slots stay masked;

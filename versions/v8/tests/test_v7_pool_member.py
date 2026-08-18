@@ -15,6 +15,7 @@ until it is run on the Spark.
 
 import numpy as np
 import pytest
+import torch
 
 from pool.v7_member import V7NetworkMember
 from tests.g1_fixtures import (
@@ -154,3 +155,60 @@ def test_a_missing_checkpoint_is_an_error_not_a_random_network():
     agent = V7Agent(V7_CONFIG, log=lambda _m: None)
     with pytest.raises(FileNotFoundError):
         agent.load_checkpoint("../../data/v7/definitely-not-here/best.pt")
+
+
+# ------------------------------------ D2: `hole_override` (CONCEPT.md §7.2)
+
+
+def test_a_v7_member_answers_the_override_not_the_real_hand():
+    """The posterior asks "what would you have done holding *this*". A member
+    that reads its cards out of the deck has to be handed the hypothetical
+    deck, or every combo gets the same answer and §7.2's posterior never
+    leaves the prior."""
+    from env.driver import DecisionContext
+    torch.manual_seed(0)
+    member = _member()
+    record = _one_record()
+    dec = record.decisions[0]
+    pos, snap_idx = int(dec["acting_pos"]), int(dec["snap_idx"])
+    turn = int(record.snapshots[snap_idx]["turn"])
+    real = record.hole_cards(pos)
+
+    def ask(hole):
+        ctx = DecisionContext(record, snap_idx, pos, dec["legal_mask"], turn,
+                              hole_override=hole)
+        return member.logits([ctx])[0]
+
+    plain = member.logits([DecisionContext(record, snap_idx, pos,
+                                           dec["legal_mask"], turn)])[0]
+    assert np.allclose(ask(real), plain), (
+        "an override naming the real cards must be the real answer")
+
+    aces, trash = ask([48, 49]), ask([0, 5])
+    assert not np.allclose(aces, trash), (
+        "the member gave the same answer for aces and for deuce-trey — the "
+        "override never reached it")
+    # The record is untouched: the swap lands in a copy of the deck.
+    assert record.hole_cards(pos) == real
+
+
+def test_the_posterior_leaves_the_prior_for_a_v7_opponent():
+    """End to end: a network opponent's posterior has to depend on what it did.
+    Before the override reached `build_v7_events` this test's weights were flat
+    to machine precision, and nothing else in the battery could see it."""
+    from oracle.posterior import opponent_posterior
+    torch.manual_seed(0)
+    pool = [_member()]
+    specs = make_specs(seed=45, n_hands=4, n_members=1, num_players=3)
+    for spec in specs:
+        spec.seat_members = [0] * spec.num_players
+    for record in play(pool, specs):
+        for t, dec in enumerate(record.decisions):
+            opp = int(dec["acting_pos"])
+            hero = (opp + 1) % record.num_players
+            _combos, w = opponent_posterior(record, opp, hero, pool, N_ACTIONS,
+                                            through_decision=t)
+            assert abs(float(w.sum()) - 1.0) < 1e-9
+            if float(w.max() - w.min()) > 1e-9:
+                return
+    raise AssertionError("no decision moved the posterior off the prior")

@@ -40,6 +40,29 @@ def test_lockstep_matches_sequential():
         assert len(a.snapshots) == len(b.snapshots) == len(c.snapshots)
 
 
+def test_lockstep_matches_sequential_with_a_pinned_deck_and_forced_prefix():
+    """The equivalence property still holds with the rollout fields on: a
+    forced decision is scheduled outside the per-member batching, so it is
+    exactly the place batching could start to matter."""
+    from tests.test_rollout_plumbing import rollout_spec
+
+    pool = make_pool()
+    played = play(pool, make_specs(seed=11, n_hands=40, n_members=len(pool)))
+    specs = [rollout_spec(r, n_forced=max(0, len(r.decisions) - 2))
+             for r in played]
+
+    full = play(pool, specs, batch_size=len(specs))
+    sequential = play(pool, specs, batch_size=1)
+    chunked = play(pool, specs, batch_size=7)
+
+    for a, b, c in zip(full, sequential, chunked):
+        assert _trajectory(a) == _trajectory(b) == _trajectory(c)
+        assert np.array_equal(a.deck, b.deck) and np.array_equal(a.deck, c.deck)
+        assert np.array_equal(a.rewards, b.rewards)
+        assert np.array_equal(a.rewards, c.rewards)
+        assert len(a.snapshots) == len(b.snapshots) == len(c.snapshots)
+
+
 def test_chips_are_conserved_over_every_hand():
     """Chips in = chips out. The engine guarantees it; the driver must not
     break it by mishandling the all-in runout."""

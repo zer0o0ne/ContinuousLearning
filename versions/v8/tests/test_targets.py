@@ -21,7 +21,9 @@ from tests.test_agent_net import _agent_at_seat_zero, _net
 from train.agent_train import (
     embedding_dropout, steps_for_iteration, token_embeddings, train_agent,
 )
-from train.targets import kl_loss, policy_target
+from train.targets import (
+    kl_loss, normalised_q, policy_target, soft_q_loss,
+)
 
 
 def _legal(*idx):
@@ -293,7 +295,7 @@ TRAIN_CFG = {
 }
 
 
-def _labels(num_players=3, n_hands=10, seed=1):
+def _labels(num_players=3, n_hands=10, seed=1, loss="kl"):
     """Real observations from a played session, with synthetic oracle EVs.
 
     The hands are the agent's own — collected through the driver, so they carry
@@ -310,8 +312,9 @@ def _labels(num_players=3, n_hands=10, seed=1):
         q[legal] = rng.normal(0.0, 4.0, size=int(legal.sum()))
         _stack, pot_bb, to_call_bb = (float(x) for x in tok.scalars[-1])
         hands.append(tok)
-        targets.append(policy_target(q, legal, pot_bb, to_call_bb,
-                                     temperature=0.5))
+        targets.append(
+            normalised_q(q, legal, pot_bb, to_call_bb) if loss == "soft_q"
+            else policy_target(q, legal, pot_bb, to_call_bb, temperature=0.5))
         tables.append(rng.normal(0.0, 0.3, size=(MAX_PLAYERS,
                                                  NET_CFG["d_emb"])))
     assert len(hands) >= TRAIN_CFG["batch_hands"]
@@ -436,3 +439,146 @@ def test_the_cycles_are_a_chain_and_not_a_sequence_of_restarts():
                               _silent, seed=0, iteration=iteration)
         opens.append(history[0]["kl"])
     assert opens[0] > opens[1] > opens[2]
+
+
+# --------------------------------------------------- 6b: the linear loss (§6.2)
+
+
+def _q_setup(dtype=torch.float64):
+    """One decision: four legal actions, two illegal, EVs already normalised."""
+    legal = torch.tensor([[True, True, True, True, False, False]])
+    q = torch.tensor([[1.5, -0.5, 0.25, 0.0, 0.0, 0.0]], dtype=dtype)
+    logits = torch.tensor([[0.3, -1.2, 0.8, 0.1, 7.0, -7.0]], dtype=dtype)
+    return logits, q, legal
+
+
+def _target_from(q, legal, t):
+    return torch.softmax((q / t).masked_fill(~legal, float("-inf")), dim=-1)
+
+
+def _grad(loss_fn, logits, legal, payload, t):
+    x = logits.clone().requires_grad_(True)
+    g, = torch.autograd.grad(loss_fn(x, payload, legal, t), x)
+    return g
+
+
+def _kl(x, target, legal, _t):
+    return kl_loss(x, target, legal)
+
+
+def test_the_two_losses_share_a_minimiser():
+    """`soft_q` never builds the target, so the test is that it agrees anyway."""
+    logits, q, legal = _q_setup()
+    t = 0.7
+    target = _target_from(q, legal, t)
+    at_optimum = torch.log(target.clamp_min(1e-300))
+
+    assert float(soft_q_loss(at_optimum, q, legal, t)) == pytest.approx(
+        0.0, abs=1e-12)
+    assert float(kl_loss(at_optimum, target, legal)) == pytest.approx(
+        0.0, abs=1e-12)
+    assert float(soft_q_loss(logits, q, legal, t)) > 0.0
+
+
+def test_the_linear_loss_is_positive_as_soon_as_the_prediction_moves():
+    _logits, q, legal = _q_setup()
+    t = 0.7
+    at_optimum = torch.log(_target_from(q, legal, t).clamp_min(1e-300))
+    for eps in (1e-3, 0.1, 5.0):
+        moved = at_optimum.clone()
+        moved[0, 0] += eps
+        assert float(soft_q_loss(moved, q, legal, t)) > 0.0
+
+
+def test_noise_in_the_labels_biases_the_kl_gradient_and_not_the_linear_one():
+    """The reason `soft_q` exists (§6.2), stated as the thing it has to do.
+
+    A symmetric pair of label errors is the cheapest complete case: averaging
+    the gradients at `Q+ε` and `Q−ε` is what training does over many labels, so
+    if that average is the gradient at `Q` then the noise cost nothing but
+    variance. `soft_q` is linear in the labels, so it is exact. `kl` puts the
+    labels through a softmax first, and the gap that leaves is the bias no
+    amount of averaging removes.
+    """
+    logits, q, legal = _q_setup()
+    t = 0.7
+    eps = torch.tensor([[2.0, -1.5, 0.0, -0.5, 0.0, 0.0]], dtype=q.dtype)
+
+    exact = _grad(soft_q_loss, logits, legal, q, t)
+    averaged = 0.5 * (_grad(soft_q_loss, logits, legal, q + eps, t)
+                      + _grad(soft_q_loss, logits, legal, q - eps, t))
+    assert torch.allclose(averaged, exact, rtol=0.0, atol=1e-12)
+
+    kl_exact = _grad(_kl, logits, legal, _target_from(q, legal, t), t)
+    kl_averaged = 0.5 * (
+        _grad(_kl, logits, legal, _target_from(q + eps, legal, t), t)
+        + _grad(_kl, logits, legal, _target_from(q - eps, legal, t), t))
+    assert not torch.allclose(kl_averaged, kl_exact, rtol=0.0, atol=1e-3)
+
+
+def test_a_constant_on_every_legal_ev_changes_nothing():
+    """The target depends on EV *differences*, so the loss must too.
+
+    `−⟨π, Q+c⟩` loses `c` and `T·log Z(Q+c)` gains it back, which is the same
+    shift invariance the softmax has — and the reason the common part of the
+    oracle's noise, the part common random numbers already share across
+    actions, cannot reach the gradient at all.
+    """
+    logits, q, legal = _q_setup()
+    t = 0.7
+    shifted = q + torch.where(legal, torch.full_like(q, 3.25),
+                              torch.zeros_like(q))
+    assert float(soft_q_loss(logits, shifted, legal, t)) == pytest.approx(
+        float(soft_q_loss(logits, q, legal, t)), rel=0.0, abs=1e-12)
+    assert torch.allclose(_grad(soft_q_loss, logits, legal, shifted, t),
+                          _grad(soft_q_loss, logits, legal, q, t),
+                          rtol=0.0, atol=1e-12)
+
+
+def test_the_linear_loss_ignores_the_logits_of_illegal_actions():
+    logits, q, legal = _q_setup()
+    poisoned = logits.clone()
+    poisoned[0, 4:] = 100.0
+    assert float(soft_q_loss(poisoned, q, legal, 0.7)) == float(
+        soft_q_loss(logits, q, legal, 0.7))
+    grad = _grad(soft_q_loss, logits, legal, q, 0.7)
+    assert float(grad[0, 4:].abs().max()) == 0.0
+
+
+def test_a_label_that_disagrees_with_the_mask_is_refused():
+    logits, q, legal = _q_setup()
+    bad = q.clone()
+    bad[0, 4] = 0.1
+    with pytest.raises(AssertionError, match="illegal action"):
+        soft_q_loss(logits, bad, legal, 0.7)
+
+
+def test_a_toy_training_run_with_the_linear_loss_reaches_its_target():
+    """More steps than the `kl` run, and the reason is worth recording.
+
+    `soft_q` reports and differentiates `T·KL`, so at `T = 0.5` its gradient is
+    half the size, and the direction is reversed on top of that. The toy budget
+    the `kl` test uses is simply too short for it — not a symptom of anything,
+    but it would look like one the first time the number failed to move.
+    """
+    hands, targets, tables = _labels(loss="soft_q")
+    cfg = dict(TRAIN_CFG, loss="soft_q", temperature=0.5,
+               first_iteration_steps=400)
+    net = _net(0)
+    history = train_agent(net, hands, targets, tables, cfg, "cpu",
+                          _silent, seed=0, iteration=0)
+
+    assert len(history) == 400
+    assert all(np.isfinite(h["kl"]) and h["kl"] >= 0.0 for h in history)
+    first = np.mean([h["kl"] for h in history[:10]])
+    assert np.mean([h["kl"] for h in history[-10:]]) < 0.1 * first
+
+
+def test_a_distribution_is_not_a_valid_payload_for_the_linear_loss():
+    """The two losses read the same array differently, so the guard is real."""
+    hands, targets, tables = _labels(loss="kl")
+    cfg = dict(TRAIN_CFG, loss="nope", temperature=0.5)
+    with pytest.raises(AssertionError, match="unknown loss"):
+        train_agent(_net(0), hands, targets, tables, cfg, "cpu", _silent,
+                    seed=0, iteration=0)
+

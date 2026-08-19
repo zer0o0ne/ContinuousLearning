@@ -53,6 +53,31 @@ Min-max is sensitive to one extreme member stretching the denominator and
 compressing everybody else; if that ever shows up, the replacement is a rank
 instead of a min-max, which costs no config either.
 
+**The accumulation forgets, because the quantity it estimates is not stationary.**
+A procedural pool member never changes, but hero does — every iteration replaces
+it — so "hero's BB/100 against member *i*" is a property of a *pair*, and a
+lifetime mean over thirty iterations is a mean over thirty different heroes. The
+consequence is the one that matters operationally: a member the early agents
+crushed keeps a positive mean built on tens of thousands of hands, and the ~330
+hands per iteration the floor delivers would take on the order of thirty
+iterations to drag it back across zero — the length of a whole run. The loop
+would not notice that it had stopped beating it. The same smearing also destroys
+the `PLAN_PIPELINE.md` R2 diagnostic, which reads fictitious-play cycling off
+exactly these scores.
+
+`end_iteration` therefore scales both accumulators by `result_decay` at every
+iteration boundary, giving an effective window of roughly
+`hands_per_iteration / (1 - result_decay)` hands. Two properties make this the
+right shape rather than a patch:
+
+* the mean of a member nobody sampled this iteration is **unchanged** —
+  numerator and denominator decay together. No new information, no new estimate.
+* what does shrink is its *confidence*, the effective hand count, which is
+  precisely what lets the next session it does play flip the estimate quickly.
+
+`result_decay = 1.0` is the lifetime accumulation, kept reachable because it is
+the honest way to turn the mechanism off.
+
 **The floor is an independent coin flip per draw.** A deterministic schedule
 ("every fifth draw") gives the same mean with less variance, and was the first
 implementation, but it aligns with table structure: at a fixed table size and a
@@ -121,7 +146,7 @@ class PoolSampler:
             the larger `n_members` and `load_state_dict` the smaller one's state
             into it (see `load_state_dict`).
         cfg: the `pool_sampling` config section (§8.1) — `pfsp_exponent`,
-            `floor_fraction`, `n_clusters`.
+            `floor_fraction`, `n_clusters`, `result_decay`.
         rng: `np.random.Generator`. Owned by the sampler: its state is part of
             `state_dict`, so a restart resumes the same stream.
     """
@@ -132,10 +157,16 @@ class PoolSampler:
         self.pfsp_exponent = float(cfg["pfsp_exponent"])
         self.floor_fraction = float(cfg["floor_fraction"])
         self.n_clusters = int(cfg["n_clusters"])
+        self.result_decay = float(cfg["result_decay"])
         assert 0.0 <= self.floor_fraction <= 1.0, (
             f"floor_fraction is a fraction of draws, got {self.floor_fraction}")
+        assert 0.0 < self.result_decay <= 1.0, (
+            f"result_decay scales the accumulated results once per iteration, "
+            f"got {self.result_decay}")
         self.rng = rng
-        self._hands = np.zeros(self.n_members, dtype=np.int64)
+        # Float rather than integer hands: `end_iteration` scales them, so the
+        # count is an *effective* number of hands, not a tally.
+        self._hands = np.zeros(self.n_members, dtype=np.float64)
         self._bb = np.zeros(self.n_members, dtype=np.float64)
         # Until `set_vectors` is called there is no embedding space to cluster
         # in, so every member is its own cluster and the dedup step is a no-op.
@@ -155,9 +186,19 @@ class PoolSampler:
         i = int(member_idx)
         assert 0 <= i < self.n_members, (
             f"member {i} is outside a pool of {self.n_members}")
-        assert int(n_hands) > 0, "a result over zero hands says nothing"
-        self._hands[i] += int(n_hands)
+        assert float(n_hands) > 0, "a result over zero hands says nothing"
+        self._hands[i] += float(n_hands)
         self._bb[i] += float(hero_bb)
+
+    def end_iteration(self):
+        """Age the accumulated results by `result_decay` (§8's iteration boundary).
+
+        Called once per iteration of the outer loop, by the loop — the sampler
+        has no notion of an iteration of its own. See the module docstring for
+        why forgetting is required rather than optional.
+        """
+        self._hands *= self.result_decay
+        self._bb *= self.result_decay
 
     def mean_bb_per_100(self):
         """Hero's BB/100 against each member; `nan` where there is no result."""
@@ -272,9 +313,9 @@ class PoolSampler:
         assert n_old <= self.n_members, (
             f"saved sampler has {n_old} members, this pool has "
             f"{self.n_members} — the pool only ever grows (§8)")
-        self._hands = np.zeros(self.n_members, dtype=np.int64)
+        self._hands = np.zeros(self.n_members, dtype=np.float64)
         self._bb = np.zeros(self.n_members, dtype=np.float64)
-        self._hands[:n_old] = np.asarray(state["hands"], dtype=np.int64)
+        self._hands[:n_old] = np.asarray(state["hands"], dtype=np.float64)
         self._bb[:n_old] = np.asarray(state["bb"], dtype=np.float64)
         clusters = np.asarray(state["cluster_of"], dtype=np.int64)
         self._cluster_of = np.arange(self.n_members, dtype=np.int64)

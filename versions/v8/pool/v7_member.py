@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from pool.base import PoolMember
+from utils import get_amp_config
 from vendor.v7.events import build_v7_events
 
 
@@ -52,6 +53,17 @@ class V7NetworkMember(PoolMember):
         assert agent.n_actions == n_actions, (
             f"v7 checkpoint has {agent.n_actions} actions, pool uses "
             f"{n_actions}. The action layouts must match — see CONCEPT.md §6.1.")
+        # G3 measured the label's wall clock: 85% of it is this forward and
+        # under 6% is everything Python does to prepare it, so precision is the
+        # only lever left on the pool's side. `get_amp_config` is v8's existing
+        # answer to "what does this device want" and picks bf16 on CUDA, which
+        # is the regime v7 itself was trained and evaluated under
+        # (`evaluation/slumbot_eval.py`); on CPU it disables autocast, so the
+        # dev box keeps running the fp32 path the test battery pins.
+        # Resolved here because `build_pool` calls `set_device` before it
+        # constructs a member, and never moves one afterwards.
+        (self.amp_enabled, self.amp_device_type,
+         self.amp_dtype, _scaler) = get_amp_config(agent.device_)
 
     def logits(self, contexts):
         event_sequences = []
@@ -62,6 +74,8 @@ class V7NetworkMember(PoolMember):
                 rec.num_players, rec.spec.big_blind, rec.spec.small_blind,
                 self.n_actions, up_to=ctx.snap_idx,
             ))
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(
+                device_type=self.amp_device_type, dtype=self.amp_dtype,
+                enabled=self.amp_enabled):
             out = self.agent.action_logits(event_sequences)
         return out.float().cpu().numpy().astype(np.float64)

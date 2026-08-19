@@ -56,10 +56,13 @@ import numpy as np
 
 import pool.base
 import pool.v7_member
+import vendor.v7.perception.perception as v7_perception
 from env.driver import HandSpec, LockstepDriver
 from gates.g1 import raise_sizes_from
 from oracle.rollout import OracleConfig, action_values
+from oracle.posterior import _context_of
 from pool.build import build_pool
+from train.targets import DIVISORS
 from utils import Logger, progress, resolve_device
 
 
@@ -82,10 +85,19 @@ class Profile:
         `vendor.v7.events.build_v7_events` — one Python event-dict sequence per
         row. The posterior calls it once per combo, for what is the same
         situation with two cards changed.
-    ``forward``
-        the rest of `V7NetworkMember.logits`: tensor packing and the model.
-        `logits` ends in ``.cpu()``, which synchronises, so an async CUDA
-        launch cannot leak out of this bucket into the next one.
+    ``pack``
+        `EventSequenceEmbedder._build_batch_tensors` — a second Python pass over the same
+        events, this one turning them into tensors. It is timed separately
+        because it is CPU work that a GPU cannot absorb: the first run put
+        `events` at 4.9% of a label, and on the dev box this pass is a stable
+        2.15× the cost of `events`, which would make it the second largest item
+        after the model. The embedding lookups at its end are asynchronous CUDA
+        launches, so what is measured here is the Python.
+    ``model``
+        the rest of `V7NetworkMember.logits` — the encoder, decoder and action
+        head. `logits` ends in ``.cpu()``, which synchronises, so no async CUDA
+        launch leaks out of this bucket into the next one and this is the one
+        number that says whether the GPU is the wall.
     ``style``
         the rest of `PoolMember.policy`: the legality stack, the style
         modifier, and the degenerate members' own logits — they have no
@@ -107,6 +119,7 @@ class Profile:
 
     def reset(self):
         self.events = 0.0
+        self.pack = 0.0
         self.member_logits = 0.0
         self.policy = 0.0
         self.event_rows = 0
@@ -117,7 +130,8 @@ class Profile:
         """The four buckets, in seconds, summing to `seconds` by construction."""
         return {
             "t_events": self.events,
-            "t_forward": self.member_logits - self.events,
+            "t_pack": self.pack,
+            "t_model": self.member_logits - self.events - self.pack,
             "t_style": self.policy - self.member_logits,
             "t_driver": seconds - self.policy,
         }
@@ -143,6 +157,7 @@ def profiling():
     base_policy = pool.base.PoolMember.policy
     v7_logits = pool.v7_member.V7NetworkMember.logits
     build_events = pool.v7_member.build_v7_events
+    build_tensors = v7_perception.EventSequenceEmbedder._build_batch_tensors
 
     def policy(self, contexts):
         t0 = time.perf_counter()
@@ -168,15 +183,24 @@ def profiling():
             PROFILE.events += time.perf_counter() - t0
             PROFILE.event_rows += 1
 
+    def pack(self, *args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return build_tensors(self, *args, **kwargs)
+        finally:
+            PROFILE.pack += time.perf_counter() - t0
+
     pool.base.PoolMember.policy = policy
     pool.v7_member.V7NetworkMember.logits = logits
     pool.v7_member.build_v7_events = events
+    v7_perception.EventSequenceEmbedder._build_batch_tensors = pack
     try:
         yield PROFILE
     finally:
         pool.base.PoolMember.policy = base_policy
         pool.v7_member.V7NetworkMember.logits = v7_logits
         pool.v7_member.build_v7_events = build_events
+        v7_perception.EventSequenceEmbedder._build_batch_tensors = build_tensors
 
 
 class MeasuringDriver(LockstepDriver):
@@ -227,6 +251,23 @@ def build_hands(rng, member_ids, game, num_players, stack_bb, n_hands,
     return specs
 
 
+def member_ids_for(kind, descriptors):
+    """The pool members of one `bootstrap` kind, or all of them.
+
+    G3's first run sampled seats uniformly over a pool that is 23 degenerate
+    members out of 79, while §4.4 says the pipeline samples by PFSP with a
+    uniform floor of 10–20% — so the measured cost and the measured noise were
+    both taken against a table the pipeline will not set. Making the
+    composition an axis is what turns that from an argument into a column.
+    """
+    ids = [i for i, d in enumerate(descriptors)
+           if kind == "all" or d["kind"] == kind]
+    assert ids, (
+        f"no pool member of kind {kind!r}; the pool has "
+        f"{sorted({d['kind'] for d in descriptors})}")
+    return ids
+
+
 def choose_decisions(rng, records, n_wanted):
     """A fixed set of hero decisions, shared by every cell of the sweep.
 
@@ -244,15 +285,21 @@ def choose_decisions(rng, records, n_wanted):
     return [pairs[int(i)] for i in sorted(picked)]
 
 
-def measure_label(record, decision_idx, driver, pool, cfg, rng):
-    """Label one hero decision and report what it cost."""
+def measure_label(record, decision_idx, driver, pool, hero_member, cfg, rng):
+    """Label one hero decision and report what it cost.
+
+    `hero_member` plays hero in the rollouts and is chosen by the caller, not
+    read out of the seat. The first run took whoever was sitting there, which
+    on a pool that is 29% degenerate meant that roughly every third label had
+    `always_fold` or `maniac` as its rollout policy — a hand that ends
+    instantly or stacks off, and neither is what §8 puts in that seat. The
+    depth and the variance that came out of it were both measurements of the
+    wrong thing.
+    """
     driver.last_records = None
     PROFILE.reset()
     hero_pos = int(record.decisions[decision_idx]["acting_pos"])
-    # The member already in hero's seat plays hero in the rollouts. At
-    # iteration 0 of §8 that is exactly what happens — the oracle improves on a
-    # pool member — so the cost measured here is the cost of the real thing.
-    hero_member = int(record.spec.seat_members[hero_pos])
+    hero_member = int(hero_member)
 
     # Wrapped per label rather than around the whole sweep: a row that carries
     # a profile it did not measure is the one way this can quietly lie, and the
@@ -260,6 +307,14 @@ def measure_label(record, decision_idx, driver, pool, cfg, rng):
     with profiling():
         q, legal, stats = action_values(record, decision_idx, driver, pool,
                                         hero_member, cfg, rng)
+
+    _ctx = _context_of(record, record.decisions[decision_idx])
+    _bb = float(record.spec.big_blind)
+    _divisor = float(DIVISORS["pot_plus_bet"](_ctx.pot / _bb,
+                                              _ctx.to_call / _bb))
+    assert _divisor > 0.0, (
+        "the §6.2 normaliser is zero, so the error has no scale to be read in "
+        "— every decision has blinds in the pot behind it")
 
     played = driver.last_records or []
     # Identical to the oracle's own count: `forced_actions` is prefix + [a], so
@@ -283,7 +338,11 @@ def measure_label(record, decision_idx, driver, pool, cfg, rng):
         "collision_rate": float(stats.collision_rate),
         "depth": (rollout_forwards / stats.n_rollouts) if stats.n_rollouts
                  else float("nan"),
-        "half_gap_sq": [],
+        "half_gap": [],
+        # §6.2 divides `Q` by this before the target is built, so it is the
+        # scale the split-half error has to be read in as well: an SE of 12 BB
+        # is fatal in a 3 BB pot and irrelevant in a 300 BB one.
+        "divisor": _divisor,
         "policy_rows": int(PROFILE.policy_rows),
         "policy_calls": int(PROFILE.policy_calls),
         "event_rows": int(PROFILE.event_rows),
@@ -296,7 +355,11 @@ def measure_label(record, decision_idx, driver, pool, cfg, rng):
                              dtype=np.float64).reshape(n_samples, n_legal) / bb
         half = n_samples // 2
         gap = rewards[:half].mean(axis=0) - rewards[half:2 * half].mean(axis=0)
-        row["half_gap_sq"] = [float(g * g) for g in gap]
+        # Signed, per action. The squares are all `se_q` needs, but the target
+        # is a softmax and a softmax is shift-invariant, so what actually
+        # reaches the loss is the noise on the *differences* between actions —
+        # and a difference of gaps cannot be recovered once the signs are gone.
+        row["half_gap"] = [float(g) for g in gap]
     return row
 
 
@@ -308,7 +371,8 @@ def _mean(values):
 def aggregate_cell(cell, rows, iteration_labels):
     """One row of the printed table, from the labels of one cell."""
     seconds = _mean([r["seconds"] for r in rows])
-    gaps = [g for r in rows for g in r["half_gap_sq"]]
+    gaps = [g for r in rows for g in r["half_gap"]]
+    gaps_norm = [g / r["divisor"] for r in rows for g in r["half_gap"]]
     out = dict(cell)
     out.update({
         "n_labels": len(rows),
@@ -325,12 +389,16 @@ def aggregate_cell(cell, rows, iteration_labels):
         "policy_calls": _mean([r["policy_calls"] for r in rows]),
         "event_rows": _mean([r["event_rows"] for r in rows]),
         "t_events": _mean([r["t_events"] for r in rows]),
-        "t_forward": _mean([r["t_forward"] for r in rows]),
+        "t_pack": _mean([r["t_pack"] for r in rows]),
+        "t_model": _mean([r["t_model"] for r in rows]),
         "t_style": _mean([r["t_style"] for r in rows]),
         "t_driver": _mean([r["t_driver"] for r in rows]),
         "labels_per_hour": (3600.0 / seconds) if seconds > 0 else float("nan"),
-        "se_q": (math.sqrt(float(np.mean(gaps))) / 2.0) if gaps
+        # `E[(q_A − q_B)²] = 4·Var(q)` for two equal independent halves.
+        "se_q": (math.sqrt(float(np.mean(np.square(gaps)))) / 2.0) if gaps
                 else float("nan"),
+        "se_q_norm": (math.sqrt(float(np.mean(np.square(gaps_norm)))) / 2.0)
+                     if gaps_norm else float("nan"),
     })
     out["iteration_hours"] = (iteration_labels / out["labels_per_hour"]
                               if out["labels_per_hour"] > 0 else float("nan"))
@@ -354,7 +422,8 @@ def profile_groups(rows):
     def agg(label, subset):
         seconds = sum(r["seconds"] for r in subset)
         buckets = {k: sum(r[k] for r in subset)
-                   for k in ("t_events", "t_forward", "t_style", "t_driver")}
+                   for k in ("t_events", "t_pack", "t_model", "t_style",
+                             "t_driver")}
         n_rows = sum(r["policy_rows"] for r in subset)
         n_calls = sum(r["policy_calls"] for r in subset)
         n_events = sum(r["event_rows"] for r in subset)
@@ -390,14 +459,17 @@ def headline(cells, iteration_labels):
     """
     out = []
     budgets = sorted({c["samples_per_action"] for c in cells})
-    for s in budgets:
+    pools = sorted({c["pool"] for c in cells})
+    for pool_kind, s in [(p, b) for p in pools for b in budgets]:
         rows = [c for c in cells
-                if c["samples_per_action"] == s and c["max_combos"] is None]
+                if c["samples_per_action"] == s and c["max_combos"] is None
+                and c["pool"] == pool_kind]
         if not rows:
             continue
         seconds = _mean([r["seconds_per_label"] for r in rows])
         per_hour = 3600.0 / seconds if seconds > 0 else float("nan")
         out.append({
+            "pool": pool_kind,
             "samples_per_action": s,
             "seconds_per_label": seconds,
             "forwards_per_label": _mean([r["forwards_per_label"]
@@ -407,6 +479,7 @@ def headline(cells, iteration_labels):
             "iteration_hours": (iteration_labels / per_hour
                                 if per_hour > 0 else float("nan")),
             "se_q": _mean([r["se_q"] for r in rows]),
+            "se_q_norm": _mean([r["se_q_norm"] for r in rows]),
         })
     return out
 
@@ -414,46 +487,54 @@ def headline(cells, iteration_labels):
 def format_report(report, log):
     log("")
     log("G3 — cost of one oracle label (variant A, CONCEPT.md §7.1)")
-    log(f"{'smp':>4} {'combos':>7} {'plr':>4} {'stack':>6} {'s/label':>9} "
-        f"{'forwards':>10} {'post':>8} {'roll':>8} {'depth':>7} "
-        f"{'coll%':>7} {'lab/h':>9} {'SE(q)BB':>9}")
+    log(f"{'pool':>10} {'smp':>4} {'combos':>7} {'plr':>4} {'stack':>6} "
+        f"{'s/label':>9} {'forwards':>10} {'post':>8} {'roll':>8} "
+        f"{'depth':>7} {'coll%':>7} {'lab/h':>9} {'SEbb':>9} {'SE/pot':>8}")
     for c in report["cells"]:
         combos = "all" if c["max_combos"] is None else str(c["max_combos"])
-        log(f"{c['samples_per_action']:>4} {combos:>7} {c['players']:>4} "
-            f"{c['stack_bb']:>6} {c['seconds_per_label']:>9.3f} "
+        log(f"{c['pool']:>10} {c['samples_per_action']:>4} {combos:>7} "
+            f"{c['players']:>4} {c['stack_bb']:>6} "
+            f"{c['seconds_per_label']:>9.3f} "
             f"{c['forwards_per_label']:>10.0f} {c['posterior_forwards']:>8.0f} "
             f"{c['rollout_forwards']:>8.0f} {c['depth']:>7.2f} "
             f"{100 * c['collision_rate']:>7.1f} {c['labels_per_hour']:>9.0f} "
-            f"{c['se_q']:>9.3f}")
+            f"{c['se_q']:>9.3f} {c['se_q_norm']:>8.3f}")
 
     log("")
     log("G3 profile — where a label's wall clock goes (share of seconds)")
     log(f"{'group':>8} {'labels':>7} {'seconds':>9} {'events':>8} "
-        f"{'forward':>8} {'style':>7} {'driver':>7} {'us/row':>8} "
+        f"{'pack':>7} {'model':>7} {'style':>7} {'driver':>7} {'us/row':>8} "
         f"{'rows/call':>10} {'net%':>6}")
     for g in report["profile"]:
         share = (lambda k: 100 * g[k] / g["seconds"] if g["seconds"] else
                  float("nan"))
         log(f"{g['group']:>8} {g['n_labels']:>7} {g['seconds']:>9.1f} "
-            f"{share('t_events'):>7.1f}% {share('t_forward'):>7.1f}% "
-            f"{share('t_style'):>6.1f}% {share('t_driver'):>6.1f}% "
-            f"{g['us_per_row']:>8.1f} {g['rows_per_call']:>10.1f} "
-            f"{100 * g['network_share']:>5.0f}%")
+            f"{share('t_events'):>7.1f}% {share('t_pack'):>6.1f}% "
+            f"{share('t_model'):>6.1f}% {share('t_style'):>6.1f}% "
+            f"{share('t_driver'):>6.1f}% {g['us_per_row']:>8.1f} "
+            f"{g['rows_per_call']:>10.1f} {100 * g['network_share']:>5.0f}%")
 
     log("")
     log("Headline (exact posterior, averaged over table size and stack depth)")
     for h in report["headline"]:
-        log(f"  samples_per_action={h['samples_per_action']:<4} "
+        log(f"  pool={h['pool']:<12} samples_per_action={h['samples_per_action']:<4} "
             f"{h['seconds_per_label']:.2f} s/label, "
             f"{h['forwards_per_label']:.0f} forwards/label "
             f"→ {h['labels_per_hour']:.0f} labels/hour; an iteration of "
             f"{h['iteration_labels']} labels costs "
-            f"{h['iteration_hours']:.1f} h; SE(q) ≈ {h['se_q']:.3f} BB")
+            f"{h['iteration_hours']:.1f} h; SE(q) ≈ {h['se_q']:.3f} BB "
+            f"= {h['se_q_norm']:.3f} of the pot")
 
     n = report["n_labels"]
     log("")
     log(f"labels planned {n['planned']}, done {n['done']}, "
         f"skipped {n['skipped']} (too few decisions in the played hands)")
+    # A label whose every joint draw collided has no `q` at all, so it is a
+    # hole in the training set and not a noisy row (§7.3).
+    log(f"labels with no rollout at all (every joint draw collided): "
+        f"{sum(c['empty_labels'] for c in report['cells'])}")
+    log(f"hero seat played by pool member {report['hero_member']} "
+        f"(kind {report['hero_kind']!r})")
     log(f"hands played to source the decisions: {report['n_hands_played']}")
 
 
@@ -469,16 +550,19 @@ def run(config, log, out_dir):
     pool, descriptors = build_pool(config, rng, device=device, log=log)
     log(f"pool: {len(pool)} members")
     driver = MeasuringDriver(pool, int(game["n_actions"]))
-    member_ids = list(range(len(pool)))
 
     # ---- the hands the labelled decisions come out of, one batch, one bar
-    groups = [(int(p), int(s)) for p in sweep["table_sizes"]
-              for s in sweep["stack_bb"]]
+    hero_kind = sweep.get("hero_kind", "v7")
+    hero_member = member_ids_for(hero_kind, descriptors)[0]
+    log(f"hero seat: member {hero_member} of kind {hero_kind!r}")
+
+    groups = [(str(k), int(p), int(s)) for k in sweep["pool_kinds"]
+              for p in sweep["table_sizes"] for s in sweep["stack_bb"]]
     hands_per_group = int(sweep["hands_per_table"])
     specs, spans = [], []
-    for gi, (players, stack_bb) in enumerate(groups):
-        group_specs = build_hands(rng, member_ids, game, players, stack_bb,
-                                  hands_per_group,
+    for gi, (pool_kind, players, stack_bb) in enumerate(groups):
+        group_specs = build_hands(rng, member_ids_for(pool_kind, descriptors),
+                                  game, players, stack_bb, hands_per_group,
                                   seed_base=int(config["seed"]) * 1_000_000
                                             + gi * 10_000)
         spans.append((len(specs), len(specs) + len(group_specs)))
@@ -494,18 +578,20 @@ def run(config, log, out_dir):
     combo_caps = list(sweep["max_combos"])
     labels_per_cell = int(sweep["labels_per_cell"])
     planned = len(groups) * len(budgets) * len(combo_caps) * labels_per_cell
+    log(f"sweep: {len(groups)} groups x {len(budgets)} sample budgets x "
+        f"{len(combo_caps)} combo caps x {labels_per_cell} labels")
     bar = progress(total=planned, desc="label", unit="label")
 
     cells, rows_all, done, skipped = [], [], 0, 0
     t0 = time.perf_counter()
-    for gi, (players, stack_bb) in enumerate(groups):
+    for gi, (pool_kind, players, stack_bb) in enumerate(groups):
         lo, hi = spans[gi]
         records = played[lo:hi]
         chosen = choose_decisions(np.random.default_rng([config["seed"], gi]),
                                   records, labels_per_cell)
         if len(chosen) < labels_per_cell:
-            log(f"[{players}p/{stack_bb}bb] only {len(chosen)} decisions "
-                f"available, wanted {labels_per_cell}")
+            log(f"[{pool_kind} {players}p/{stack_bb}bb] only {len(chosen)} "
+                f"decisions available, wanted {labels_per_cell}")
         for si, samples in enumerate(budgets):
             for ci, max_combos in enumerate(combo_caps):
                 cfg = OracleConfig(
@@ -522,7 +608,7 @@ def run(config, log, out_dir):
                     label_rng = np.random.default_rng(
                         [config["seed"], gi, si, ci, li])
                     rows.append(measure_label(records[h], d, driver, pool,
-                                              cfg, label_rng))
+                                              hero_member, cfg, label_rng))
                     bar.update(1)
                     done += 1
                 # A skipped label still owes the bar its units (`CLAUDE.md` §5)
@@ -530,7 +616,8 @@ def run(config, log, out_dir):
                 if missing > 0:
                     bar.update(missing)
                     skipped += missing
-                cell = {"samples_per_action": int(samples),
+                cell = {"pool": pool_kind,
+                        "samples_per_action": int(samples),
                         "max_combos": (None if max_combos is None
                                        else int(max_combos)),
                         "players": players, "stack_bb": stack_bb}
@@ -546,6 +633,8 @@ def run(config, log, out_dir):
         "headline": headline(cells, iteration_labels),
         "n_labels": {"planned": planned, "done": done, "skipped": skipped},
         "n_hands_played": len(played),
+        "hero_member": hero_member,
+        "hero_kind": hero_kind,
         "labelling_seconds": elapsed,
         "device": str(device),
     }

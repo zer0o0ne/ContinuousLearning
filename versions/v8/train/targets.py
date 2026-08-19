@@ -1,7 +1,30 @@
-"""Agent targets and loss (CONCEPT.md §6.2).
+"""Agent targets and losses (CONCEPT.md §6.2).
 
-The target at a hero decision is `softmax(Q_normalised / T)` over the legal
-actions, and the loss is the KL from it to the agent's masked policy.
+Two losses with the same optimum and different behaviour under label noise;
+`agent_train`'s `loss` key picks one.
+
+* **`kl`** — the baseline §6.2 describes. Build `softmax(Q_normalised / T)` and
+  take the KL from it to the agent's masked policy.
+* **`soft_q`** — the same optimum reached without ever forming that
+  distribution: `−⟨π_θ, Q_normalised⟩ − T·H(π_θ)`, whose minimiser over the
+  simplex is exactly `softmax(Q_normalised / T)`.
+
+**Why the second one exists.** `Q` is a Monte-Carlo estimate, `Q̂ = Q + ε`, and
+G3 measured `ε` at 0.65 BB heads-up on 20 BB stacks and 25.7 BB six-handed on
+300 BB. A softmax is not linear, so `E[softmax(Q̂/T)] ≠ softmax(Q/T)`: under the
+`kl` loss the *gradient* the network sees is the expected target, and label
+noise turns into target **bias** that averaging over labels cannot remove. In
+the large-noise limit the target degenerates towards whichever action drew the
+luckiest sample, whose average is uniform-over-legal — that is, the policy is
+pushed towards uniform exactly where the labels are noisiest, which is deep
+stacks and multiway.
+
+`soft_q` is linear in `Q̂`, so its gradient is unbiased at every `θ` and the
+noise stays noise. The price is that it is the *reverse* KL — mode-seeking
+rather than mass-covering — so where the network cannot fit the target it
+drops small-probability actions rather than smearing over them, and mixing is
+the thing §11.2 cares about. Which one wins is a measurement, which is why
+both are here rather than one.
 
 **The normalisation is the whole of this module, and it is a scar.** Raw EVs in
 a 300 BB pot and a 10 BB pot differ by more than an order of magnitude, so one
@@ -35,12 +58,11 @@ DIVISORS = {
 }
 
 
-def policy_target(q, legal, pot_bb, facing_bet_bb, temperature,
-                  divisor="pot_plus_bet"):
-    """softmax(Q_normalised / T) over legal actions (§6.2).
+def normalised_q(q, legal, pot_bb, facing_bet_bb, divisor="pot_plus_bet"):
+    """`Q / scale` on the legal actions, exact zero off them (§6.2).
 
-    `q` in BB with `nan` at illegal actions. Returns (n_actions,) summing to 1
-    with exact zeros off `legal`.
+    The payload the `soft_q` loss consumes, and the first half of what
+    `policy_target` does — one normalisation, not two.
 
     Args:
         q: (n_actions,) oracle EVs in big blinds. Entries off `legal` are never
@@ -48,8 +70,6 @@ def policy_target(q, legal, pot_bb, facing_bet_bb, temperature,
         legal: (n_actions,) bool — the environment's mask for this decision.
         pot_bb: pot before the decision, in big blinds.
         facing_bet_bb: what hero has to call, in big blinds.
-        temperature: `T`. Positive and finite; the two limits are reached by
-            passing a very small or very large `T`, not by passing 0 or `inf`.
         divisor: a key of `DIVISORS`.
     """
     q = np.asarray(q, dtype=np.float64)
@@ -61,8 +81,6 @@ def policy_target(q, legal, pot_bb, facing_bet_bb, temperature,
         "every legal action needs a finite EV — `nan` marks the illegal ones, "
         "and a `nan` under the mask means the oracle skipped an action it was "
         "asked about")
-    assert np.isfinite(temperature) and temperature > 0, (
-        f"temperature must be finite and positive, got {temperature}")
     assert divisor in DIVISORS, (
         f"unknown divisor {divisor!r}; choices are {sorted(DIVISORS)}")
 
@@ -72,8 +90,30 @@ def policy_target(q, legal, pot_bb, facing_bet_bb, temperature,
         "defined — every decision has blinds in the pot behind it")
 
     out = np.zeros_like(q)
+    out[legal] = q[legal] / scale
+    return out
+
+
+def policy_target(q, legal, pot_bb, facing_bet_bb, temperature,
+                  divisor="pot_plus_bet"):
+    """softmax(Q_normalised / T) over legal actions (§6.2), for the `kl` loss.
+
+    `q` in BB with `nan` at illegal actions. Returns (n_actions,) summing to 1
+    with exact zeros off `legal`.
+
+    Args:
+        q, legal, pot_bb, facing_bet_bb, divisor: see `normalised_q`.
+        temperature: `T`. Positive and finite; the two limits are reached by
+            passing a very small or very large `T`, not by passing 0 or `inf`.
+    """
+    assert np.isfinite(temperature) and temperature > 0, (
+        f"temperature must be finite and positive, got {temperature}")
+    legal = np.asarray(legal, dtype=bool)
+    qn = normalised_q(q, legal, pot_bb, facing_bet_bb, divisor)
+
+    out = np.zeros_like(qn)
     with np.errstate(over="ignore", under="ignore"):
-        z = q[legal] / scale
+        z = qn[legal]
         z = (z - z.max()) / temperature
         out[legal] = np.exp(z)
 
@@ -113,3 +153,58 @@ def kl_loss(logits, target, legal):
     tiny = torch.finfo(target.dtype).tiny
     terms = target * (torch.log(target.clamp_min(tiny)) - logp)
     return terms.sum(dim=-1).mean()
+
+
+def soft_q_loss(logits, q_norm, legal, temperature):
+    """`T·KL(π_θ ‖ softmax(Q_normalised / T))`, averaged over the batch.
+
+    Written out, and this is the whole point of the function:
+
+        L = −⟨π_θ, Q̂ₙ⟩  +  T·Σ π_θ log π_θ  +  T·log Σ exp(Q̂ₙ/T)
+
+    The first two terms are the objective — expected value plus an entropy
+    bonus — and `Q̂ₙ` enters **linearly**, so `E_ε[∇_θ L] = ∇_θ L|_{Q̂=Q}` and
+    label noise never becomes target bias. The third term does not involve `θ`
+    at all; it is added so the number printed in the log is a KL, that is
+    non-negative and exactly zero when the masked policy is the target, the
+    way `kl_loss` is readable. It shifts the value and not the gradient.
+
+    Note the direction: this is `KL(π ‖ target)`, the reverse of `kl_loss`.
+    Same minimiser, different behaviour when the network cannot reach it — see
+    the module docstring.
+
+    Args:
+        logits: (B, n_actions) — the agent's raw output, unmasked (§6.1).
+        q_norm: (B, n_actions) — `normalised_q` per row, exact zeros off
+            `legal`. Data, so no gradient flows into it.
+        legal: (B, n_actions) bool.
+        temperature: `T`, positive and finite.
+    """
+    assert logits.shape == q_norm.shape == legal.shape, (
+        f"logits {tuple(logits.shape)}, q_norm {tuple(q_norm.shape)} and legal "
+        f"{tuple(legal.shape)} must agree")
+    assert bool(legal.any(dim=-1).all()), (
+        "a row with no legal action cannot be scored")
+    assert float(temperature) > 0.0 and np.isfinite(float(temperature)), (
+        f"temperature must be finite and positive, got {temperature}")
+    q_norm = q_norm.detach().to(logits.dtype)
+    assert not bool((q_norm * ~legal).any()), (
+        "q_norm carries a value on an illegal action — it was built with a "
+        "different mask than the one being scored (§6.2 says there is one)")
+    assert bool(torch.isfinite(q_norm).all()), (
+        "a non-finite normalised EV would make the objective meaningless; "
+        "`nan` marks illegal actions and must have been zeroed by "
+        "`normalised_q`")
+
+    t = float(temperature)
+    logp = torch.log_softmax(logits.masked_fill(~legal, float("-inf")), dim=-1)
+    p = logp.exp()
+    # Off `legal` the policy is exactly zero, so the entropy term is zero
+    # there; the `where` is what keeps `0 · -inf` from turning it into `nan`.
+    plogp = p * torch.where(legal, logp, torch.zeros_like(logp))
+
+    shift = t * torch.logsumexp(
+        (q_norm / t).masked_fill(~legal, float("-inf")), dim=-1)
+    per_row = -(p * q_norm).sum(dim=-1) + t * plogp.sum(dim=-1) + shift
+    return per_row.mean()
+

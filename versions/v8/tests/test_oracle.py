@@ -56,14 +56,40 @@ class Caller(Deterministic):
 
 
 class ShovesInSet(Deterministic):
-    """Shoves with two cards out of `cards`, calls with anything else."""
+    """Shoves with two cards out of `cards`, calls with anything else.
+
+    `street` restricts the shove to one street, so a hand can be walked to the
+    river before the range-defining action is taken. That is what makes an
+    exactly enumerable case possible now that the runout is dealt rather than
+    reused: on the river there is no runout left to average over.
+    """
+
+    def __init__(self, name, n_actions, cards, style=None, street=None):
+        super().__init__(name, n_actions, style)
+        self.cards = set(int(c) for c in cards)
+        self.street = street
+
+    def action_for(self, ctx):
+        if self.street is not None and ctx.turn != self.street:
+            return CALL
+        return ALLIN if set(ctx.hole_cards) <= self.cards else CALL
+
+
+class CallsInSet(Deterministic):
+    """Calls with two cards out of `cards`, shoves with anything else.
+
+    The inverse of `ShovesInSet`, and the inverse is what makes a *narrow*
+    posterior out of a *non-terminal* action: a seat that called can only hold
+    a combo from `cards`, and calling — unlike shoving — leaves the hand alive
+    for the seats behind it.
+    """
 
     def __init__(self, name, n_actions, cards, style=None):
         super().__init__(name, n_actions, style)
         self.cards = set(int(c) for c in cards)
 
     def action_for(self, ctx):
-        return ALLIN if set(ctx.hole_cards) <= self.cards else CALL
+        return CALL if set(ctx.hole_cards) <= self.cards else ALLIN
 
 
 class Recorder(PoolMember):
@@ -142,6 +168,26 @@ def shove_fold_hand():
     return pool, record
 
 
+def river_shove_hand():
+    """The same enumerated case, walked to the river before the jam.
+
+    Both members check every street until the river, where the shover jams if
+    it holds two of `SPADES`. Hero's decision is therefore taken with all five
+    board cards visible, so `_rollout_deck` has no runout to draw and `Q` is an
+    exact function of the assignment — which is what lets the test enumerate.
+    """
+    pool = [ShovesInSet("shover", N_ACTIONS, SPADES, StyleParams.identity(),
+                        street=3),
+            Caller("hero", N_ACTIONS, StyleParams.identity())]
+    deck = deck_with(BOARD, [SPADES[:2], HERO_ACES])
+    record = one_hand(pool, [0, 1], deck=deck, stack_bb=10)
+    actions = [d["action_idx"] for d in record.decisions]
+    idx = actions.index(ALLIN) + 1
+    assert int(record.snapshots[record.decisions[idx]["snap_idx"]]["turn"]) == 3
+    assert int(record.decisions[idx]["acting_pos"]) == 1
+    return pool, record, idx
+
+
 def contribution_bb(record, decision_idx):
     """What hero has already put in, in BB — the closed-form fold value."""
     dec = record.decisions[decision_idx]
@@ -189,22 +235,24 @@ def test_folding_is_worth_exactly_what_hero_has_already_put_in(
 
 
 def test_q_is_the_posterior_weighted_sum_of_the_rollout_payoffs():
-    pool, record = shove_fold_hand()
+    """On the river, where the runout is empty, `Q` is exactly enumerable."""
+    pool, record, idx = river_shove_hand()
     driver = LockstepDriver(pool, N_ACTIONS)
     cfg = OracleConfig(samples_per_action=16, likelihood_floor=0.0)
 
-    q, legal, _stats = action_values(record, 1, driver, pool, 1, cfg,
+    q, legal, _stats = action_values(record, idx, driver, pool, 1, cfg,
                                      np.random.default_rng(11))
     assert np.flatnonzero(legal).tolist() == [FOLD, CALL]
 
     # The posterior, enumerated. Payoffs come from replaying the hand with each
     # combo pinned at the shover's seat — deterministic, so no seed is involved.
+    prefix = [d["action_idx"] for d in record.decisions[:idx]]
     combos, weights = opponent_posterior(record, 0, 1, pool, N_ACTIONS,
-                                         through_decision=0, floor=0.0)
+                                         through_decision=idx - 1, floor=0.0)
     support = [(c, w) for c, w in zip(combos, weights) if w > 0.0]
     assert len(support) == 6, "the range is the six two-card spade holdings"
 
-    payoff = _payoffs(pool, [c for c, _w in support], CALL)
+    payoff = _payoffs(pool, [c for c, _w in support], CALL, prefix)
     exact = sum(w * r for (_c, w), r in zip(support, payoff)) / BIG_BLIND
     np.testing.assert_allclose(q[CALL], exact, rtol=0.0, atol=1e-12)
 
@@ -214,10 +262,10 @@ def test_q_is_the_posterior_weighted_sum_of_the_rollout_payoffs():
     others = [c for c, w in zip(combos, weights)
               if w == 0.0 and not set(int(x) for x in c) & set(BOARD)][:20]
     assert any(abs(r / BIG_BLIND - q[CALL]) > 1.0
-               for r in _payoffs(pool, others, CALL))
+               for r in _payoffs(pool, others, CALL, prefix))
 
 
-def _payoffs(pool, combos, action):
+def _payoffs(pool, combos, action, prefix):
     """Hero's chip delta for each combo in the shover's seat, in chips."""
     specs = []
     for i, combo in enumerate(combos):
@@ -226,7 +274,7 @@ def _payoffs(pool, combos, action):
             seed=1000 + i, big_blind=BIG_BLIND, small_blind=SMALL_BLIND,
             raise_sizes=RAISE_SIZES,
             deck=deck_with(BOARD, [list(combo), HERO_ACES]),
-            forced_actions=[ALLIN, action]))
+            forced_actions=list(prefix) + [action]))
     return [float(r.rewards[1]) for r in play(pool, specs)]
 
 
@@ -320,21 +368,69 @@ def test_the_label_does_not_depend_on_how_the_hand_went_on():
 # ------------------------------------------------------ 8. collision accounting
 
 
-def test_a_range_made_only_of_board_cards_collides_every_time():
-    """The rejection rule's other half: a card the board took is unavailable.
+def test_the_runout_is_dealt_per_sample_but_the_visible_board_is_not():
+    """The board splits in two at the decision, and the halves behave oppositely.
 
-    The posterior is computed against the board as it was *visible*, so a combo
-    it likes can turn out to contain the turn or the river. Here the whole range
-    does, by construction — every draw dies, nothing is rolled out, and the
-    label is `nan` rather than a number nobody computed.
+    What hero can see is fixed — every rollout has to replay that flop or the
+    label is about a different hand. What hero cannot see is drawn again for
+    every sample, because §7.1's `Q` averages over everything hero does not
+    know and the turn and the river are part of it. Pinning the whole board,
+    as an earlier version did, makes the estimate conditional on one runout
+    and no sample budget can undo that.
+
+    The dead set is hero's information exactly: no opponent is ever dealt a
+    card off the *visible* board or out of hero's hand, and a card of a street
+    still to come is fair game — it is in the deck as far as hero knows.
     """
-    pool = [ShovesInSet("board-lover", N_ACTIONS, BOARD, StyleParams.identity()),
-            Caller("hero", N_ACTIONS, StyleParams.identity())]
-    deck = deck_with(BOARD, [SPADES[:2], HERO_ACES])
-    record = one_hand(pool, [0, 1], deck=deck, forced=[ALLIN], stack_bb=10)
+    pool = [Caller("call", N_ACTIONS, StyleParams.identity())]
+    record = one_hand(pool, [0, 0], stack_bb=50, seed=31)
+    idx = next(i for i, d in enumerate(record.decisions)
+               if int(record.snapshots[d["snap_idx"]]["turn"]) == 1)
+    hero_pos = int(record.decisions[idx]["acting_pos"])
+    opp_pos = 1 - hero_pos
+
+    driver = CapturingDriver(pool, N_ACTIONS)
+    q, legal, stats = action_values(
+        record, idx, driver, pool, 0,
+        OracleConfig(samples_per_action=16, max_collision_retries=32),
+        np.random.default_rng(12))
+
+    assert stats.n_rollouts == len(driver.captured) > 0
+    assert np.isfinite(q[legal]).all()
+
+    visible = [int(c) for c in record.deck[:3]]
+    dead = set(visible) | set(record.hole_cards(hero_pos))
+    runouts = set()
+    for played in driver.captured:
+        assert [int(c) for c in played.deck[:3]] == visible
+        assert played.hole_cards(hero_pos) == record.hole_cards(hero_pos)
+        assert not set(played.hole_cards(opp_pos)) & dead
+        runouts.add(tuple(int(c) for c in played.deck[3:5]))
+
+    assert len(runouts) > 1, "every sample got the same turn and river"
+
+
+def test_a_label_whose_every_draw_collides_is_nan():
+    """Eight ranges inside three cards: no joint assignment exists at all.
+
+    Sixteen cards are needed and three are available, so the rejection is a
+    pigeonhole and not a probability — nothing is rolled out, and `q` is `nan`
+    rather than a number nobody computed. `nan` is the contract §6.2's masking
+    relies on: a zero here would average silently into a target.
+    """
+    trio = [card(8, 3), card(7, 3), card(6, 3)]                 # T♣ 9♣ 8♣
+    pool = [Caller("hero", N_ACTIONS, StyleParams.identity()),
+            CallsInSet("narrow", N_ACTIONS, trio, StyleParams.identity())]
+    board = [card(12, 0), card(11, 0), card(5, 0), card(2, 1), card(0, 2)]
+    holes = [HERO_ACES] + [[card(r, 1), card(r, 2)] for r in range(3, 11)]
+    record = one_hand(pool, [0] + [1] * 8, deck=deck_with(board, holes),
+                      forced=[CALL] * 9, stack_bb=100)
+    idx = 9
+    assert int(record.decisions[idx]["acting_pos"]) == 0
+    assert not set(trio) & (set(board[:3]) | set(HERO_ACES))
 
     q, legal, stats = action_values(
-        record, 1, LockstepDriver(pool, N_ACTIONS), pool, 1,
+        record, idx, LockstepDriver(pool, N_ACTIONS), pool, 0,
         OracleConfig(samples_per_action=32, likelihood_floor=0.0,
                      max_collision_retries=4),
         np.random.default_rng(4))

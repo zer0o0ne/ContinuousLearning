@@ -18,7 +18,8 @@ import pytest
 
 from pool.sampling import PoolSampler
 
-CFG = {"pfsp_exponent": 2.0, "floor_fraction": 0.2, "n_clusters": 3}
+CFG = {"pfsp_exponent": 2.0, "floor_fraction": 0.2, "n_clusters": 3,
+       "result_decay": 1.0}
 
 
 def _sampler(cfg=CFG, n_members=6, seed=7):
@@ -63,6 +64,58 @@ def test_results_accumulate_into_a_mean_and_the_mean_into_a_weight():
         [1.0, 11.0 / 15.0, 0.0, 0.0, 0.0, 0.0])
     assert s.weights().tolist() == pytest.approx(
         [1.0, (11.0 / 15.0) ** 2, 0.0, 0.0, 0.0, 0.0])
+
+
+def test_forgetting_leaves_an_unsampled_member_where_it_was():
+    """`end_iteration` ages the evidence without moving the estimate.
+
+    Numerator and denominator decay together, so a member nobody played this
+    iteration keeps exactly the mean it had — no new information, no new
+    estimate. What shrinks is the effective hand count behind it.
+    """
+    s = _sampler(dict(CFG, result_decay=0.5))
+    before = s.mean_bb_per_100().tolist()
+    for _ in range(10):
+        s.end_iteration()
+    assert s.mean_bb_per_100().tolist() == pytest.approx(before)
+    assert s.hardness().tolist() == pytest.approx(_sampler().hardness().tolist())
+
+
+def test_forgetting_is_what_lets_the_loop_notice_it_has_stopped_winning():
+    """The recovery path, on the numbers (module docstring).
+
+    A member the early agents crushed over 20 000 hands, against which the
+    current agent now loses 10 BB/100 in 330-hand sessions — one iteration's
+    worth of what the uniform floor delivers at the scale §13 sketches.
+
+    Without forgetting the estimate is still +7.2 BB/100 after ten iterations
+    and reaches zero only around the sixtieth: the loop does not notice inside
+    the length of a run. At 0.8 it crosses at the twelfth
+    iteration, which is also where the member takes the top PFSP weight; at 0.5
+    it crosses at the fifth. The transient is the old evidence decaying to the window's scale, so
+    it is set by the decay and not by how much history there was.
+    """
+    def run(decay, n_iterations):
+        s = PoolSampler(2, dict(CFG, result_decay=decay), np.random.default_rng(0))
+        s.update(0, 2000.0, 20000)      # +10 BB/100 over 20 000 hands
+        s.update(1, 0.0, 20000)
+        for _ in range(n_iterations):
+            s.end_iteration()
+            s.update(0, -33.0, 330)     # −10 BB/100 over one floor session
+            s.update(1, 0.0, 330)
+        return s
+
+    assert run(1.0, 10).mean_bb_per_100()[0] == pytest.approx(7.167, abs=0.001)
+    assert run(1.0, 40).mean_bb_per_100()[0] > 0.0
+
+    assert run(0.8, 10).mean_bb_per_100()[0] == pytest.approx(1.864, abs=0.001)
+    assert run(0.8, 11).mean_bb_per_100()[0] > 0.0
+    assert run(0.8, 12).mean_bb_per_100()[0] < 0.0
+    assert run(0.8, 11).hardness().tolist() == [0.0, 1.0]
+    assert run(0.8, 12).hardness().tolist() == [1.0, 0.0]
+
+    assert run(0.5, 4).mean_bb_per_100()[0] > 0.0
+    assert run(0.5, 5).mean_bb_per_100()[0] < 0.0
 
 
 def test_a_pool_with_no_results_and_a_pool_with_no_spread_are_both_flat():

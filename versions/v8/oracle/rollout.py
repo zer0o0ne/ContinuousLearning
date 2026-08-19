@@ -28,13 +28,18 @@ nowhere else. Hero's member is queried through `DecisionContext`, whose
 holding into hero's observation. `tests/test_oracle.py` asserts it by recording
 every holding hero's member is ever handed, not by reading this file.
 
-**Why the board is the real one.** Hero's action does not change the runout, and
-the posterior was computed with the visible board dead. Re-dealing the board
-would make `Q` an average over runouts the posterior has already conditioned
-away — a different quantity, and the wrong one. The price is that a sampled
-combo can collide with a board card that was not yet visible when the posterior
-was computed; those draws are rejected below and counted, because that is the
-size of an approximation and it belongs in the log rather than in a comment.
+**Why the runout is dealt, not reused.** Only the board hero can *see* at the
+decision is fixed; the streets still to come are dealt afresh for every sample,
+out of whatever the assignment left in the deck. §7.1 defines `Q` as the EV over
+everything hero does not know, and the turn and the river are part of that. An
+earlier version pinned the whole five-card board of the hand the decision came
+out of, which makes the label an estimate of `E[chips | this exact river]` — a
+quantity whose error `samples_per_action` cannot reduce at all, because every
+sample shares the one runout. It is drawn *after* the opponents' combos, so the
+decomposition is `p(hands | visible board) · p(runout | hands)`: the posterior
+conditions on what hero saw, the runout comes out of what is left, and both are
+exact. The draw is per sample and not per action, so common random numbers still
+hold — the actions of one sample are compared on one board.
 
 **Fold needs no special case.** Hero's chip delta after folding is minus what
 hero has already put in, whatever the opponents hold, so the rollout returns the
@@ -48,7 +53,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from oracle.posterior import opponent_posterior
+from oracle.posterior import _visible_board, opponent_posterior
 
 FOLD = 0
 N_CARDS = 52
@@ -91,24 +96,30 @@ def _folded_before(record, decision_idx):
             if int(d["action_idx"]) == FOLD}
 
 
-def _rollout_deck(record, hero_pos, opp_seats, opp_cards):
+def _rollout_deck(record, hero_pos, opp_seats, opp_cards, n_visible, rng):
     """The 52-card deck of one rollout.
 
-    The real board, hero's real cards, the sampled cards at the opponents'
-    seats, and every card nobody was dealt filled into the remaining slots in
-    ascending order — arbitrary, but a function of the assignment alone, so two
-    identical assignments deal identical hands.
+    The board hero can see, hero's real cards, the sampled cards at the
+    opponents' seats, the streets still to come drawn from what is left, and
+    every card nobody was dealt filled into the remaining slots in ascending
+    order — arbitrary, but a function of the assignment and the runout, so the
+    same assignment and the same runout deal identical hands.
     """
     deck = np.full(N_CARDS, -1, dtype=np.int64)
-    deck[:5] = [int(c) for c in record.deck[:5]]
+    deck[:n_visible] = [int(c) for c in record.deck[:n_visible]]
     deck[5 + 2 * hero_pos: 7 + 2 * hero_pos] = record.hole_cards(hero_pos)
     for seat, cards in zip(opp_seats, opp_cards):
         deck[5 + 2 * seat: 7 + 2 * seat] = cards
 
     used = np.zeros(N_CARDS, dtype=bool)
     used[deck[deck >= 0]] = True
-    empty = np.flatnonzero(deck < 0)
-    deck[empty] = np.flatnonzero(~used)
+    free = np.flatnonzero(~used)
+    n_hidden = 5 - n_visible
+    if n_hidden:
+        drawn = rng.choice(free, size=n_hidden, replace=False)
+        deck[n_visible:5] = drawn
+        free = free[~np.isin(free, drawn)]
+    deck[np.flatnonzero(deck < 0)] = free
     return deck
 
 
@@ -118,8 +129,8 @@ def _sample_joint(posteriors, dead_mask, n_samples, max_retries, rng):
     The exact joint over eight opponents is combinatorially impossible, so the
     marginals are treated as independent and the card-removal correction is
     made by **rejection**: a draw in which two opponents share a card, or in
-    which a card is already on the board or in hero's hand, is thrown away and
-    redrawn. A sample that has not survived `max_retries` redraws is dropped —
+    which a card is already on the *visible* board or in hero's hand, is thrown
+    away and redrawn. A sample that has not survived `max_retries` redraws is dropped —
     it reduces the divisor of the average, it is not an outcome of zero.
 
     Returns `(cards, n_attempts, n_rejected)` with `cards` of shape
@@ -208,9 +219,13 @@ def action_values(record, decision_idx, driver, pool, hero_member_idx, cfg, rng)
         forwards += len(combos) * acted
         posteriors.append((combos, weights))
 
-    # The full board, not the visible one: these cards are in the rollout deck.
+    # Hero's information and no more: the board hero can see at this decision
+    # plus hero's own cards. A card of a street still to come is not dead — it
+    # is in the deck, and an opponent holding it is exactly a runout that
+    # cannot happen, which is what dealing the runout after the combos says.
+    visible = _visible_board(record, decision_idx)
     dead_mask = np.zeros(N_CARDS, dtype=bool)
-    dead_mask[[int(c) for c in record.deck[:5]]] = True
+    dead_mask[[int(c) for c in visible]] = True
     dead_mask[record.hole_cards(hero_pos)] = True
 
     samples, attempts, rejected = _sample_joint(
@@ -223,7 +238,8 @@ def action_values(record, decision_idx, driver, pool, hero_member_idx, cfg, rng)
 
     specs = []
     for s in range(len(samples)):
-        deck = _rollout_deck(record, hero_pos, opp_seats, samples[s])
+        deck = _rollout_deck(record, hero_pos, opp_seats, samples[s],
+                             len(visible), rng)
         for a in legal_idx:
             specs.append(replace(
                 record.spec, seat_members=seat_members, deck=deck,

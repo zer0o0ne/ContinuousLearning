@@ -40,7 +40,7 @@ import numpy as np
 import torch
 
 from nets.features import collate
-from train.targets import kl_loss
+from train.targets import kl_loss, soft_q_loss
 from utils import progress
 
 
@@ -88,15 +88,20 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
             returned, not a fresh one (see the module docstring).
         hands: list of `HandTokens`, each ending in the pending token of the
             decision that was labelled (`action[-1] == -1`).
-        targets: (N, n_actions) distributions, one per hand, from
-            `train.targets.policy_target`.
+        targets: (N, n_actions), one row per hand. What a row *is* depends on
+            `cfg["loss"]`: a distribution from `train.targets.policy_target`
+            under `kl`, and a normalised EV vector from
+            `train.targets.normalised_q` under `soft_q` (§6.2). Both carry
+            exact zeros off the decision's legal mask.
         embeddings: sequence of N tables of shape (max_players, d_emb) — the
             vectors the hand's seats were conditioned on. Frozen here: they are
             fitted by the embedding network (§5.5), not by this loss.
         cfg: the `agent_train` config section — `steps`,
             `first_iteration_steps`, `batch_hands`, `lr`, and optionally
-            `weight_decay`, `eta_min`, `grad_clip`, `embedding_dropout`,
-            `log_every`.
+            `loss` (`kl`, the default, or `soft_q`), `temperature` (required by
+            `soft_q` and unused by `kl`, which has already spent it building
+            the target), `weight_decay`, `eta_min`, `grad_clip`,
+            `embedding_dropout`, `log_every`.
         iteration: which cycle of §8's loop this is. Selects the step count and
             nothing else.
 
@@ -120,16 +125,26 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         "a labelled hand must end in the pending token of the decision the "
         "label is about (§9) — a hand whose last token carries an action is "
         "one the agent has already been told the answer to")
-    assert np.allclose(targets.sum(axis=1), 1.0, atol=1e-9), (
-        "every target must be a distribution")
+    loss_name = cfg.get("loss", "kl")
+    assert loss_name in ("kl", "soft_q"), (
+        f"unknown loss {loss_name!r}; choices are 'kl' and 'soft_q' (§6.2)")
+    if loss_name == "kl":
+        assert np.allclose(targets.sum(axis=1), 1.0, atol=1e-9), (
+            "every target must be a distribution")
+    else:
+        assert np.isfinite(targets).all(), (
+            "a normalised EV must be finite — `nan` marks illegal actions and "
+            "`train.targets.normalised_q` zeroes them")
+        temperature = float(cfg["temperature"])
     assert not (targets * ~legal_last).any(), (
-        "a target puts mass on an action the environment called illegal")
+        "a target carries a value on an action the environment called illegal")
 
     steps = steps_for_iteration(cfg, iteration)
     batch_hands = min(int(cfg["batch_hands"]), n)
     p_drop = float(cfg.get("embedding_dropout", 0.0))
     log(f"[agent] iteration {iteration}: {steps} steps over {n} labels, "
-        f"batch {batch_hands} hands, embedding dropout {p_drop}")
+        f"batch {batch_hands} hands, loss {loss_name}, "
+        f"embedding dropout {p_drop}")
 
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["lr"],
                             weight_decay=cfg.get("weight_decay", 0.0))
@@ -156,7 +171,10 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         legal = batch["legal"][rows, last]
         target = torch.as_tensor(targets[pick], dtype=logits.dtype,
                                  device=logits.device)
-        loss = kl_loss(logits, target, legal)
+        if loss_name == "kl":
+            loss = kl_loss(logits, target, legal)
+        else:
+            loss = soft_q_loss(logits, target, legal, temperature)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -165,8 +183,12 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         opt.step()
         sched.step()
 
+        # Both losses are a KL and both are zero at the optimum, so one key
+        # carries either: `kl` reports `KL(target ‖ π)` and `soft_q` reports
+        # `T·KL(π ‖ target)`.
         history.append({"step": step, "kl": float(loss.detach())})
         if step % cfg.get("log_every", 100) == 0 or step == 1:
-            log(f"[agent] step {step}/{steps} kl={history[-1]['kl']:.4f}")
+            log(f"[agent] step {step}/{steps} "
+                f"{loss_name}={history[-1]['kl']:.4f}")
     net.eval()
     return history

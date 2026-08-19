@@ -37,8 +37,10 @@ SAMPLES = [2, 8]
 COMBOS = [None, 8]
 TABLES = [2, 3]
 STACKS = [10, 20]
+POOLS = ["all", "degenerate"]
 LABELS_PER_CELL = 2
-N_CELLS = len(SAMPLES) * len(COMBOS) * len(TABLES) * len(STACKS)
+N_CELLS = (len(POOLS) * len(SAMPLES) * len(COMBOS) * len(TABLES)
+           * len(STACKS))
 
 
 def _config():
@@ -58,6 +60,8 @@ def _config():
              "label": "maniac_styles"},
         ],
         "sweep": {
+            "pool_kinds": POOLS,
+            "hero_kind": "degenerate",
             "samples_per_action": SAMPLES,
             "max_combos": COMBOS,
             "table_sizes": TABLES,
@@ -86,11 +90,11 @@ def test_the_sweep_has_exactly_one_cell_per_point_of_the_grid(gate):
     report, _ = gate
     cells = report["cells"]
     assert len(cells) == N_CELLS
-    keys = {(c["samples_per_action"], c["max_combos"], c["players"],
-             c["stack_bb"]) for c in cells}
+    keys = {(c["pool"], c["samples_per_action"], c["max_combos"],
+             c["players"], c["stack_bb"]) for c in cells}
     assert len(keys) == N_CELLS, "a cell was labelled twice"
-    assert keys == {(s, c, p, b) for s in SAMPLES for c in COMBOS
-                    for p in TABLES for b in STACKS}
+    assert keys == {(k, s, c, p, b) for k in POOLS for s in SAMPLES
+                    for c in COMBOS for p in TABLES for b in STACKS}
     for c in cells:
         assert c["n_labels"] == LABELS_PER_CELL
         assert 0.0 <= c["collision_rate"] <= 1.0
@@ -116,7 +120,7 @@ def test_the_forward_count_grows_with_the_sample_budget(gate):
     report, _ = gate
     by_group = {}
     for c in report["cells"]:
-        key = (c["max_combos"], c["players"], c["stack_bb"])
+        key = (c["pool"], c["max_combos"], c["players"], c["stack_bb"])
         by_group.setdefault(key, {})[c["samples_per_action"]] = c
     assert by_group
     for key, cells in by_group.items():
@@ -140,11 +144,16 @@ def test_the_posterior_and_the_rollouts_split_the_forwards_between_them(gate):
         # Zero at the very first decision of a hand: no opponent has acted, so
         # there is no likelihood to evaluate and the posterior is the prior.
         assert r["posterior_forwards"] >= 0
-        assert r["rollout_forwards"] > 0
-        assert r["depth"] == pytest.approx(
-            r["rollout_forwards"] / r["n_rollouts"])
+        # Zero when every rollout ended on hero's own action — heads-up, hero
+        # calling a shove is a showdown and nobody is asked anything after it.
+        assert r["rollout_forwards"] >= 0
+        if r["n_rollouts"]:
+            assert r["depth"] == pytest.approx(
+                r["rollout_forwards"] / r["n_rollouts"])
     assert any(r["posterior_forwards"] > 0 for r in rows), (
         "no label in the whole sweep paid for a posterior")
+    assert any(r["rollout_forwards"] > 0 for r in rows), (
+        "no label in the whole sweep played a free decision")
 
 
 def test_the_bar_reaches_its_total(gate):
@@ -188,12 +197,15 @@ def test_the_headline_is_one_line_per_sample_budget_at_the_exact_posterior():
     """`max_combos = None` is what §7.2 describes; the capped rows are the
     fallback and must not be averaged into the sentence §13 asks for."""
     cells = [
-        {"samples_per_action": 32, "max_combos": None, "seconds_per_label": 2.0,
-         "forwards_per_label": 100.0, "se_q": 0.4},
-        {"samples_per_action": 32, "max_combos": 128, "seconds_per_label": 1.0,
-         "forwards_per_label": 50.0, "se_q": 0.4},
-        {"samples_per_action": 64, "max_combos": None, "seconds_per_label": 4.0,
-         "forwards_per_label": 200.0, "se_q": 0.2},
+        {"pool": "all", "samples_per_action": 32, "max_combos": None,
+         "seconds_per_label": 2.0, "forwards_per_label": 100.0,
+         "se_q": 0.4, "se_q_norm": 0.1},
+        {"pool": "all", "samples_per_action": 32, "max_combos": 128,
+         "seconds_per_label": 1.0, "forwards_per_label": 50.0,
+         "se_q": 0.4, "se_q_norm": 0.1},
+        {"pool": "all", "samples_per_action": 64, "max_combos": None,
+         "seconds_per_label": 4.0, "forwards_per_label": 200.0,
+         "se_q": 0.2, "se_q_norm": 0.05},
     ]
     rows = headline(cells, iteration_labels=3600)
     assert [r["samples_per_action"] for r in rows] == [32, 64]
@@ -250,28 +262,30 @@ def _play(rng, num_players, stack_bb, n_hands):
 # ---------------------------------------------------------------- the profile
 
 
-def test_the_four_buckets_account_for_every_second_of_a_label(gate):
+def test_the_five_buckets_account_for_every_second_of_a_label(gate):
     """The profile is a decomposition, not a sample: whatever the label spent
-    that the wrapped layers did not see is `driver`, and the four add back up.
+    that the wrapped layers did not see is `driver`, and the five add back up.
     A bucket that silently dropped time would make the shares argue for
     attacking the wrong thing."""
     _, payload = gate
     for r in payload["rows"]:
-        total = r["t_events"] + r["t_forward"] + r["t_style"] + r["t_driver"]
+        total = sum(r[k] for k in ("t_events", "t_pack", "t_model",
+                                   "t_style", "t_driver"))
         assert total == pytest.approx(r["seconds"], rel=1e-9, abs=1e-9)
-        for key in ("t_events", "t_forward", "t_style", "t_driver"):
+        for key in ("t_events", "t_pack", "t_model", "t_style", "t_driver"):
             assert r[key] >= 0.0, f"{key} is negative: {r}"
 
 
-def test_a_pool_with_no_network_spends_nothing_on_events_or_forwards(gate):
+def test_a_pool_with_no_network_spends_nothing_in_the_network_buckets(gate):
     """This config's pool is degenerate only, so no query reaches
-    `build_v7_events` or a model — and the profile has to say so rather than
-    attribute the time to a layer that never ran."""
+    `build_v7_events`, no tensor packing and no model — and the profile has
+    to say so rather than attribute the time to a layer that never ran."""
     _, payload = gate
     for r in payload["rows"]:
         assert r["event_rows"] == 0
         assert r["t_events"] == 0.0
-        assert r["t_forward"] == 0.0
+        assert r["t_pack"] == 0.0
+        assert r["t_model"] == 0.0
         assert r["policy_rows"] > 0
         assert r["policy_calls"] > 0
 
@@ -284,7 +298,7 @@ def test_the_counters_are_per_label_and_not_cumulative(gate):
     by_key = {}
     for r in payload["rows"]:
         by_key.setdefault(
-            (r["max_combos"], r["players"], r["stack_bb"]), {}
+            (r["pool"], r["max_combos"], r["players"], r["stack_bb"]), {}
         ).setdefault(r["samples_per_action"], []).append(r["policy_rows"])
     assert by_key
     for key, by_samples in by_key.items():
@@ -293,7 +307,7 @@ def test_the_counters_are_per_label_and_not_cumulative(gate):
         assert totals[-1] > totals[0], f"{key} did not move at all"
 
 
-def test_a_network_member_puts_its_time_in_events_and_forward(tmp_path):
+def test_a_network_member_splits_its_time_over_events_pack_and_model(tmp_path):
     """The bucket that decides the next step is `events` against `forward`, and
     the degenerate pool above can never exercise it. A tiny randomly
     initialised v7 network can: nothing here is about how it plays, only that a
@@ -304,21 +318,26 @@ def test_a_network_member_puts_its_time_in_events_and_forward(tmp_path):
     specs = make_specs(seed=7, n_hands=4, n_members=len(pool), num_players=3,
                        stack_bb=20)
     for spec in specs:
-        spec.seat_members = [0, 1, 2]      # seat 0 is the network
+        spec.seat_members = [1, 2, 3]      # every seat is a degenerate
     driver = MeasuringDriver(pool, pool[0].n_actions)
     records = driver.run(specs, batch_size=4)
     record = next(r for r in records if len(r.decisions) > 1)
 
     cfg = OracleConfig(samples_per_action=2, max_combos=8,
                        batch_hands=32)
-    row = measure_label(record, 1, driver, pool, cfg,
+    row = measure_label(record, 1, driver, pool, 0, cfg,   # 0 is the network
                         np.random.default_rng(0))
 
+    # Nobody at the table is a network and the posterior only ever asks the
+    # seated members, so a single event build proves the *passed* hero member
+    # played hero's rollouts — which is the whole point of it being an argument.
     assert row["event_rows"] > 0, "the network was never asked anything"
     assert row["t_events"] > 0.0
-    assert row["t_forward"] > 0.0
+    assert row["t_pack"] > 0.0, "the tensor-packing pass was never timed"
+    assert row["t_model"] > 0.0
     assert 0 < row["event_rows"] <= row["policy_rows"]
-    total = row["t_events"] + row["t_forward"] + row["t_style"] + row["t_driver"]
+    total = sum(row[k] for k in ("t_events", "t_pack", "t_model", "t_style",
+                                 "t_driver"))
     assert total == pytest.approx(row["seconds"], rel=1e-9, abs=1e-9)
 
 
@@ -347,10 +366,12 @@ def test_the_grouped_profile_sums_the_labels_it_groups():
     clock the run actually spent (`profile_groups`)."""
     rows = [
         {"players": 2, "samples_per_action": 32, "seconds": 1.0,
-         "t_events": 0.5, "t_forward": 0.2, "t_style": 0.1, "t_driver": 0.2,
+         "t_events": 0.3, "t_pack": 0.2, "t_model": 0.2, "t_style": 0.1,
+         "t_driver": 0.2,
          "policy_rows": 100, "policy_calls": 10, "event_rows": 100},
         {"players": 6, "samples_per_action": 32, "seconds": 9.0,
-         "t_events": 1.0, "t_forward": 6.0, "t_style": 1.0, "t_driver": 1.0,
+         "t_events": 0.5, "t_pack": 0.5, "t_model": 6.0, "t_style": 1.0,
+         "t_driver": 1.0,
          "policy_rows": 900, "policy_calls": 20, "event_rows": 450},
     ]
     groups = {g["group"]: g for g in profile_groups(rows)}
@@ -358,7 +379,8 @@ def test_the_grouped_profile_sums_the_labels_it_groups():
 
     total = groups["all"]
     assert total["seconds"] == pytest.approx(10.0)
-    assert total["t_events"] == pytest.approx(1.5)
+    assert total["t_events"] == pytest.approx(0.8)
+    assert total["t_model"] == pytest.approx(6.2)
     assert total["rows_per_call"] == pytest.approx(1000 / 30)
     assert total["network_share"] == pytest.approx(0.55)
     # (10.0 - 1.2) seconds inside `policy`, over 1000 rows.
@@ -368,3 +390,49 @@ def test_the_grouped_profile_sums_the_labels_it_groups():
     assert groups["plr=2"]["n_labels"] == 1
     assert groups["plr=6"]["us_per_row"] == pytest.approx(1e6 * 8.0 / 900)
 
+
+def test_the_split_half_gaps_keep_their_sign(gate):
+    """The target is a softmax and a softmax is shift-invariant, so what the
+    loss actually sees is the noise on the *differences* between actions. A
+    difference of two gaps needs both signs; storing the squares — which is all
+    `se_q` reads — throws exactly that away and cannot be undone afterwards."""
+    _, payload = gate
+    gaps = [g for r in payload["rows"] for g in r["half_gap"]]
+    assert gaps, "no label produced a split-half gap at all"
+    assert all(np.isfinite(g) for g in gaps)
+    assert any(g < 0.0 for g in gaps) and any(g > 0.0 for g in gaps), (
+        "every gap has the same sign, which is not a two-sided error")
+
+
+def test_the_error_is_reported_in_pot_units_as_well_as_big_blinds(gate):
+    """`se_q` in BB cannot be read without the pot beside it: §6.2 divides `Q`
+    by `pot + facing_bet` before the target is built, so the same 12 BB is
+    fatal in a 3 BB pot and irrelevant in a 300 BB one. The normalisation is
+    per label — dividing the aggregate by an average pot would be a different
+    number — which is what this recomputation pins."""
+    report, payload = gate
+    by_cell = {}
+    for r in payload["rows"]:
+        key = (r["pool"], r["samples_per_action"], r["max_combos"],
+               r["players"], r["stack_bb"])
+        by_cell.setdefault(key, []).append(r)
+
+    for cell in report["cells"]:
+        key = (cell["pool"], cell["samples_per_action"], cell["max_combos"],
+               cell["players"], cell["stack_bb"])
+        rows = by_cell[key]
+        assert all(r["divisor"] > 0.0 for r in rows)
+        expected = [g / r["divisor"] for r in rows for g in r["half_gap"]]
+        assert cell["se_q_norm"] == pytest.approx(
+            float(np.sqrt(np.mean(np.square(expected)))) / 2.0)
+        assert np.isfinite(cell["se_q_norm"])
+
+
+def test_the_hero_seat_is_the_configured_member_and_not_whoever_sat_there(gate):
+    """§8 puts one policy in hero's seat, so measuring the cost of whoever the
+    hand happened to seat there measures a rollout policy the pipeline never
+    uses — `always_fold` ends a rollout at depth zero and `maniac` stacks off."""
+    report, payload = gate
+    assert report["hero_kind"] == "degenerate"
+    kinds = {i: d["kind"] for i, d in enumerate(payload["pool"])}
+    assert kinds[report["hero_member"]] == "degenerate"

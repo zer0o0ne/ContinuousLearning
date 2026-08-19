@@ -76,7 +76,10 @@ section as they are settled.
 | **D5** | Does the agent get a value head now? `CONCEPT.md` §6.1 says no; §7.4's variant C — the first lever if the compute budget does not close — requires one. | **No head now.** Build the baseline literally; if G3 (S4) says variant A does not fit, adding the head is a contained change to `AgentNet` plus a new oracle module. Building it "just in case" is the unrequested addition §5 forbids. | S5, S6 |
 | **D6** | `max_combos` subsampling semantics. `CONCEPT.md` §7.3 says "v7's `gpu_solver_v5` already has this knob and its semantics". | **Read `gto_utils/gpu_solver_v5.py` and reuse whatever it does.** Do not invent a scheme; if v5's is not self-normalised importance sampling, say so and ask rather than silently improving it. | S2 |
 | **D7** | The G1 run found both showdown heads memorising the corpus (held-out `class_ce` 5.75 against `ln 169` = 5.13; held-out strength MSE 0.095 against a target variance of ~0.085), and the showdown term contributing nothing to the inference fit (−0.007 ± 0.005 nats pooled). §5.1a's weights are `train` config. | **Leave §5.1a exactly as designed for now, and carry the finding as a risk (§13, R4).** Changing the embedding objective before the pipeline exists means the pipeline is built on a network nobody has measured. The weights are config; the experiment is cheap once there is something to run it against. | — |
-| **D9** | The embedding table is `nn.Embedding(n_members, d_emb)` and §8 grows the pool by one member per iteration, so the agent needs a row and the corpus needs a member index for hero's tokens. | **Reserve the rows up front** (owner decision 2026-08-19): the table is sized `len(pool₀) + max_iterations`, the agent of iteration *k* owns row `len(pool₀) + k` from the moment it is first seated as hero, and retraining is a continuation rather than a rebuild. See `CONCEPT.md` §5.4. | S9 |
+| **D9** | The embedding table is `nn.Embedding(n_members, d_emb)` and §8 grows the pool by one member per iteration, so the agent needs a row and the corpus needs a member index for hero's tokens. | **Reserve the rows up front** (owner decision 2026-08-19): the table is sized `len(pool₀) + max_iterations × style.agent_variants`, iteration *k* owns the block starting at `len(pool₀) + k × agent_variants` (its first row is the agent itself, from the moment it is first seated as hero, the rest are its style draws — D11), and retraining is a continuation rather than a rebuild. See `CONCEPT.md` §5.4. | S9 |
+| **D10** | PFSP scores accumulate over the whole run, but hero is replaced every iteration, so the quantity being estimated is non-stationary and a member the early agents beat keeps its score forever. | **Forget geometrically** (owner decision 2026-08-19): `pool_sampling.result_decay` scales the accumulated hands and BB once per iteration, and `PoolSampler.end_iteration()` is called by the loop. At 0.8, a member with 20 000 hands of history crosses back over zero twelve iterations after it stops losing; without the decay it takes about sixty. `result_decay = 1.0` is the old lifetime behaviour. | S9 |
+| **D11** | Does a trained agent join the pool as one member or as several? `CONCEPT.md` §4.2 says the style layer "applies uniformly to any pool member, v7 or v8", but §4.1 only ever said "the agent joins the pool". | **Several, and the count is config** (owner decision 2026-08-19): `style.agent_variants` — the agent plus `agent_variants − 1` style draws off it, exactly as a v7 checkpoint is expanded at bootstrap. Thirty iterations of one lineage are the most correlated members the pool will ever hold (§11.3 turned on ourselves) and a style draw costs no forward and no parameter. `1` is the no-multiplication setting. Changes D9's arithmetic. | S9 |
+| **D12** | A past agent seated as an *opponent* is not a plain `PoolMember`: `AgentPoolMember` is one member per seat and needs an opponent-embedding table of its own, so "what does agent *k−3* believe about its tablemates while it plays" has to be answered. | **OPEN — owner decision required before S9.** Two candidates. *(a)* Seat past agents at `e = 0`, the unconditional policy that §6.2's embedding dropout already trains explicitly: no extra fit, no recursion, and the pool member is a fixed policy like every other. *(b)* Give each past agent its own §5.5 inference fit over its tablemates, which is faithful but nests one fit inside another and multiplies the cost of every rollout. Recommendation is (a); (b) has no cheap form and no measurement asking for it yet. | S9 |
 
 **D8 — plan-level.** Sessions S5/S6 (the agent) do not depend on S1–S4 (the oracle). The order
 below puts the oracle first because `CONCEPT.md` §13 says it is the piece most likely to kill
@@ -773,10 +776,25 @@ Iteration *n*:
 3. fit / refresh opponent embeddings                     (§5.5)
 4. oracle labels at hero decisions                       (S3, S7)
 5. train the agent on KL to softmax(Q_norm / T)          (S6)
-6. every `embedding_retrain_every` iterations, retrain the embedding network
+   — on all but `agent_train.heldout_fraction` of the labels
+6. measure the oracle gap on the held-out labels         (§8, below)
+7. every `embedding_retrain_every` iterations, retrain the embedding network
    on the enlarged history corpus                        (§8)
-7. append the trained agent to the pool                  (§4.1)
+8. append the trained agent to the pool as `style.agent_variants`
+   members — the agent plus its style draws              (§4.1, D11)
+9. `sampler.end_iteration()` — age the PFSP results      (S8, D10)
 ```
+
+**The oracle gap (§8, owner decision 2026-08-19).** Every checkpoint is measured against the
+oracle that taught it, on the slice of that iteration's labels training never saw. Four numbers
+— `kl`, `ev_gap_target`, `ev_gap_greedy`, `agreement` — plus the same four broken down by table
+size and by stack depth, into `iter_<n>/metrics.json`. It costs one agent forward per held-out
+decision and **no new rollouts**: the oracle's answer is already in the shard, so this is a
+`softmax` over stored `q` and one batched forward, not a second labelling pass. `CONCEPT.md` §8
+carries the definitions and, importantly, what the number is *not* — it is scored by the oracle's
+own noisy `Q` on hero's own state distribution, so it bounds nothing about exploitability and its
+floor is G3's Monte-Carlo error rather than zero. What it answers is whether this iteration's
+training absorbed this iteration's labels, separately from whether the labels were any good.
 
 **Iteration 0 is different and only in one way** (§7.1, OI-2 revised): the agent is trained from
 scratch, and a **v7 pool member sits in hero's seat**, named by the `agent_init` config section —
@@ -798,9 +816,16 @@ as text — a bar is not a record (`CLAUDE.md` §5).
 ### Tests — `tests/test_pipeline.py`
 A 2-iteration toy pipeline on CPU, everything shrunk to seconds:
 1. It runs to completion and writes every expected artefact.
-2. The pool grows by exactly one member per iteration.
+2. The pool grows by exactly `style.agent_variants` members per iteration.
 3. Iteration 0 seats the `agent_init` member and iteration 1 seats the agent — asserted by
    inspecting who was queried, not by reading config.
+3b. The held-out labels reach the metric and never the optimiser: the gap is computed on
+   decisions absent from every training batch, and a run with `heldout_fraction = 0` reports no
+   gap rather than a gap on training data. On a hand-built pair of distributions the four numbers
+   match values computed by hand, and `ev_gap_greedy` is zero exactly when the agent puts all its
+   mass on the oracle's best action.
+3c. The pool grows by `style.agent_variants` members per iteration, each with its own embedding
+   row, and the reserved table is exactly `len(pool₀) + max_iterations × agent_variants`.
 4. Resume from an interrupted phase produces byte-identical artefacts to an uninterrupted run.
 5. Table sizes and stack depths over the run cover 2–9 and 10–300 BB with no weighting toward
    heads-up or 200 BB — the `CLAUDE.md` §1 compliance test, asserted on the exact multiset.

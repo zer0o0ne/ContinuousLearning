@@ -1,213 +1,218 @@
 {
-  "name": "g3",
-  "seed": 11,
-  "device": "auto",
-  "out_dir": "../../data/v8",
-  "iteration_labels": 100000,
-  "game": {
-    "n_actions": 14,
-    "max_players": 9,
-    "big_blind": 10,
-    "small_blind": 5,
-    "players_range": [
-      2,
-      9
-    ],
-    "stack_bb_range": [
-      10,
-      300
-    ],
-    "raise_sizes": {
-      "preflop": [
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        2.5,
-        3.0,
-        3.5,
-        4.0,
-        4.5,
-        5.0,
-        6.0
-      ],
-      "flop": [
-        0.1,
-        0.25,
-        0.33,
-        0.4,
-        0.5,
-        0.67,
-        0.75,
-        1.0,
-        1.25,
-        1.5,
-        2.0
-      ],
-      "turn": [
-        0.1,
-        0.25,
-        0.33,
-        0.4,
-        0.5,
-        0.67,
-        0.75,
-        1.0,
-        1.25,
-        1.5,
-        2.0
-      ],
-      "river": [
-        0.1,
-        0.25,
-        0.33,
-        0.4,
-        0.5,
-        0.67,
-        0.75,
-        1.0,
-        1.25,
-        1.5,
-        2.0
-      ]
-    }
-  },
-  "style": {
-    "uncond_scale": 1.0,
-    "position_scale": 0.5,
-    "street_scale": 0.5,
-    "log_temperature_range": [
-      -0.7,
-      0.7
-    ],
-    "uniform_mix_range": [
-      0.0,
-      0.25
-    ]
-  },
-  "bootstrap": [
-    {
-      "kind": "degenerate",
-      "strategy": "always_fold",
-      "style": "identity"
-    },
-    {
-      "kind": "degenerate",
-      "strategy": "always_call",
-      "style": "identity"
-    },
-    {
-      "kind": "degenerate",
-      "strategy": "always_min_raise",
-      "style": "identity"
-    },
-    {
-      "kind": "degenerate",
-      "strategy": "maniac",
-      "style": "identity"
-    },
-    {
-      "kind": "degenerate",
-      "strategy": "nit",
-      "style": "identity"
-    },
-    {
-      "kind": "degenerate",
-      "strategy": "always_call",
-      "n_variants": 6,
-      "label": "call_styles"
-    },
-    {
-      "kind": "degenerate",
-      "strategy": "maniac",
-      "n_variants": 6,
-      "label": "maniac_styles"
-    },
-    {
-      "kind": "degenerate",
-      "strategy": "nit",
-      "n_variants": 6,
-      "label": "nit_styles"
-    },
-    {
-      "kind": "v7",
-      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/gto_predict/2026_08_06_19_10_02/best.pt",
-      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
-      "n_variants": 8,
-      "label": "v7_pure"
-    },
-    {
-      "kind": "v7",
-      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/lag_bluffer/gto_predict/2026_08_07_04_04_21/best.pt",
-      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
-      "n_variants": 8,
-      "label": "v7_bluff"
-    },
-    {
-      "kind": "v7",
-      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/value_heavy/gto_predict/2026_08_07_21_58_41/best.pt",
-      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
-      "n_variants": 8,
-      "label": "v7_value"
-    },
-    {
-      "kind": "v7",
-      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_14_11_40_25/cycles/cycle_0010.pt",
-      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
-      "n_variants": 8,
-      "label": "v7_pure_mcts_10"
-    },
-    {
-      "kind": "v7",
-      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/lag_bluffer/mcts_predict/2026_08_14_11_40_26/cycles/cycle_0020.pt",
-      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
-      "n_variants": 8,
-      "label": "v7_bluff_mcts_20"
-    },
-    {
-      "kind": "v7",
-      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/value_heavy/mcts_predict/2026_08_14_11_40_28/cycles/cycle_0030.pt",
-      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
-      "n_variants": 8,
-      "label": "v7_value_mcts_30"
-    },
-    {
-      "kind": "v7",
-      "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_14_11_40_25/cycles/cycle_0050.pt",
-      "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
-      "n_variants": 8,
-      "label": "v7_pure_mcts_50"
-    }
+ "name": "g3",
+ "seed": 11,
+ "device": "auto",
+ "out_dir": "../../data/v8",
+ "iteration_labels": 100000,
+ "game": {
+  "n_actions": 14,
+  "max_players": 9,
+  "big_blind": 10,
+  "small_blind": 5,
+  "players_range": [
+   2,
+   9
   ],
-  "sweep": {
-    "samples_per_action": [
-      32,
-      64,
-      128,
-      256
-    ],
-    "max_combos": [
-      null,
-      512,
-      128
-    ],
-    "table_sizes": [
-      2,
-      6,
-      9
-    ],
-    "stack_bb": [
-      20,
-      100,
-      300
-    ],
-    "hands_per_table": 40,
-    "labels_per_cell": 8,
-    "driver_batch_size": 512
-  },
-  "oracle": {
-    "likelihood_floor": 1e-06,
-    "batch_hands": 2048,
-    "max_collision_retries": 32
+  "stack_bb_range": [
+   10,
+   300
+  ],
+  "raise_sizes": {
+   "preflop": [
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    3.5,
+    4.0,
+    4.5,
+    5.0,
+    6.0
+   ],
+   "flop": [
+    0.1,
+    0.25,
+    0.33,
+    0.4,
+    0.5,
+    0.67,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0
+   ],
+   "turn": [
+    0.1,
+    0.25,
+    0.33,
+    0.4,
+    0.5,
+    0.67,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0
+   ],
+   "river": [
+    0.1,
+    0.25,
+    0.33,
+    0.4,
+    0.5,
+    0.67,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0
+   ]
   }
+ },
+ "style": {
+  "uncond_scale": 1.0,
+  "position_scale": 0.5,
+  "street_scale": 0.5,
+  "log_temperature_range": [
+   -0.7,
+   0.7
+  ],
+  "uniform_mix_range": [
+   0.0,
+   0.25
+  ]
+ },
+ "bootstrap": [
+  {
+   "kind": "degenerate",
+   "strategy": "always_fold",
+   "style": "identity"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "always_call",
+   "style": "identity"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "always_min_raise",
+   "style": "identity"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "maniac",
+   "style": "identity"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "nit",
+   "style": "identity"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "always_call",
+   "n_variants": 6,
+   "label": "call_styles"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "maniac",
+   "n_variants": 6,
+   "label": "maniac_styles"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "nit",
+   "n_variants": 6,
+   "label": "nit_styles"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/gto_predict/2026_08_06_19_10_02/best.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 8,
+   "label": "v7_pure"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/lag_bluffer/gto_predict/2026_08_07_04_04_21/best.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 8,
+   "label": "v7_bluff"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/value_heavy/gto_predict/2026_08_07_21_58_41/best.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 8,
+   "label": "v7_value"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_14_11_40_25/cycles/cycle_0010.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 8,
+   "label": "v7_pure_mcts_10"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/lag_bluffer/mcts_predict/2026_08_14_11_40_26/cycles/cycle_0020.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 8,
+   "label": "v7_bluff_mcts_20"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/value_heavy/mcts_predict/2026_08_14_11_40_28/cycles/cycle_0030.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 8,
+   "label": "v7_value_mcts_30"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_14_11_40_25/cycles/cycle_0050.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 8,
+   "label": "v7_pure_mcts_50"
+  }
+ ],
+ "sweep": {
+  "pool_kinds": [
+   "all",
+   "v7"
+  ],
+  "hero_kind": "v7",
+  "samples_per_action": [
+   32,
+   64,
+   128,
+   256
+  ],
+  "max_combos": [
+   null,
+   512,
+   128
+  ],
+  "table_sizes": [
+   2,
+   6,
+   9
+  ],
+  "stack_bb": [
+   20,
+   100,
+   300
+  ],
+  "hands_per_table": 40,
+  "labels_per_cell": 8,
+  "driver_batch_size": 512
+ },
+ "oracle": {
+  "likelihood_floor": 1e-06,
+  "batch_hands": 2048,
+  "max_collision_retries": 32
+ }
 }

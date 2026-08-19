@@ -33,7 +33,7 @@ versions/v8/
   ARCHITECTURE.md       this file
   config_g1.json        the G1 experiment surface
   config_g1_pilot.json  a shrunk G1 for measuring throughput on the Spark first
-  config_g3.json        the G3 sweep surface — samples × combos × table × stack
+  config_g3.json        the G3 sweep surface — samples × combos × table × stack × pool
 
   env/                  poker engine, from v7, verbatim
     legal.py            the one legality rule (§6.2)                    NEW
@@ -77,7 +77,7 @@ versions/v8/
   gto_utils/            hand evaluation, equity, CFR solvers v1–v5, from v7
   evaluation/
     slumbot_eval.py     from v7, verbatim — does not import yet (§5)
-  tests/                19 files, 306 tests, ~58 s
+  tests/                19 files, 308 tests, ~58 s
 ```
 
 ### What was inherited, and why
@@ -237,10 +237,11 @@ One label is:
 2. one `opponent_posterior(..., through_decision=decision_idx − 1)` per **live** opponent (a seat
    that has folded holds nothing that can change a showdown and gets filler cards);
 3. one **joint sample** — each opponent's combo drawn independently from its own marginal, and
-   the draw rejected and redrawn if two opponents share a card or a card is already on the board
-   or in hero's hand;
-4. one `HandSpec` per (legal action, surviving sample): the real board and hero's real cards in
-   the deck, the sampled cards at the opponents' seats, the rest filled in ascending order;
+   the draw rejected and redrawn if two opponents share a card or a card is already on the
+   **visible** board or in hero's hand;
+4. one `HandSpec` per (legal action, surviving sample): the visible board and hero's real cards
+   in the deck, the sampled cards at the opponents' seats, the streets still to come drawn from
+   what the assignment left, the rest filled in ascending order;
    `forced_actions` = the recorded prefix plus that action; `seat_members` = the real members
    with `hero_member_idx` in hero's seat; `seed` = a `blake2b` hash of
    `(spec.seed, decision_idx, action, sample)`, so a label does not depend on which other
@@ -259,10 +260,25 @@ is queried through `DecisionContext`, whose `hole_cards` reads hero's own seat. 
 asserts it by recording every holding hero's member is handed over ~900 rollout queries, not by
 reading the code.
 
-**Why the board is the real one.** Hero's action does not change the runout, and the posterior
-already conditioned on the visible board. Re-dealing it would average over runouts the posterior
-has conditioned away. The price is paid in step 3: a combo the posterior still likes may contain
-the turn or the river, and that draw has to die.
+**Why the runout is dealt and the visible board is not** (`CONCEPT.md` §7.1, owner decision
+2026-08-19). The dead set in step 3 is hero's information exactly: `_visible_board(record,
+decision_idx)` plus hero's own two cards. A card of a street still to come is **not** dead — it
+is in the deck as far as hero knows — so `_rollout_deck` draws the missing board cards per
+sample out of whatever the assignment left. The order matters and is the whole argument:
+combos first, from `p(· | visible board)`, then the runout from the remainder, which is the
+exact factorisation `p(hands | visible) · p(runout | hands)`.
+
+An earlier version pinned the full five-card board of the hand the decision came out of. That
+makes `q` an estimate of `E[chips | this exact river]`, an error no `samples_per_action` can
+reduce because every sample shares the one runout — and one invisible to the split-half column
+that is supposed to size the sample budget. The draw is per **sample**, not per action, so the
+common-random-numbers property above is unaffected: the actions of one sample are still compared
+on one board.
+
+The residual collision source is now only the one-decision offset: the posterior conditions
+`through_decision = decision_idx − 1`, so its dead set is the board visible at the *previous*
+decision, while step 3 rejects against the board visible at *this* one. A combo containing a card
+that turned over in between still has to die.
 
 **Fold is not special-cased.** Hero's chip delta after folding is minus what hero has already
 put in, whatever the opponents hold, so the rollout returns the closed form with zero variance —
@@ -275,7 +291,8 @@ both stack extremes.
 That last one is the size of §7.3's approximation, and it is large: measured on a **9-handed**
 preflop decision with eight live opponents, **~98.5 % of draws are rejected** — 16 cards drawn
 independently from one 50-card deck almost always repeat. Heads-up on the river it is exactly
-zero. So `max_collision_retries` is not a formality at a full ring, and the cost of a full-ring
+zero. (These are the numbers before the runout change above, which can only lower the rate:
+fewer cards are dead.) So `max_collision_retries` is not a formality at a full ring, and the cost of a full-ring
 label is roughly `1 / P(accept)` draws per usable sample. This is a CPU measurement of the
 sampler, not of the GPU cost — G3 (S4) is what measures the label.
 
@@ -302,6 +319,18 @@ opponent space is continuous and effectively infinite, which is the answer to §
 maniac, nit. They emit finite-scale logits rather than one-hots so a style draw can still move
 them. The nit's strength test is a hole-card lookup, not an equity evaluation — §4.2 drops
 equity-gated conditions as far too expensive inside rollouts.
+
+**`v7_member.py` runs the network under autocast.** G3 measured a label's wall clock at roughly
+75 % the v7 forward and under 6 % everything Python does to prepare it, so precision is the only
+lever the pool side has, and `V7NetworkMember` was running fp32 with no autocast at all while
+`utils.get_amp_config` — v8's existing answer to "what does this device want" — sat unused.
+`logits` now wraps `agent.action_logits` in `torch.autocast` with what that helper returns: bf16
+on CUDA, which is the regime v7 itself trained and evaluated under (`evaluation/slumbot_eval.py`
+does the same), and **disabled on CPU**, so the dev box keeps running the fp32 path the test
+battery pins. Resolved in `__init__` from `agent.device_`, because `build_pool` calls
+`set_device` before it constructs a member and never moves one afterwards. Whether bf16 actually
+pays on sm_121 is a hypothesis until the Spark says so (`CLAUDE.md` §3); the `.float()` already
+at the end of `logits` is there because v7 ran this way too.
 
 **`build.py`.** Builds the pool from the `bootstrap` config section and produces the descriptor
 list the G1 report needs. `fresh_style_variants` draws the never-trained-on styles that
@@ -340,6 +369,25 @@ discards information that averaging keeps, and discards it irreversibly. Min-max
 sensitive to one extreme member stretching the denominator; the replacement if that shows up is a
 rank, which costs no config either.
 
+**The accumulation forgets (`end_iteration`, `result_decay`, D10).** A procedural member never
+changes but hero does, so "hero's BB/100 against member *i*" is a property of a *pair* and a
+lifetime mean is a mean over every past agent. Left alone it produces exactly the failure the
+mechanism exists to prevent: a member the agents of iterations 1–10 crushed carries a positive
+score built on tens of thousands of hands, the ~330 hands per iteration the uniform floor keeps
+delivering move it by a few percent, and the loop does not notice it has stopped beating it until
+about the sixtieth iteration — past the length of a run. `end_iteration` scales both accumulators
+by `result_decay` at the loop's iteration boundary, giving an effective window of roughly
+`hands_per_iteration / (1 − result_decay)`; at 0.8 the same member crosses back over zero at the
+twelfth iteration and takes the top PFSP weight there. Two properties make this the right shape:
+the mean of a member nobody sampled is **unchanged** (numerator and denominator decay together —
+no new information, no new estimate), while its effective hand count shrinks, which is exactly
+what lets the next session it plays move the estimate. `result_decay = 1.0` is the lifetime
+behaviour, kept reachable as the honest way to switch the mechanism off.
+
+The same smearing is why this is not only about recovery: `PLAN_PIPELINE.md` R2 reads
+fictitious-play cycling (agent *n* losing to agent *n−2*) off these scores, and a lifetime mean
+averages that signal away across every past hero.
+
 **The floor is an independent coin flip per draw.** A deterministic schedule ("every fifth draw")
 has the same mean and less variance and was the first implementation, but it aligns with table
 structure: at a fixed table size and a floor of 0.25 the floor lands on the *same two slots of
@@ -357,8 +405,8 @@ Seats within one table are drawn **independently**, so a member may occupy two s
 that would bias the draw away from small clusters, which is the opposite of what the dedup is
 for.
 
-`state_dict` / `load_state_dict` carry the accumulated hands and BB, the cluster labels and the
-rng state, so a restart resumes the same stream (§8's resume requirement). A stored state may
+`state_dict` / `load_state_dict` carry the accumulated (and decayed, hence fractional) hands and
+BB, the cluster labels and the rng state, so a restart resumes the same stream (§8's resume requirement). A stored state may
 cover a **prefix** of the members: §8 appends one agent per iteration, so the sampler that
 resumes is one member larger than the one that saved. The new members arrive unplayed, each in a
 cluster of its own until the next `set_vectors`; a stored state *larger* than the pool is an
@@ -526,7 +574,7 @@ cd versions/v8 && python3 -m gates.g3 --config config_g3.json
 
 `CONCEPT.md` §14 (G3) and §13. A realistic pool plays a few hundred hands; a fixed set of hero
 decisions out of those hands is then labelled by `oracle/rollout.py` (§2.2c) under a sweep over
-the four axes that plausibly move the cost:
+the five axes that plausibly move the cost:
 
 | Axis | `config_g3.json` |
 |---|---|
@@ -534,8 +582,9 @@ the four axes that plausibly move the cost:
 | `max_combos` | `null` (the exact posterior), 512, 128 |
 | table size | 2, 6, 9 |
 | stack depth | 20, 100, 300 BB |
+| `pool_kinds` | `all`, `v7` |
 
-108 cells × `labels_per_cell` labels, one global `tqdm` bar over labels (`CLAUDE.md` §5); a cell
+216 cells × `labels_per_cell` labels, one global `tqdm` bar over labels (`CLAUDE.md` §5); a cell
 that runs short of decisions advances the bar by the labels it did not take, and the shortfall is
 reported rather than hidden. Output is `data/v8/g3/<timestamp>/g3_report.json` — every per-label
 row as well as the aggregates — plus the printed table.
@@ -549,23 +598,51 @@ needs; the two columns it cannot give (rollout depth, and the per-sample rewards
 read by `MeasuringDriver`, a `LockstepDriver` that keeps the records of its last `run`. The
 oracle's return value was not widened for one experiment.
 
-**The `se_q` column** is the one addition to what §14 asks for, and it is in because the owner
-asked for it. The sweep says what a label *costs*; it says nothing about how many samples a label
-*needs*, and both are required to fix `oracle.samples_per_action`. It is free: each label's
-samples are split in half and the two halves compared, so with equal independent halves
-`E[(q_A − q_B)²] = 4·Var(q)` and the reported figure is `sqrt(mean((q_A − q_B)²)) / 2` in BB,
-pooled over every label and every legal action of the cell.
+**The `se_q` columns** are the one addition to what §14 asks for, and they are in because the
+owner asked for them. The sweep says what a label *costs*; it says nothing about how many
+samples a label *needs*, and both are required to fix `oracle.samples_per_action`. They are
+free: each label's samples are split in half and the two halves compared, so with equal
+independent halves `E[(q_A − q_B)²] = 4·Var(q)` and the reported figure is
+`sqrt(mean((q_A − q_B)²)) / 2`, pooled over every label and every legal action of the cell.
+
+Two details of that column are load-bearing and were wrong in the first run:
+
+* **the gaps are stored signed.** `se_q` only needs the squares, but the target is a softmax and
+  a softmax is shift-invariant, so what reaches the loss is the noise on the *differences*
+  between actions — and a difference of two gaps cannot be recovered once the signs are gone.
+  With `half_gap` signed, the contrast error is computable offline from `g3_report.json` without
+  replaying a single rollout.
+* **the error is reported in pot units as well as BB** (`SE/pot`), because §6.2 divides `Q` by
+  `pot + facing_bet` before the target is built: the same 12 BB is fatal in a 3 BB pot and
+  irrelevant in a 300 BB one. The divisor is per label, so the normalisation happens per label
+  and not on the aggregate.
+
+**The profile block** splits a label's wall clock five ways — `build_v7_events`, tensor packing
+in `EventSequenceEmbedder._build_batch_tensors`, the model itself, the style-and-legality last
+mile, and everything left over as driver and engine — and reports the rows per policy call and
+the share of queries that reached a network at all. `Profile` and the `profiling()` context
+manager live in the gate and wrap the production paths rather than instrumenting them: a timer
+inside `PoolMember.policy` would be exactly the "while I was there" addition `CLAUDE.md` §5
+forbids, and the gate is the only caller that wants the numbers. The wrapping is entered once
+per label, so a row can never carry a profile it did not measure, and the five buckets sum to
+the label's wall clock by construction (`test_g3_gate.py` pins that).
 
 Every cell labels the **same** decisions, which is what makes the columns comparable and the
-forwards count monotone in the sample budget for a reason other than luck. Hero's seat is played
-by the member already sitting in it — at iteration 0 of §8 the oracle improves on a pool member,
-so that is the cost of the real thing. G3 is also the one place where table size and stack depth
-are pinned instead of sampled: the question is how cost varies along them, which needs cells, not
-a uniform draw. Nothing here is training data, so `CLAUDE.md` §1's sampling rule is untouched.
+forwards count monotone in the sample budget for a reason other than luck. **Hero's seat is
+played by `sweep.hero_kind`, not by whoever the hand seated** — the first run took the seated
+member, which on a pool that is 29 % degenerate meant roughly every third label had
+`always_fold` or `maniac` as its rollout policy, and §8 never puts either there. `pool_kinds`
+exists for the mirror image of that problem: §4.4 samples opponents by PFSP with a uniform
+floor, while `build_hands` samples uniformly, so cost and noise were both measured against a
+table the pipeline will not set. G3 is also the one place where table size and stack depth are
+pinned instead of sampled: the question is how cost varies along them, which needs cells, not a
+uniform draw. Nothing here is training data, so `CLAUDE.md` §1's sampling rule is untouched.
 
 The gate measures and stops. It tunes nothing and it does not try to make the number better; the
 decision that follows — variant A as it stands, or §7.4's variant C — is read off the table by
-the owner. **It has not been run** (§5).
+the owner. **It has been run twice on the Spark** (2026-08-18 and 2026-08-19); what the first
+run said is recorded in `CONCEPT.md` §13, and the changes above plus the §7.1 runout fix and
+bf16 in the pool member are why the second one is not comparable to it.
 
 ---
 
@@ -631,9 +708,11 @@ The second and third together mean the agent **cannot yet be an opponent in §7.
 
 ### 2.9 Targets and agent training (§6.2, §8) — `train/targets.py`, `train/agent_train.py`
 
-`policy_target(q, legal, pot_bb, facing_bet_bb, temperature, divisor)` turns one decision's
-oracle EVs into the distribution the agent is fitted to, and `kl_loss(logits, target, legal)`
-is the loss. `train/agent_train.py` is one training cycle around them.
+`normalised_q(q, legal, pot_bb, facing_bet_bb, divisor)` puts one decision's oracle EVs on the
+scale of the situation; `policy_target(...)` softmaxes that at temperature `T` into the
+distribution the agent is fitted to. Two losses consume them and `agent_train`'s `loss` key
+picks one — `kl_loss(logits, target, legal)` or `soft_q_loss(logits, q_norm, legal, T)`.
+`train/agent_train.py` is one training cycle around them.
 
 **The normalisation is the point of the module.** `q / (pot + facing_bet)`, then a softmax at
 temperature `T`. Raw EVs in a 300 BB pot and a 10 BB pot differ by more than an order of
@@ -652,6 +731,32 @@ when it builds it.
 `kl_loss` is the full KL and not a cross-entropy, so it reads as a distance: it is exactly zero
 when the masked prediction is the target. The target is detached — a gradient into it would be
 a gradient into the oracle.
+
+**`soft_q_loss` — the same optimum, linear in the labels** (`CONCEPT.md` §6.2, owner decision
+2026-08-19). It computes
+
+```
+−⟨π_θ, Q̂ₙ⟩ + T·Σ π_θ log π_θ + T·log Σ_legal exp(Q̂ₙ/T)   =   T·KL(π_θ ‖ softmax(Q̂ₙ/T))
+```
+
+`Q̂ₙ` — a `normalised_q` row, exact zeros off `legal` — enters the first term **linearly** and
+the third term does not involve `θ` at all, so `E_ε[∇_θ L] = ∇_θ L|_{Q̂=Q}`: Monte-Carlo error in
+the labels stays variance instead of becoming target bias, which is what it becomes when the
+labels are pushed through a softmax first. The third term is added only so the printed number is
+a KL — non-negative, zero at the optimum, readable the way `kl_loss` is — and it shifts the value
+without touching the gradient.
+
+`test_targets.py` pins the property rather than the formula: averaging the gradients at `Q + ε`
+and `Q − ε` reproduces the gradient at `Q` to `1e-12` for `soft_q` and demonstrably does not for
+`kl`. It also pins that adding a constant to every legal EV changes neither the value nor the
+gradient — the same shift invariance the softmax has, and the reason the common part of the
+oracle's noise, the part §2.2c's common random numbers already share across actions, cannot
+reach the gradient at all.
+
+Note the direction: this is `KL(π ‖ target)`, the reverse of `kl_loss`. Same minimiser, but
+mode-seeking where the network cannot reach it, which is why both losses exist rather than one
+replacing the other. Under `soft_q` the history's `kl` key is `T·KL`, so the two losses' curves
+are not comparable in absolute size.
 
 **Embedding dropout (§6.2)** zeroes a slot's vector for a whole hand with probability `p`. The
 draw is taken on the per-hand `(B, n_slots, d_emb)` table *before* it is read per token, which
@@ -858,19 +963,22 @@ in v8. Treat it as reference material. When v8's agent lands, split it as `CONCE
 describes: keep the protocol layer (HTTP client, action-string grammar, token ↔ action mapping,
 state replay, BB/100 + SE accounting), rewrite the agent adapter against v8's observation format.
 
-**The v7 pool member has never been run with real weights.** `data/v7/` does not exist on the dev
-box and there is no GPU (`CLAUDE.md` §3), so `test_v7_pool_member.py` exercises a randomly
-initialised network: it verifies that the vendored stack imports and runs under the installed
-`transformers`, that the event format is built correctly, and that a v7 member obeys the
-observation-parity and legality contracts. It says nothing about a trained checkpoint. Loading
-real v7 weights, and everything about GPU throughput, stays a hypothesis until run on the Spark.
+**The v7 pool member is not covered by the battery with real weights.** `data/v7/` does not
+exist on the dev box and there is no GPU (`CLAUDE.md` §3), so `test_v7_pool_member.py` exercises
+a randomly initialised network: it verifies that the vendored stack imports and runs under the
+installed `transformers`, that the event format is built correctly, and that a v7 member obeys
+the observation-parity and legality contracts. It says nothing about a trained checkpoint. Real
+checkpoints have loaded and played on the Spark since 2026-08-18 (seven of them, 79 members,
+through G3), but nothing in the battery sees that, and the bf16 path of §2.3 has not been run at
+all.
 
-**G3 has never been run.** `gates/g3.py` is exercised by `test_g3_gate.py` at a scale that
-proves the experiment is the right shape and nothing else: a few hands, two samples per action,
-a degenerate pool, on CPU. Every number it prints — seconds per label, labels per hour, the
-standard error of `q` — is a property of the Spark and does not exist yet (`CLAUDE.md` §3). Until
-it runs, `CONCEPT.md` §13's ~3 s and ~10⁵ forwards per label remain a design figure, and the
-choice between variant A and §7.4's variant C has not been informed by any measurement.
+**G3 has run twice on the Spark**, 2026-08-18 and 2026-08-19; `CONCEPT.md` §13 records what the
+first run measured and §7.4 records the design claim it withdrew. What is still a hypothesis on
+this box is everything the gate touches at scale: `test_g3_gate.py` exercises it at a few hands,
+two samples per action, a degenerate pool, on CPU, which proves the experiment is the right
+shape and nothing else. The second run also changed what is being measured — the §7.1 runout
+draw, the configured hero seat, the `pool_kinds` axis and bf16 all landed together — so its
+numbers replace the first run's rather than extending them.
 
 **The G1 checkpoint no longer loads** (§2.8, D3). Extracting the trunk renamed every parameter
 under it, so a `state_dict` saved before the extraction no longer matches
@@ -911,7 +1019,7 @@ In roughly the order `CONCEPT.md` §14 says to build it:
 cd versions/v8 && python3 -m pytest tests/ -q
 ```
 
-306 tests, ~58 s on the dev box (CPU-only). The 30-minute budget from `CLAUDE.md` §4 is barely
+308 tests, ~58 s on the dev box (CPU-only). The 30-minute budget from `CLAUDE.md` §4 is barely
 touched.
 
 | File | Covers |
@@ -922,7 +1030,7 @@ touched.
 | `test_driver_lockstep.py` | **Lock-step ≡ sequential** (also with a pinned deck and a forced prefix), chip conservation through the driver, the v7 snapshot convention, the max-actions cap, every table size and stack depth, and the legality rule's corner cases |
 | `test_rollout_plumbing.py` | **Replay identity**: a recorded hand replayed from its own deck and action sequence reproduces itself element for element, at every table size and both stack extremes; a forced replay issues zero policy calls; the deck override deals exactly what was asked and is refused if it is not a permutation; a partial prefix is replayed and the rest runs free with chips conserved; an illegal forced action raises naming the seat and the mask; the pending token adds exactly one action-less token, leaves every earlier token bit-identical, shows only the observer's cards, and is refused together with a showdown |
 | `test_posterior.py` | The opponent posterior: a hand-computed two-decision example to `1e-12`; one batched policy call per opponent decision; card removal relative to the observer (`C(45, 2)` on the river, the opponent's real holding still in the universe); every prefix length normalised; **a card-independent member leaves the prior exactly alone** and a card-dependent one does not; the posterior through *k* is bit-identical on a record truncated at *k*; an opponent who has not acted is the prior; a zero likelihood warns and falls back instead of returning NaN; `max_combos` caps, renormalises and is seeded, is spent **before** any member is asked (32-row batches, not 1081), draws the same combos under two different posteriors, reproduces the full posterior restricted to its draw, and recovers a functional of the full posterior to 0.02 over 200 seeds; `hole_override` changes the cards and nothing else |
-| `test_oracle.py` | The BR oracle, every case exact rather than within a Monte-Carlo tolerance: `q[FOLD]` equals hero's own contribution to `1e-12` at every table size 2–9 and both stack extremes; `Q` equals an enumerated posterior-weighted sum on a fixture where hero's payoff is constant on the range's support and different off it; **hero is never handed a card it could not see** over ~900 rollout queries; every rollout conserves chips; illegal actions carry `nan` and the mask is the recorded one; the same seed gives a bit-identical label; the label is unchanged when the record is truncated at the labelled decision; a range made only of board cards collides every time and labels nothing; a heads-up river decision cannot collide; dropped samples reduce the divisor instead of counting as zeros; the forward count is a hand count |
+| `test_oracle.py` | The BR oracle, every case exact rather than within a Monte-Carlo tolerance: `q[FOLD]` equals hero's own contribution to `1e-12` at every table size 2–9 and both stack extremes; `Q` equals an enumerated posterior-weighted sum on a fixture where hero's payoff is constant on the range's support and different off it; **hero is never handed a card it could not see** over ~900 rollout queries; every rollout conserves chips; illegal actions carry `nan` and the mask is the recorded one; the same seed gives a bit-identical label; the label is unchanged when the record is truncated at the labelled decision; **the runout is dealt per sample and the visible board is not** — every rollout replays the flop, the turn and river differ between samples, and no opponent is ever handed a card off the visible board or out of hero's hand; eight ranges inside three cards make every joint draw collide by pigeonhole and the label is `nan`; a heads-up river decision cannot collide; dropped samples reduce the divisor instead of counting as zeros; the forward count is a hand count |
 | `test_observation_parity.py` | **The fatal invariant**: only the observer's hole cards, board never ahead of the street, no token carries its own action, scalars from the pre-decision snapshot, prefixes independent of what came later |
 | `test_embedding_net_masking.py` | Causal within a hand, block-diagonal across hands, hand order irrelevant, the embedding is what changes the prediction, padding inert, **a showdown token cannot reach back into any decision**, the action loss ignores showdown tokens, both showdown heads reach the embedding, zero weights reduce the objective to action CE |
 | `test_inference_fit.py` | The joint fit reaches the loss of the vectors that generated the labels, determinism, `K = 0` is the ablation, network weights untouched, cold start, regularisation, **the showdown terms reach the fitted vector** and zero weights reproduce the action-only fit |
@@ -930,11 +1038,11 @@ touched.
 | `test_pool_style.py` | The five categories partition the action set, 32-scalar round trip, identity style is a masked softmax, position and street gating, temperature, uniform mix, every draw is a valid distribution over legal actions, each degenerate strategy does what it says |
 | `test_v7_pool_member.py` | The vendored v7 stack constructs and plays legal hands; the v7 event format is built from the acting seat, masked to the street, and stops at its decision; **a `hole_override` reaches the network** — an override naming the real cards reproduces the plain answer, aces and deuce-trey do not, the record is untouched, and end to end a v7 opponent's posterior leaves the prior |
 | `test_g1_gate.py` | The gate end to end: button rotation, uniform 2–9 × 10–300 BB, the four report sections, cold start ≡ `e = 0`, and that the standard error's unit is the session |
-| `test_g3_gate.py` | The label-cost sweep end to end: one cell per point of the grid, every column the decision is taken on present and finite, forwards and rollouts monotone in the sample budget, the posterior's and the rollouts' shares adding up to the total, the bar reaching its total when a cell runs short of decisions, the split-half error finite, the headline built from the exact-posterior cells only, and a pinned table size that a hand cannot quietly leave |
+| `test_g3_gate.py` | The label-cost sweep end to end: one cell per point of the grid, every column the decision is taken on present and finite, forwards and rollouts monotone in the sample budget, the posterior's and the rollouts' shares adding up to the total, the bar reaching its total when a cell runs short of decisions, the split-half error finite and its gaps **signed on both sides**, the pot-unit error recomputed per label from the stored rows, the hero seat being the configured member and not whoever sat there, the five profile buckets summing to the label's wall clock with the counters reset per label and the wrapping undone on exit, the headline built from the exact-posterior cells only, and a pinned table size that a hand cannot quietly leave |
 | `test_agent_net.py` | The agent end to end: one row of logits per hand and every padded position inert; each row answers from **its own** last real token and no hand moves another; through the driver, at every table size 2–9 and both stack extremes, a valid distribution over legal actions and chips conserved; the observation obeys §9 parity along the agent's own call path — only its own cards, board never ahead of the street, no showdown token, the pending token action-less — and the observation does not grow as the record does; with `e = 0` permuting the players is bit-identical and a non-zero vector is not; determinism, weights untouched by a `policy` call, and both parity guards refusing what they are meant to refuse |
 | `test_label_generation.py` | Label generation end to end: a toy run whose every label is a valid distribution over the environment's own mask with `nan` exactly off it; hero is slot 0 and every hero decision is labelled once; an ordinary pool member works as hero (iteration 0, §7.1); **the embedding of a block ignores every later hand** — hero jams from hand `R` on and the block's vectors come out bit-identical anyway, while block 0 is the zero cold start; the stored prefix stops at the labelled decision, carries only hero's cards and a board never ahead of the street; the same seed writes byte-identical shards and a shard round-trips; the table draw is the exact uniform multiset of a fixed seed; and the session machinery is shared with G1 rather than copied |
-| `test_pool_sampling.py` | Pool sampling: a fixed history and seed produce an exact sequence; results accumulate across sessions of different lengths into a mean and the mean into a weight, with a pool of no results and a pool of no spread both flat, and the **magnitude** of a loss — not its sign — moving the weight; a member hero beats the most is reached **only** through the floor — never at `floor_fraction = 0`, every draw uniform at 1; a member nobody has played is drawn immediately; clustering recovers a hand-built structure and a ten-member blob of near-duplicates does not crowd out a lone style, while a duplicate pair splits one cluster's share; more clusters than members is no clustering; the state round-trips and reproduces the next draw, survives a pool that has since grown by one member and refuses one that has shrunk; and every table size 2–9 gets one member per non-hero seat |
-| `test_targets.py` | Targets, loss and the training cycle: a hand-computed softmax to `1e-12`; exact zeros off the mask and what sits under it never read; the two temperature limits reached in float, not approached; one legal action, equal EVs, no legal action, a `nan` under the mask; **the v7 scar** — two situations differing by a factor of 30 give the same target to `1e-12`, and without the divisor one is near-uniform while the other is near-deterministic; the KL is exactly zero on a match, positive off it, blind to illegal logits, and its gradient reaches the logits and not the target; dropout at `p = 0` and `p = 1`, reproducible from its generator, and per hand per slot rather than per token; a toy run that reduces the loss, is deterministic, leaves the pool and the embeddings untouched and refuses a hand that is not a pending decision; and the cycle — the first iteration runs its own step count, a later one opens from the weights the previous one left, and three cycles in a row keep improving |
+| `test_pool_sampling.py` | Pool sampling: a fixed history and seed produce an exact sequence; results accumulate across sessions of different lengths into a mean and the mean into a weight, with a pool of no results and a pool of no spread both flat, and the **magnitude** of a loss — not its sign — moving the weight; a member hero beats the most is reached **only** through the floor — never at `floor_fraction = 0`, every draw uniform at 1; forgetting leaves an unsampled member's estimate exactly where it was and is what lets a member the early agents crushed climb back to the top PFSP weight at all — at `result_decay = 1` it is still winning after forty iterations, at 0.8 it crosses at the twelfth and at 0.5 at the fifth; a member nobody has played is drawn immediately; clustering recovers a hand-built structure and a ten-member blob of near-duplicates does not crowd out a lone style, while a duplicate pair splits one cluster's share; more clusters than members is no clustering; the state round-trips and reproduces the next draw, survives a pool that has since grown by one member and refuses one that has shrunk; and every table size 2–9 gets one member per non-hero seat |
+| `test_targets.py` | Targets, loss and the training cycle: a hand-computed softmax to `1e-12`; exact zeros off the mask and what sits under it never read; the two temperature limits reached in float, not approached; one legal action, equal EVs, no legal action, a `nan` under the mask; **the v7 scar** — two situations differing by a factor of 30 give the same target to `1e-12`, and without the divisor one is near-uniform while the other is near-deterministic; the KL is exactly zero on a match, positive off it, blind to illegal logits, and its gradient reaches the logits and not the target; **the linear loss** — the two losses share a minimiser, averaging the gradients at `Q ± ε` reproduces the gradient at `Q` to `1e-12` for `soft_q` and demonstrably not for `kl`, a constant added to every legal EV changes neither value nor gradient, illegal logits are ignored, a label off the mask is refused, and a toy run reaches its target; dropout at `p = 0` and `p = 1`, reproducible from its generator, and per hand per slot rather than per token; a toy run that reduces the loss, is deterministic, leaves the pool and the embeddings untouched and refuses a hand that is not a pending decision; and the cycle — the first iteration runs its own step count, a later one opens from the weights the previous one left, and three cycles in a row keep improving |
 
 `conftest.py` puts `gto_utils/` and the version root on `sys.path` and reseeds
 `random`/`numpy`/`torch` to 42 before every test. `tests/g1_fixtures.py` holds the shared toy

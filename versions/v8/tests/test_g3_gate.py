@@ -15,8 +15,12 @@ import json
 import numpy as np
 import pytest
 
-from gates.g3 import build_hands, choose_decisions, headline, run
-from tests.g1_fixtures import RAISE_SIZES
+from gates.g3 import (
+    PROFILE, MeasuringDriver, build_hands, choose_decisions, headline,
+    measure_label, profile_groups, profiling, run,
+)
+from oracle.rollout import OracleConfig
+from tests.g1_fixtures import RAISE_SIZES, make_pool, make_specs
 
 GAME = {
     "n_actions": 6,
@@ -241,3 +245,126 @@ def _play(rng, num_players, stack_bb, n_hands):
     specs = build_hands(rng, list(range(len(pool))), GAME, num_players,
                         stack_bb, n_hands, seed_base=7)
     return MeasuringDriver(pool, GAME["n_actions"]).run(specs)
+
+
+# ---------------------------------------------------------------- the profile
+
+
+def test_the_four_buckets_account_for_every_second_of_a_label(gate):
+    """The profile is a decomposition, not a sample: whatever the label spent
+    that the wrapped layers did not see is `driver`, and the four add back up.
+    A bucket that silently dropped time would make the shares argue for
+    attacking the wrong thing."""
+    _, payload = gate
+    for r in payload["rows"]:
+        total = r["t_events"] + r["t_forward"] + r["t_style"] + r["t_driver"]
+        assert total == pytest.approx(r["seconds"], rel=1e-9, abs=1e-9)
+        for key in ("t_events", "t_forward", "t_style", "t_driver"):
+            assert r[key] >= 0.0, f"{key} is negative: {r}"
+
+
+def test_a_pool_with_no_network_spends_nothing_on_events_or_forwards(gate):
+    """This config's pool is degenerate only, so no query reaches
+    `build_v7_events` or a model — and the profile has to say so rather than
+    attribute the time to a layer that never ran."""
+    _, payload = gate
+    for r in payload["rows"]:
+        assert r["event_rows"] == 0
+        assert r["t_events"] == 0.0
+        assert r["t_forward"] == 0.0
+        assert r["policy_rows"] > 0
+        assert r["policy_calls"] > 0
+
+
+def test_the_counters_are_per_label_and_not_cumulative(gate):
+    """Every cell labels the same decisions, so a label's row count has to
+    grow with the sample budget and with nothing else. If `reset` were missed
+    the counters would grow monotonically down the sweep instead."""
+    _, payload = gate
+    by_key = {}
+    for r in payload["rows"]:
+        by_key.setdefault(
+            (r["max_combos"], r["players"], r["stack_bb"]), {}
+        ).setdefault(r["samples_per_action"], []).append(r["policy_rows"])
+    assert by_key
+    for key, by_samples in by_key.items():
+        totals = [sum(by_samples[s]) for s in SAMPLES]
+        assert totals == sorted(totals), f"{key}: {totals}"
+        assert totals[-1] > totals[0], f"{key} did not move at all"
+
+
+def test_a_network_member_puts_its_time_in_events_and_forward(tmp_path):
+    """The bucket that decides the next step is `events` against `forward`, and
+    the degenerate pool above can never exercise it. A tiny randomly
+    initialised v7 network can: nothing here is about how it plays, only that a
+    query through it lands in the two buckets it passes through."""
+    from tests.test_v7_pool_member import _member
+
+    pool = [_member()] + make_pool()
+    specs = make_specs(seed=7, n_hands=4, n_members=len(pool), num_players=3,
+                       stack_bb=20)
+    for spec in specs:
+        spec.seat_members = [0, 1, 2]      # seat 0 is the network
+    driver = MeasuringDriver(pool, pool[0].n_actions)
+    records = driver.run(specs, batch_size=4)
+    record = next(r for r in records if len(r.decisions) > 1)
+
+    cfg = OracleConfig(samples_per_action=2, max_combos=8,
+                       batch_hands=32)
+    row = measure_label(record, 1, driver, pool, cfg,
+                        np.random.default_rng(0))
+
+    assert row["event_rows"] > 0, "the network was never asked anything"
+    assert row["t_events"] > 0.0
+    assert row["t_forward"] > 0.0
+    assert 0 < row["event_rows"] <= row["policy_rows"]
+    total = row["t_events"] + row["t_forward"] + row["t_style"] + row["t_driver"]
+    assert total == pytest.approx(row["seconds"], rel=1e-9, abs=1e-9)
+
+
+def test_the_wrapping_is_undone_when_the_block_exits():
+    """`profiling` patches production classes. Leaving them patched would make
+    every later test measure a wrapped `policy`, which is exactly the kind of
+    order-dependence `CLAUDE.md` §4 rules out."""
+    import pool.base
+    import pool.v7_member
+
+    before = (pool.base.PoolMember.policy,
+              pool.v7_member.V7NetworkMember.logits,
+              pool.v7_member.build_v7_events)
+    with profiling() as prof:
+        assert prof is PROFILE
+        assert pool.base.PoolMember.policy is not before[0]
+        assert pool.v7_member.V7NetworkMember.logits is not before[1]
+        assert pool.v7_member.build_v7_events is not before[2]
+    assert (pool.base.PoolMember.policy,
+            pool.v7_member.V7NetworkMember.logits,
+            pool.v7_member.build_v7_events) == before
+
+
+def test_the_grouped_profile_sums_the_labels_it_groups():
+    """Seconds are summed, not averaged, so the shares are shares of the wall
+    clock the run actually spent (`profile_groups`)."""
+    rows = [
+        {"players": 2, "samples_per_action": 32, "seconds": 1.0,
+         "t_events": 0.5, "t_forward": 0.2, "t_style": 0.1, "t_driver": 0.2,
+         "policy_rows": 100, "policy_calls": 10, "event_rows": 100},
+        {"players": 6, "samples_per_action": 32, "seconds": 9.0,
+         "t_events": 1.0, "t_forward": 6.0, "t_style": 1.0, "t_driver": 1.0,
+         "policy_rows": 900, "policy_calls": 20, "event_rows": 450},
+    ]
+    groups = {g["group"]: g for g in profile_groups(rows)}
+    assert set(groups) == {"plr=2", "plr=6", "smp=32", "all"}
+
+    total = groups["all"]
+    assert total["seconds"] == pytest.approx(10.0)
+    assert total["t_events"] == pytest.approx(1.5)
+    assert total["rows_per_call"] == pytest.approx(1000 / 30)
+    assert total["network_share"] == pytest.approx(0.55)
+    # (10.0 - 1.2) seconds inside `policy`, over 1000 rows.
+    assert total["us_per_row"] == pytest.approx(8800.0)
+
+    assert groups["smp=32"]["seconds"] == pytest.approx(10.0)
+    assert groups["plr=2"]["n_labels"] == 1
+    assert groups["plr=6"]["us_per_row"] == pytest.approx(1e6 * 8.0 / 900)
+

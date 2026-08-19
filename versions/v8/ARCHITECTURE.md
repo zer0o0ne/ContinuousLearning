@@ -2,12 +2,13 @@
 
 **Status: gates G1 and G3 implemented (CONCEPT.md §14), the BR oracle (variant A) with them,
 the agent network (§6.1), the target construction and training loop that fits it (§6.2), and
-label generation end to end (§8) — play, refresh the embeddings, label hero's decisions, shard.
+label generation end to end (§8) — play, refresh the embeddings, label hero's decisions, shard —
+and the pool sampler that decides who sits at those tables (§4.4).
 G3 has been exercised only at toy scale on CPU — it has not been run, so what a label costs is
 still the hypothesis §13 wrote down, and the decision it is supposed to inform (variant A or the
 value-bootstrapped variant C of §7.4) has not been taken. Everything below has run only at toy
 scale on CPU; no agent has yet been trained on a generated corpus, because nothing ties the
-pieces into a loop — `pipeline.py` and pool sampling are still missing.**
+pieces into a loop — `pipeline.py` is still missing.**
 
 This document describes **what the code in `versions/v8/` actually is**. The design it is
 being built toward is in **[`CONCEPT.md`](CONCEPT.md)**: five entities (environment, opponent
@@ -45,6 +46,7 @@ versions/v8/
     degenerate.py       always-fold / call / min-raise / maniac / nit
     v7_member.py        a vendored v7 checkpoint as a pool member (§4.3)
     build.py            pool construction from config, fresh style draws
+    sampling.py         PFSP + embedding dedup + uniform floor (§4.4)   NEW
   nets/                 v8's own networks                               NEW
     features.py         §5.1 token features — where observation parity lives
     tokeniser.py        the shared tokeniser MLP (§5.1, OI-4)
@@ -57,6 +59,7 @@ versions/v8/
     targets.py          softmax(Q_norm / T) and the KL loss (§6.2)
     agent_train.py      one training cycle of the agent (§6.2, §8)
     generate.py         label generation end to end + the shards (§8)        NEW
+    embed_train.py      §5.4 training of the embedding network (§5.4, §8)     NEW
   oracle/               entity 5 — the BR oracle (§7)                  NEW
     posterior.py        reach-weighted opponent ranges (§7.2)
     rollout.py          variant A: Q(s, ·) by full rollout (§7.1)
@@ -74,7 +77,7 @@ versions/v8/
   gto_utils/            hand evaluation, equity, CFR solvers v1–v5, from v7
   evaluation/
     slumbot_eval.py     from v7, verbatim — does not import yet (§5)
-  tests/                18 files, 285 tests, ~56 s
+  tests/                19 files, 306 tests, ~58 s
 ```
 
 ### What was inherited, and why
@@ -303,6 +306,63 @@ equity-gated conditions as far too expensive inside rollouts.
 **`build.py`.** Builds the pool from the `bootstrap` config section and produces the descriptor
 list the G1 report needs. `fresh_style_variants` draws the never-trained-on styles that
 measurement §14.2 is made of.
+
+**`sampling.py` — who sits at the table (§4.4).** `PoolSampler.sample_table(n_opponents)`
+returns one member index per non-hero seat; hero is slot 0 of the session and is never drawn
+(§2.10). Every draw passes the same three mechanisms:
+
+- **PFSP** — weight `f(x) = x ** pfsp_exponent` on the member's *hardness*, so the batch
+  concentrates on opponents hero loses to. `update(member_idx, hero_bb, n_hands)` feeds it; a
+  member with no results yet has the maximum hardness, so an agent appended by §8 is sampled on
+  the next draw rather than after the first result exists.
+- **Embedding-space dedup** — `set_vectors` re-clusters the pool from the embedding network's own
+  table (§5.4) and a *cluster* is drawn before a member inside it, at a probability proportional
+  to the cluster's **mean** weight. The mean, not the sum: a sum would put the proportional-to-
+  size behaviour straight back and there would be nothing left of §11.3's mitigation.
+- **Uniform floor** — a fixed fraction of draws ignores both. This is the only route back for a
+  member whose PFSP weight has gone to zero, which is what "nothing is deleted, things are
+  down-weighted" means operationally.
+
+**From BB/100 to a number PFSP can use.** §4.4 transplants AlphaStar's formula, which is written
+in terms of a *loss rate*, and that quantity does not exist here: StarCraft results are binary,
+poker results are money. `PoolSampler` accumulates hero's total BB and total hands against each
+member, takes the mean BB/100, and min-maxes it over the pool — `(m_max − m_i) / (m_max − m_min)`,
+with an unplayed member at 1. The scale comes out of the pool itself, so there is no fourth
+config knob (§8.1 gives `pool_sampling` three) and no constant that stops meaning anything as the
+agent gets stronger.
+
+The cheaper reading — count the sessions whose BB/100 was negative — was implemented first and
+then rejected, and the reason is worth keeping. A session's *sign* is close to a coin flip: at
+σ ≈ 6 BB/hand a 200-hand session has SE ≈ 42 BB/100, so a member hero beats by 10 BB/100 still
+loses 41 % of sessions and one that beats hero by 10 wins 59 % of them. Every rate bunches around
+0.5, PFSP flattens towards uniform, and §4.4 stops doing anything. Thresholding once per session
+discards information that averaging keeps, and discards it irreversibly. Min-max is in exchange
+sensitive to one extreme member stretching the denominator; the replacement if that shows up is a
+rank, which costs no config either.
+
+**The floor is an independent coin flip per draw.** A deterministic schedule ("every fifth draw")
+has the same mean and less variance and was the first implementation, but it aligns with table
+structure: at a fixed table size and a floor of 0.25 the floor lands on the *same two slots of
+every table*, forever, and the slot index is carried on the token. Uniform table sizes (§4.4)
+make the phase drift, so it would not bite today — it is a trap laid for the first fixed-size
+diagnostic anybody runs.
+
+Clustering is Lloyd's algorithm with a farthest-point initialisation, written against numpy —
+there is no scikit-learn in `requirements.txt` and adding one for k-means would be an aarch64
+dependency (`CLAUDE.md` §3) bought for forty lines. It consumes no randomness at all, so the
+same vectors always give the same partition; ties go to the lowest index and an empty cluster
+keeps its previous centre.
+
+Seats within one table are drawn **independently**, so a member may occupy two seats. Rejecting
+that would bias the draw away from small clusters, which is the opposite of what the dedup is
+for.
+
+`state_dict` / `load_state_dict` carry the accumulated hands and BB, the cluster labels and the
+rng state, so a restart resumes the same stream (§8's resume requirement). A stored state may
+cover a **prefix** of the members: §8 appends one agent per iteration, so the sampler that
+resumes is one member larger than the one that saved. The new members arrive unplayed, each in a
+cluster of its own until the next `set_vectors`; a stored state *larger* than the pool is an
+error rather than a truncation.
 
 ### 2.4 `nets/` — the tokeniser and entity 4
 
@@ -632,7 +692,8 @@ are fitted by the embedding network (§5.5), not by this loss.
 One turn of the outer loop's middle three lines: play sessions, refresh the opponent
 embeddings, label hero's decisions with the oracle, write shards. Nothing else — no agent
 training (that is `train/agent_train.py`, called by the loop that does not exist yet) and no
-pool sampling policy (§4.4, still missing; it arrives here as the `sampler` argument).
+pool sampling policy (§4.4 — that is `pool/sampling.py`, and it arrives here as the `sampler`
+argument).
 
 **`env/session.py` is G1's session machinery, moved.** `Session`, `build_sessions`, `play` and
 `raise_sizes_from` were in `gates/g1.py`; they are now here and G1 imports them back
@@ -698,6 +759,21 @@ anyone wants (`CLAUDE.md` §5).
 **A label whose joint draws all collided** carries `nan` on legal actions and no target can be
 built from it, so it is dropped and counted; `n_dropped` is in the manifest, because a large one
 means a broken run rather than a rounding detail.
+
+**`train/embed_train.py` is §5.4's training loop, moved out of the gate.** `train_embedding_net`
+was in `gates/g1.py`, which made the pipeline depend on an experiment; it is now production code
+and G1 imports it back, verified the same way the rest of the move was — `test_g1_gate.py` green
+with no edits. Nothing in `env/`, `nets/`, `pool/`, `oracle/`, `agent/` or `train/` imports
+`gates/` any more, so the loop's only external dependency is the v7 checkpoints the first cycle
+needs (§4.3).
+
+**Hero's `member` index is a placeholder.** A token's `member` field comes from
+`spec.seat_members`, and hero's seat holds a temporary member appended past the pool, so hero's
+tokens carry an index that is not a row of the embedding table. Nothing reads it today — the
+§5.5 fit indexes by `slot` — but the §8 retraining of the embedding network indexes by `member`,
+and under the owner decision of 2026-08-19 (`CONCEPT.md` §5.4) hero's tokens have to carry the
+agent's reserved row `len(pool₀) + k`. Stamping it is S9's job, and it is the one place where a
+wrong index would be read as a different player rather than raised as an error.
 
 **Untested here.** Everything above has run at four sessions of six hands with two rollout
 samples per action, on CPU. The memory profile at real scale is a hypothesis: the phase holds
@@ -824,7 +900,6 @@ In roughly the order `CONCEPT.md` §14 says to build it:
 
 | Piece | `CONCEPT.md` | Notes |
 |---|---|---|
-| pool sampling: PFSP, embedding dedup, uniform floor | §4.4 | `train/generate.py` already takes it as an argument |
 | `pipeline.py`, `config.json` | §8.1 | the outer loop |
 | Slumbot adapter rewrite | §12 | protocol layer survives |
 
@@ -836,7 +911,7 @@ In roughly the order `CONCEPT.md` §14 says to build it:
 cd versions/v8 && python3 -m pytest tests/ -q
 ```
 
-285 tests, ~56 s on the dev box (CPU-only). The 30-minute budget from `CLAUDE.md` §4 is barely
+306 tests, ~58 s on the dev box (CPU-only). The 30-minute budget from `CLAUDE.md` §4 is barely
 touched.
 
 | File | Covers |
@@ -858,6 +933,7 @@ touched.
 | `test_g3_gate.py` | The label-cost sweep end to end: one cell per point of the grid, every column the decision is taken on present and finite, forwards and rollouts monotone in the sample budget, the posterior's and the rollouts' shares adding up to the total, the bar reaching its total when a cell runs short of decisions, the split-half error finite, the headline built from the exact-posterior cells only, and a pinned table size that a hand cannot quietly leave |
 | `test_agent_net.py` | The agent end to end: one row of logits per hand and every padded position inert; each row answers from **its own** last real token and no hand moves another; through the driver, at every table size 2–9 and both stack extremes, a valid distribution over legal actions and chips conserved; the observation obeys §9 parity along the agent's own call path — only its own cards, board never ahead of the street, no showdown token, the pending token action-less — and the observation does not grow as the record does; with `e = 0` permuting the players is bit-identical and a non-zero vector is not; determinism, weights untouched by a `policy` call, and both parity guards refusing what they are meant to refuse |
 | `test_label_generation.py` | Label generation end to end: a toy run whose every label is a valid distribution over the environment's own mask with `nan` exactly off it; hero is slot 0 and every hero decision is labelled once; an ordinary pool member works as hero (iteration 0, §7.1); **the embedding of a block ignores every later hand** — hero jams from hand `R` on and the block's vectors come out bit-identical anyway, while block 0 is the zero cold start; the stored prefix stops at the labelled decision, carries only hero's cards and a board never ahead of the street; the same seed writes byte-identical shards and a shard round-trips; the table draw is the exact uniform multiset of a fixed seed; and the session machinery is shared with G1 rather than copied |
+| `test_pool_sampling.py` | Pool sampling: a fixed history and seed produce an exact sequence; results accumulate across sessions of different lengths into a mean and the mean into a weight, with a pool of no results and a pool of no spread both flat, and the **magnitude** of a loss — not its sign — moving the weight; a member hero beats the most is reached **only** through the floor — never at `floor_fraction = 0`, every draw uniform at 1; a member nobody has played is drawn immediately; clustering recovers a hand-built structure and a ten-member blob of near-duplicates does not crowd out a lone style, while a duplicate pair splits one cluster's share; more clusters than members is no clustering; the state round-trips and reproduces the next draw, survives a pool that has since grown by one member and refuses one that has shrunk; and every table size 2–9 gets one member per non-hero seat |
 | `test_targets.py` | Targets, loss and the training cycle: a hand-computed softmax to `1e-12`; exact zeros off the mask and what sits under it never read; the two temperature limits reached in float, not approached; one legal action, equal EVs, no legal action, a `nan` under the mask; **the v7 scar** — two situations differing by a factor of 30 give the same target to `1e-12`, and without the divisor one is near-uniform while the other is near-deterministic; the KL is exactly zero on a match, positive off it, blind to illegal logits, and its gradient reaches the logits and not the target; dropout at `p = 0` and `p = 1`, reproducible from its generator, and per hand per slot rather than per token; a toy run that reduces the loss, is deterministic, leaves the pool and the embeddings untouched and refuses a hand that is not a pending decision; and the cycle — the first iteration runs its own step count, a later one opens from the weights the previous one left, and three cycles in a row keep improving |
 
 `conftest.py` puts `gto_utils/` and the version root on `sys.path` and reseeds

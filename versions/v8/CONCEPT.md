@@ -352,6 +352,20 @@ Baseline (owner decision): **no inner loop during training.** Per-player embeddi
 ordinary trainable table, one vector per pool member, optimised jointly with the transformer
 weights by the same optimiser. The gradient-descent fit exists only at inference.
 
+**The table carries a row for every agent the loop will ever produce** (owner decision
+2026-08-19). `n_members` is fixed when the table is constructed, and §8 adds one member per
+iteration, so the table is sized `len(pool₀) + max_iterations` up front: the agent of iteration
+*k* owns row `len(pool₀) + k`, from the moment it is first seated as hero — not from the moment
+it joins the pool. A row nobody has occupied yet is never read, because no token carries its
+index; it is a dead parameter at its initialisation until its agent exists. Retraining the
+network across iterations is therefore a **continuation**: every converged row survives, and the
+new agent's row starts where the initialisation put it.
+
+The two alternatives were considered and rejected. Rebuilding the table at each retrain turns
+that continuation into a restart and discards every row the previous iterations converged.
+Dropping hero's tokens from the corpus is cheaper still, but it means the network never learns to
+read the one opponent it is guaranteed to face after §8's last line — the previous agent.
+
 This is the cheapest of the three options (the alternatives — full MAML through the inner loop,
 or first-order approximations — are recorded here and not implemented). Its known weakness is a
 train/deploy mismatch: at training the vector is fully converged, at deployment it is *K* steps
@@ -597,7 +611,7 @@ to be separable actually are.
 | `bootstrap` | list of entries, each: checkpoint path (into `data/v7/`), `n_variants` (how many random style draws to generate from it), optional explicit style vector (for the hand-designed degenerate strategies), optional label |
 | `style` | the distribution style draws come from — per-block scale for the §4.2 bias vector, temperature and `λ` ranges |
 | `agent_init` | which pool member sits in hero's seat at iteration 0 (§7.1), the agent itself being trained from scratch. **Deliberately separate from `bootstrap`** — the strongest opponent to have in the pool and the best policy to seat as hero are different questions and need not resolve to the same member |
-| `embedding_net` | model dims, `K` (inference gradient steps), fit learning rate, regularisation toward zero, `R` (recompute interval), amortised-head weight, ablation switch |
+| `embedding_net` | model dims, `K` (inference gradient steps), fit learning rate, regularisation toward zero, `R` (recompute interval), amortised-head weight, ablation switch, and the number of table rows reserved for the agents the loop will produce (`max_iterations`, owner decision 2026-08-19, see §5.4). Nothing in the loop decides that number — it is config, like every other hyperparameter that changes a result |
 | `oracle` | samples per action, `max_combos`, variant (A / C), EV normalisation divisor, temperature `T` |
 | `pool_sampling` | PFSP exponent, uniform floor fraction, dedup cluster count |
 | `game` | `raise_sizes` per street, players range (2–9), stack range (10–300 BB) |

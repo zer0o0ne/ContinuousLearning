@@ -386,15 +386,40 @@ progress file stay in the parent, and finished labels are consumed **in `todo` o
 the shards are the same shards with the same rows in the same files. That matters beyond
 tidiness: `split_heldout` partitions by position.
 
-**What it does not buy, and what would.** With every forward serialised through one process
-the ceiling is `1 / 0.69 ≈ 1.45×`, reached at a handful of workers; on the dev box, which
-has no GPU and so runs the "server" on the same cores as the workers, four workers measured
-at parity with one process. The number that explains it is in the server's own log: at toy
-scale, **946 forwards for 21 487 rows — 23 rows per forward.** The oracle asks for many tiny
-policy batches, and neither more workers nor a faster wire changes that. Widening them means
-labelling several hero decisions in one `driver.run`, which multiplies rows per forward and
-divides forwards per label by the same factor; it is a change to the oracle's call pattern,
-not to this module, and it would speed the sequential path up too.
+**What it does not buy.** With every forward serialised through one process the ceiling is
+`1 / 0.69 ≈ 1.45×`, reached at a handful of workers; on the dev box, which has no GPU and so
+runs the "server" on the same cores as the workers, four workers measured at parity with one
+process. The number that explains it is in the server's own log: at toy scale, **946 forwards
+for 21 487 rows — 23 rows per forward.** The oracle asks for many small policy batches, and
+neither more workers nor a faster wire changes that.
+
+### `oracle.labels_per_batch` — several labels through one `driver.run`
+
+The width of a policy batch is set by how many rollout hands are in flight. One label puts
+`samples_per_action × |legal|` hands into `driver.run`, and the lock-step group *drains* as
+they finish, so the last rounds of every label are narrow. `action_values_batch` builds `k`
+labels' rollouts and plays them together: the driver refills to `batch_hands` throughout, so
+the network sees fewer, wider batches for the same work. `train/generate.py::label_chunks`
+does the grouping and never lets a chunk cross a `(session, block)` boundary, because hero is
+reseated there (§5.5) and a chunk's rollouts are all built before any of them is played.
+
+**It changes what a label costs, not what it is.** Every rollout hand keeps its own deck and
+its own `_rollout_seed`, and `env/driver.py` draws each hand's actions from a generator seeded
+by that alone, so which other hands shared the batch cannot move an action.
+`tests/test_parallel_labels.py` asserts the labels are byte-identical between `k = 1` and
+`k = 8` with a network-free pool — the version of "no bias" that can actually be asserted.
+With a network in the pool the remaining difference is floating point: a wider batch reduces
+in a different order, which on GPU can move a logit in its last bits. Same class as changing
+`batch_hands`, and unbiased.
+
+**Two caveats, both measured or arithmetic.** The width is capped by `batch_hands`: with
+`samples_per_action = 128` a single label already queues ~1500 hands against a cap of 2048, so
+`k` mostly removes the draining tail and the two knobs want raising together. And memory grows
+with `k` — `driver.run` holds a `HandRecord` per spec until it returns, so `k = 8` keeps of the
+order of 10⁴ records per worker. On the dev box the sweep over `k` measured flat, which is
+what §3 predicts and not evidence either way: a 128-row and a 256-row batch cost nearly the
+same on a GPU and nearly double on a CPU, so whether widening pays is exactly the question this
+box cannot answer.
 
 **`v7_member.py` runs the network under autocast.** G3 measured a label's wall clock at roughly
 75 % the v7 forward and under 6 % everything Python does to prepare it, so precision is the only

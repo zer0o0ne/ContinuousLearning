@@ -288,3 +288,66 @@ def test_a_finished_phase_resumes_into_a_no_op(tmp_path):
     assert again["n_labels"] == first["n_labels"] == len(labels)
     assert again["shards"] == first["shards"]
     assert len(again_labels) == len(labels)
+
+
+# --------------------------------------------------- labels_per_batch (§7.1)
+
+
+def _batched_cfg(labels_per_batch, n_workers=0, **kwargs):
+    cfg = _parallel_cfg(n_workers, **kwargs)
+    cfg["oracle"]["labels_per_batch"] = labels_per_batch
+    return cfg
+
+
+def test_labelling_several_decisions_in_one_run_changes_no_label(tmp_path_factory):
+    """`labels_per_batch` is a batching knob and nothing else.
+
+    Every rollout hand keeps its own deck and its own `_rollout_seed`, and the
+    driver draws each hand's actions from a generator seeded by that alone, so
+    queueing another label's hands alongside cannot move an action. With a
+    network-free pool the arithmetic has no reordering freedom either, so the
+    two runs agree byte for byte — which is the version of "no bias" that can
+    actually be asserted.
+    """
+    one = _run(tmp_path_factory.mktemp("k1"), cfg=_batched_cfg(1),
+               hero=_scripted_hero())[1]
+    many = _run(tmp_path_factory.mktemp("k8"), cfg=_batched_cfg(8),
+                hero=_scripted_hero())[1]
+
+    assert len(many) == len(one) > 0
+    for a, b in zip(one, many):
+        assert (a["session"], a["hand"], a["decision"]) == \
+               (b["session"], b["hand"], b["decision"])
+        assert np.array_equal(a["legal"], b["legal"])
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-999.0),
+                              np.nan_to_num(b["q"], nan=-999.0))
+
+
+def test_batching_does_not_cross_a_block_boundary():
+    """Hero is reseated between blocks (§5.5) and a chunk's rollouts are all
+    built before any of them is played — so a chunk that straddled a boundary
+    would build half its labels against the wrong seated member."""
+    from train.generate import label_chunks
+
+    R = 3
+    todo = [(pos, 0, h, d) for pos, (h, d) in
+            enumerate([(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)])]
+    todo += [(pos + 6, 1, h, 0) for pos, h in enumerate([0, 1, 2])]
+
+    chunks = list(label_chunks(todo, R, 8))
+    for chunk in chunks:
+        blocks = {(i, h // R) for _pos, i, h, _d in chunk}
+        assert len(blocks) == 1, f"chunk spans {blocks}"
+    assert [p for chunk in chunks for p, _i, _h, _d in chunk] == \
+           [p for p, _i, _h, _d in todo], "every label, still in order"
+
+
+def test_batching_and_workers_compose(tmp_path_factory):
+    one = _run(tmp_path_factory.mktemp("plain"), cfg=_batched_cfg(1),
+               hero=_scripted_hero())[1]
+    both = _run(tmp_path_factory.mktemp("both"),
+                cfg=_batched_cfg(4, n_workers=2), hero=_scripted_hero())[1]
+    assert len(both) == len(one) > 0
+    for a, b in zip(one, both):
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-999.0),
+                              np.nan_to_num(b["q"], nan=-999.0))

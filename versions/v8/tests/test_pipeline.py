@@ -484,25 +484,26 @@ def test_a_crash_in_the_middle_of_labelling_costs_a_shard_and_not_the_phase(
                            name="whole")
 
     calls = {"n": 0}
-    real = train.generate.action_values
+    real = train.generate.action_values_batch
 
-    def crash_after(*args, **kwargs):
-        calls["n"] += 1
+    def crash_after(requests, *args, **kwargs):
+        calls["n"] += len(requests)
         if calls["n"] > 7:
             raise RuntimeError("the box went away")
-        return real(*args, **kwargs)
+        return real(requests, *args, **kwargs)
 
     cfg = toy_config(labels_per_shard=3)
     cfg["out_dir"] = str(tmp_path / "part")
     part = os.path.join(cfg["out_dir"], "toy")
     log = Logger(cfg["out_dir"])
-    monkeypatch.setattr(train.generate, "action_values", crash_after)
+    monkeypatch.setattr(train.generate, "action_values_batch",
+                        crash_after)
     try:
         with pytest.raises(RuntimeError, match="the box went away"):
             run(cfg, lambda _m: None, part)
     finally:
         log.close()
-    monkeypatch.setattr(train.generate, "action_values", real)
+    monkeypatch.setattr(train.generate, "action_values_batch", real)
 
     it0 = os.path.join(part, "iter_0000", "labels")
     assert os.path.exists(os.path.join(it0, "progress.json"))

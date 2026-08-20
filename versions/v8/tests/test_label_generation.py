@@ -415,18 +415,18 @@ def test_labelling_resumes_at_the_shard_boundary_and_loses_only_a_shard(
     assert len(whole["shards"]) >= 3, "the toy run must span several shards"
 
     calls = {"n": 0}
-    real = train.generate.action_values
+    real = train.generate.action_values_batch
 
-    def crash_after(*args, **kwargs):
-        calls["n"] += 1
+    def crash_after(requests, *args, **kwargs):
+        calls["n"] += len(requests)
         if calls["n"] > 12:
             raise RuntimeError("the box went away")
-        return real(*args, **kwargs)
+        return real(requests, *args, **kwargs)
 
-    monkeypatch.setattr(train.generate, "action_values", crash_after)
+    monkeypatch.setattr(train.generate, "action_values_batch", crash_after)
     with pytest.raises(RuntimeError, match="the box went away"):
         _run(tmp_path / "part", cfg=cfg)
-    monkeypatch.setattr(train.generate, "action_values", real)
+    monkeypatch.setattr(train.generate, "action_values_batch", real)
 
     part_dir = tmp_path / "part"
     survived = sorted(p.name for p in part_dir.glob("shard_*.npz"))

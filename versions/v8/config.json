@@ -189,6 +189,7 @@
   "likelihood_floor": 1e-06,
   "batch_hands": 2048,
   "n_workers": 8,
+  "labels_per_batch": 8,
   "max_collision_retries": 32,
   "temperature": 0.5,
   "divisor": "pot_plus_bet"

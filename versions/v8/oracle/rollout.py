@@ -67,6 +67,7 @@ class OracleConfig:
     likelihood_floor: float = 1e-6
     batch_hands: int = 2048
     max_collision_retries: int = 32
+    labels_per_batch: int = 1   # how many labels share one `driver.run` (§7.1)
 
 
 @dataclass
@@ -167,11 +168,12 @@ def _sample_joint(posteriors, dead_mask, n_samples, max_retries, rng):
     return cards, attempts, attempts - len(cards)
 
 
-def action_values(record, decision_idx, driver, pool, hero_member_idx, cfg, rng):
-    """Q for every legal action at `record.decisions[decision_idx]`, in BB.
+def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng):
+    """Build one label's rollouts without playing them.
 
-    Returns (q, legal, stats): q is (n_actions,) float64 with `nan` at illegal
-    actions, legal is the recorded mask, stats is a `LabelStats`.
+    Returns a `_LabelPlan`; `action_values` plays it and `_label_q` reduces it
+    to `(q, legal, stats)` — `q` is `(n_actions,)` float64 with `nan` at illegal
+    actions, `legal` the recorded mask, `stats` a `LabelStats`.
 
     `nan` rather than zero at an illegal action is deliberate: S6 masks them,
     and a masking bug then fails loudly instead of quietly averaging in a value
@@ -246,18 +248,108 @@ def action_values(record, decision_idx, driver, pool, hero_member_idx, cfg, rng)
                 forced_actions=prefix + [a],
                 seed=_rollout_seed(record.spec.seed, decision_idx, a, s)))
 
-    played = driver.run(specs, batch_size=cfg.batch_hands)
-    forwards += sum(len(r.decisions) - len(prefix) - 1 for r in played)
+    return _LabelPlan(specs=specs, q=q, legal=legal, legal_idx=legal_idx,
+                      n_samples=len(samples), hero_pos=hero_pos,
+                      prefix_len=len(prefix),
+                      big_blind=float(record.spec.big_blind),
+                      forwards=forwards, attempts=attempts, rejected=rejected,
+                      prepared=time.perf_counter() - started)
+
+
+@dataclass
+class _LabelPlan:
+    """One label's rollouts, built but not yet played.
+
+    Splitting the label here is what lets several of them share one
+    `driver.run`: everything above depends on the labelled decision alone, and
+    everything below is arithmetic over that decision's own hands. Nothing
+    crosses between labels — the specs carry their own seats, decks and seeds.
+    """
+    specs: list
+    q: np.ndarray
+    legal: np.ndarray
+    legal_idx: list
+    n_samples: int
+    hero_pos: int
+    prefix_len: int
+    big_blind: float
+    forwards: int
+    attempts: int
+    rejected: int
+    prepared: float
+
+
+def _label_q(plan, played, seconds):
+    """`(q, legal, stats)` from the hands `plan.specs` turned into."""
+    q, legal_idx = plan.q, plan.legal_idx
+    forwards = plan.forwards
+    forwards += sum(len(r.decisions) - plan.prefix_len - 1 for r in played)
 
     if played:
-        rewards = np.asarray([r.rewards[hero_pos] for r in played],
+        rewards = np.asarray([r.rewards[plan.hero_pos] for r in played],
                              dtype=np.float64)
-        q[legal_idx] = (rewards.reshape(len(samples), len(legal_idx)).mean(axis=0)
-                        / float(record.spec.big_blind))
+        q[legal_idx] = (rewards.reshape(plan.n_samples, len(legal_idx)).mean(axis=0)
+                        / plan.big_blind)
 
     stats = LabelStats(
         forwards=forwards,
-        seconds=time.perf_counter() - started,
-        collision_rate=(rejected / attempts) if attempts else 0.0,
+        seconds=seconds,
+        collision_rate=(plan.rejected / plan.attempts) if plan.attempts else 0.0,
         n_rollouts=len(played))
-    return q, legal, stats
+    return q, plan.legal, stats
+
+
+def action_values(record, decision_idx, driver, pool, hero_member_idx, cfg, rng):
+    """Q for every legal action at one decision. See `_label_plan` for the args."""
+    plan = _label_plan(record, decision_idx, driver, pool, hero_member_idx,
+                       cfg, rng)
+    started = time.perf_counter()
+    played = driver.run(plan.specs, batch_size=cfg.batch_hands)
+    return _label_q(plan, played, plan.prepared + time.perf_counter() - started)
+
+
+def action_values_batch(requests, driver, pool, cfg):
+    """Label several decisions through **one** `driver.run` (§7.1).
+
+    `requests` is a list of `(record, decision_idx, hero_member_idx, rng)`, and
+    the result is one `(q, legal, stats)` per request, in the same order.
+
+    **This changes what a label costs, not what it is.** Every rollout hand
+    keeps its own deck and its own `_rollout_seed`, and the driver samples each
+    hand from a generator seeded by that alone (`env/driver.py`), so which other
+    hands shared the batch cannot move an action. What it does move is the
+    *width* of the policy batches: a single label's rollouts drain away as its
+    hands finish and the lock-step group shrinks with them, while `k` labels
+    queued together keep the driver refilled to `batch_hands` throughout. The
+    network sees fewer, wider batches for exactly the same work.
+
+    The one thing that is not bit-identical is floating point: a wider batch
+    reduces in a different order, which on GPU can move a logit in its last bits
+    and, through the inverse-CDF draw, an occasional action. That is the same
+    class of difference as changing `batch_hands`, it is unbiased — the rollout
+    policy, the sampled ranges and the seeds are untouched — and it is why
+    `labels_per_batch` is a config knob and not a silent default.
+
+    `seconds` is the label's own preparation plus its share of the shared run,
+    split by how many hands it contributed; the total over a batch is the batch's
+    wall clock.
+    """
+    plans = [_label_plan(record, decision_idx, driver, pool, hero_member_idx,
+                         cfg, rng)
+             for record, decision_idx, hero_member_idx, rng in requests]
+    specs = [spec for plan in plans for spec in plan.specs]
+
+    started = time.perf_counter()
+    played = driver.run(specs, batch_size=cfg.batch_hands)
+    elapsed = time.perf_counter() - started
+
+    out, offset = [], 0
+    for plan in plans:
+        n = len(plan.specs)
+        share = elapsed * (n / len(specs)) if specs else 0.0
+        out.append(_label_q(plan, played[offset:offset + n],
+                            plan.prepared + share))
+        offset += n
+    assert offset == len(specs), (
+        f"{offset} of {len(specs)} rollout hands were claimed by a label")
+    return out

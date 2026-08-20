@@ -75,7 +75,8 @@ from nets.embedding_net import fit_embeddings, loss_weights
 from oracle.parallel import (ForwardServer, collect, join_workers,
                              runner_table, spawn_workers, worker_count)
 from nets.features import HandTokens, collate, hand_tokens
-from oracle.rollout import LabelStats, OracleConfig, action_values
+from oracle.rollout import (LabelStats, OracleConfig,
+                            action_values_batch)
 from pool.base import PoolMember
 from utils import progress
 
@@ -467,6 +468,52 @@ def _read_progress(out_dir, n_todo, log):
     return done
 
 
+def label_chunks(todo, R, size):
+    """Consecutive labels of one `(session, block)`, at most `size` at a time.
+
+    `size` is `oracle.labels_per_batch`: the labels of a chunk are built and
+    then played through one `driver.run`, which is what keeps the lock-step
+    group refilled to `batch_hands` instead of draining away as one label's
+    rollouts finish (`oracle/rollout.py::action_values_batch`).
+
+    A chunk never crosses a block boundary. Hero's member is reseated there
+    (§5.5), and every label of a chunk has its rollouts built *before* any of
+    them is played, so they must all be built against the same seated member.
+    """
+    chunk, key = [], None
+    for item in todo:
+        _pos, i, h, _d = item
+        here = (i, h // R)
+        if chunk and (here != key or len(chunk) >= int(size)):
+            yield chunk
+            chunk = []
+        key = here
+        chunk.append(item)
+    if chunk:
+        yield chunk
+
+
+def _seat_hero(play_pool, hero_slots, session, block_vectors, block,
+               agent_member):
+    """Put hero's member in its pool slots for one `(session, block)`."""
+    for seat in range(session.num_players):
+        sos = _slot_of_seat_at(session.num_players, seat)
+        member = agent_member(seat, sos, block_vectors[block])
+        for slots in hero_slots:
+            play_pool[slots[seat]] = member
+
+
+def _label_requests(chunk, sessions, hero_plain, seed):
+    """`action_values_batch`'s input for one chunk, in todo order."""
+    out = []
+    for _pos, i, h, d in chunk:
+        s = sessions[i]
+        hero_seat = s.seat_of_slot(HERO_SLOT, h)
+        out.append((s.records[h], d, hero_plain[i][hero_seat],
+                    np.random.default_rng([int(seed), i, h, d])))
+    return out
+
+
 def _label_in_parallel(n_workers, todo, start, consume, sessions, play_pool,
                        hero_plain, hero_rec, block_vectors, agent_member, ocfg,
                        R, cfg, driver, log):
@@ -615,28 +662,23 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                            agent_member, ocfg, R, cfg, driver, log)
     else:
         current = (None, None)
-        for pos, (i, h, d) in enumerate(todo):
-            if pos < start:
-                continue
-            s = sessions[i]
+        pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)
+                   if pos >= start]
+        for chunk in label_chunks(pending, R, ocfg.labels_per_batch):
+            i, h = chunk[0][1], chunk[0][2]
             block = h // R
             if (i, block) != current:
                 # Hero plays its own rollouts with the vectors it acted under;
                 # the member is rebuilt per block because the pool slot holds
                 # whichever block was played last.
                 current = (i, block)
-                for seat in range(s.num_players):
-                    sos = _slot_of_seat_at(s.num_players, seat)
-                    play_pool[hero_plain[i][seat]] = agent_member(
-                        seat, sos, block_vectors[i][block])
-
-            record = s.records[h]
-            hero_seat = s.seat_of_slot(HERO_SLOT, h)
-            label_rng = np.random.default_rng([int(cfg["seed"]), i, h, d])
-            q, legal, stats = action_values(
-                record, d, driver, play_pool, hero_plain[i][hero_seat], ocfg,
-                label_rng)
-            consume(pos, i, h, d, q, legal, stats)
+                _seat_hero(play_pool, (hero_plain[i],), sessions[i],
+                           block_vectors[i], block, agent_member)
+            answers = action_values_batch(
+                _label_requests(chunk, sessions, hero_plain, cfg["seed"]),
+                driver, play_pool, ocfg)
+            for (pos, i, h, d), (q, legal, stats) in zip(chunk, answers):
+                consume(pos, i, h, d, q, legal, stats)
     flush(len(todo))
     bar.close()
 

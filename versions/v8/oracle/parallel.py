@@ -63,7 +63,7 @@ import torch
 from agent.policy import AgentPoolMember, FrozenAgentMember
 from env.driver import LockstepDriver
 from nets.features import derived_masks
-from oracle.rollout import action_values
+from oracle.rollout import action_values_batch
 from oracle.transport import Slab, slab_rows, token_fields, v7_fields
 from pool.degenerate import DEGENERATE_STRATEGIES
 from pool.v7_member import V7NetworkMember
@@ -76,6 +76,9 @@ POLL_SECONDS = 5.0
 
 V7 = "v7"
 AGENT = "agent"
+
+_BLAS_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
 
 # ------------------------------------------------------------ worker-side nets
@@ -344,27 +347,22 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
     hero_factory = hero_mirror(hero_spec, client)
     driver = LockstepDriver(play_pool, n_actions)
 
-    from train.generate import HERO_SLOT, _slot_of_seat_at
+    from train.generate import (_label_requests, _seat_hero, label_chunks)
 
     current = (None, None)
     try:
-        for pos, i, h, d in todo:
-            s = session_of[i]
+        for chunk in label_chunks(todo, R, ocfg.labels_per_batch):
+            i, h = chunk[0][1], chunk[0][2]
             block = h // R
             if (i, block) != current:
                 current = (i, block)
-                for seat in range(s.num_players):
-                    member = hero_factory(
-                        seat, _slot_of_seat_at(s.num_players, seat),
-                        block_vectors[i][block])
-                    play_pool[hero_plain[i][seat]] = member
-                    play_pool[hero_rec[i][seat]] = member
-            record = s.records[h]
-            hero_seat = s.seat_of_slot(HERO_SLOT, h)
-            q, legal, stats = action_values(
-                record, d, driver, play_pool, hero_plain[i][hero_seat], ocfg,
-                np.random.default_rng([int(seed), i, h, d]))
-            result_q.put((pos, q, legal, stats))
+                _seat_hero(play_pool, (hero_plain[i], hero_rec[i]),
+                           session_of[i], block_vectors[i], block, hero_factory)
+            answers = action_values_batch(
+                _label_requests(chunk, session_of, hero_plain, seed),
+                driver, play_pool, ocfg)
+            for (pos, _i, _h, _d), (q, legal, stats) in zip(chunk, answers):
+                result_q.put((pos, q, legal, stats))
     finally:
         client.done()
 
@@ -420,6 +418,13 @@ def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
 
     ctx = mp.get_context("spawn")
     result_q = ctx.Queue()
+    # A worker is one core's worth of Python. numpy's BLAS does not read
+    # `torch.set_num_threads`, and it picks its thread count up from the
+    # environment at import — which under `spawn` is this process's environment
+    # as of `start()`. Left alone, N workers each open a pool the width of the
+    # machine and 20 cores get several hundred threads to schedule.
+    inherited = {k: os.environ.get(k) for k in _BLAS_VARS}
+    os.environ.update({k: "1" for k in _BLAS_VARS})
     rows = slab_rows(ocfg.batch_hands, ocfg.max_combos)
     specs = [v7_fields(int(game["max_players"]), int(game["n_actions"]))]
     specs += [r.fields for r in runners.values()]
@@ -449,6 +454,11 @@ def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
         slabs.append(slab)
         log(f"[labels] worker {w}: {len(mine)} labels over "
             f"{len(session_of)} sessions (pid {p.pid})")
+    for key, value in inherited.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
     log(f"[labels] {n_workers} slabs of {slabs[0].nbytes() / 1e6:.0f} MB "
         f"shared memory, {rows} rows each")
     return procs, conns, slabs, result_q

@@ -6,7 +6,8 @@ import torch
 from tqdm import tqdm
 
 
-def progress(iterable=None, *, total=None, desc=None, unit="it", disable=False):
+def progress(iterable=None, *, total=None, desc=None, unit="it", disable=False,
+             initial=0):
     """A `tqdm` bar with the settings `CLAUDE.md` §5 requires of long loops.
 
     Two of them are not tqdm's defaults and both matter:
@@ -21,13 +22,21 @@ def progress(iterable=None, *, total=None, desc=None, unit="it", disable=False):
       stderr redirected to a file, and tqdm's 0.1 s default would write tens of
       thousands of lines into it.
 
+    ``initial`` is how much of ``total`` was already done **before this process
+    started** — a resumed phase skipping the labels a previous run wrote. It has
+    to be passed here and not advanced with ``bar.update`` afterwards: with
+    ``smoothing=0`` tqdm's rate is ``(n - initial) / elapsed``, so a bar that is
+    jumped forward by 225 completed units at `t = 0` counts them as having taken
+    no time at all and reports a rate — and an ETA — inflated by exactly that
+    ratio. Which is how a resumed run of 4.5 s/label came to display 1.03 s/label.
+
     The bar goes to stderr so it never lands in the `Logger` file.
 
     Nesting is deliberately not supported: when a loop has sub-iterations, the
     caller passes the **total number of units** and advances once per unit, so
     there is one bar covering the whole job (`CLAUDE.md` §5).
     """
-    return tqdm(iterable, total=total, desc=desc, unit=unit,
+    return tqdm(iterable, total=total, desc=desc, unit=unit, initial=initial,
                 smoothing=0.0, mininterval=1.0, file=sys.stderr,
                 disable=disable)
 

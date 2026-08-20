@@ -332,6 +332,34 @@ maniac, nit. They emit finite-scale logits rather than one-hots so a style draw 
 them. The nit's strength test is a hole-card lookup, not an equity evaluation — §4.2 drops
 equity-gated conditions as far too expensive inside rollouts.
 
+### Progress bars that are not lying — `utils.progress`
+
+`CLAUDE.md` §5 fixes `smoothing=0`, which makes tqdm's rate the plain average
+`(n - initial) / elapsed`. Two consequences bit this tree and both are now
+handled in one place.
+
+**A resumed phase must pass `initial=`, never `bar.update(start)`.** Advancing the
+bar by the labels a *previous* run wrote counts them as having taken this run zero
+seconds, and the rate and ETA come out inflated by exactly that ratio — a resumed
+run at 4.5 s/label displayed 1.03 s/label, which is how "the workers are 4× faster"
+was briefly believed. `_label_sessions` passes `initial=start`;
+`tests/test_label_generation.py` pins the construction, since no behaviour can
+catch it.
+
+Two bars stand still for long stretches by design, and a bar that does not move is
+indistinguishable from a hung run — which is the whole reason §5 asks for one. Both
+now say what they are standing still for, in the postfix, without inventing units
+or a second bar:
+
+* the **play** bar of `_play_sessions` counts hands, and the §5.5 refit between
+  blocks is not a hand: it reports `fit block b: k/N sessions` while it runs;
+* the **label** bar releases labels in `todo` order while workers finish out of
+  order, so it moves in bursts: it reports how many finished labels are held for
+  ordering.
+
+The ETA stays correct through both, because `smoothing=0` averages the stalled
+seconds into the elapsed time they actually cost.
+
 ### Labelling in parallel — `oracle/parallel.py`, `oracle/transport.py`
 
 A label costs, by G3's profile, roughly 69 % network forward and 31 % Python (v7 event

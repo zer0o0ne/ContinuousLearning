@@ -73,7 +73,8 @@ import torch
 
 from agent.policy import AgentPoolMember, FrozenAgentMember
 from env.driver import LockstepDriver
-from env.session import build_sessions, play
+from env.session import (assert_seeds_stay_distinct, build_sessions,
+                         hand_seed_bases, phase_hands, play)
 from gates.g1 import _stack_bucket
 from nets.agent_net import AgentNet
 from nets.embedding_net import OpponentEmbeddingNet
@@ -88,13 +89,6 @@ from train.targets import normalised_q, policy_target
 from utils import Logger, progress, resolve_device
 
 TAG = "loop"
-
-# One iteration owns one block of a million hand seeds, split in half between
-# the embedding corpus and the labelled sessions. The halves are asserted to fit
-# rather than assumed to: two phases dealing the same hands would make the
-# corpus and the label set correlated in a way nothing downstream could see.
-SEEDS_PER_PHASE = 500_000
-
 
 def _iter_dir(exp_dir, iteration):
     return os.path.join(exp_dir, f"iter_{int(iteration):04d}")
@@ -319,7 +313,8 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration)
         np.random.default_rng([int(seed), int(iteration), 11]),
         list(range(len(pool))), game, int(emb_cfg["corpus_sessions"]),
         int(emb_cfg["corpus_hands_per_session"]),
-        seed_base=it_seed * 1_000_000 + SEEDS_PER_PHASE, tag="corpus")
+        seed_base=hand_seed_bases(it_seed, phase_hands(config))[0]["corpus"],
+        tag="corpus")
     driver = LockstepDriver(pool, int(game["n_actions"]))
     play(driver, sessions, int(config["driver_batch_size"]), log, "corpus")
     torch.manual_seed(it_seed + 500_000)
@@ -385,14 +380,11 @@ def run(config, log, exp_dir):
     assert n_iterations <= max_iterations, (
         f"the embedding table reserves rows for {max_iterations} iterations "
         f"(§5.4, D9) and the run asks for {n_iterations}")
-    for phase, n_hands in (("labels", int(config["n_sessions"])
-                            * int(config["hands_per_session"])),
-                           ("corpus", int(emb_cfg["corpus_sessions"])
-                            * int(emb_cfg["corpus_hands_per_session"]))):
-        assert n_hands <= SEEDS_PER_PHASE, (
-            f"the {phase} phase asks for {n_hands} hands and one iteration "
-            f"reserves {SEEDS_PER_PHASE} seeds per phase; two phases sharing a "
-            f"seed would deal the same hands")
+    hands = phase_hands(config)
+    _bases, span = hand_seed_bases(0, hands)
+    assert_seeds_stay_distinct(span, n_iterations)
+    log(f"[{TAG}] hand seeds: {span} per iteration "
+        + ", ".join(f"{p} {hands[p]}" for p in hands))
 
     rng = np.random.default_rng(seed)
     pool, descriptors = build_pool(config, rng, device=device, log=log)

@@ -68,6 +68,68 @@ class Session:
         return out
 
 
+# The phases of one iteration that deal hands, in the order their seed ranges
+# are laid out. Adding a third phase means adding it here and nowhere else.
+HAND_PHASES = ("labels", "corpus")
+
+
+def phase_hands(cfg):
+    """How many hands each phase of one iteration deals, from the config.
+
+    Read from the same keys the phases themselves read, so the seed layout
+    cannot describe a run different from the one that happens.
+    """
+    emb = cfg["embedding_net"]
+    return {
+        "labels": int(cfg["n_sessions"]) * int(cfg["hands_per_session"]),
+        "corpus": (int(emb["corpus_sessions"])
+                   * int(emb["corpus_hands_per_session"])),
+    }
+
+
+def hand_seed_bases(iteration_seed, hands):
+    """`({phase: first seed}, span)` for one iteration.
+
+    Every hand of the run gets a distinct `HandSpec.seed`, and that is the whole
+    requirement: the seed fixes the deck and every action draw (`env/driver.py`),
+    so two hands sharing one are the *same* hand. Two phases sharing hands would
+    make the embedding corpus and the labelled set correlated in a way nothing
+    downstream could see.
+
+    The ranges are laid out end to end and each is exactly as long as its phase
+    asks for, so the layout scales with the config instead of capping it. An
+    earlier version reserved a fixed 500 000 seeds per phase and refused any run
+    that wanted more, which is a limit on the experiment imposed by its
+    bookkeeping — the wrong way round.
+
+    Iteration `k` takes the whole `span` starting at `iteration_seed · span`, so
+    the ranges of consecutive iterations abut and never overlap either.
+    """
+    span = sum(hands[phase] for phase in HAND_PHASES)
+    bases, offset = {}, 0
+    for phase in HAND_PHASES:
+        bases[phase] = int(iteration_seed) * span + offset
+        offset += hands[phase]
+    return bases, span
+
+
+def assert_seeds_stay_distinct(span, n_iterations):
+    """The one real constraint on the layout, named instead of guessed at.
+
+    `env/driver.py::_start` deals the deck through `np.random.seed`, which takes
+    32 bits, so it sees `spec.seed % 2**32` and two hands whose seeds differ by a
+    multiple of `2**32` are dealt the same cards. Every hand of a run lies in one
+    contiguous interval of `n_iterations · span` seeds, so "all distinct" is
+    exactly that product fitting in 32 bits — which at any plausible size it does
+    by orders of magnitude.
+    """
+    total = int(span) * int(n_iterations)
+    assert total <= 2 ** 32, (
+        f"{n_iterations} iterations of {span} hands is {total} seeds, past the "
+        f"{2 ** 32} the deck draw can tell apart (`np.random.seed` takes 32 "
+        f"bits), so some hands would be dealt identical cards")
+
+
 def raise_sizes_from(game):
     return [list(game["raise_sizes"][s]) for s in STREETS]
 

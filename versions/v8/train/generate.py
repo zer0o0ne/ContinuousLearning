@@ -70,7 +70,8 @@ from dataclasses import fields
 
 import numpy as np
 
-from env.session import Session, build_sessions, play
+from env.session import (Session, build_sessions, hand_seed_bases,
+                         phase_hands, play)
 from nets.embedding_net import fit_embeddings, loss_weights
 from oracle.parallel import (ForwardServer, collect, join_workers,
                              runner_table, spawn_workers, worker_count)
@@ -283,9 +284,12 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     weights = loss_weights(emb_cfg)
     rng = np.random.default_rng(cfg["seed"])
 
+    # The same layout `pipeline.py` uses for the corpus, asked the same way, so
+    # the two phases cannot disagree about who owns which seeds (`env/session`).
+    seed_base = hand_seed_bases(int(cfg["seed"]), phase_hands(cfg))[0]["labels"]
     sessions = build_sessions(rng, list(range(len(pool))), game,
                               int(cfg["n_sessions"]), hands_per_session,
-                              seed_base=int(cfg["seed"]) * 1_000_000, tag=TAG)
+                              seed_base=seed_base, tag=TAG)
 
     # `build_sessions` draws its members uniformly and those draws are dropped:
     # who sits at the table is the sampler's decision (§4.4), and the table
@@ -392,6 +396,13 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                 None, _slot_of_seat_at(s.num_players, seat), max_players,
                 n_actions, seat)
 
+    # One bar over every hand of the job. The refit between blocks is not a
+    # hand and does not advance it — but it is minutes of silence, and a bar
+    # that does not move is indistinguishable from a hung run, which is the
+    # whole reason §5 asks for one. So the fit reports itself in the postfix:
+    # the bar stands still and *says* what it is standing still for. The ETA
+    # stays honest either way, because `smoothing=0` averages the fits into the
+    # elapsed time they actually cost.
     bar = progress(total=len(sessions) * hands_per_session, desc="play",
                    unit="hand")
     for b in range(n_blocks):
@@ -412,7 +423,12 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
 
         if b + 1 == n_blocks:
             break
-        for s, vectors in zip(sessions, block_vectors):
+        every = max(1, len(sessions) // 50)   # ≤ 50 refreshes per refit round
+        for fitted_n, (s, vectors) in enumerate(zip(sessions, block_vectors), 1):
+            if fitted_n % every == 0 or fitted_n == len(sessions):
+                bar.set_postfix_str(
+                    f"fit block {b + 1}: {fitted_n}/{len(sessions)} sessions",
+                    refresh=True)
             observed = [t for t in s.tokens(max_players, n_actions) if len(t)]
             if not observed:
                 vectors.append(vectors[-1])
@@ -425,6 +441,7 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                 weights=weights)
             vectors.append(_pad_vectors(fitted.cpu().numpy(), max_players,
                                         d_emb))
+        bar.set_postfix_str("", refresh=True)
     bar.close()
     log(f"[{TAG}] played {sum(len(s.records) for s in sessions)} hands over "
         f"{len(sessions)} sessions in {n_blocks} blocks of {R}")
@@ -443,7 +460,7 @@ def _hero_decisions(sessions, hero_rec):
     return out
 
 
-def _read_progress(out_dir, n_todo, log):
+def _read_progress(out_dir, n_todo, seed_base, log):
     """Where a previous call to this phase got to, if there was one.
 
     A progress file whose decision count does not match this call's is refused
@@ -451,6 +468,12 @@ def _read_progress(out_dir, n_todo, log):
     seed, a different session count — and resuming would splice two different
     label sets into one directory. Missing shards are refused for the same
     reason.
+
+    `seed_base` is refused for the same reason and catches the case the count
+    cannot: the phases' seed ranges are laid out end to end, so changing how
+    many hands the *corpus* takes moves where the labelled hands start
+    (`env/session.hand_seed_bases`). The decision count would be unchanged and
+    the resumed half of the directory would be a different set of hands.
     """
     path = os.path.join(out_dir, PROGRESS)
     if not os.path.exists(path):
@@ -461,6 +484,16 @@ def _read_progress(out_dir, n_todo, log):
         f"{path} was written for {done['n_todo']} hero decisions and this "
         f"phase has {n_todo} — the sessions are not the same sessions, so "
         f"there is nothing to resume")
+    assert "seed_base" in done, (
+        f"{path} predates the seed layout of `env/session.hand_seed_bases` and "
+        f"cannot be checked against it. Its hands were dealt from a different "
+        f"range than this phase deals from, so resuming would splice two label "
+        f"sets; delete the directory and let the phase run from the start.")
+    assert int(done["seed_base"]) == int(seed_base), (
+        f"{path} was written for hands seeded from {done['seed_base']} and "
+        f"this phase deals from {seed_base} — the seed layout moved under it "
+        f"(a phase changed size), so these are different hands and resuming "
+        f"would splice two label sets")
     missing = [p for p in done["shards"] if not os.path.exists(p)]
     assert not missing, f"{path} names shards that are not on disk: {missing}"
     log(f"[{TAG}] resuming after {done['todo_done']}/{n_todo} decisions "
@@ -516,7 +549,7 @@ def _label_requests(chunk, sessions, hero_plain, seed):
 
 def _label_in_parallel(n_workers, todo, start, consume, sessions, play_pool,
                        hero_plain, hero_rec, block_vectors, agent_member, ocfg,
-                       R, cfg, driver, log):
+                       R, cfg, driver, log, results=None):
     """The §3 layout: `n_workers` CPU processes, this process as the server.
 
     Everything about *what* a label is stays where it was — the workers call
@@ -544,7 +577,8 @@ def _label_in_parallel(n_workers, todo, start, consume, sessions, play_pool,
         int(cfg["seed"]), R, log)
     server = ForwardServer(runners, slabs, conns, procs, log)
     try:
-        done = collect(server, result_q, procs, todo, start, consume, log)
+        done = collect(server, result_q, procs, todo, start, consume, log,
+                       results=results)
         assert done == len(todo), (
             f"the workers returned {done - start} of {len(todo) - start} labels")
     finally:
@@ -579,8 +613,11 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     todo = _hero_decisions(sessions, hero_rec)
     log(f"[{TAG}] {len(todo)} hero decisions to label")
 
+    # The base this phase's hands were dealt from; `_read_progress` refuses a
+    # directory written from a different one.
+    seed_base = hand_seed_bases(int(cfg["seed"]), phase_hands(cfg))[0]["labels"]
     per_shard = int(cfg["labels_per_shard"])
-    done = _read_progress(out_dir, len(todo), log)
+    done = _read_progress(out_dir, len(todo), seed_base, log)
     shards = list(done["shards"]) if done else []
     start = int(done["todo_done"]) if done else 0
     n_labels = int(done["n_labels"]) if done else 0
@@ -604,16 +641,20 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             shards.append(path)
             buffer.clear()
         with open(os.path.join(out_dir, PROGRESS), "w") as fh:
-            json.dump({"n_todo": len(todo), "todo_done": int(todo_done),
+            json.dump({"n_todo": len(todo), "seed_base": int(seed_base),
+                       "todo_done": int(todo_done),
                        "shards": shards, "n_labels": n_labels,
                        "n_dropped": dropped, "forwards": forwards,
                        "n_rollouts": rollouts, "seconds": seconds,
                        "collision_sum": collision_sum,
                        "collision_n": collision_n}, fh)
 
-    bar = progress(total=len(todo), desc="label", unit="label")
-    if start:
-        bar.update(start)
+    # `initial` and not `bar.update(start)`: the skipped labels were done by an
+    # earlier run and must not be counted as having taken this run's zero
+    # seconds — see `utils.progress`.
+    bar = progress(total=len(todo), desc="label", unit="label", initial=start)
+
+    buffered = None
 
     def consume(pos, i, h, d, q, legal, stats):
         """One finished label, whoever computed it.
@@ -632,6 +673,15 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         collision_sum += stats.collision_rate
         collision_n += 1
         bar.update(1)
+        if buffered is not None:
+            # Workers finish out of order and the parent releases labels only
+            # in `todo` order, so the bar moves in bursts: it can sit still
+            # while several hundred labels are already computed and waiting for
+            # an earlier one. Saying how many are held is the difference
+            # between "stalled" and "reordering", and the two look identical
+            # otherwise.
+            bar.set_postfix_str(f"{buffered()} held for ordering",
+                                refresh=False)
 
         if not np.isfinite(q[legal]).all():
             # Every joint draw collided, so there is no EV to build a target
@@ -657,9 +707,12 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
 
     n_workers = worker_count(cfg)
     if n_workers and start < len(todo):
+        held = {}
+        buffered = held.__len__
         _label_in_parallel(n_workers, todo, start, consume, sessions,
                            play_pool, hero_plain, hero_rec, block_vectors,
-                           agent_member, ocfg, R, cfg, driver, log)
+                           agent_member, ocfg, R, cfg, driver, log,
+                           results=held)
     else:
         current = (None, None)
         pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)

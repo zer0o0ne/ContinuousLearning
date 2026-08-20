@@ -464,7 +464,7 @@ def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
     return procs, conns, slabs, result_q
 
 
-def collect(server, result_q, procs, todo, start, consume, log):
+def collect(server, result_q, procs, todo, start, consume, log, results=None):
     """Serve the workers and hand finished labels to `consume` in todo order.
 
     Workers own strided sessions, so labels come back out of order; the parent
@@ -473,7 +473,10 @@ def collect(server, result_q, procs, todo, start, consume, log):
     would have written — which matters because `split_heldout` partitions by
     position, so a reordered corpus is a different held-out set.
     """
-    results, next_pos = {}, int(start)
+    # The caller may pass the reorder buffer in so it can report its depth on
+    # the progress bar; it is this function's own dict either way.
+    results = {} if results is None else results
+    next_pos = int(start)
 
     def drain():
         drain_results(result_q, results)

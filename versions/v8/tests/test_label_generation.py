@@ -57,6 +57,11 @@ def _cfg(seed=3, n_sessions=4, hands=6, R=3, samples=2, max_combos=4):
         "labels_per_shard": 8,
         "game": GAME,
         "embedding_net": {
+            # The seed layout lays the phases' ranges end to end, so the labels
+            # phase's own base depends on how many hands the corpus takes
+            # (`env/session.hand_seed_bases`). A fixture that named only one
+            # phase would describe half an iteration.
+            "corpus_sessions": 3, "corpus_hands_per_session": 5,
             "K": 2, "fit_lr": 0.1, "fit_reg": 0.01, "R": R,
             "amortised_weight": 1.0, "showdown_strength_weight": 0.3,
             "showdown_class_weight": 0.1,
@@ -454,3 +459,157 @@ def test_a_progress_file_from_different_sessions_is_refused(tmp_path):
     _manifest, _labels = _run(tmp_path, cfg=_cfg(n_sessions=4, hands=6))
     with pytest.raises(AssertionError, match="not the same sessions"):
         _run(tmp_path, cfg=_cfg(n_sessions=3, hands=6))
+
+
+def test_a_resumed_run_does_not_count_the_skipped_labels_as_this_runs_work(
+        tmp_path, monkeypatch):
+    """The bar's rate is `(n - initial) / elapsed` (`utils.progress`).
+
+    A resumed phase that jumped the bar forward with `bar.update(start)` instead
+    counted labels an *earlier* run computed as having taken this run zero
+    seconds, and reported a rate — and an ETA — inflated by exactly that ratio.
+    Seen in the wild: 4.5 s/label displayed as 1.03 s/label. Behaviour cannot
+    catch this, so the construction is what is pinned.
+    """
+    cfg = _cfg(n_sessions=4, hands=6)
+    calls = {"n": 0}
+    real = train.generate.action_values_batch
+
+    def crash_after(requests, *args, **kwargs):
+        calls["n"] += len(requests)
+        if calls["n"] > 12:
+            raise RuntimeError("the box went away")
+        return real(requests, *args, **kwargs)
+
+    monkeypatch.setattr(train.generate, "action_values_batch", crash_after)
+    with pytest.raises(RuntimeError):
+        _run(tmp_path, cfg=cfg)
+    monkeypatch.setattr(train.generate, "action_values_batch", real)
+
+    done = json.loads((tmp_path / "progress.json").read_text())["todo_done"]
+    assert done > 0, "the crash must leave something to resume from"
+
+    seen = {}
+    real_progress = train.generate.progress
+
+    def spy(*args, **kwargs):
+        if kwargs.get("desc") == "label":
+            seen.update(kwargs)
+        return real_progress(*args, **kwargs)
+
+    monkeypatch.setattr(train.generate, "progress", spy)
+    _run(tmp_path, cfg=cfg)
+
+    assert seen.get("initial") == done, (
+        f"the resumed bar starts at {seen.get('initial')} of its total but "
+        f"{done} labels were already on disk")
+
+
+# ------------------------------------------------- the hand-seed layout (§15)
+
+
+def test_the_two_phases_of_an_iteration_never_deal_the_same_hand():
+    """The property the layout exists for. Two phases sharing a `HandSpec.seed`
+    share the deck *and* every action draw — they are the same hand — which
+    would correlate the embedding corpus with the labelled set invisibly."""
+    from env.session import build_sessions, hand_seed_bases, phase_hands
+
+    cfg = _cfg(n_sessions=7, hands=11)
+    cfg["embedding_net"]["corpus_sessions"] = 5
+    cfg["embedding_net"]["corpus_hands_per_session"] = 13
+    bases, span = hand_seed_bases(3, phase_hands(cfg))
+
+    seeds = {}
+    for phase, n_sessions, hands in (("labels", 7, 11), ("corpus", 5, 13)):
+        sessions = build_sessions(np.random.default_rng(0), list(range(9)),
+                                  GAME, n_sessions, hands,
+                                  seed_base=bases[phase], tag=phase)
+        seeds[phase] = {spec.seed for s in sessions for spec in s.specs}
+        assert len(seeds[phase]) == n_sessions * hands, "a phase repeated a seed"
+
+    assert not (seeds["labels"] & seeds["corpus"]), "the phases share hands"
+    assert span == 7 * 11 + 5 * 13, "the span is what the phases actually ask"
+
+
+def test_consecutive_iterations_never_deal_the_same_hand():
+    from env.session import hand_seed_bases, phase_hands
+
+    cfg = _cfg(n_sessions=4, hands=6)
+    hands = phase_hands(cfg)
+    seen = set()
+    for k in range(5):
+        bases, span = hand_seed_bases(k, hands)
+        for phase, n in hands.items():
+            block = set(range(bases[phase], bases[phase] + n))
+            assert not (block & seen), f"iteration {k} reuses {phase} seeds"
+            seen |= block
+    assert len(seen) == 5 * sum(hands.values())
+
+
+def test_a_corpus_bigger_than_the_old_fixed_reservation_is_fine_now():
+    """The cap this replaced refused any phase over 500 000 hands, which is a
+    limit on the experiment imposed by its bookkeeping."""
+    from env.session import assert_seeds_stay_distinct, hand_seed_bases
+
+    hands = {"labels": 40_000, "corpus": 2_000_000}
+    bases, span = hand_seed_bases(29, hands)
+    assert span == 2_040_000
+    assert bases["corpus"] == 29 * span + 40_000
+    assert_seeds_stay_distinct(span, 30)
+
+
+def test_a_layout_too_wide_for_the_deck_draw_is_refused():
+    """`np.random.seed` takes 32 bits, so past that two hands get one deck."""
+    from env.session import assert_seeds_stay_distinct
+
+    with pytest.raises(AssertionError, match="dealt identical cards"):
+        assert_seeds_stay_distinct(2 ** 30, 30)
+
+
+def _crashed_run(tmp_path, monkeypatch, cfg, after=12):
+    """A half-finished labels directory: shards on disk, `progress.json` written."""
+    calls = {"n": 0}
+    real = train.generate.action_values_batch
+
+    def crash_after(requests, *args, **kwargs):
+        calls["n"] += len(requests)
+        if calls["n"] > after:
+            raise RuntimeError("the box went away")
+        return real(requests, *args, **kwargs)
+
+    monkeypatch.setattr(train.generate, "action_values_batch", crash_after)
+    with pytest.raises(RuntimeError):
+        _run(tmp_path, cfg=cfg)
+    monkeypatch.setattr(train.generate, "action_values_batch", real)
+    return tmp_path / "progress.json"
+
+
+def test_resuming_after_the_seed_layout_moved_is_refused(tmp_path, monkeypatch):
+    """The phases' ranges are laid end to end, so changing how many hands the
+    *corpus* takes moves where the labelled hands start. The recorded base is
+    what catches it; the hands themselves would just quietly be other hands."""
+    cfg = _cfg(n_sessions=4, hands=6)
+    path = _crashed_run(tmp_path, monkeypatch, cfg)
+
+    done = json.loads(path.read_text())
+    done["seed_base"] = int(done["seed_base"]) + 1
+    path.write_text(json.dumps(done))
+
+    with pytest.raises(AssertionError, match="seed layout moved"):
+        _run(tmp_path, cfg=cfg)
+
+
+def test_a_progress_file_from_before_the_layout_is_refused(tmp_path,
+                                                           monkeypatch):
+    """The directories already on disk when the layout changed. Their hands came
+    from the old fixed 500 000-per-phase reservation, so they cannot be resumed
+    into the new one — and nothing in them says so except the missing field."""
+    cfg = _cfg(n_sessions=4, hands=6)
+    path = _crashed_run(tmp_path, monkeypatch, cfg)
+
+    done = json.loads(path.read_text())
+    del done["seed_base"]
+    path.write_text(json.dumps(done))
+
+    with pytest.raises(AssertionError, match="predates the seed layout"):
+        _run(tmp_path, cfg=cfg)

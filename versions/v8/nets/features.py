@@ -245,21 +245,15 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
                       token_type, sd_strength, sd_class, own_strength)
 
 
-def collate(hands, device="cpu"):
-    """Pad a list of `HandTokens` into one batch of tensors.
+def empty_batch(B, T, n_actions, max_players):
+    """A padded, all-sentinel batch of `B` hands of `T` tokens.
 
-    Hands are the batch dimension, not a sequence — that is what the
-    block-diagonal attention mask of §5.2 amounts to once cross-hand attention
-    is cut, and it is why the corpus can be subsampled per gradient step.
+    Split out of `collate` because the padding *values* are load-bearing and
+    there must be exactly one statement of them: `oracle/parallel.py` merges
+    already-collated batches from several worker processes into one wider batch
+    and has to pad the short ones the same way `collate` would have.
     """
-    hands = [h for h in hands if len(h) > 0]
-    assert hands, "cannot collate an empty batch of hands"
-    B = len(hands)
-    T = max(len(h) for h in hands)
-    n_actions = hands[0].prev_action.shape[1]
-    max_players = hands[0].seat_stacks.shape[1]
-
-    out = {
+    return {
         "cards": torch.full((B, T, 7), UNKNOWN_CARD, dtype=torch.long),
         "decision_idx": torch.zeros((B, T), dtype=torch.long),
         "acting_pos": torch.zeros((B, T), dtype=torch.long),
@@ -280,6 +274,23 @@ def collate(hands, device="cpu"):
         "own_strength": torch.full((B, T), -1.0, dtype=torch.float32),
         "mask": torch.zeros((B, T), dtype=torch.float32),
     }
+
+
+def collate(hands, device="cpu"):
+    """Pad a list of `HandTokens` into one batch of tensors.
+
+    Hands are the batch dimension, not a sequence — that is what the
+    block-diagonal attention mask of §5.2 amounts to once cross-hand attention
+    is cut, and it is why the corpus can be subsampled per gradient step.
+    """
+    hands = [h for h in hands if len(h) > 0]
+    assert hands, "cannot collate an empty batch of hands"
+    B = len(hands)
+    T = max(len(h) for h in hands)
+    n_actions = hands[0].prev_action.shape[1]
+    max_players = hands[0].seat_stacks.shape[1]
+
+    out = empty_batch(B, T, n_actions, max_players)
     for b, h in enumerate(hands):
         t = len(h)
         out["token_type"][b, :t] = torch.from_numpy(h.token_type)

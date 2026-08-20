@@ -72,6 +72,8 @@ import numpy as np
 
 from env.session import Session, build_sessions, play
 from nets.embedding_net import fit_embeddings, loss_weights
+from oracle.parallel import (ForwardServer, collect, join_workers,
+                             runner_table, spawn_workers, worker_count)
 from nets.features import HandTokens, collate, hand_tokens
 from oracle.rollout import LabelStats, OracleConfig, action_values
 from pool.base import PoolMember
@@ -465,6 +467,55 @@ def _read_progress(out_dir, n_todo, log):
     return done
 
 
+def _label_in_parallel(n_workers, todo, start, consume, sessions, play_pool,
+                       hero_plain, hero_rec, block_vectors, agent_member, ocfg,
+                       R, cfg, driver, log):
+    """The §3 layout: `n_workers` CPU processes, this process as the server.
+
+    Everything about *what* a label is stays where it was — the workers call
+    the same `action_values` over the same records with the same per-decision
+    seeds, and `consume` is the same `consume`. What moves is the network: the
+    workers hold weightless mirrors of the pool and this process runs every
+    forward, batching across workers at a barrier. See `oracle/parallel.py`.
+    """
+    # Hero's slots are rebuilt inside each worker from the block vectors it
+    # owns, so they are mirrored as holes rather than as members.
+    mirror_pool = list(play_pool)
+    for seats in list(hero_plain) + list(hero_rec):
+        for idx in seats:
+            mirror_pool[idx] = None
+
+    prototype = agent_member(0, _slot_of_seat_at(sessions[0].num_players, 0),
+                             block_vectors[0][0])
+    runners, pool_spec, hero_spec = runner_table(
+        mirror_pool, prototype, _device_of(play_pool), log)
+
+    procs, request_q, reply_qs, result_q = spawn_workers(
+        n_workers, [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)
+                    if pos >= start], sessions, block_vectors,
+        pool_spec, hero_spec, hero_plain, hero_rec, driver.n_actions, ocfg,
+        int(cfg["seed"]), R, log)
+    server = ForwardServer(runners, request_q, reply_qs, procs, log)
+    try:
+        done = collect(server, result_q, procs, todo, start, consume, log)
+        assert done == len(todo), (
+            f"the workers returned {done - start} of {len(todo) - start} labels")
+    finally:
+        join_workers(procs, log)
+
+
+def _device_of(play_pool):
+    """The device the pool's networks are on — where the server will run."""
+    for member in play_pool:
+        net = getattr(member, "net", None)
+        if net is not None:
+            return next(net.parameters()).device
+        agent = getattr(member, "agent", None)
+        if agent is not None:
+            return agent.device_
+    return "cpu"
+
+
 def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                     block_vectors, agent_member, ocfg, R, max_players, cfg,
                     out_dir, log):
@@ -516,28 +567,18 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     bar = progress(total=len(todo), desc="label", unit="label")
     if start:
         bar.update(start)
-    current = (None, None)
-    for pos, (i, h, d) in enumerate(todo):
-        if pos < start:
-            continue
-        s = sessions[i]
-        block = h // R
-        if (i, block) != current:
-            # Hero plays its own rollouts with the vectors it acted under; the
-            # member is rebuilt per block because the pool slot holds whichever
-            # block was played last.
-            current = (i, block)
-            for seat in range(s.num_players):
-                sos = _slot_of_seat_at(s.num_players, seat)
-                play_pool[hero_plain[i][seat]] = agent_member(
-                    seat, sos, block_vectors[i][block])
 
-        record = s.records[h]
-        hero_seat = s.seat_of_slot(HERO_SLOT, h)
-        label_rng = np.random.default_rng([int(cfg["seed"]), i, h, d])
-        q, legal, stats = action_values(
-            record, d, driver, play_pool, hero_plain[i][hero_seat], ocfg,
-            label_rng)
+    def consume(pos, i, h, d, q, legal, stats):
+        """One finished label, whoever computed it.
+
+        Both paths — the sequential loop below and the workers of
+        `oracle/parallel.py` — end here, so a label is turned into a shard row
+        by one piece of code and the two paths cannot drift apart in what they
+        write.
+        """
+        nonlocal n_labels, dropped, forwards, seconds, rollouts
+        nonlocal collision_sum, collision_n
+        s = sessions[i]
         forwards += stats.forwards
         seconds += stats.seconds
         rollouts += stats.n_rollouts
@@ -550,14 +591,15 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             # from (`oracle/rollout.py`). Dropping it is the honest outcome; the
             # count is in the manifest because a large one is a broken run.
             dropped += 1
-            continue
+            return
 
+        hero_seat = s.seat_of_slot(HERO_SLOT, h)
         tokens = play_pool[hero_rec[i][hero_seat]].seen[(s.idx, h, d)]
         _stack_bb, pot_bb, to_call_bb = (float(x) for x in tokens.scalars[-1])
         buffer.append({
             "tokens": tokens, "q": q, "legal": legal,
             "pot_bb": pot_bb, "facing_bet_bb": to_call_bb,
-            "embeddings": block_vectors[i][block],
+            "embeddings": block_vectors[i][h // R],
             "session": s.idx, "hand": h, "decision": d,
             "num_players": s.num_players, "stack_bb": s.stack_bb,
             "hero_seat": hero_seat,
@@ -565,6 +607,36 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         n_labels += 1
         if len(buffer) >= per_shard:
             flush(pos + 1)
+
+    n_workers = worker_count(cfg)
+    if n_workers and start < len(todo):
+        _label_in_parallel(n_workers, todo, start, consume, sessions,
+                           play_pool, hero_plain, hero_rec, block_vectors,
+                           agent_member, ocfg, R, cfg, driver, log)
+    else:
+        current = (None, None)
+        for pos, (i, h, d) in enumerate(todo):
+            if pos < start:
+                continue
+            s = sessions[i]
+            block = h // R
+            if (i, block) != current:
+                # Hero plays its own rollouts with the vectors it acted under;
+                # the member is rebuilt per block because the pool slot holds
+                # whichever block was played last.
+                current = (i, block)
+                for seat in range(s.num_players):
+                    sos = _slot_of_seat_at(s.num_players, seat)
+                    play_pool[hero_plain[i][seat]] = agent_member(
+                        seat, sos, block_vectors[i][block])
+
+            record = s.records[h]
+            hero_seat = s.seat_of_slot(HERO_SLOT, h)
+            label_rng = np.random.default_rng([int(cfg["seed"]), i, h, d])
+            q, legal, stats = action_values(
+                record, d, driver, play_pool, hero_plain[i][hero_seat], ocfg,
+                label_rng)
+            consume(pos, i, h, d, q, legal, stats)
     flush(len(todo))
     bar.close()
 

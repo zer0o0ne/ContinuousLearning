@@ -28,10 +28,12 @@ needs to say which style each member was, and which base it came from.
 import json
 import os
 
+from env.session import raise_sizes_from
+from pool.action_map import RaiseGridMap
 from pool.degenerate import DEGENERATE_STRATEGIES
 from pool.style import StyleParams, sample_style
 from pool.v7_member import V7NetworkMember
-from vendor.v7.agent import V7Agent, n_actions_from_config
+from vendor.v7.agent import V7Agent
 
 
 def _resolve_style(entry, rng, style_cfg):
@@ -78,10 +80,39 @@ def _load_v7_agent(entry, device, log, cache=None):
     agent.load_checkpoint(ckpt)
     agent.eval()
     agent.set_device(device)
-    loaded = (agent, n_actions_from_config(v7_config))
+    loaded = (agent, v7_config.get("game", {}))
     if cache is not None:
         cache[key] = loaded
     return loaded
+
+
+def _grid_map(entry, v7_game, agent, game):
+    """`RaiseGridMap` from the checkpoint's raise grid onto the pool's.
+
+    `None` when the two grids are the same, which is the case every gate config
+    is written for: the map is then the identity and the member reads and
+    writes v8 action indices directly, exactly as before this existed.
+    """
+    v7_sizes = v7_game.get("raise_sizes")
+    pool_n_actions = int(game["n_actions"])
+    if not v7_sizes:
+        assert agent.n_actions == pool_n_actions, (
+            f"v7 pool entry {entry.get('label') or entry['checkpoint']!r} has "
+            f"{agent.n_actions} actions and the pool uses {pool_n_actions}, "
+            f"but its config carries no `game.raise_sizes` — without the "
+            f"checkpoint's raise fractions the two grids cannot be aligned. "
+            f"Point \"arch_config\" at the config the checkpoint was trained "
+            f"under.")
+        return None
+    grid_map = RaiseGridMap(raise_sizes_from(v7_game), raise_sizes_from(game))
+    assert grid_map.n_src == agent.n_actions, (
+        f"v7 pool entry {entry.get('label') or entry['checkpoint']!r}: its "
+        f"config's raise grid implies {grid_map.n_src} actions but the loaded "
+        f"network has {agent.n_actions}")
+    assert grid_map.n_dst == pool_n_actions, (
+        f"`game.n_actions` is {pool_n_actions} but `game.raise_sizes` implies "
+        f"{grid_map.n_dst}")
+    return None if grid_map.is_identity else grid_map
 
 
 def build_pool(config, rng, device="cpu", log=print):
@@ -111,11 +142,18 @@ def build_pool(config, rng, device="cpu", log=print):
             factory = DEGENERATE_STRATEGIES[strategy]
             bases = [factory(base_name, entry_n_actions, styles[0])]
         elif kind == "v7":
-            agent, entry_n_actions = _load_v7_agent(entry, device, log,
-                                                     cache=v7_cache)
+            agent, v7_game = _load_v7_agent(entry, device, log, cache=v7_cache)
+            grid_map = _grid_map(entry, v7_game, agent, config["game"])
+            # A v7 member is a member of *this* pool: it speaks the v8 action
+            # set, and `grid_map` — when the checkpoint's raise grid differs —
+            # is what makes that true in both directions.
+            entry_n_actions = int(config["game"]["n_actions"])
             base_name = label or os.path.basename(str(entry["checkpoint"]))
             bases = [V7NetworkMember(base_name, entry_n_actions, agent,
-                                     styles[0])]
+                                     styles[0], action_map=grid_map)]
+            if grid_map is not None:
+                log(f"{base_name}: {grid_map.n_src} v7 actions ↔ "
+                    f"{grid_map.n_dst} pool actions, nearest raise bin")
         else:
             raise ValueError(f"unknown pool entry kind {kind!r}")
 

@@ -51,8 +51,12 @@ def make_pool(seed=0, n_styled=6):
 
 
 def make_specs(seed=0, n_hands=16, n_members=1, num_players=None,
-               stack_bb=None):
-    """Hands with uniformly sampled table size and stack depth."""
+               stack_bb=None, raise_sizes=None):
+    """Hands with uniformly sampled table size and stack depth.
+
+    `raise_sizes` overrides the fixture grid for the tests that need the table
+    to run on a grid other than the one a v7 checkpoint was trained on.
+    """
     rng = np.random.default_rng(seed + 1)
     specs = []
     for h in range(n_hands):
@@ -64,15 +68,15 @@ def make_specs(seed=0, n_hands=16, n_members=1, num_players=None,
             seat_members=[int(rng.integers(0, n_members)) for _ in range(n)],
             seed=90_000 + seed * 1000 + h,
             big_blind=BIG_BLIND, small_blind=SMALL_BLIND,
-            raise_sizes=RAISE_SIZES,
+            raise_sizes=raise_sizes if raise_sizes else RAISE_SIZES,
             meta={"hand": h},
         ))
     return specs
 
 
-def play(pool, specs, batch_size=None):
+def play(pool, specs, batch_size=None, n_actions=N_ACTIONS):
     """Play the specs and label the showdowns, as the corpus builder does."""
-    records = LockstepDriver(pool, N_ACTIONS).run(specs, batch_size=batch_size)
+    records = LockstepDriver(pool, n_actions).run(specs, batch_size=batch_size)
     label_showdowns(records)
     return records
 

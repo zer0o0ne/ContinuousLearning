@@ -47,12 +47,22 @@ class V7NetworkMember(PoolMember):
     §4.2. `agent` is therefore held by reference and never mutated here.
     """
 
-    def __init__(self, name, n_actions, agent, style=None):
+    def __init__(self, name, n_actions, agent, style=None, action_map=None):
         super().__init__(name, n_actions, style)
         self.agent = agent
-        assert agent.n_actions == n_actions, (
-            f"v7 checkpoint has {agent.n_actions} actions, pool uses "
-            f"{n_actions}. The action layouts must match — see CONCEPT.md §6.1.")
+        self.action_map = action_map
+        if action_map is None:
+            assert agent.n_actions == n_actions, (
+                f"v7 checkpoint has {agent.n_actions} actions, pool uses "
+                f"{n_actions}. Either the action layouts match — see "
+                f"CONCEPT.md §6.1 — or the member is given a `RaiseGridMap` "
+                f"between them.")
+        else:
+            assert (action_map.n_src, action_map.n_dst) == (agent.n_actions,
+                                                            n_actions), (
+                f"the grid map transports {action_map.n_src} → "
+                f"{action_map.n_dst} actions, but the v7 checkpoint has "
+                f"{agent.n_actions} and the pool uses {n_actions}")
         # G3 measured the label's wall clock: 85% of it is this forward and
         # under 6% is everything Python does to prepare it, so precision is the
         # only lever left on the pool's side. `get_amp_config` is v8's existing
@@ -65,17 +75,53 @@ class V7NetworkMember(PoolMember):
         (self.amp_enabled, self.amp_device_type,
          self.amp_dtype, _scaler) = get_amp_config(agent.device_)
 
+    def _snapshots(self, record, cache):
+        """`record.snapshots` with every action one-hot in the v7 layout.
+
+        Without a map this is the record's own list and nothing is copied. With
+        one, each action-bearing snapshot is shallow-copied with its one-hot
+        rewritten for that snapshot's street; `bets` and the rest are shared,
+        and the record itself is never touched.
+
+        `cache` memoises per record for the duration of one `logits` call, for
+        the same reason `build_pool` memoises checkpoints: the oracle asks one
+        member about many hole-card combos of the *same* record (§7.2), and the
+        translation depends on the record alone. The record is kept in the
+        cache alongside its translation so its `id` cannot be recycled while
+        the entry is live.
+        """
+        if self.action_map is None:
+            return record.snapshots
+        hit = cache.get(id(record))
+        if hit is not None:
+            return hit[1]
+        out = []
+        for snap in record.snapshots:
+            action = snap["action"]
+            if action is None:
+                out.append(snap)
+            else:
+                out.append(dict(snap, action=self.action_map.src_onehot(
+                    snap["turn"], int(np.argmax(action)))))
+        cache[id(record)] = (record, out)
+        return out
+
     def logits(self, contexts):
+        cache = {}
         event_sequences = []
         for ctx in contexts:
             rec = ctx.record
             event_sequences.append(build_v7_events(
-                rec.snapshots, _deck_seen_by(ctx), ctx.acting_pos,
+                self._snapshots(rec, cache), _deck_seen_by(ctx), ctx.acting_pos,
                 rec.num_players, rec.spec.big_blind, rec.spec.small_blind,
-                self.n_actions, up_to=ctx.snap_idx,
+                self.agent.n_actions, up_to=ctx.snap_idx,
             ))
         with torch.no_grad(), torch.autocast(
                 device_type=self.amp_device_type, dtype=self.amp_dtype,
                 enabled=self.amp_enabled):
             out = self.agent.action_logits(event_sequences)
-        return out.float().cpu().numpy().astype(np.float64)
+        out = out.float().cpu().numpy().astype(np.float64)
+        if self.action_map is None:
+            return out
+        return self.action_map.dst_logprobs(
+            out, [int(ctx.turn) for ctx in contexts])

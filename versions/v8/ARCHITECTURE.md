@@ -53,6 +53,7 @@ versions/v8/
     style.py            live style modifiers, 32 scalars per member (§4.2)
     degenerate.py       always-fold / call / min-raise / maniac / nit
     v7_member.py        a vendored v7 checkpoint as a pool member (§4.3)
+    action_map.py       nearest-bin transport between two raise grids
     build.py            pool construction from config, fresh style draws
     sampling.py         PFSP + embedding dedup + uniform floor (§4.4)   NEW
   nets/                 v8's own networks                               NEW
@@ -1236,6 +1237,44 @@ Two files are not copies:
   the `_build_events` of the inherited `slumbot_eval.py` before that file was deleted (§2.12).
   Events are
   built from the acting player's seat, so a v7 member sees its own hole cards and nothing else's.
+
+### 3.1 A run whose raise grid is not the checkpoint's — `pool/action_map.py`
+
+`CONCEPT.md` §6.1 reuses v7's action set, and until 2026-08-20 that was enforced rather than
+implemented: `build_pool` asserted that a v7 entry's action count equalled the pool's and stopped
+there. A v8 run is free to choose its own `game.raise_sizes` — a finer preflop grid costs the
+evaluation adapter less when it snaps Slumbot's bets to a bin (`evaluation/protocol.py`
+`token_to_action_idx`) — and a checkpoint is welded to the grid it was trained on **from both
+ends**: `perception.action_proj` is a `Linear(n_actions, d_model)` over the one-hot of the action
+just taken, and `action_head` emits one logit per action of that layout.
+
+`RaiseGridMap` is the translation, and the only place that knows the two grids differ. Both
+directions are nearest bin by raise fraction, per street — `env/legal.py` reads
+`raise_sizes[turn][i]` as a fraction of the effective pot on *every* street, preflop included, so
+the two grids' numbers are directly comparable. `fold`, `call` and `all-in` are positional.
+
+* **History (pool → v7).** Each action-bearing snapshot is shallow-copied with its one-hot
+  rewritten to v7's layout. The approximation is bounded: what actually went into the pot is
+  carried exactly by `pot`, `bets` and `stacks` in the same event, and the one-hot is a redundant
+  categorical channel beside them.
+* **Policy (v7 → pool).** The member's distribution is softmaxed in v7's layout and each bin's
+  whole mass is moved to the single nearest pool bin (owner decision 2026-08-20: nearest bin, not
+  split between neighbours, so a member keeps betting the size it meant to). Returning
+  log-probabilities rather than logits changes nothing downstream —
+  `softmax(log softmax(z) / T) == softmax(z / T)`.
+
+Pool bins that are nobody's nearest therefore receive no mass from v7 members. That hole is
+deliberate: the agent's targets are the oracle's Q over every legal action (§ the label pipeline),
+not an imitation of the pool, so a size no v7 member plays is still trained — it is simply not
+part of the *opponent* distribution. Such a bin is floored to `EMPTY_BIN_PROB` rather than zeroed,
+because `StyleParams.apply` masks illegal actions with `-inf` and subtracts the row max: a row in
+which every legal action was `-inf` would come out `nan` instead of reaching the driver's "zero
+mass on every legal action" assertion.
+
+When the grids match — every gate config — the map is the identity and `build_pool` passes `None`,
+so that path is bit-for-bit what it was before. A checkpoint whose config carries no
+`game.raise_sizes` (only v7's older `table_bins`) cannot be aligned at all and is refused unless
+the action counts already agree.
 
 ---
 

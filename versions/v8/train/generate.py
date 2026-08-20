@@ -488,14 +488,14 @@ def _label_in_parallel(n_workers, todo, start, consume, sessions, play_pool,
     prototype = agent_member(0, _slot_of_seat_at(sessions[0].num_players, 0),
                              block_vectors[0][0])
     runners, pool_spec, hero_spec = runner_table(
-        mirror_pool, prototype, _device_of(play_pool), log)
+        mirror_pool, prototype, cfg["game"], _device_of(play_pool), log)
 
-    procs, request_q, reply_qs, result_q = spawn_workers(
+    procs, conns, slabs, result_q = spawn_workers(
         n_workers, [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)
-                    if pos >= start], sessions, block_vectors,
-        pool_spec, hero_spec, hero_plain, hero_rec, driver.n_actions, ocfg,
+                    if pos >= start], sessions, block_vectors, pool_spec,
+        hero_spec, hero_plain, hero_rec, runners, cfg["game"], ocfg,
         int(cfg["seed"]), R, log)
-    server = ForwardServer(runners, request_q, reply_qs, procs, log)
+    server = ForwardServer(runners, slabs, conns, procs, log)
     try:
         done = collect(server, result_q, procs, todo, start, consume, log)
         assert done == len(todo), (

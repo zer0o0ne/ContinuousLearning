@@ -73,6 +73,7 @@ versions/v8/
     posterior.py        reach-weighted opponent ranges (§7.2)
     rollout.py          variant A: Q(s, ·) by full rollout (§7.1)
     parallel.py         N CPU label workers + one GPU inference server
+    transport.py        the shared-memory slab those two talk over
   gates/
     g1.py               the G1 experiment (§14)                         NEW
     g1_analysis.py      section A — regrouping a finished g1_report.json NEW
@@ -331,67 +332,69 @@ maniac, nit. They emit finite-scale logits rather than one-hots so a style draw 
 them. The nit's strength test is a hole-card lookup, not an equity evaluation — §4.2 drops
 equity-gated conditions as far too expensive inside rollouts.
 
-### Labelling in parallel — `oracle/parallel.py`
+### Labelling in parallel — `oracle/parallel.py`, `oracle/transport.py`
 
-A label costs, by G3's profile, roughly 69 % network forward and 31 % Python (v7
-event building, tensor packing, the driver's bookkeeping). One process parallelises
-neither, and the label phase is the longest phase of an iteration. `CLAUDE.md` §3
-names the layout the box wants and this is it: **N CPU worker processes and one GPU
-inference server**, the server being the parent process, which already owns the
-CUDA context and every network.
+A label costs, by G3's profile, roughly 69 % network forward and 31 % Python (v7 event
+building, tensor packing, the driver's bookkeeping). One process parallelises neither,
+and the label phase is the longest phase of an iteration. `CLAUDE.md` §3 names the layout
+the box wants and this is it: **N CPU worker processes and one GPU inference server**, the
+server being the parent process, which already owns the CUDA context and every network.
+`oracle.n_workers` turns it on; `0` or `1` is the sequential path, unchanged.
 
-`oracle.n_workers` turns it on. `0` or `1` is the sequential path — the same code,
-in this process, that ran before the module existed.
-
-**What makes it legitimate.** A label is a pure function of a finished record: every
-draw inside `action_values` is keyed by the decision (`default_rng([seed, i, h, d])`,
-`_rollout_seed(spec.seed, decision_idx, a, s)`), and the driver samples each hand from
-its own generator, so nothing about a label depends on what else is being computed or
-in what order. That was already true; this module only takes advantage of it.
+**What makes it legitimate.** A label is a pure function of a finished record: every draw
+inside `action_values` is keyed by the decision (`default_rng([seed, i, h, d])`,
+`_rollout_seed(spec.seed, decision_idx, a, s)`), and the driver samples each hand from its
+own generator, so nothing about a label depends on what else is being computed or in what
+order.
 
 **Workers hold a weightless mirror of the pool.** `mirror_spec` describes each member
-without its weights and `build_mirror` rebuilds it in the worker with the network
-replaced by a proxy — `_V7Proxy` for a v7 checkpoint, `_AgentNetProxy` for `AgentNet`.
-Neither `V7NetworkMember` nor `AgentPoolMember` changes: a v7 member asks its network
-for `n_actions`, `device_` and `action_logits`, an agent member for `d_emb` and a call,
-and a proxy answers exactly those. Styles, grid maps, legality and the transport of
-`pool/action_map.py` all run in the worker, on the CPU, in parallel; only the forward
-crosses to the parent.
+without its weights and `build_mirror` rebuilds it in the worker with the network replaced
+by a proxy. Neither `V7NetworkMember` nor `AgentPoolMember` changes: a v7 member asks its
+network for `n_actions`, `device_` and `action_logits`, an agent member for `d_emb` and a
+call, and a proxy answers exactly those. Styles, legality and the grid transport of
+`pool/action_map.py` all run in the worker; only the forward crosses to the parent.
 
-**The seam is v7's own.** `extract_event_tensors` → `forward_batch(precomputed=…)`
-exists in the vendored perception for precisely this reason ("moves the CPU-bound
-Python loop out of the GPU forward path"), so the packing is CPU work the workers can
-own and what travels between processes is contiguous tensors rather than event dicts.
+**One request, one forward.** The server answers whichever worker is ready, over exactly
+the rows one process would have given the model. So a parallel run's labels equal a
+sequential run's **to the bit** — `tests/test_parallel_labels.py` asserts it with a v7
+checkpoint in the pool and the agent in hero's seat.
 
-**The server batches at a barrier.** Each worker has at most one request in flight and
-the server waits for *every live worker* before running anything, then groups by
-network and answers all of them from one forward. Bulk-synchronous rather than
-opportunistic, and that is a deliberate trade: a server that coalesced whatever
-happened to be queued would not stall on a straggler, but the batch would depend on
-arrival times and a run would stop being reproducible. Batch composition decides
-floating-point reduction order, so a different `n_workers` gives bitwise-different
-logits on GPU exactly as a different `oracle.batch_hands` does today; a fixed
-`n_workers` reproduces.
+#### Two measurements that shaped this, both on the dev box
 
-**Partition by session, strided.** A worker owns whole sessions, so it reads a disjoint
-slice of the records and rebuilds hero's member once per block just as the sequential
-path does. Strided rather than contiguous because at a barrier an idle worker costs
-everybody.
+*The first design sent tensors through an `mp.Queue`.* `torch` gives every tensor its own
+shared-memory segment, created, fd-passed and mapped per send: **8.7–13.9 ms per round
+trip** for a ten-tensor payload, comparable to the forward it carried and paid tens of
+times per label. `oracle/transport.py` allocates one slab of shared memory per worker at
+spawn and sends only offsets over a `Pipe` — the same round trip is **0.062 ms**, a factor
+of 140–220. The field layouts (`v7_fields`, `token_fields`) are tables that `pack`/`unpack`
+walk, each field landing contiguously so the tensor handed to the model needs no repacking.
+
+*The first design also batched at a barrier* — the server collected one request from every
+live worker and answered them in one wide batch, which is reproducible and looks like good
+batching. Measured, it was **4.8× slower than one process** and got *worse* from two workers
+to four. Workers are never in phase: their requests interleave posterior batches of a
+thousand combos with driver steps of a dozen hands, and at a barrier everybody pays the
+slowest. Asynchronous service keeps the GPU busy by *overlap* instead, and as a bonus makes
+the result bit-identical to sequential.
+
+**Partition by session, strided.** A worker owns whole sessions, reads a disjoint slice of
+the records and rebuilds hero's member once per block exactly as the sequential path does.
 
 **The parent keeps the bookkeeping.** Workers return `(position, q, legal, stats)` and
-nothing else. The tokens `_ObservedHero` recorded during play, the embedding table a
-label points at, the shard writing and the progress file all stay in the parent, and
-finished labels are consumed **in `todo` order** — so the shards are the same shards,
-with the same rows in the same files, that one process would have written. That matters
-beyond tidiness: `split_heldout` partitions by position, so a reordered corpus is a
-different held-out set.
+nothing else; the tokens `_ObservedHero` recorded during play, the shard writing and the
+progress file stay in the parent, and finished labels are consumed **in `todo` order**, so
+the shards are the same shards with the same rows in the same files. That matters beyond
+tidiness: `split_heldout` partitions by position.
 
-**What it does not buy.** Amdahl: with the forward at ~69 % of a label and the GPU
-already handed batches of order a thousand rows, the ceiling is not large. What
-parallelism removes is the 31 % Python and the narrowness of the per-label batch; the
-network time itself only improves insofar as one wide batch beats N narrow ones. The
-multiplicative levers on this phase remain `oracle.samples_per_action` and
-`oracle.max_combos`, which G3 measured and which are config, not code.
+**What it does not buy, and what would.** With every forward serialised through one process
+the ceiling is `1 / 0.69 ≈ 1.45×`, reached at a handful of workers; on the dev box, which
+has no GPU and so runs the "server" on the same cores as the workers, four workers measured
+at parity with one process. The number that explains it is in the server's own log: at toy
+scale, **946 forwards for 21 487 rows — 23 rows per forward.** The oracle asks for many tiny
+policy batches, and neither more workers nor a faster wire changes that. Widening them means
+labelling several hero decisions in one `driver.run`, which multiplies rows per forward and
+divides forwards per label by the same factor; it is a change to the oracle's call pattern,
+not to this module, and it would speed the sequential path up too.
 
 **`v7_member.py` runs the network under autocast.** G3 measured a label's wall clock at roughly
 75 % the v7 forward and under 6 % everything Python does to prepare it, so precision is the only

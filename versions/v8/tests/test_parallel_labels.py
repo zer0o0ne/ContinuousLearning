@@ -27,7 +27,8 @@ from agent.policy import AgentPoolMember
 from env.driver import LockstepDriver
 from nets.agent_net import AgentNet
 from nets.features import collate
-from oracle.parallel import merge_tokens, merge_v7, mirror_spec
+from oracle.parallel import V7Runner, mirror_spec
+from oracle.transport import Slab, token_fields, v7_fields
 from pool.base import PoolMember
 from pool.degenerate import DEGENERATE_STRATEGIES
 from pool.style import StyleParams
@@ -141,7 +142,8 @@ def test_more_workers_than_sessions_still_labels_everything(tmp_path_factory):
 def test_a_v7_member_and_the_agent_are_labelled_through_the_server(
         tmp_path_factory):
     """The path that actually uses the proxies: a v7 checkpoint in the pool and
-    the agent in hero's seat, every forward taken in the parent process."""
+    the agent in hero's seat, every forward taken in the parent process — and
+    the labels are still the labels one process computes, to the bit."""
     v7 = V7Agent(V7_CONFIG, log=lambda _m: None).eval()
     pool = [V7NetworkMember("v7", n_actions_from_config(V7_CONFIG), v7)]
     pool += make_pool()
@@ -153,14 +155,22 @@ def test_a_v7_member_and_the_agent_are_labelled_through_the_server(
         return AgentPoolMember(agent_net, embeddings, slot_of_seat,
                                MAX_PLAYERS, N_ACTIONS, observer_pos, "cpu")
 
-    out = tmp_path_factory.mktemp("nets")
-    cfg = _parallel_cfg(2, n_sessions=2, hands=4)
-    manifest, labels = _run_with_pool(out, cfg, pool, hero)
+    seq = _run_with_pool(tmp_path_factory.mktemp("nets_seq"),
+                         _parallel_cfg(0, n_sessions=2, hands=4), pool, hero)[1]
+    par = _run_with_pool(tmp_path_factory.mktemp("nets_par"),
+                         _parallel_cfg(2, n_sessions=2, hands=4), pool, hero)[1]
 
-    assert labels, "nothing was labelled"
-    assert manifest["n_labels"] == len(labels)
-    for lab in labels:
-        assert np.isfinite(lab["q"][lab["legal"]]).all()
+    assert seq, "nothing was labelled"
+    assert len(par) == len(seq)
+    for a, b in zip(seq, par):
+        assert (a["session"], a["hand"], a["decision"]) == \
+               (b["session"], b["hand"], b["decision"])
+        assert np.array_equal(a["legal"], b["legal"])
+        # Bit for bit: every forward the workers asked for was taken over
+        # exactly the rows one process would have handed the model, so no
+        # reduction anywhere happened in a different order.
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-999.0),
+                              np.nan_to_num(b["q"], nan=-999.0))
 
 
 def _run_with_pool(out, cfg, pool, hero):
@@ -177,11 +187,11 @@ def _run_with_pool(out, cfg, pool, hero):
     return manifest, [lab for p in manifest["shards"] for lab in load_shard(p)]
 
 
-# ------------------------------------------------------------ batch merging
+# ------------------------------------------------------------- the transport
 
 
-def _v7_payloads(n_seqs):
-    """Two v7 payloads out of one played record, as two workers would send."""
+def _v7_seqs(n_seqs):
+    """A few real v7 event sequences out of one played hand."""
     member = V7NetworkMember("v7", n_actions_from_config(V7_CONFIG),
                              V7Agent(V7_CONFIG, log=lambda _m: None).eval())
     from tests.g1_fixtures import BIG_BLIND, SMALL_BLIND, make_specs, play
@@ -195,66 +205,68 @@ def _v7_payloads(n_seqs):
     return member.agent, seqs
 
 
-def test_a_merged_v7_batch_is_the_batch_the_model_would_have_been_given():
-    agent, seqs = _v7_payloads(4)
-    cut = len(seqs) // 2
-    parts = [extract_event_tensors(seqs[:cut], agent.max_players),
-             extract_event_tensors(seqs[cut:], agent.max_players)]
+def test_a_v7_payload_survives_the_slab_unchanged():
+    agent, seqs = _v7_seqs(4)
+    payload = extract_event_tensors(seqs, agent.max_players)
+    fields = v7_fields(agent.max_players, agent.n_actions)
+    slab = Slab(64, [fields], agent.n_actions)
+    cells = int(payload["card_ids"].shape[0])
 
-    merged = merge_v7(parts)
-    together = extract_event_tensors(seqs, agent.max_players)
-    for key in ("card_ids", "hero_pos", "acting_pos", "num_players", "scalars",
-                "bets", "stacks", "actions", "batch_idx", "event_idx"):
-        assert torch.equal(merged[key], together[key]), key
-    assert merged["seq_lengths"] == together["seq_lengths"]
-    assert merged["B"] == together["B"]
-    assert merged["max_events"] == together["max_events"]
+    slab.pack(fields, payload, cells)
+    out = slab.unpack(fields, cells, (cells,))
+    for name, _cols, _dtype in fields:
+        assert torch.equal(out[name], payload[name]), name
 
 
-def test_a_merged_v7_batch_gives_each_row_its_own_answer():
-    """The rows must come back in the order they went in — a scatter bug here
-    hands one worker another worker's policy and nothing ever complains."""
-    agent, seqs = _v7_payloads(4)
-    one_at_a_time = torch.cat([agent.action_logits([s]) for s in seqs], dim=0)
-    merged = merge_v7([extract_event_tensors([s], agent.max_players)
-                       for s in seqs])
-    out, _enc, mask = agent.perception.forward_batch(
-        None, device="cpu", skip_memory=True, skip_opponent_emb=True,
-        precomputed=merged)
-    batched = agent.action_head(out, mask=mask)
-    assert torch.allclose(batched, one_at_a_time, atol=1e-4)
+def test_a_forward_through_the_slab_is_the_forward_without_it():
+    """The determinism claim in one assertion: the transport moves bytes and
+    changes no number, so a worker's forward is the forward one process takes."""
+    agent, seqs = _v7_seqs(4)
+    direct = agent.action_logits(seqs)
+
+    payload = extract_event_tensors(seqs, agent.max_players)
+    fields = v7_fields(agent.max_players, agent.n_actions)
+    slab = Slab(64, [fields], agent.n_actions)
+    cells = int(payload["card_ids"].shape[0])
+    slab.pack(fields, payload, cells)
+    runner = V7Runner(agent, (False, "cpu", torch.float32))
+    slab.meta[:int(payload["B"])].copy_(
+        torch.as_tensor(payload["seq_lengths"], dtype=torch.int64))
+    through = runner.run(slab, cells, (int(payload["B"]),),
+                         int(payload["max_events"]))
+    assert torch.equal(through, direct)
 
 
-def test_merged_token_batches_pad_the_way_collate_pads():
-    from tests.g1_fixtures import contexts_from, make_specs, play
+def test_a_token_batch_survives_the_slab_unchanged():
     from nets.features import hand_tokens
+    from tests.g1_fixtures import make_specs, play
 
     pool = make_pool()
     records = play(pool, make_specs(seed=81, n_hands=4, n_members=len(pool),
                                     num_players=3))
-    hands = []
-    for record in records:
-        hands.append(hand_tokens(record, observer_pos=0,
-                                 slot_of_seat=[0, 1, 2],
-                                 max_players=MAX_PLAYERS,
-                                 n_actions=N_ACTIONS))
+    hands = [hand_tokens(r, observer_pos=0, slot_of_seat=[0, 1, 2],
+                         max_players=MAX_PLAYERS, n_actions=N_ACTIONS)
+             for r in records]
     hands = [h for h in hands if len(h) > 0]
-    assert len(hands) >= 3
-    assert len({len(h) for h in hands}) > 1, (
-        "the fixture must mix hand lengths — padding is what is under test")
+    assert len({len(h) for h in hands}) > 1, "the fixture must mix hand lengths"
 
+    batch = collate(hands)
     d_emb = 4
-    parts = []
-    for group in ([hands[0]], hands[1:]):
-        batch = collate(group)
-        emb = torch.zeros(*batch["mask"].shape, d_emb)
-        parts.append((batch, emb))
-    merged, emb = merge_tokens(parts)
-    together = collate(hands)
+    emb = torch.arange(batch["mask"].numel() * d_emb, dtype=torch.float32)
+    emb = emb.reshape(*batch["mask"].shape, d_emb)
+    fields = token_fields(MAX_PLAYERS, N_ACTIONS, d_emb)
+    b, t = batch["mask"].shape
+    slab = Slab(max(b, 8), [fields], N_ACTIONS)
 
-    for key, value in together.items():
-        assert torch.equal(merged[key], value), key
-    assert emb.shape == (len(hands), together["mask"].shape[1], d_emb)
+    tensors = dict(batch)
+    tensors["emb"] = emb
+    slab.pack(fields, tensors, b * t)
+    out = slab.unpack(fields, b * t, (b, t))
+    for name, _cols, _dtype in fields:
+        assert torch.equal(out[name], tensors[name]), name
+    # The three derived masks are rebuilt, not carried.
+    assert set(batch) - set(out) == {"decision_mask", "showdown_mask",
+                                     "strength_mask"}
 
 
 # ---------------------------------------------------------------- the mirror

@@ -310,11 +310,21 @@ def collate(hands, device="cpu"):
         out["legal"][b, :t] = torch.from_numpy(h.legal)
         out["mask"][b, :t] = 1.0
 
-    # Three derived masks, so no caller has to re-derive them and get it wrong:
-    # an action target only exists on decision tokens, a revealed hand only on
-    # showdown tokens, and the §5.6 strength target only where `hand_tokens`
-    # left a percentile instead of the sentinel.
-    out["decision_mask"] = out["mask"] * (out["token_type"] == TOKEN_DECISION)
-    out["showdown_mask"] = out["mask"] * (out["token_type"] == TOKEN_SHOWDOWN)
-    out["strength_mask"] = out["mask"] * (out["own_strength"] >= 0)
+    out.update(derived_masks(out))
     return {k: v.to(device) for k, v in out.items()}
+
+
+def derived_masks(batch):
+    """The three masks every consumer of a batch needs, derived once.
+
+    An action target only exists on decision tokens, a revealed hand only on
+    showdown tokens, and the §5.6 strength target only where `hand_tokens` left
+    a percentile instead of the sentinel. `oracle/transport.py` does not carry
+    them between processes — it rebuilds them here, so there is one statement of
+    what they are.
+    """
+    return {
+        "decision_mask": batch["mask"] * (batch["token_type"] == TOKEN_DECISION),
+        "showdown_mask": batch["mask"] * (batch["token_type"] == TOKEN_SHOWDOWN),
+        "strength_mask": batch["mask"] * (batch["own_strength"] >= 0),
+    }

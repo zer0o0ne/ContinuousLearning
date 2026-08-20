@@ -35,25 +35,34 @@ def _tokens_for(record, observer):
 
 
 def test_only_the_observers_hole_cards_are_ever_present():
-    checked_masked = checked_own = 0
+    """One rule, every token type — decision tokens and showdown tokens alike.
+
+    The observer's own hand is never something the observer has to infer, so it
+    is present wherever the observer is the acting seat; nobody else's ever is
+    (owner decision 2026-08-20). The showdown tokens are deliberately *not*
+    skipped here — that they obey the same rule is the property.
+    """
+    checked_masked = checked_own = checked_showdown = 0
     for record in _records():
         for observer in range(record.num_players):
             tok = _tokens_for(record, observer)
             own = record.hole_cards(observer)
             for t in range(len(tok)):
-                if tok.token_type[t] != TOKEN_DECISION:
-                    continue
                 acting = int(tok.acting_pos[t])
                 slots = tok.cards[t, 5:].tolist()
                 if acting == observer:
                     assert slots == own
                     checked_own += 1
+                    checked_showdown += int(
+                        tok.token_type[t] == TOKEN_SHOWDOWN)
                 else:
                     assert slots == [UNKNOWN_CARD, UNKNOWN_CARD], (
                         f"seat {acting}'s hole cards leaked into a token built "
                         f"for observer {observer}")
                     checked_masked += 1
     assert checked_masked > 0 and checked_own > 0
+    assert checked_showdown > 0, (
+        "no observer reached a showdown, so the showdown half is untested")
 
 
 def test_no_other_seats_cards_appear_anywhere_in_a_decision_token():
@@ -166,18 +175,54 @@ def test_showdown_tokens_appear_exactly_for_the_revealed_seats():
     assert seen_showdown and seen_foldout
 
 
-def test_the_revealed_cards_are_the_target_and_never_an_input():
-    """The whole point of the terminal token: the hand it shows is what the two
-    heads have to predict, so it must not be readable from the token."""
+def test_another_seats_revealed_cards_are_the_target_and_never_an_input():
+    """The whole point of the terminal token, for every seat but the observer.
+
+    A showdown token is the only channel from a reveal to that player's vector,
+    and it is a channel only while the answer is absent from the input. So
+    another seat's hand must not be readable from its token — not in the hole
+    slots and not anywhere else in it. The observer's own token is the declared
+    exception and is checked by the test below.
+    """
+    checked = 0
     for record in _records():
-        tok = _tokens_for(record, 0)
+        observer = 0
+        tok = _tokens_for(record, observer)
         for t in range(len(record.decisions), len(tok)):
-            assert tok.cards[t, 5:].tolist() == [UNKNOWN_CARD, UNKNOWN_CARD]
             pos = int(tok.acting_pos[t])
+            if pos == observer:
+                continue
+            assert tok.cards[t, 5:].tolist() == [UNKNOWN_CARD, UNKNOWN_CARD]
             revealed = set(record.hole_cards(pos))
             present = set(int(c) for c in tok.cards[t])
             board = set(int(c) for c in record.deck[:5])
             assert not ((present & revealed) - board)
+            checked += 1
+    assert checked > 0
+
+
+def test_the_observers_own_showdown_token_carries_the_observers_own_hand():
+    """The 2026-08-20 exception, and the reason it is not one of substance.
+
+    The observer knows its own cards at every moment of the hand, so a token
+    that hid them from the observer alone would be hiding public information
+    from the only player entitled to it. Its strength target then becomes
+    readable from its own input — which is a fact about the *metric*
+    (`OpponentEmbeddingNet.showdown_losses`) and not about §9.
+    """
+    checked = 0
+    for record in _records():
+        for observer in range(record.num_players):
+            if observer not in record.showdown:
+                continue
+            tok = _tokens_for(record, observer)
+            rows = [t for t in range(len(record.decisions), len(tok))
+                    if int(tok.acting_pos[t]) == observer]
+            assert len(rows) == 1, "one showdown token per revealed seat"
+            assert tok.cards[rows[0], 5:].tolist() == \
+                record.hole_cards(observer)
+            checked += 1
+    assert checked > 0
 
 
 def test_a_showdown_token_shows_the_full_final_board():

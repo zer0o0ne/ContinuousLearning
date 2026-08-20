@@ -1,9 +1,19 @@
-"""Showdown reveals and their labels (CONCEPT.md §5.1a).
+"""Hand-strength labels: the showdown reveals, and every seat's own hand
+(CONCEPT.md §5.1a, §5.6).
 
 A showdown is the only place where an opponent's line is tied to an actual
 holding, so it is the sharpest style signal available. It reaches the embedding
 through a **terminal token** appended after every decision of the hand
 (`nets/features.py`), whose targets are computed here.
+
+**The same enumeration answers a second question (§5.6).** The percentile of the
+*observer's own* hand on the final board is the target of the strength head —
+the poker prior the trunk is pretrained on, so that the oracle's noisy EV labels
+do not also have to teach hand evaluation from scratch. It is wanted on **every**
+hand and for **every dealt seat**, not only the ones that showed, so this module
+computes the percentile for all of them in one pass and `showdown_strength` is
+that dict restricted to the revealed seats. One enumeration, two consumers; the
+showdown labels are bit-identical to what a showdown-only pass produced.
 
 Two targets, deliberately different in kind:
 
@@ -116,27 +126,41 @@ def strength_percentiles(board, holes, device="cpu"):
 
 
 def label_showdowns(records, device="cpu", desc=None):
-    """Fill `record.showdown_strength` / `record.showdown_class` in place.
+    """Fill `record.hand_strength`, `showdown_strength` and `showdown_class`.
 
     Called once over a corpus, outside any inner loop: the labels depend only on
     the cards, so they never have to be recomputed.
 
+    Every dealt seat gets a `hand_strength` percentile (§5.6) — including seats
+    that folded, whose "final board" is the runout the deck had pinned for the
+    hand and never turned over. That is a legitimate target and not a leak: it
+    is the *label* of a prediction made from the visible board, exactly as a
+    value target is, and `nets/features.py` never writes it into a token. It is
+    one sample of the runout rather than an expectation over runouts, so the
+    head's MSE floor is the conditional variance of the runout and not zero —
+    the number to read it against is the marginal variance of the target, never
+    zero (`CONCEPT.md` §5.6).
+
+    `showdown_strength` is `hand_strength` restricted to the revealed seats, so
+    the §5.1a labels are bit-identical to what a showdown-only pass produced.
+
     `desc` labels the progress bar (`CLAUDE.md` §5); omitting it runs silently.
     The unit is the hand, not the reveal, so the bar reaches its total even
-    though most hands carry no label.
+    though most hands carry no reveal. Returns the number of reveals labelled.
     """
     labelled = 0
     for record in progress(records, desc=desc, unit="hand",
                            disable=desc is None):
+        seats = list(range(record.num_players))
+        holes = np.array([record.hole_cards(p) for p in seats], dtype=np.int64)
+        strengths = strength_percentiles(record.deck[:5], holes, device=device)
+        record.hand_strength = {p: float(s) for p, s in zip(seats, strengths)}
         if not record.showdown:
             continue
-        holes = np.array([record.hole_cards(p) for p in record.showdown],
-                         dtype=np.int64)
-        strengths = strength_percentiles(record.deck[:5], holes, device=device)
-        record.showdown_strength = {
-            p: float(s) for p, s in zip(record.showdown, strengths)}
+        record.showdown_strength = {p: record.hand_strength[p]
+                                    for p in record.showdown}
         record.showdown_class = {
-            p: hand_class_169(int(h[0]), int(h[1]))
-            for p, h in zip(record.showdown, holes)}
+            p: hand_class_169(*record.hole_cards(p))
+            for p in record.showdown}
         labelled += len(record.showdown)
     return labelled

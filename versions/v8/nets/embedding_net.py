@@ -48,6 +48,16 @@ and the second time is the one that is easy to miss:
 
 Both terms are computable at fit time from what hero saw: the hands being fitted
 are finished, and their showdowns are public.
+
+**The strength head (§5.6).** A third head reads the *observer's own* decision
+tokens and predicts the percentile its hand reached on that hand's final board.
+It carries no style at all — that is the point. It is the poker prior: hand
+evaluation, board texture and the value of a draw, learned from a corpus of free
+self-play rather than from the oracle's EV labels, whose signal-to-noise at deep
+stacks cannot afford to also teach it. `pipeline.py`'s `warm_start_trunk` is what
+hands the resulting trunk to the agent. Unlike the showdown terms it is
+**training-only** and deliberately absent from the §5.5 fit — see
+`strength_loss` for why.
 """
 
 import torch
@@ -97,6 +107,9 @@ class OpponentEmbeddingNet(nn.Module):
         # §5.1a — the two showdown heads. Read only on terminal tokens.
         self.showdown_strength_out = nn.Linear(d_model, 1)
         self.showdown_class_out = nn.Linear(d_model, N_HAND_CLASSES)
+        # §5.6 — the strength head. Read only on the observer's own decision
+        # tokens, and only during training (see `strength_loss`).
+        self.strength_out = nn.Linear(d_model, 1)
 
         # §5.4: an ordinary trainable table, one vector per pool member. Hero
         # has one too — every seated player is just a member here.
@@ -163,6 +176,17 @@ class OpponentEmbeddingNet(nn.Module):
 
         Returns ``(None, None)`` when the batch contains no showdown at all —
         a corpus of fold-outs is a legitimate batch, not an error.
+
+        **The number mixes two populations** since 2026-08-20, and reading it as
+        one is the mistake to avoid. The observer's own showdown token carries
+        the observer's own cards (`nets/features.py`), so its strength target is
+        a deterministic function of its input and the head answers it almost
+        immediately; every other seat's token still has to infer the holding
+        from the line, which is the hard task and the only one that carries
+        style. The pooled MSE therefore falls for a reason that is not the head
+        getting better at ranges, and it is **not comparable to G1's 0.095**.
+        Training is unaffected — a term the head can already answer stops
+        producing gradient — but the diagnostic needs the split to be read.
         """
         sel = batch["showdown_mask"] > 0
         if not bool(sel.any()):
@@ -173,6 +197,24 @@ class OpponentEmbeddingNet(nn.Module):
         cls = F.cross_entropy(self.showdown_class_out(h),
                               batch["sd_class"][sel])
         return strength, cls
+
+    def strength_loss(self, hidden, batch):
+        """MSE of the observer's own hand strength (§5.6). `None` if untargeted.
+
+        **Training only, and deliberately not part of `objective`.** The target
+        is a property of the observer's *cards*, not of anybody's style: its
+        gradient with respect to an opponent's vector is noise, and with respect
+        to the observer's own vector it is a channel that carries nothing the
+        vector is for. Putting it in the §5.5 fit would spend K gradient steps
+        pulling the vectors toward a term that cannot inform them. It shapes the
+        trunk, which is what §5.6 wants and what `warm_start_trunk` then hands to
+        the agent.
+        """
+        sel = batch["strength_mask"] > 0
+        if not bool(sel.any()):
+            return None
+        return F.mse_loss(self.strength_out(hidden[sel]).squeeze(-1),
+                          batch["own_strength"][sel])
 
     def objective(self, batch, emb, weights, hidden=None):
         """The loss the embedding is fitted against — training and inference.
@@ -203,11 +245,18 @@ class OpponentEmbeddingNet(nn.Module):
         """Training losses for one batch of hands.
 
         Returns ``(total, parts)``. Two trunk passes: one with the fitted table
-        rows for the prediction and showdown losses, one with `e = 0` whose
-        pooled hidden states are the amortised head's input (see the module
-        docstring).
+        rows for the prediction, showdown and §5.6 strength losses, one with
+        `e = 0` whose pooled hidden states are the amortised head's input (see
+        the module docstring).
         """
-        total, parts = self.objective(batch, self.member_emb(batch), weights)
+        hidden = self.hidden(batch, self.member_emb(batch))
+        total, parts = self.objective(batch, None, weights, hidden=hidden)
+
+        # §5.6 — the poker prior. In training only, never in the §5.5 fit.
+        strength = self.strength_loss(hidden, batch)
+        if strength is not None:
+            parts["own_strength_mse"] = float(strength.detach())
+            total = total + weights.get("strength", 0.0) * strength
 
         amortised_weight = weights.get("amortised", 0.0)
         if amortised_weight > 0.0:
@@ -246,11 +295,16 @@ def loss_weights(cfg):
     `showdown_strength` and `showdown_class` weight the two showdown heads and
     are used **both** in training and in the inference-time fit — setting either
     to 0 is the ablation that answers "does the showdown anchor earn its keep".
+
+    `strength` weights the §5.6 head and is read in **training only**; the fit
+    never sees it (`strength_loss`). 0 is the ablation that asks whether the
+    poker prior earns its keep.
     """
     return {
         "amortised": cfg.get("amortised_weight", 1.0),
         "showdown_strength": cfg.get("showdown_strength_weight", 0.0),
         "showdown_class": cfg.get("showdown_class_weight", 0.0),
+        "strength": cfg.get("strength_weight", 0.0),
     }
 
 

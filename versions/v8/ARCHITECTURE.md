@@ -4,11 +4,16 @@
 the agent network (§6.1), the target construction and training loop that fits it (§6.2), and
 label generation end to end (§8) — play, refresh the embeddings, label hero's decisions, shard —
 and the pool sampler that decides who sits at those tables (§4.4).
-G3 has been exercised only at toy scale on CPU — it has not been run, so what a label costs is
-still the hypothesis §13 wrote down, and the decision it is supposed to inform (variant A or the
-value-bootstrapped variant C of §7.4) has not been taken. Everything below has run only at toy
-scale on CPU; no agent has yet been trained on a generated corpus, because nothing ties the
-pieces into a loop — `pipeline.py` is still missing.**
+G3 has run twice on the Spark (2026-08-18, 2026-08-19), so what a label costs is measured rather
+than assumed and the decision it exists to inform has been taken: **variant A stands, there is
+no value head, and `oracle.samples_per_action = 128`** (`CONCEPT.md` §13, §14). The outer loop
+that ties all of it together — `pipeline.py` and `config.json` (§8) — now exists as well, so the
+tree is complete from the bootstrap pool to a trained agent joining it. The Slumbot
+adapter and the evaluation runner (§12) exist as well, cold and warm, so **the tree is now
+complete end to end — bootstrap pool → oracle labels → trained agent → BB/100 against Slumbot.**
+Everything below has run only at toy scale on CPU: **no iteration has yet been run at size and
+no hand has yet been played against Slumbot**, so nothing here has yet met an opponent stronger
+than the −90 BB/100 bootstrap pool.**
 
 This document describes **what the code in `versions/v8/` actually is**. The design it is
 being built toward is in **[`CONCEPT.md`](CONCEPT.md)**: five entities (environment, opponent
@@ -34,6 +39,9 @@ versions/v8/
   config_g1.json        the G1 experiment surface
   config_g1_pilot.json  a shrunk G1 for measuring throughput on the Spark first
   config_g3.json        the G3 sweep surface — samples × combos × table × stack × pool
+  pipeline.py           the outer loop (§8) — labels, training, gap, pool growth   NEW
+  eval_pipeline.py      Slumbot: cold and warm, BB/100 ± SE (§12)                  NEW
+  config.json           the experiment surface of a run and its evaluation (§8.1)  NEW
 
   env/                  poker engine, from v7, verbatim
     legal.py            the one legality rule (§6.2)                    NEW
@@ -54,7 +62,7 @@ versions/v8/
     embedding_net.py    entity 4 — the opponent-embedding network (§5)
     agent_net.py        entity 3 — the agent's policy network (§6.1)         NEW
   agent/                                                                     NEW
-    policy.py           the agent as a pool member (§6.1, §7.1)
+    policy.py           the agent as hero, and a past agent as an opponent (§6.1, §7.1, §8)
   train/                                                                     NEW
     targets.py          softmax(Q_norm / T) and the KL loss (§6.2)
     agent_train.py      one training cycle of the agent (§6.2, §8)
@@ -76,8 +84,9 @@ versions/v8/
   utils.py              Logger, get_amp_config, resolve_device, progress
   gto_utils/            hand evaluation, equity, CFR solvers v1–v5, from v7
   evaluation/
-    slumbot_eval.py     from v7, verbatim — does not import yet (§5)
-  tests/                19 files, 308 tests, ~58 s
+    protocol.py         Slumbot's wire protocol, kept from v7 (§12)             NEW
+    v8_adapter.py       the v8 agent as a Slumbot player (§12)                  NEW
+  tests/                22 files, 373 tests, ~111 s
 ```
 
 ### What was inherited, and why
@@ -93,7 +102,7 @@ is not inheritance but vendoring: see §3.
 | `gto_utils/` | `v7/agent/gto_utils/` | Hand evaluation, equity, range utilities, CFR solvers v1–v5. Not on the G1 path at all; needed later by the oracle. Requires `eval7`. |
 | `utils.py` | `v7/utils.py` + `resolve_device`, `progress` | `Logger`, `get_amp_config`, the CUDA → MPS → CPU device resolution `CLAUDE.md` §3 requires, and the single `tqdm` wrapper §5 requires long loops to use. |
 | `attn_utils.py` | `v7/agent/attn_utils.py` verbatim | Causal + padding attention mask. Architecture-independent. |
-| `evaluation/slumbot_eval.py` | `v7/evaluation/slumbot_eval.py` verbatim | **Does not import yet** — see §5. |
+| `evaluation/protocol.py` | `v7/evaluation/slumbot_eval.py`, the architecture-independent half | The HTTP client and its retry policy, the action-string grammar, token ↔ action-index translation, the action-string replay, BB/100 + SE. Bodies verbatim; see §2.12. The v7-specific half — the event builder, the action chooser, the MCTS and solver paths — was deleted with the file. |
 
 ---
 
@@ -325,12 +334,19 @@ equity-gated conditions as far too expensive inside rollouts.
 lever the pool side has, and `V7NetworkMember` was running fp32 with no autocast at all while
 `utils.get_amp_config` — v8's existing answer to "what does this device want" — sat unused.
 `logits` now wraps `agent.action_logits` in `torch.autocast` with what that helper returns: bf16
-on CUDA, which is the regime v7 itself trained and evaluated under (`evaluation/slumbot_eval.py`
-does the same), and **disabled on CPU**, so the dev box keeps running the fp32 path the test
+on CUDA, which is the regime v7 itself trained and evaluated under (v7's own
+`slumbot_eval.py` does the same), and **disabled on CPU**, so the dev box keeps running the fp32 path the test
 battery pins. Resolved in `__init__` from `agent.device_`, because `build_pool` calls
 `set_device` before it constructs a member and never moves one afterwards. Whether bf16 actually
 pays on sm_121 is a hypothesis until the Spark says so (`CLAUDE.md` §3); the `.float()` already
 at the end of `logits` is there because v7 ran this way too.
+
+**Measured 2026-08-19: about 1.5×, not the 2–4× the change was made on.** The two G3 runs are not
+directly comparable — hero, pool mix and hand lengths all changed with them — so the honest
+normaliser is the model's cost per unit of the `events` bucket, which is pure Python
+proportional to sequence length: it fell from 15.3 to 10.0. The model is still 68.8% of a
+label's wall clock, so the remaining engineering lever is the 13.9% in tensor packing, and it is
+now a larger share of what is left than it was before autocast landed.
 
 **`build.py`.** Builds the pool from the `bootstrap` config section and produces the descriptor
 list the G1 report needs. `fresh_style_variants` draws the never-trained-on styles that
@@ -448,8 +464,63 @@ Two properties carry the design and both are tested behaviourally:
   state from a forward pass; v8's is a latent found by gradient descent at deployment, so a
   training-only term would be optimised straight back out of the fitted vector.
 
+**The observer's own showdown token is unmasked** (2026-08-20): its hole slots carry the
+observer's own hand, so `nets/features.py` applies one rule to every token type — the observer's
+own cards always, everybody else's never. Every *other* seat's showdown token stays masked,
+because that masking is the anchor's entire mechanism: no decision token attends to a showdown
+token, so the only channel from a reveal to that player's vector is the gradient of a loss whose
+answer is not in the input. The cost lands on the metric — `showdown_strength_mse` now pools a
+trivial population (the observer's, readable off its own input) with the hard one, so it is no
+longer comparable to G1's 0.095 and `showdown_losses` says so in its docstring.
+
 Weights live in the `train` config section (`showdown_strength_weight`, `showdown_class_weight`)
 and are applied identically in both places; setting them to zero is the ablation.
+`showdown_class_weight` is **0** in `config.json` as of 2026-08-20 — G1 measured the 169-way head
+at 5.75 nats held out against a 5.005-nat marginal entropy, i.e. worse than a constant. The code
+stays, because zero is the documented ablation and dropping the field would change the shard
+format for nothing.
+
+### 2.4b The strength head and the poker prior (§5.6)
+
+The third head on the embedding network's trunk, and the only one that carries no style at all.
+On every decision token of the **observer** it predicts the percentile the observer's own hand
+reached on that hand's final board; MSE, weight `embedding_net.strength_weight`.
+
+What it is for: the trunk learns hand evaluation, board texture and the value of a draw from a
+corpus of free self-play, so that the oracle's EV labels — whose noise at depth is larger than
+the EV differences they are meant to teach (§13, §11.4) — do not also have to teach it. §2.11's
+`warm_start_trunk` is what hands the result to the agent.
+
+Four properties, all tested in `tests/test_strength_head.py`:
+
+* **one enumeration, two consumers.** `env/showdown.py::label_showdowns` now scores *every* dealt
+  seat and `showdown_strength` is that dict restricted to the revealed ones, so §5.1a's labels
+  are bit-identical and non-showdown hands are labelled too. `HandRecord.hand_strength` carries
+  it; the cost is that every hand pays the enumeration, not only the ~⅓ that show.
+* **a target and never an input.** `hand_tokens` writes it into `own_strength` and touches no
+  other field; the tokeniser does not read it. Predicting a quantity the observer only learns
+  later is what a value target does. `-1` is the sentinel and the mask (a percentile is in
+  [0, 1]), so `collate` derives `strength_mask` from it and the padded tail is excluded.
+* **no target where there is no final board.** A tokenisation with a pending decision carries
+  none — the hand is still in progress — and neither does a record nobody labelled, which is the
+  shape the Slumbot replay builds.
+* **training only, unlike §5.1a.** `strength_loss` is called from `loss_terms` and deliberately
+  not from `objective`, so `fit_embeddings` is bit-identical with and without it. The strength of
+  the observer's *own* cards says nothing about anybody's style: its gradient into an opponent's
+  vector is noise, and spending K fit steps on it would buy nothing.
+
+**The MSE floor is not zero.** The target is one runout, not an expectation over runouts, so a
+perfect head still pays the conditional variance of the runout — large at preflop, zero on the
+river. The number to read it against is the marginal variance of the target on the same corpus,
+never zero. This is the §11.4 trap in a second place, and the reason `train_embedding_net` logs
+the strength-target count: a corpus nobody labelled would otherwise train the head on nothing
+while the curve looked ordinary.
+
+**The agent has no showdown head and no strength head.** `AgentNet` carries `action_out` and
+nothing else, and `train_agent` computes `kl_loss` / `soft_q_loss` and nothing else. Every
+auxiliary weight (`showdown_strength_weight`, `showdown_class_weight`, `strength_weight`) is read
+by `loss_weights` alone, whose callers are the embedding trainer, G1, and the two §5.5 fit sites.
+The only path from any of them into the agent is `warm_start_trunk`, once, through the weights.
 
 ### 2.5 `gates/g1.py` — the experiment
 
@@ -640,9 +711,23 @@ uniform draw. Nothing here is training data, so `CLAUDE.md` §1's sampling rule 
 
 The gate measures and stops. It tunes nothing and it does not try to make the number better; the
 decision that follows — variant A as it stands, or §7.4's variant C — is read off the table by
-the owner. **It has been run twice on the Spark** (2026-08-18 and 2026-08-19); what the first
-run said is recorded in `CONCEPT.md` §13, and the changes above plus the §7.1 runout fix and
-bf16 in the pool member are why the second one is not comparable to it.
+the owner, and on 2026-08-19 it was: **variant A stands.** **The gate has been run twice on the
+Spark** (2026-08-18 and 2026-08-19); `CONCEPT.md` §13 records both, and the changes above plus the §7.1 runout fix and bf16 in the pool member are why
+the second is not comparable to the first.
+
+**The answer, for whoever writes `config.json`: `oracle.samples_per_action = 128`.** The
+derivation is worth carrying here because it is a property of the two columns this gate prints
+rather than of anything downstream. A label costs `a + b·n` with `a` the posterior, which does
+not move with `n`; for a fixed second-budget the total label noise goes as `(a/n + b)/C`, so the
+efficiency of a sample budget is *exactly* the share of the label's wall clock spent on rollouts
+rather than on the posterior — 68% at n=32, 77% at 64, 85% at 128, 91% at 256. Read as samples
+bought per Spark-hour the curve peaks at 128 and turns slightly down after it. Below that the
+label re-derives a posterior it does not use enough; above it, nothing is bought.
+
+Second-run headline: `SE ~ n^-0.5` with no plateau (median exponent −0.51 in BB, −0.46 in pot
+units over the 18 cells), which is the direct evidence that the pinned board of the earlier
+`_rollout_deck` had been an irreducible floor and is not one any more. Wall clock splits 6.9%
+events, 13.9% packing, 68.8% model, 0.3% style, 10.3% driver at 584 µs per policy row.
 
 ---
 
@@ -668,7 +753,9 @@ to move, the refactor would have changed behaviour and would have been reverted.
 
 **`AgentNet` is the trunk plus one linear head.** No value head (§6.1, D5) and no search: the
 search that produces its targets is the offline BR oracle of §7, not something this forward
-does. §7.4's variant C would need a value head, and that is a decision G3 has to inform.
+does. §7.4's variant C would have needed a value head; G3 was run to inform that decision and the
+owner took it on 2026-08-19 — **variant A stands, D5 does not flip, no head is added.** The
+noise problem C was the candidate answer to was solved in the loss instead (§2.9's `soft_q`).
 
 The logits are read at each hand's **own** last real token. The observation of a decision that
 has not been taken yet is the hand so far plus one pending token (§9), and that token is last
@@ -701,8 +788,30 @@ reads something it will not have at deployment:
 * the pending decision must be the record's latest snapshot, otherwise the tokens would carry
   decisions taken *after* the one being asked about.
 
-The second and third together mean the agent **cannot yet be an opponent in §7.2's posterior**
-(see §5).
+The second and third together mean this member cannot be an opponent in §7.2's posterior — and
+that is what the second class exists for.
+
+**`FrozenAgentMember` — a past agent, seated as an opponent (D12, §8's last line).** §8 appends
+the agent to the pool at the end of every iteration, and from then on it is asked the two
+questions every pool member is asked: *what do you do here* (the driver, in play and inside the
+oracle's rollouts) and *what would you have done holding this* (the §7.2 posterior). Three things
+follow, and each one is why this is a second class rather than a flag on the first:
+
+* **The vectors are zero** — D12 option (a), the plan's recommendation, taken 2026-08-19. A past
+  agent plays its *unconditional* policy, the one §6.2's embedding dropout trains explicitly, so
+  it is a fixed policy like every other member: no fit nested inside a fit, no recursion, no
+  answer needed to "what did agent *k−3* believe about its tablemates". The alternative — a §5.5
+  fit per past agent per table — has no cheap form and no measurement asking for it.
+* **One member serves every seat**, because with `e = 0` the slot only selects which zero vector
+  is read. That is what `PoolMember` requires and what `AgentPoolMember` cannot give.
+* **The observation is rebuilt for the moment being asked about**: the record is truncated at the
+  asked-about snapshot and the hypothetical holding is swapped into a copy of the deck. This is
+  the same pair of moves `pool/v7_member.py` makes for the same two reasons, and it shares
+  `_deck_seen_by` with it rather than repeating it. On the hot path — the driver, acting now,
+  real cards — no copy is made at all.
+
+The style layer applies to it exactly as to a v7 checkpoint (§4.2), so the `agent_variants`
+members one agent contributes are `with_style` siblings sharing one network by reference (D11).
 
 ---
 
@@ -888,6 +997,218 @@ that many, generation has to be chunked, and it is the caller's `n_sessions` tha
 
 ---
 
+### 2.11 The outer loop (§8) — `pipeline.py`, `config.json`
+
+The file that turns every piece above into a training run. Five phases per iteration, and only
+the last two are new code:
+
+| | Phase | Does | Artefact |
+|---|---|---|---|
+| A | embedding network | plays a corpus of pool self-play and runs §5.4 training over it, every `embedding_net.retrain_every` iterations | `embedding.pt` |
+| B | labels | `train/generate.py` — play, refresh the vectors, label hero's decisions | `labels/*.npz`, `labels.json` |
+| C | agent | `train/agent_train.py` over all but `agent_train.heldout_fraction` of them | `agent.pt` |
+| D | oracle gap | §8's four numbers on the held-out slice | `metrics.json` |
+| E | close | PFSP results in, `result_decay` applied, the agent appended to the pool | `state.json` |
+
+**The agent's trunk is warm-started from phase A** (§6.1 OI-4, §5.6), at iteration 0 only, when
+`agent_train.warm_start_trunk` is set. `pipeline.py::warm_start_trunk` copies
+`OpponentEmbeddingNet.encoder`'s state dict into `AgentNet.encoder` — they are built from the
+same `embedding_net` config over the same tokeniser and the same §5.1 token, which is exactly
+what OI-4 bought by sharing the trunk as code, so the two state dicts correspond key for key. The
+action head keeps its initialisation. It is an initialisation and not a tie: the weights are
+separate objects and the agent's trunk moves under `soft_q` from its first gradient step. It runs
+after phase A because there has to be a trained trunk to copy, and it is skipped when this
+iteration already has an `agent.pt` on disk, because a resumed run loads that one instead.
+
+**Iteration 0 differs in exactly one way** (§7.1): the agent trains from scratch and the
+`agent_init` member — built through `build_pool` so it is an ordinary member, and deliberately
+*not* part of `bootstrap` — sits in hero's seat, so the labelled states come from a competent
+policy rather than a random walk. From iteration 1 hero is the agent and the labels are
+on-policy. Training continues across iterations; only iteration 0 starts from random weights and
+gets its own `first_iteration_steps`.
+
+**The embedding network is the first phase, not a later one.** §8 says it "can be trained before
+any v8 agent exists, on hands played by pool members among themselves — that is both gate G1 and
+the first pipeline phase", so it runs at the *start* of an iteration: iteration 0's labels carry
+the vectors it fitted, and a network still at its initialisation would attach noise to every one
+of them. **Its corpus is pool self-play, replayed at each retrain over the pool as it stands** —
+which is what grows, since iteration *k*'s pool contains the agents of iterations 0 … *k*−1 as
+opponents, the case §5.4 cares about. Replaying rather than accumulating is a deliberate reading
+of "the enlarged history corpus": it keeps a resumed run identical to an uninterrupted one
+without carrying every hand ever played on disk, and it costs hero's own hands never entering the
+corpus. Whether the network should also see hero's tokens — which is what §5.4's "the agent's row
+belongs to it from the moment it is first seated as hero" points at — is not settled by anything
+measured, and the row still exists and is still read the moment that agent is seated as an
+opponent.
+
+**Row *i* of the embedding table is pool member *i*.** The table is sized
+`len(pool₀) + max_iterations × agent_variants` up front (D9) and the pool grows by exactly
+`agent_variants` members per iteration (D11), so the two indices coincide by construction and
+iteration *k*'s block starts at `len(pool₀) + k × agent_variants`. A row nobody occupies yet is a
+dead parameter at its initialisation, because no token carries its index.
+
+**The oracle gap** (`gap_terms`, `oracle_gap`) is §8's four numbers — `kl`, `ev_gap_target`,
+`ev_gap_greedy`, `agreement` — on the held-out slice, overall and grouped by table size and by
+stack depth. One agent forward per held-out decision and **no new rollouts**: the oracle's answer
+is already in the shard. What it answers is whether this iteration's training absorbed this
+iteration's labels; what it does not is anything about exploitability, and its floor is G3's
+Monte-Carlo error rather than zero. `heldout_fraction = 0` reports no gap at all rather than one
+measured on the data the optimiser just saw.
+
+**PFSP is fed from the hands the label phase already played.** `train/generate.py`'s manifest now
+carries hero's BB and hand count against every member it sat with, and phase E hands them to
+`PoolSampler.update` before `end_iteration` ages them (D10). A hand is credited to **every**
+opponent at the table in full: hero's chip delta in a multiway hand is not divisible between the
+opponents who produced it, and splitting it by table size would make a nine-handed beating look
+an eighth as bad as the heads-up one it is being compared against. The cost is that the
+nine-handed number carries eight opponents' worth of noise, which is what `result_decay` keeps
+from accumulating.
+
+**Resume is per phase, and inside labelling per shard.** `./run.sh --version=v8` after a crash or
+a stop continues where it left off: every phase writes its artefact before the next one starts and
+skips itself if that artefact is already there, and phase B — the one measured in days — writes a
+`labels/progress.json` after every flushed shard as well, so a crash in its middle costs at most
+one shard rather than the phase (§2.10). What a mid-labelling resume does re-do is playing the
+iteration's hands and refitting the embeddings — minutes against days, and the price of not
+keeping a corpus of records on disk. What makes the resumed run *identical*
+rather than merely valid is that no phase reads a running RNG: every stream is seeded from
+`(seed, iteration)`, and the one piece of genuinely sequential state — the sampler, whose draws
+are consumed in phase B — is written out with phase B's own artefact and restored from it. One
+iteration owns one block of a million hand seeds, split in half between the corpus and the
+labelled sessions, and both halves are asserted to fit rather than assumed to.
+
+**One temperature.** §6.2's `T` builds the `kl` target and is the unit the `soft_q` loss is
+written in; it lives once, in the `oracle` section (§8.1), and is handed to the trainer rather
+than configured twice.
+
+`config.json` carries exactly §8.1's sections. Sizes and paths that belong to the run rather than
+to a section — `experiment`, `seed`, `device`, `out_dir`, `n_iterations`, `n_sessions`,
+`hands_per_session`, `labels_per_shard`, `driver_batch_size` — are top-level, as they are in
+`config_g1.json` and `config_g3.json`. Two readings worth knowing before editing it: the agent's
+trunk dimensions come from the `embedding_net` section, because OI-4 shares the trunk as code and
+the two must agree on `d_emb` anyway; and `evaluation` is read by `eval_pipeline.py` (S11) and by
+nothing here.
+
+### 2.12 Slumbot (§12) — `evaluation/protocol.py`, `evaluation/v8_adapter.py`
+
+v7's `slumbot_eval.py` was split rather than ported. One half of it never knew what an agent
+was — the HTTP client and its retry policy, the action-string grammar, the token ↔ action-index
+translation, the replay of an action string into a betting state, and the BB/100 accounting —
+and that half is `protocol.py`, bodies verbatim. The other half was the v7 event builder, the
+action chooser and the MCTS/solver paths, and it was deleted with the file.
+
+**This is plumbing, not specialisation** (`CLAUDE.md` §1, `CONCEPT.md` §10). What is forbidden
+and is not here: a Slumbot-specific policy branch, an opponent model keyed on "this is Slumbot",
+or an assumption that a table is heads-up or a stack 200 BB. The adapter takes both from `game`
+config and **refuses** a table outside `players_range` / `stack_bb_range` rather than clamping —
+a clamped table would report a number about a situation the agent never saw under the name of
+one it did.
+
+**The chips are the table's, not the abstraction's.** The engine could have replayed the hand
+from a pinned deck and a forced prefix (§2.2a), which would be one construction path fewer. It
+was not used, and the reason is the whole design of this file: a forced action is an *index*, so
+the engine would size the opponent's bets out of *our* raise bins, and Slumbot does not bet in
+our bins. The pot and the stacks the agent read would be the nearest bin's. The abstraction is
+unavoidable in what hero can *say* (`action_idx_to_incr` snaps and, when it must, clamps); it
+must not reach what hero *sees*. So the `HandRecord` is built from the replay with Slumbot's own
+chip amounts, and only the action indices on the tokens are abstracted. `test_slumbot_adapter.py`
+pins it with a `b250` — a bet that lands on no bin of the test's grid and still reads as a 5 BB
+pot.
+
+**One legality rule, one observation builder, one last mile.** The mask comes from
+`env.legal.legal_action_mask`, which reads an `env.table.Table` — so the adapter *assigns* one
+from the replayed state rather than re-deriving legality (`_table_view`). The tokens come from
+`nets.features.hand_tokens`. Logits become a played distribution in `PoolMember.policy`, reached
+through the ordinary `AgentPoolMember`. None of the three has a Slumbot branch, and the record
+built here is the only second construction path the file introduces.
+
+**The two seat frames meet here and nowhere else.** Slumbot numbers seats `pos 0 = BB`,
+`pos 1 = SB` with the SB first preflop; v8's `env/table.py` posts the small blind at seat 0 and,
+heads-up, has seat 1 act first postflop (`next_turn`'s `start_pos = 1 if num_players == 2`). The
+conventions are exact mirrors, so `v8_seat = 1 - slumbot_pos` on every street and the flip is
+applied once, in `_flip`. Hero is **slot 0**, as in every session it was trained on, so the
+vector at slot 0 is hero's and slot 1 is the opponent's; the cold start is a table of zeros
+(§5.5) and §12's *warm* run replaces it through `set_embeddings`.
+
+**Two indices per decision, and confusing them is silent.** `act` returns the index the agent
+*chose* and the index it can be said to have *played* once `action_idx_to_incr` has had its say.
+They differ exactly when a clamp fires — a fold with nothing to call leaves as a check — and the
+caller must append the *effective* one to `hero_action_indices`, or every later observation in
+the hand carries an action hero did not take. `effective_action_idx` recovers it from the token
+that actually went on the wire.
+
+Two things are recorded rather than solved. A wire bet can map to an index our own legality rule
+would not have offered — the opponent really did bet that much, so the token carries it, and the
+`legal_mask` beside it can disagree; that is what an abstraction gap looks like from the inside.
+And `_table_view` maps `last_raise_size` straight from Slumbot's own min-raise quantity while
+making `_last_full_raise_level` inert, which is exact heads-up because a short all-in there makes
+every other live player all-in and `legal_actions` already drops every raise on that branch.
+
+### 2.13 The Slumbot run (§12) — `eval_pipeline.py`
+
+The only number in this project measured against something that is not ours. It plays the hands,
+keeps the books and writes the report; `evaluation/` does the talking.
+
+**Two numbers, always both.** *Cold* pins the embedding to zero for the whole run — the
+unconditional policy, the one §6.2's embedding dropout trains explicitly and the one §11.2 says
+cannot be a lookup table. *Warm* fits the vector online through the generic §5.5 mechanism, with
+the same `K`, `fit_lr`, `fit_reg` and `R` the pipeline uses against every other opponent, which is
+why `fit_vectors` is four lines of composition rather than a mechanism of its own — and why
+`CONCEPT.md` §10 records it as adaptation and not specialisation.
+
+**"How many hands it took to warm up"** is not a number the run can read off directly, so it is
+derived and the derivation is written down: every warm hand records how many hands its vector had
+been fitted from, the run is bucketed by that count (`evaluation.warmup_buckets`), and
+`warmup_hands` is the first bucket whose BB/100 reaches the cold run's overall BB/100. `None` —
+never caught up — is a result, not a missing value, and §11.2's R5 already predicts its shape:
+the fit was measurably *worse* than `e = 0` for members observed for two decisions or fewer.
+
+**If warm is worse than cold, the report says so in §12's own words** — "the exploitation
+mechanism is a net negative … a result to report, not a bug to tune away".
+
+**Reporting discipline is code, not habit.** The report always carries hand count, BB/100, its
+standard error, and §12's selection disclosure — how many candidates were screened over how many
+hands each — and `build_report` **refuses to produce a report without it**, because without it the
+headline reads as an unbiased measurement when it is the maximum of several noisy ones. A run
+below `evaluation.min_reportable_hands` is stamped `SCREENING ONLY` in the JSON and in the printed
+header (`CLAUDE.md` §1).
+
+**Parallel, because a million hands is a million HTTP round trips.** A hand is dominated by
+network latency, not by the forward, so `evaluation.n_workers` **processes** each play their own
+share. Processes and not threads for the reason v7's evaluation was multiprocess as well: the GIL
+and a single CUDA stream make threaded inference on batch-of-one forwards slower than the serial
+path. Three properties follow from how the split is drawn:
+
+* **Each worker is a session in §5.5's sense** — it sits down at its own Slumbot table, observes
+  the same opponent from scratch and fits its own vector from its own window. That is the quantity
+  §12's warm-up curve is about, and it means there is no shared state to make the fit
+  irreproducible.
+* **Each worker owns its own file** (`<mode>_w<k>.jsonl`) and its own share of the hand count, so a
+  resume is per worker and needs no coordination.
+* **The parent holds no network and touches no GPU** while workers run: the checkpoints are loaded
+  inside each worker from their paths, `spawn` is the start method, and the parent only drains the
+  queue, moves the one bar and adds the files up at the end. The refusals that belong to the run
+  rather than to a worker — a missing checkpoint, warm with no embedding network — are still made
+  in the parent, because learning about them one process deep is worse.
+
+**Resumable at the hand boundary.** Every completed hand is appended to its worker's file before
+the next one starts; a restart replays that file into the accumulators, rebuilds the fit window
+from its tail and carries on. The agent's own generator is seeded per hand from
+`(seed, mode, worker, hand index)` rather than carried, so a resumed run draws what an
+uninterrupted one would have. **A hand the wire loses is written too, marked failed**, so the index
+does not shift underneath a resume; failed hands are counted in the report and never enter the
+statistics — a run that is quietly failing cannot look like a clean one. **The clamp counters ride
+on each hand rather than being tallied in memory**, so a resumed run's totals are the run's totals
+and not what happened since the restart; every reported number is added up from disk by
+`aggregate` for the same reason.
+
+Two things are bounded rather than exact and both are recorded. The §5.5 fit is over the most
+recent `evaluation.fit_window` hands rather than "the histories observed so far", because an
+unbounded fit over a million hands is not computable; the window is config and is set well past
+the range G1 measured. And the standard error is accumulated by Welford's form through
+`protocol.stderr_bb_per_100_online`, so a million-hand run keeps no list of hands — the formula
+still lives in one place.
+
 ## 3. `vendor/v7/` — the frozen v7 snapshot
 
 `CONCEPT.md` §4.3 / OI-6. Two version trees cannot be imported into one process (`CLAUDE.md`
@@ -912,7 +1233,8 @@ Two files are not copies:
   state distribution at iteration 0) is now bought by seating a v7 pool member in hero's seat for
   that iteration, which needs no weight transfer at all (`CONCEPT.md` §7.1).
 * `events.py` — the v7 event format, from `generate.py::_rebuild_events`, cross-checked against
-  `evaluation/slumbot_eval.py::_build_events`, which is the copy that came into v8. Events are
+  the `_build_events` of the inherited `slumbot_eval.py` before that file was deleted (§2.12).
+  Events are
   built from the acting player's seat, so a v7 member sees its own hole cards and nothing else's.
 
 ---
@@ -957,11 +1279,11 @@ they could be code. They are listed here so the owner can overrule any of them c
 
 ## 5. Known non-working state
 
-`evaluation/slumbot_eval.py` **will not import as-is**: it depends on `agent.agent.ASI`,
-`agent.mcts.*`, `evaluation.evaluate` and `agent.train_scenarios.generation`, none of which exist
-in v8. Treat it as reference material. When v8's agent lands, split it as `CONCEPT.md` §12
-describes: keep the protocol layer (HTTP client, action-string grammar, token ↔ action mapping,
-state replay, BB/100 + SE accounting), rewrite the agent adapter against v8's observation format.
+**No hand has been played against Slumbot.** `evaluation/` and `eval_pipeline.py` import and are
+tested against a canned Slumbot that speaks the real grammar, but **nothing in the battery opens
+a socket**. The retry policy, the live grammar and the server's actual responses are first
+exercised by a screening run on the Spark, and that run is also the first evidence that any of
+this talks to Slumbot at all.
 
 **The v7 pool member is not covered by the battery with real weights.** `data/v7/` does not
 exist on the dev box and there is no GPU (`CLAUDE.md` §3), so `test_v7_pool_member.py` exercises
@@ -969,8 +1291,16 @@ a randomly initialised network: it verifies that the vendored stack imports and 
 installed `transformers`, that the event format is built correctly, and that a v7 member obeys
 the observation-parity and legality contracts. It says nothing about a trained checkpoint. Real
 checkpoints have loaded and played on the Spark since 2026-08-18 (seven of them, 79 members,
-through G3), but nothing in the battery sees that, and the bf16 path of §2.3 has not been run at
-all.
+through G3) and the bf16 path of §2.3 has run there since 2026-08-19, but nothing in the battery
+sees either: on CPU `get_amp_config` disables autocast, which is deliberate — the dev box keeps
+testing the fp32 path — and means the battery is silent about the path production uses.
+
+**Nothing in this tree has been run against a strong opponent.** The bootstrap pool is v7
+checkpoints, and v7 plays about **−90 BB/100** against Slumbot (`CONCEPT.md` §4.1). The oracle is
+not wrong because of it — `Q` is the EV against whatever pool it is given — but every posterior
+in `oracle/posterior.py` is a weak strategy's range, so any conclusion that depends on the
+*shape* of a range does not transfer, and the first §12 evaluation is the first time anything
+here meets a strategy worth the name.
 
 **G3 has run twice on the Spark**, 2026-08-18 and 2026-08-19; `CONCEPT.md` §13 records what the
 first run measured and §7.4 records the design claim it withdrew. What is still a hypothesis on
@@ -986,14 +1316,12 @@ under it, so a `state_dict` saved before the extraction no longer matches
 and `fitted_vectors.npz` are what post-hoc analysis reads — but re-evaluating those weights
 would now need a key-remap shim, which does not exist.
 
-**The agent is untrained and cannot answer a hypothetical.** `AgentPoolMember` refuses a
-`hole_override` and refuses any decision that is not the record's latest snapshot, so it can
-play — through the driver, and through the oracle's rollouts — but it cannot be the opponent
-whose range §7.2's posterior is estimating. When the agent enters the pool (§4.4, §8) that
-becomes a real gap: it needs an observation builder that truncates a finished record at the
-decision being asked about and substitutes the hypothetical cards, which is what
-`pool/v7_member.py` does through `up_to` and its deck copy. Until then the assertions make the
-gap loud instead of silent.
+**A past agent in the pool plays its unconditional policy, and that is a decision, not a
+detail.** `FrozenAgentMember` (§2.11) seats it at `e = 0` — D12 option (a). It is cheap and it
+has no recursion, but it means the pool's own agents never *exploit* the tables they sit at,
+while hero always does. Whether the loop should instead fit a vector for each past agent (D12
+option (b)) is open; nothing has measured the difference, and it would nest one §5.5 fit inside
+another for every rollout.
 
 `config_g1.json` ships its `v7` bootstrap entry with placeholder paths
 (`../../data/v7/FILL_ME/…`). They must be filled in before a real G1 run; without them the pool
@@ -1006,10 +1334,10 @@ modulate but does not change what G1 measures.
 
 In roughly the order `CONCEPT.md` §14 says to build it:
 
-| Piece | `CONCEPT.md` | Notes |
-|---|---|---|
-| `pipeline.py`, `config.json` | §8.1 | the outer loop |
-| Slumbot adapter rewrite | §12 | protocol layer survives |
+Nothing. Every piece `CONCEPT.md` describes is on disk (`PLAN_PIPELINE.md` S1–S11 are all done).
+What is missing is not code but **runs**: no iteration at size, no hand against Slumbot, and
+therefore no number measured against anything but the pool that produced it. §5 lists what that
+leaves unverified.
 
 ---
 
@@ -1019,8 +1347,8 @@ In roughly the order `CONCEPT.md` §14 says to build it:
 cd versions/v8 && python3 -m pytest tests/ -q
 ```
 
-308 tests, ~58 s on the dev box (CPU-only). The 30-minute budget from `CLAUDE.md` §4 is barely
-touched.
+388 tests, ~118 s on the dev box (CPU-only) — the parallel-evaluation cases spawn processes and
+account for most of the increase. The 30-minute budget from `CLAUDE.md` §4 is barely touched.
 
 | File | Covers |
 |---|---|
@@ -1034,15 +1362,22 @@ touched.
 | `test_observation_parity.py` | **The fatal invariant**: only the observer's hole cards, board never ahead of the street, no token carries its own action, scalars from the pre-decision snapshot, prefixes independent of what came later |
 | `test_embedding_net_masking.py` | Causal within a hand, block-diagonal across hands, hand order irrelevant, the embedding is what changes the prediction, padding inert, **a showdown token cannot reach back into any decision**, the action loss ignores showdown tokens, both showdown heads reach the embedding, zero weights reduce the objective to action CE |
 | `test_inference_fit.py` | The joint fit reaches the loss of the vectors that generated the labels, determinism, `K = 0` is the ablation, network weights untouched, cold start, regularisation, **the showdown terms reach the fitted vector** and zero weights reproduce the action-only fit |
-| `test_observation_parity.py` (§5.1a part) | Showdown tokens exist exactly for the revealed seats and never among the decisions, the revealed cards are the target and never an input, the labels match the cards shown, the two masks partition the real tokens, a showdown hand with no labels is refused |
+| `test_observation_parity.py` (§5.1a part) | Showdown tokens exist exactly for the revealed seats and never among the decisions; **another seat's** revealed cards are the target and appear nowhere in its token, while **the observer's own showdown token carries the observer's own hand** — one rule across every token type, checked on decision and showdown tokens together; the labels match the cards shown, the two masks partition the real tokens, a showdown hand with no labels is refused |
+| `test_strength_head.py` | The §5.6 poker prior and the §6.1 warm start: the target is the observer's own percentile on the final board, on the observer's own decision tokens and `-1` everywhere else, matching an independently enumerated value to `1e-12`; §5.1a's showdown labels are that same dict restricted to the revealed seats, so they did not move when the two passes merged; **a hand still in progress carries no target** and neither does a record nobody labelled; **it is a target and not an input** — the same hands tokenised with and without the label differ in `own_strength` alone and the action logits are bit-identical; `collate` masks the padded tail through the sentinel and selects exactly the labelled tokens; the weight shifts the total by exactly its term and 0 removes it while leaving the action CE untouched; a batch with no target is a batch and not an error; the head can actually learn the target, below the variance that is the only baseline it is read against; **the fit never sees the term** — `fit_embeddings` is bit-identical with and without it, and it did move, so that is not two no-ops; `first_retrain_steps` selects the first retrain only, leaves the agent's own key alone, and the trainer runs the count the iteration asks for; and the warm start copies the trunk key for key, leaves the action head at its initialisation, and is an initialisation rather than a tie — one gradient step moves the agent's trunk and not the embedding network's |
 | `test_pool_style.py` | The five categories partition the action set, 32-scalar round trip, identity style is a masked softmax, position and street gating, temperature, uniform mix, every draw is a valid distribution over legal actions, each degenerate strategy does what it says |
 | `test_v7_pool_member.py` | The vendored v7 stack constructs and plays legal hands; the v7 event format is built from the acting seat, masked to the street, and stops at its decision; **a `hole_override` reaches the network** — an override naming the real cards reproduces the plain answer, aces and deuce-trey do not, the record is untouched, and end to end a v7 opponent's posterior leaves the prior |
 | `test_g1_gate.py` | The gate end to end: button rotation, uniform 2–9 × 10–300 BB, the four report sections, cold start ≡ `e = 0`, and that the standard error's unit is the session |
 | `test_g3_gate.py` | The label-cost sweep end to end: one cell per point of the grid, every column the decision is taken on present and finite, forwards and rollouts monotone in the sample budget, the posterior's and the rollouts' shares adding up to the total, the bar reaching its total when a cell runs short of decisions, the split-half error finite and its gaps **signed on both sides**, the pot-unit error recomputed per label from the stored rows, the hero seat being the configured member and not whoever sat there, the five profile buckets summing to the label's wall clock with the counters reset per label and the wrapping undone on exit, the headline built from the exact-posterior cells only, and a pinned table size that a hand cannot quietly leave |
 | `test_agent_net.py` | The agent end to end: one row of logits per hand and every padded position inert; each row answers from **its own** last real token and no hand moves another; through the driver, at every table size 2–9 and both stack extremes, a valid distribution over legal actions and chips conserved; the observation obeys §9 parity along the agent's own call path — only its own cards, board never ahead of the street, no showdown token, the pending token action-less — and the observation does not grow as the record does; with `e = 0` permuting the players is bit-identical and a non-zero vector is not; determinism, weights untouched by a `policy` call, and both parity guards refusing what they are meant to refuse |
-| `test_label_generation.py` | Label generation end to end: a toy run whose every label is a valid distribution over the environment's own mask with `nan` exactly off it; hero is slot 0 and every hero decision is labelled once; an ordinary pool member works as hero (iteration 0, §7.1); **the embedding of a block ignores every later hand** — hero jams from hand `R` on and the block's vectors come out bit-identical anyway, while block 0 is the zero cold start; the stored prefix stops at the labelled decision, carries only hero's cards and a board never ahead of the street; the same seed writes byte-identical shards and a shard round-trips; the table draw is the exact uniform multiset of a fixed seed; and the session machinery is shared with G1 rather than copied |
+| `test_label_generation.py` | Label generation end to end, including **resume**: a run stopped in the middle of its second shard comes back with the same label set shard for shard and byte for byte, and a progress file written for different sessions is refused rather than spliced; a toy run whose every label is a valid distribution over the environment's own mask with `nan` exactly off it; hero is slot 0 and every hero decision is labelled once; an ordinary pool member works as hero (iteration 0, §7.1); **the embedding of a block ignores every later hand** — hero jams from hand `R` on and the block's vectors come out bit-identical anyway, while block 0 is the zero cold start; the stored prefix stops at the labelled decision, carries only hero's cards and a board never ahead of the street; the same seed writes byte-identical shards and a shard round-trips; the table draw is the exact uniform multiset of a fixed seed; and the session machinery is shared with G1 rather than copied |
 | `test_pool_sampling.py` | Pool sampling: a fixed history and seed produce an exact sequence; results accumulate across sessions of different lengths into a mean and the mean into a weight, with a pool of no results and a pool of no spread both flat, and the **magnitude** of a loss — not its sign — moving the weight; a member hero beats the most is reached **only** through the floor — never at `floor_fraction = 0`, every draw uniform at 1; forgetting leaves an unsampled member's estimate exactly where it was and is what lets a member the early agents crushed climb back to the top PFSP weight at all — at `result_decay = 1` it is still winning after forty iterations, at 0.8 it crosses at the twelfth and at 0.5 at the fifth; a member nobody has played is drawn immediately; clustering recovers a hand-built structure and a ten-member blob of near-duplicates does not crowd out a lone style, while a duplicate pair splits one cluster's share; more clusters than members is no clustering; the state round-trips and reproduces the next draw, survives a pool that has since grown by one member and refuses one that has shrunk; and every table size 2–9 gets one member per non-hero seat |
 | `test_targets.py` | Targets, loss and the training cycle: a hand-computed softmax to `1e-12`; exact zeros off the mask and what sits under it never read; the two temperature limits reached in float, not approached; one legal action, equal EVs, no legal action, a `nan` under the mask; **the v7 scar** — two situations differing by a factor of 30 give the same target to `1e-12`, and without the divisor one is near-uniform while the other is near-deterministic; the KL is exactly zero on a match, positive off it, blind to illegal logits, and its gradient reaches the logits and not the target; **the linear loss** — the two losses share a minimiser, averaging the gradients at `Q ± ε` reproduces the gradient at `Q` to `1e-12` for `soft_q` and demonstrably not for `kl`, a constant added to every legal EV changes neither value nor gradient, illegal logits are ignored, a label off the mask is refused, and a toy run reaches its target; dropout at `p = 0` and `p = 1`, reproducible from its generator, and per hand per slot rather than per token; a toy run that reduces the loss, is deterministic, leaves the pool and the embeddings untouched and refuses a hand that is not a pending decision; and the cycle — the first iteration runs its own step count, a later one opens from the weights the previous one left, and three cycles in a row keep improving |
+
+| `test_pipeline.py` | The outer loop end to end at toy scale, including that **a crash in the middle of labelling costs a shard and not the phase** — re-running produces the artefacts an uninterrupted run would have left: two iterations run to completion and write every artefact of every phase; the pool grows by exactly `style.agent_variants` members per iteration, variant 0 unmodified and the rest style draws, with the embedding table reserving `len(pool₀) + max_iterations × agent_variants` rows; **iteration 0 seats the `agent_init` member and iteration 1 seats the agent**, asserted from who was actually asked for an action; the four §8 gap numbers computed by hand, including that `ev_gap_greedy` is zero exactly when the agent's mass sits on the oracle's best action; the held-out slice reaches the metric and never the optimiser, and `heldout_fraction = 0` reports **no gap** rather than one on training data; the split is a partition, deterministic in `(seed, iteration)` and different between iterations; **a run resumed from a crash in the middle of an iteration reproduces an uninterrupted one** — the same shards byte for byte, the same weights tensor for tensor, differing only in wall clocks; table size and stack depth span 2–9 and 10–300 BB with no weighting; and a past agent in the pool answers `hole_override` (two holdings, two answers, a posterior that moves off the prior) while observing only the moment it was asked about |
+
+| `test_slumbot_adapter.py` | The Slumbot seam, entirely off canned action strings — no socket: the mask hero acts under **is `env.legal`'s** on every canned state and reaches the token unchanged, folding is offered facing the blind and refused with nothing to call, and an opponent's all-in leaves no raise; **the chips are Slumbot's and not the abstraction's** — a `b250` that lands on no bin of ours still reads as a 5 BB pot, and every canned state's pot, stack and amount-to-call match the wire to 1e-9; the two seat frames are mirrors, hero holds hero's cards, the first decision of a hand belongs to seat 0 and the first of the flop to seat 1; §9 parity on the built record — only hero's hole cards, a board never ahead of the token's street, no showdown token, the pending decision action-less, and a prefix independent of what came later; **index → wire → index round-trips for every legal action on all four streets with no clamp firing**, while a fold with nothing to call becomes a check, says so in the counter, and is read back as a call; hero's own clamped action is what the next replay sees, and `hero_action_indices` overrides hero's seat only; BB/100 and its standard error against hand-computed values, with Welford's online form agreeing and the zero- and one-hand cases returning zero; a table outside `players_range` / `stack_bb_range` is **refused, not clamped**; and end to end the agent answers every canned state with a legal token, deterministically under its own generator, cold from the zero table and warm from a fitted one, reaching the network through the ordinary `AgentPoolMember` and not a copy of it |
+
+| `test_eval_pipeline.py` | The evaluation runner against a canned Slumbot that speaks the real grammar through `evaluation/protocol.py` — no socket anywhere; the parallel path really spawns processes, which reach the stub by name: shares add up to the hand count for every split, each worker plays its own share into its own file and the aggregate is their sum, a parallel run resumes per worker, and the clamp counters survive a resume because they ride on the hands rather than being tallied; BB/100 and its standard error hand-computed, agreeing with the batch form, with the zero- and one-hand cases returning zero rather than crashing; **a short run is stamped `SCREENING ONLY` and a run at the threshold is not**, and the selection disclosure is refused when absent or incomplete rather than quietly omitted; **cold pins `e = 0` at every decision** — asserted from the vector the member actually held — and never fits anything; warm refreshes exactly on the configured `R`, records per hand how many hands its vector was fitted from, buckets the run by it, and a fitted vector demonstrably reaches the policy; the warm-up hand count is the first bucket that caught cold up and `None` when it never did; **warm worse than cold is reported in §12's own words**; **a resumed run reproduces an uninterrupted one** — the same BB/100, the same standard error, the same per-bucket curve and the same hands byte for byte; a failed hand is counted, keeps its slot in the file so the index does not shift, and does not enter the statistics; and both modes off, or warm with no embedding checkpoint, are refused |
 
 `conftest.py` puts `gto_utils/` and the version root on `sys.path` and reseeds
 `random`/`numpy`/`torch` to 42 before every test. `tests/g1_fixtures.py` holds the shared toy
@@ -1056,6 +1391,27 @@ pool, hand specs and network config.
 All data lives outside `versions/` under `data/v8/…` (gitignored). v8 never writes into
 `data/v7/`; it only **reads** v7 checkpoints, by path, from config (`CONCEPT.md` §4.3, §8.1).
 
+```
+data/v8/
+  logs/<timestamp>.txt              one file per process, from `utils.Logger`
+  g1/<timestamp>/…                  a G1 run
+  g3/<timestamp>/…                  a G3 run
+  <experiment>/                     one run of the loop — named, not timestamped,
+    report.json                       because resume has to find what it is resuming
+    iter_0000/
+      labels/shard_0000.npz …       the labels (`train/generate.py`)
+      labels/progress.json          how far labelling got; a crash costs one shard
+      labels.json                   manifest, per-member results, sampler state after the draws
+      embedding.pt                  only on the iterations that retrained it
+      agent.pt                      the checkpoint this iteration produced
+      metrics.json                  the §8 oracle gap, overall and by table size and stack depth
+      state.json                    sampler state after the decay; the phase boundary resume reads
+    iter_0001/ …
+    slumbot/<run>/                one evaluation (`eval_pipeline.py`)
+      cold_w00.jsonl …            one file per worker per mode; a resume reads these
+      slumbot_report.json         BB/100 ± SE cold and warm, and the §12 disclosure
+```
+
 ## 9. Running
 
 ```bash
@@ -1064,6 +1420,7 @@ cd versions/v8 && python3 -m gates.g1_analysis \
     --report ../../data/v8/g1/<run>/g1_report.json              # G1 section A
 cd versions/v8 && python3 -m gates.g3 --config config_g3.json   # gate G3 (§14)
 
-./run.sh      --version=v8   # → python3 pipeline.py       (does not exist yet)
+./run.sh      --version=v8   # → python3 pipeline.py --config config.json
+./evaluate.sh --version=v8   # → python3 eval_pipeline.py --config config.json
 ./evaluate.sh --version=v8   # → python3 eval_pipeline.py  (does not exist yet)
 ```

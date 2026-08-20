@@ -87,6 +87,9 @@ class HandRecord:
     showdown: list = field(default_factory=list)          # seats revealed, §5.1a
     showdown_strength: dict = field(default_factory=dict)  # seat → percentile
     showdown_class: dict = field(default_factory=dict)     # seat → 169-way class
+    # §5.6 — every dealt seat's percentile on the final board, revealed or not.
+    # `showdown_strength` is this dict restricted to the seats that showed.
+    hand_strength: dict = field(default_factory=dict)      # seat → percentile
 
     @property
     def num_players(self):

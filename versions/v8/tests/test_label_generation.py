@@ -13,12 +13,15 @@ is wrong:
 * the session machinery is the one G1 used, not a copy of it (D4).
 """
 
+import json
+
 import numpy as np
 import pytest
 import torch
 
 import env.session
 import gates.g1
+import train.generate
 from agent.policy import AgentPoolMember
 from env.driver import LockstepDriver
 from env.session import build_sessions
@@ -393,3 +396,61 @@ def test_hero_is_slot_zero_and_the_sampler_supplies_the_opponents(tmp_path):
                               seed_base=cfg["seed"] * 1_000_000, tag="labels")
     assert asked == [s.num_players - 1 for s in sessions]
     assert manifest["n_labels"] > 0
+
+
+# ------------------------------------------- 7: resuming a crashed phase
+
+
+def test_labelling_resumes_at_the_shard_boundary_and_loses_only_a_shard(
+        tmp_path, monkeypatch):
+    """The phase is budgeted in days (§13); a crash must not cost all of it.
+
+    The interrupted run is stopped in the middle of its second shard. What comes
+    back is the *same* label set, shard for shard and byte for byte — which is
+    the only version of this property worth having, because a resume that merely
+    produced *a* label set would hide a splice between two different ones.
+    """
+    cfg = _cfg(n_sessions=4, hands=6)
+    whole, labels = _run(tmp_path / "whole", cfg=cfg)
+    assert len(whole["shards"]) >= 3, "the toy run must span several shards"
+
+    calls = {"n": 0}
+    real = train.generate.action_values
+
+    def crash_after(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 12:
+            raise RuntimeError("the box went away")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(train.generate, "action_values", crash_after)
+    with pytest.raises(RuntimeError, match="the box went away"):
+        _run(tmp_path / "part", cfg=cfg)
+    monkeypatch.setattr(train.generate, "action_values", real)
+
+    part_dir = tmp_path / "part"
+    survived = sorted(p.name for p in part_dir.glob("shard_*.npz"))
+    assert survived, "not even one shard survived the crash"
+    assert len(survived) < len(whole["shards"]), "nothing was left to resume"
+    progress = json.loads((part_dir / "progress.json").read_text())
+    assert progress["todo_done"] > 0
+    assert len(progress["shards"]) == len(survived)
+
+    resumed, resumed_labels = _run(part_dir, cfg=cfg)
+    assert resumed["n_labels"] == whole["n_labels"]
+    assert resumed["n_dropped"] == whole["n_dropped"]
+    assert len(resumed["shards"]) == len(whole["shards"])
+    for a, b in zip(sorted(whole["shards"]), sorted(resumed["shards"])):
+        assert open(a, "rb").read() == open(b, "rb").read(), (a, b)
+    for a, b in zip(labels, resumed_labels):
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-1.0),
+                              np.nan_to_num(b["q"], nan=-1.0))
+        assert (a["session"], a["hand"], a["decision"]) == (
+            b["session"], b["hand"], b["decision"])
+
+
+def test_a_progress_file_from_different_sessions_is_refused(tmp_path):
+    """Resuming into a directory whose labels came from another run is a splice."""
+    _manifest, _labels = _run(tmp_path, cfg=_cfg(n_sessions=4, hands=6))
+    with pytest.raises(AssertionError, match="not the same sessions"):
+        _run(tmp_path, cfg=_cfg(n_sessions=3, hands=6))

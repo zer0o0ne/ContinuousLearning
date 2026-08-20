@@ -12,7 +12,9 @@ Concretely, in this file:
   observer's;
 * the board is the board as of that decision's street, never the final board;
 * hole cards are the **observer's own**; every other player's two card slots are
-  the unknown token (52).
+  the unknown token (52). This rule holds on **every** token type, showdown
+  tokens included: the observer never has to infer its own hand, and no token
+  ever shows anybody else's.
 
 * everything else in the token (stack, pot, amount to call, position, number of
   players, per-seat stacks, the previous action) is public;
@@ -24,8 +26,19 @@ opponents' cards may appear "in tokens strictly after the reveal" — is what
 these are: they are the only tokens after the reveal, because the reveal happens
 when the hand is already over.
 
-The revealed cards are the **target** of those tokens, not an input: the card
-slots stay masked and two heads predict what was shown (`env/showdown.py`).
+**Another seat's** revealed cards are the **target** of those tokens, not an
+input: their card slots stay masked and the head predicts what was shown
+(`env/showdown.py`). That masking is the whole mechanism — attention is causal
+and no decision token attends to a showdown token, so the only channel from a
+reveal to that player's vector is the gradient of a loss whose answer is *not*
+in the input. Put another seat's cards in and the anchor stops carrying style
+altogether.
+
+The **observer's own** showdown token is the exception, and it is not one of
+substance: the observer knows its own hand, so its slots carry it (owner
+decision 2026-08-20) and the rule above becomes uniform across token types. The
+price is on the metric rather than on the model — see `nets/embedding_net.py`.
+
 Because attention is causal within the hand, a showdown token attends to every
 decision token and **no decision token attends to it**, so the action-prediction
 task is untouched and nothing about the outcome flows backwards.
@@ -36,6 +49,16 @@ what the observer knows by the time the embedding is fitted: doing that would
 tell every decision token that this player *reached* showdown — i.e. that they
 were not going to fold — which is a future leak that improves the prediction
 loss while carrying no style at all.
+
+**The strength target (§5.6).** Every decision token of the *observer* carries
+`own_strength`, the percentile of the observer's own hand on that hand's final
+board. Like the showdown labels it is a **target and never an input**: the card
+slots and the board of the token are untouched, so the observation is bit-for-bit
+what it was before this field existed, and predicting a quantity the observer
+will only learn later is what a value target does rather than a leak. It is
+`-1` — outside the [0, 1] a percentile lives in, hence its own mask — on every
+other token, on every token of a hand still in progress (no final board exists
+yet), and on every token of a record nobody labelled.
 
 The token's `member` and `slot` fields are the two ways a player is named. At
 training a player *is* a pool member and its vector is a row of the trainable
@@ -73,6 +96,10 @@ class HandTokens:
     token_type: np.ndarray     # (T,) int64 — TOKEN_DECISION / TOKEN_SHOWDOWN
     sd_strength: np.ndarray    # (T,) float32 — revealed-hand percentile
     sd_class: np.ndarray       # (T,) int64 — revealed-hand 169-way class
+    # §5.6 — the observer's own hand's percentile on the final board, on the
+    # observer's own decision tokens. `-1` everywhere else, which is the mask:
+    # a percentile is in [0, 1], so the sentinel cannot collide with a label.
+    own_strength: np.ndarray   # (T,) float32
 
     def __len__(self):
         return len(self.decision_idx)
@@ -140,6 +167,7 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
     token_type = np.full(T, TOKEN_DECISION, dtype=np.int64)
     sd_strength = np.zeros(T, dtype=np.float32)
     sd_class = np.zeros(T, dtype=np.int64)
+    own_strength = np.full(T, -1.0, dtype=np.float32)
 
     def _fill_decision(t, snap_idx, pos):
         """The public part of a decision token — identical for a decision that
@@ -182,6 +210,14 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
     for k, pos in enumerate(revealed):
         t = n_dec + k
         cards[t, :5] = [int(c) for c in record.deck[:5]]
+        # The observer's own hand is not a thing the observer has to infer, so
+        # its slots carry it here exactly as they do on a decision token
+        # (owner decision 2026-08-20). One rule for every token type: the
+        # observer's own cards always, everybody else's never. Another seat's
+        # showdown token stays masked — those cards are the target, and it is
+        # the only place the §5.1a anchor gets any gradient into the vector.
+        if pos == observer_pos:
+            cards[t, 5:] = record.hole_cards(pos)
         acting_pos[t] = pos
         scalars[t] = (final_credits[pos] / bb, float(last["pot"]) / bb, 0.0)
         seat_stacks[t, :n] = final_credits / bb
@@ -194,9 +230,19 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
         sd_strength[t] = record.showdown_strength[pos]
         sd_class[t] = record.showdown_class[pos]
 
+    # §5.6 — the strength-head target, on the observer's own decision tokens.
+    # A hand still in progress has no final board to score, so a tokenisation
+    # with a pending decision carries no target at all; the same is true of a
+    # record nobody labelled (an evaluation replay, where the unseen cards are
+    # filler and a percentile computed from them would be a fiction).
+    own = record.hand_strength.get(observer_pos)
+    if pending is None and own is not None:
+        own_strength[(acting_pos == observer_pos)
+                     & (token_type == TOKEN_DECISION)] = own
+
     return HandTokens(cards, decision_idx, acting_pos, num_players, scalars,
                       seat_stacks, prev_action, member, slot, action, legal,
-                      token_type, sd_strength, sd_class)
+                      token_type, sd_strength, sd_class, own_strength)
 
 
 def collate(hands, device="cpu"):
@@ -228,6 +274,10 @@ def collate(hands, device="cpu"):
         "token_type": torch.zeros((B, T), dtype=torch.long),
         "sd_strength": torch.zeros((B, T), dtype=torch.float32),
         "sd_class": torch.zeros((B, T), dtype=torch.long),
+        # §5.6: the pad has to be the sentinel and not zero — zero is a legal
+        # percentile, and a padded tail scored as "the worst hand possible"
+        # would be a target nobody produced.
+        "own_strength": torch.full((B, T), -1.0, dtype=torch.float32),
         "mask": torch.zeros((B, T), dtype=torch.float32),
     }
     for b, h in enumerate(hands):
@@ -235,6 +285,7 @@ def collate(hands, device="cpu"):
         out["token_type"][b, :t] = torch.from_numpy(h.token_type)
         out["sd_strength"][b, :t] = torch.from_numpy(h.sd_strength)
         out["sd_class"][b, :t] = torch.from_numpy(h.sd_class)
+        out["own_strength"][b, :t] = torch.from_numpy(h.own_strength)
         out["cards"][b, :t] = torch.from_numpy(h.cards)
         out["decision_idx"][b, :t] = torch.from_numpy(h.decision_idx)
         out["acting_pos"][b, :t] = torch.from_numpy(h.acting_pos)
@@ -248,9 +299,11 @@ def collate(hands, device="cpu"):
         out["legal"][b, :t] = torch.from_numpy(h.legal)
         out["mask"][b, :t] = 1.0
 
-    # Two derived masks, so no caller has to re-derive them and get it wrong:
+    # Three derived masks, so no caller has to re-derive them and get it wrong:
     # an action target only exists on decision tokens, a revealed hand only on
-    # showdown tokens.
+    # showdown tokens, and the §5.6 strength target only where `hand_tokens`
+    # left a percentile instead of the sentinel.
     out["decision_mask"] = out["mask"] * (out["token_type"] == TOKEN_DECISION)
     out["showdown_mask"] = out["mask"] * (out["token_type"] == TOKEN_SHOWDOWN)
+    out["strength_mask"] = out["mask"] * (out["own_strength"] >= 0)
     return {k: v.to(device) for k, v in out.items()}

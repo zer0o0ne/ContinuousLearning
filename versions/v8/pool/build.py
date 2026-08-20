@@ -48,8 +48,17 @@ def _resolve_style(entry, rng, style_cfg):
     return [StyleParams.from_list(spec)]
 
 
-def _load_v7_agent(entry, device, log):
-    """Load a v7 checkpoint into the vendored perception+action subset."""
+def _load_v7_agent(entry, device, log, cache=None):
+    """Load a v7 checkpoint into the vendored perception+action subset.
+
+    `cache` memoises by (checkpoint, arch_config). D13 puts every base in the
+    pool twice — once unmodified, once as `n_variants` style draws — and those
+    are two `bootstrap` entries naming one file, so without the cache the same
+    weights are loaded and held in memory twice. Sharing is already the rule
+    inside an entry (`with_style` shares one loaded agent across every variant);
+    this extends it across entries, and it is a cache and not a semantic change:
+    the agent is never mutated after `set_device`.
+    """
     ckpt = entry["checkpoint"]
     arch_config = entry.get("arch_config")
     if arch_config is None:
@@ -60,13 +69,19 @@ def _load_v7_agent(entry, device, log):
             f"v7 pool entry {entry.get('label') or ckpt!r} needs the v7 config "
             f"that describes its architecture; looked for {arch_config!r}. Set "
             f"\"arch_config\" on the entry.")
+    key = (str(ckpt), str(arch_config))
+    if cache is not None and key in cache:
+        return cache[key]
     with open(arch_config) as fh:
         v7_config = json.load(fh)
     agent = V7Agent(v7_config, log=log)
     agent.load_checkpoint(ckpt)
     agent.eval()
     agent.set_device(device)
-    return agent, n_actions_from_config(v7_config)
+    loaded = (agent, n_actions_from_config(v7_config))
+    if cache is not None:
+        cache[key] = loaded
+    return loaded
 
 
 def build_pool(config, rng, device="cpu", log=print):
@@ -79,6 +94,7 @@ def build_pool(config, rng, device="cpu", log=print):
     style_cfg = config.get("style", {})
     n_actions = None
     members, descriptors = [], []
+    v7_cache = {}
 
     for entry in config["bootstrap"]:
         kind = entry["kind"]
@@ -95,7 +111,8 @@ def build_pool(config, rng, device="cpu", log=print):
             factory = DEGENERATE_STRATEGIES[strategy]
             bases = [factory(base_name, entry_n_actions, styles[0])]
         elif kind == "v7":
-            agent, entry_n_actions = _load_v7_agent(entry, device, log)
+            agent, entry_n_actions = _load_v7_agent(entry, device, log,
+                                                     cache=v7_cache)
             base_name = label or os.path.basename(str(entry["checkpoint"]))
             bases = [V7NetworkMember(base_name, entry_n_actions, agent,
                                      styles[0])]

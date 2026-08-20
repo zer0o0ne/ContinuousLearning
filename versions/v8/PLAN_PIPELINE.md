@@ -73,13 +73,15 @@ section as they are settled.
 | **D2** | `DecisionContext` gains an optional `hole_override`, so the posterior can ask a pool member "what would you have done holding *this*". | **Yes.** `DecisionContext` is already a thin view with `__slots__`; the alternative is fabricating a `HandRecord` per combo, which is both slower and a second construction path for observations. | S2 |
 | **D3** | The Qwen3 trunk is extracted from `OpponentEmbeddingNet` into `nets/trunk.py::HandEncoder`, used by both networks. This renames parameters, so **the existing G1 checkpoint stops loading**. | **Extract, and accept the break.** G1 is finished and its report is on disk; `eval_corpus.pkl` and `fitted_vectors.npz` are what post-hoc analysis reads, not the weights. A key-remap shim is available if the owner wants to keep re-evaluating that checkpoint. | S5 |
 | **D4** | `gates/g1.py`'s `Session`, `build_sessions`, `play`, `raise_sizes_from` move to `env/session.py`, and G1 imports them from there. | **Yes.** Label generation needs the identical session semantics (button rotation, uniform 2–9 × 10–300 BB, slot 0 is the observer). A copy would let the two drift, and the drift would show up as a train/deploy mismatch nobody could see. | S7 |
-| **D5** | Does the agent get a value head now? `CONCEPT.md` §6.1 says no; §7.4's variant C — the first lever if the compute budget does not close — requires one. | **No head now.** Build the baseline literally; if G3 (S4) says variant A does not fit, adding the head is a contained change to `AgentNet` plus a new oracle module. Building it "just in case" is the unrequested addition §5 forbids. | S5, S6 |
+| **D5** | Does the agent get a value head now? `CONCEPT.md` §6.1 says no; §7.4's variant C — the first lever if the compute budget does not close — requires one. | **No head now.** Build the baseline literally; if G3 (S4) says variant A does not fit, adding the head is a contained change to `AgentNet` plus a new oracle module. Building it "just in case" is the unrequested addition §5 forbids. **Settled 2026-08-19: G3 ran, variant A stands, D5 does not flip — no value head is being added.** See S4's outcome block. | S5, S6 |
 | **D6** | `max_combos` subsampling semantics. `CONCEPT.md` §7.3 says "v7's `gpu_solver_v5` already has this knob and its semantics". | **Read `gto_utils/gpu_solver_v5.py` and reuse whatever it does.** Do not invent a scheme; if v5's is not self-normalised importance sampling, say so and ask rather than silently improving it. | S2 |
 | **D7** | The G1 run found both showdown heads memorising the corpus (held-out `class_ce` 5.75 against `ln 169` = 5.13; held-out strength MSE 0.095 against a target variance of ~0.085), and the showdown term contributing nothing to the inference fit (−0.007 ± 0.005 nats pooled). §5.1a's weights are `train` config. | **Leave §5.1a exactly as designed for now, and carry the finding as a risk (§13, R4).** Changing the embedding objective before the pipeline exists means the pipeline is built on a network nobody has measured. The weights are config; the experiment is cheap once there is something to run it against. | — |
 | **D9** | The embedding table is `nn.Embedding(n_members, d_emb)` and §8 grows the pool by one member per iteration, so the agent needs a row and the corpus needs a member index for hero's tokens. | **Reserve the rows up front** (owner decision 2026-08-19): the table is sized `len(pool₀) + max_iterations × style.agent_variants`, iteration *k* owns the block starting at `len(pool₀) + k × agent_variants` (its first row is the agent itself, from the moment it is first seated as hero, the rest are its style draws — D11), and retraining is a continuation rather than a rebuild. See `CONCEPT.md` §5.4. | S9 |
 | **D10** | PFSP scores accumulate over the whole run, but hero is replaced every iteration, so the quantity being estimated is non-stationary and a member the early agents beat keeps its score forever. | **Forget geometrically** (owner decision 2026-08-19): `pool_sampling.result_decay` scales the accumulated hands and BB once per iteration, and `PoolSampler.end_iteration()` is called by the loop. At 0.8, a member with 20 000 hands of history crosses back over zero twelve iterations after it stops losing; without the decay it takes about sixty. `result_decay = 1.0` is the old lifetime behaviour. | S9 |
 | **D11** | Does a trained agent join the pool as one member or as several? `CONCEPT.md` §4.2 says the style layer "applies uniformly to any pool member, v7 or v8", but §4.1 only ever said "the agent joins the pool". | **Several, and the count is config** (owner decision 2026-08-19): `style.agent_variants` — the agent plus `agent_variants − 1` style draws off it, exactly as a v7 checkpoint is expanded at bootstrap. Thirty iterations of one lineage are the most correlated members the pool will ever hold (§11.3 turned on ourselves) and a style draw costs no forward and no parameter. `1` is the no-multiplication setting. Changes D9's arithmetic. | S9 |
-| **D12** | A past agent seated as an *opponent* is not a plain `PoolMember`: `AgentPoolMember` is one member per seat and needs an opponent-embedding table of its own, so "what does agent *k−3* believe about its tablemates while it plays" has to be answered. | **OPEN — owner decision required before S9.** Two candidates. *(a)* Seat past agents at `e = 0`, the unconditional policy that §6.2's embedding dropout already trains explicitly: no extra fit, no recursion, and the pool member is a fixed policy like every other. *(b)* Give each past agent its own §5.5 inference fit over its tablemates, which is faithful but nests one fit inside another and multiplies the cost of every rollout. Recommendation is (a); (b) has no cheap form and no measurement asking for it yet. | S9 |
+| **D12** | A past agent seated as an *opponent* is not a plain `PoolMember`: `AgentPoolMember` is one member per seat and needs an opponent-embedding table of its own, so "what does agent *k−3* believe about its tablemates while it plays" has to be answered. | **Settled 2026-08-19: (a).** `agent/policy.py::FrozenAgentMember` seats past agents at `e = 0`. The recommendation below was taken as written when S9 was built; it is reversible — (b) is a change to one class — and `ARCHITECTURE.md` §5 carries what it costs. Two candidates. *(a)* Seat past agents at `e = 0`, the unconditional policy that §6.2's embedding dropout already trains explicitly: no extra fit, no recursion, and the pool member is a fixed policy like every other. *(b)* Give each past agent its own §5.5 inference fit over its tablemates, which is faithful but nests one fit inside another and multiplies the cost of every rollout. Recommendation is (a); (b) has no cheap form and no measurement asking for it yet. | S9 |
+
+| **D13** | `build_pool` gives variant #0 of an entry a random style draw like every other variant, so an entry without an explicit `style` puts **no unmodified copy of its base** in the pool. In `config_g1.json` and `config_g3.json` that is the case for all seven v7 entries: 56 v7 members, not one of them the plain network. | **Every base is in the pool unmodified as well, and the number of style draws stays per-entry config** (owner decision 2026-08-19). The mechanism needs no code: a second `bootstrap` entry for the same base with `"style": "identity"`, which is exactly what the five degenerate strategies already do in both gate configs. `n_variants` on the styled entry keeps being the knob for how many modifications that base contributes. The one cost is that two entries naming the same checkpoint load it twice — `build_pool` calls `_load_v7_agent` per entry — so S9 should memoise the loaded agent by checkpoint path. That is a cache, not a semantic change: `with_style` already shares one loaded agent across all of an entry's variants. See `CONCEPT.md` §4.1. **Done 2026-08-19:** `_load_v7_agent` takes a per-`build_pool` cache keyed by (checkpoint, arch_config), and `config.json` carries a `"style": "identity"` sibling for each of the seven v7 bases. | S9 |
 
 **D8 — plan-level.** Sessions S5/S6 (the agent) do not depend on S1–S4 (the oracle). The order
 below puts the oracle first because `CONCEPT.md` §13 says it is the piece most likely to kill
@@ -108,23 +110,55 @@ running first, S5 → S6 → S1 → S2 → S3 → S4 is a valid reordering; noth
                              S10 Slumbot adapter ── S11 eval pipeline ══════╝
 ```
 
-| S | Title | Depends on | Runs on | New code (rough) | Owner action |
-|---|---|---|---|---|---|
-| **S1** | Rollout plumbing in the driver | — | CPU | ~120 + ~250 test | D1 |
-| **S2** | Opponent posterior (§7.2) | S1 | CPU | ~180 + ~300 test | D2, D6 |
-| **S3** | BR oracle, variant A (§7.1) | S1, S2 | CPU (toy) | ~280 + ~400 test | — |
-| **S4** | G3 — what a label costs (§13, §14) | S3 | **Spark** | ~250 + ~150 test | run it; **decide A/C** |
-| **S5** | Trunk extraction + agent network (§6.1) | — | CPU | ~250 + ~350 test | D3, D5 |
-| **S6** | Targets and agent training (§6.2) | S5 | CPU (toy) | ~300 + ~400 test | D5 |
-| **S7** | Label generation end to end (§8) | S1–S3, S5, S6 | CPU (toy) | ~300 + ~250 test | D4 |
-| **S8** | Pool sampling (§4.4) | — | CPU | ~200 + ~250 test | — |
-| **S9** | Outer loop `pipeline.py` + `config.json` (§8) | S7, S8 | **Spark** | ~400 + ~300 test | run it |
-| **S10** | Slumbot adapter rewrite (§12) | S5 | CPU | ~300 + ~250 test | — |
-| **S11** | `eval_pipeline.py`, cold/warm, BB/100 ± SE (§12) | S10, S9 | **Spark** | ~250 + ~200 test | run it |
+| S | Title | Depends on | Runs on | New code (rough) | Owner action | Status |
+|---|---|---|---|---|---|---|
+| **S1** | Rollout plumbing in the driver | — | CPU | ~120 + ~250 test | D1 | **done** |
+| **S2** | Opponent posterior (§7.2) | S1 | CPU | ~180 + ~300 test | D2, D6 | **done** |
+| **S3** | BR oracle, variant A (§7.1) | S1, S2 | CPU (toy) | ~280 + ~400 test | — | **done** |
+| **S4** | G3 — what a label costs (§13, §14) | S3 | **Spark** | ~250 + ~150 test | run it; **decide A/C** | **done — ran 2026-08-18 and 2026-08-19; variant A stands** |
+| **S5** | Trunk extraction + agent network (§6.1) | — | CPU | ~250 + ~350 test | D3, D5 | **done** |
+| **S6** | Targets and agent training (§6.2) | S5 | CPU (toy) | ~300 + ~400 test | D5 | **done** — two losses, see below |
+| **S7** | Label generation end to end (§8) | S1–S3, S5, S6 | CPU (toy) | ~300 + ~250 test | D4 | **done** |
+| **S8** | Pool sampling (§4.4) | — | CPU | ~200 + ~250 test | — | **done** |
+| **S9** | Outer loop `pipeline.py` + `config.json` (§8) | S7, S8 | **Spark** | ~400 + ~300 test | run it | **done** — built 2026-08-19, CPU-only; see below |
+| **S10** | Slumbot adapter rewrite (§12) | S5 | CPU | ~300 + ~250 test | — | **done** — 2026-08-19 |
+| **S11** | `eval_pipeline.py`, cold/warm, BB/100 ± SE (§12) | S10, S9 | **Spark** | ~250 + ~200 test | run it | **done** — 2026-08-19 |
 
-The **decision gate** after S4 is real: if variant A costs more than the label budget can pay,
-S6 and everything after it change shape (variant C needs a value head and a bootstrapped target).
-Do not start S7 before S4 has been run on the Spark and read.
+**Every session in this plan is built.** What remains is not code but runs, and they are the
+expensive half: one iteration at size on the Spark, then a screening run against Slumbot, then a
+reportable one. `ARCHITECTURE.md` §5 lists what that leaves unverified.
+
+**Two owner requests landed 2026-08-19, after S11:**
+
+* **`./run.sh --version=v8` resumes.** It already did at the phase boundary; labelling — the phase
+  budgeted in days — now also writes `labels/progress.json` after every flushed shard, so a crash
+  in its middle costs one shard instead of the phase. A mid-labelling resume re-plays the
+  iteration's hands and refits the embeddings (minutes against days) because no corpus of records
+  is kept on disk. `ARCHITECTURE.md` §2.10, §2.11.
+* **The Slumbot run is multiprocess**, `evaluation.n_workers`, as v7's was and for the same
+  reason: a hand is an HTTP round trip, and threads lose to the GIL and a single CUDA stream on
+  batch-of-one forwards. Each worker is a *session* — its own table, its own §5.5 fit, its own
+  file, its own resume — so the warm-up curve stays the per-session quantity §12 asks about and
+  there is no shared state. `ARCHITECTURE.md` §2.13.
+
+The **decision gate** after S4 was real and has been passed: **variant A stands, D5 does not
+flip, there is no value head.** S4's "Outcome" block records why. Nothing downstream changes
+shape.
+
+### What S9 inherits from S4 and S6
+
+`config.json` is S9's deliverable, and four of its values are already decided rather than open:
+
+| Key | Value | Where it was decided |
+|---|---|---|
+| `oracle.samples_per_action` | **128** | S4 / `CONCEPT.md` §13, §14 — the point where the sample budget stops buying anything |
+| `oracle.max_combos` | **`null`** (exact posterior) | `CONCEPT.md` §7.3, OI-9 — the cap's accuracy is unmeasured and deliberately deferred |
+| `agent_train.loss` | ⚠ **owner's call** — `soft_q` or `kl`. `config.json` ships `soft_q`, which is what the noise analysis argues for; flipping it is a one-word edit | `CONCEPT.md` §6.2. Both are implemented; `soft_q` is the one the noise analysis argues for, `kl` is the mass-covering baseline. Whichever is chosen, `§11.4` records that the logged `soft_q` number has a noise floor and does not go to zero |
+| `agent_train.temperature` | required by `soft_q`, unused by `kl` | `train/targets.py` |
+
+Budget, so S9 sizes its cycles against something real: at 128 samples an iteration of 100 000
+labels costs **122–141 Spark-hours** of labelling alone, before any training step. `CONCEPT.md`
+§13 has the per-budget table.
 
 ---
 
@@ -468,6 +502,33 @@ The gate runs on the Spark and produces the table. **Then stop and read it with 
   `oracle/bootstrap.py` replaces `rollout.py` at the root of the label path. S3's posterior, S1's
   plumbing and S5's network are all unaffected — which is why the order in this plan is what it is.
 
+### Outcome — read with the owner 2026-08-18 and 2026-08-19
+
+**Variant A stands. Variant C is not being built.** The gate ran twice; `CONCEPT.md` §13 carries
+both tables. What decided it:
+
+1. **Cost fits.** 122–141 h per 100 000 labels at the chosen budget. Never the binding
+   constraint.
+2. **Noise was the real question, and the first run measured it wrong** — the runout was pinned,
+   hero was whoever the hand seated, and the error was taken on levels rather than on the
+   differences the target depends on. Three fixes landed between the runs (`CONCEPT.md` §7.1,
+   §14) and the second run behaves as textbook Monte-Carlo: `SE ~ n^-0.5`, **no plateau**, so
+   there is no irreducible floor left to escape from.
+3. **`oracle.samples_per_action = 128`** — the point where the sample budget stops buying
+   anything. S9 takes this as given.
+4. **Variant C's advertised 10–20× cost saving does not exist** at the measured rollout depths;
+   it is worth 20–40% of a label. Its case is variance, not budget, and `CONCEPT.md` §7.4 has
+   been corrected. It also cannot touch the rollouts that end before hero acts again, which are
+   the noisiest ones.
+5. **The bias-from-noise problem was solved in the loss instead** (`CONCEPT.md` §6.2's `soft_q`),
+   which is cheaper than a value head and does not add the value-error feedback loop §11.1 would
+   have had to absorb. D5 therefore does **not** flip: no value head.
+
+Two things the gate did *not* settle and that are recorded rather than closed: the accuracy of
+`max_combos` (OI-9, deferred — the baseline uses the exact posterior) and the contrast error,
+which is now recoverable offline from `g3_report.json` because the split-half gaps are stored
+signed.
+
 ### Non-goals
 No tuning, no pipeline, no attempt to make the number better. G3 measures; it does not optimise.
 
@@ -764,6 +825,14 @@ baseline and is not to be built).
 `pipeline.py`, `config.json` with exactly the sections `CONCEPT.md` §8.1 names: `bootstrap`,
 `style`, `agent_init`, `embedding_net`, `oracle`, `pool_sampling`, `game`, `agent_train`,
 `evaluation`.
+
+**`bootstrap` must put every base in the pool unmodified as well as styled** (D13): one entry
+with `"style": "identity"` and one with `n_variants` style draws, per base — the pattern the five
+degenerate strategies already follow in `config_g1.json` and `config_g3.json`, extended to the v7
+checkpoints, which have no unmodified member in either gate config today. The plain networks are
+the strongest members of the pool and the reference point every style draw is a perturbation of;
+`CONCEPT.md` §4.1 lists them as a pool ingredient in their own right. Memoise the loaded v7 agent
+by checkpoint path while doing this, or the two entries load the same weights twice.
 ```bash
 ./run.sh --version=v8      # → cd versions/v8 && python3 pipeline.py
 ```
@@ -834,6 +903,44 @@ A 2-iteration toy pipeline on CPU, everything shrunk to seconds:
 Tests 1, 3, 4 and 5 on CPU; then one real iteration on the Spark, with wall clock per phase
 reported against G3's prediction.
 
+### Outcome — built 2026-08-19, not yet run at size
+
+`pipeline.py`, `config.json` and `tests/test_pipeline.py` are on disk; the battery is 331 tests
+in ~84 s. `ARCHITECTURE.md` §2.11 describes what was built. Five things were decided while
+building it that the plan left open or did not name at all, and each one is a place a later
+session should look first if the loop misbehaves:
+
+1. **D12 → (a).** `agent/policy.py::FrozenAgentMember` seats a past agent at `e = 0`. It also had
+   to answer `hole_override` and observe a *historical* decision, because the §7.2 posterior asks
+   that of every member it conditions on — `AgentPoolMember` refuses both by design. No signature
+   of an existing module changed: the truncation and the deck swap happen inside the new class,
+   sharing `pool/v7_member.py`'s `_deck_seen_by`.
+2. **The embedding network runs first, not last.** §8's step list puts the retrain at the end of
+   an iteration; taken literally that leaves iteration 0's labels carrying vectors fitted by a
+   network still at its initialisation. It runs at the *start* of an iteration instead, which is
+   what §8's own "that is both gate G1 and the first pipeline phase" says.
+3. **Its corpus is pool self-play, replayed per retrain rather than accumulated.** The
+   enlargement is the pool: iteration *k*'s corpus contains agents 0 … *k*−1 as opponents.
+   Replaying is what makes resume byte-identical without keeping every hand ever played. The cost
+   is that hero's own hands never enter the corpus — see `ARCHITECTURE.md` §2.11.
+4. **`sampler.update` is called, though the step list does not name it.** PFSP with no results is
+   dead weight, so `train/generate.py`'s manifest now returns hero's BB and hand count against
+   every member it sat with. A hand is credited to every opponent at the table **in full**; the
+   argument, and what it costs at nine-handed, is in `_results_by_member`.
+5. **Config shape.** `config.json` carries exactly §8.1's sections; run sizes are top-level, as
+   in `config_g1.json` and `config_g3.json`. The agent's trunk dims come from `embedding_net`
+   (OI-4 shares the trunk as code, and `d_emb` must agree anyway) and §6.2's `T` lives once, in
+   `oracle`, rather than being configured twice.
+
+**What is untested, and it is the expensive half** (`CLAUDE.md` §3). Everything above ran on CPU
+at toy scale: two iterations, three sessions of four hands, two rollout samples per action, a
+degenerate pool. Nothing in the battery has seen a v7 checkpoint with real weights, a CUDA
+device, or an iteration at the size `config.json` asks for. **At the shipped settings — 400
+sessions × 100 hands ≈ 100 000 labels at `samples_per_action = 128` — one iteration costs
+122–141 Spark-hours of labelling alone** (`CONCEPT.md` §13), so ~5 days before a gradient step,
+and 30 iterations is not a thing anyone should start. The first run should shrink `n_sessions`
+until an iteration fits in a day, and report wall clock per phase against G3's prediction.
+
 ### Non-goals
 No distributed training, no multi-GPU, no hyperparameter search, no automatic promotion of a
 candidate (`CONCEPT.md` OI-7: selection is a manual owner step, outside the loop).
@@ -881,6 +988,32 @@ No network access — every case runs off canned strings.
 ### Acceptance
 Tests 1–4, and `python3 -c "import evaluation.protocol, evaluation.v8_adapter"` succeeds — which is
 the first time anything under `evaluation/` imports in v8.
+
+### Outcome — built 2026-08-19
+
+`evaluation/protocol.py`, `evaluation/v8_adapter.py` and `tests/test_slumbot_adapter.py` are on
+disk; `evaluation/slumbot_eval.py` is deleted; the battery is 350 tests. `ARCHITECTURE.md` §2.12
+describes what was built. Three things are worth carrying forward into S11:
+
+1. **The record is built, not replayed through the engine — deliberately.** The engine could have
+   replayed the hand from a pinned deck and a forced prefix (S1), one construction path fewer,
+   but a forced action is an *index*: the engine would then size Slumbot's bets out of *our* raise
+   bins, and the agent would read the nearest bin's pot instead of the table's. The abstraction is
+   unavoidable in what hero can say and must not reach what hero sees, so the record carries
+   Slumbot's own chip amounts and only the action indices on the tokens are abstracted.
+2. **`act` returns two indices** — what the agent chose and what it can be said to have played
+   once `action_idx_to_incr` has clamped. S11 must append the **effective** one to
+   `hero_action_indices`, or every later observation in the hand carries an action hero did not
+   take. The clamp counters are the abstraction gap reporting itself and belong in S11's report.
+3. **Cold and warm are already separable**: `SlumbotAgent` starts from the zero table (§5.5's cold
+   start, §12's *cold* run) and `set_embeddings` installs a fitted one. S11 owns the refresh
+   cadence `R` and the warm-up hand count; nothing about the fit is Slumbot-specific, which is
+   what `CONCEPT.md` §10 records as adaptation rather than specialisation.
+
+**What is untested:** no socket is opened anywhere in the battery, so the client's retry policy,
+the live grammar and the wire itself are exercised only against canned strings. The first
+screening run is S11's, and it is also the first evidence that any of this talks to Slumbot at
+all.
 
 ### Non-goals
 No hand-count runs, no result reporting (S11), no bet-size abstraction changes.
@@ -930,6 +1063,34 @@ Offline, against a stubbed client.
 ### Acceptance
 Tests 1, 2 and 3, then a screening run on the Spark end to end.
 
+### Outcome — built 2026-08-19, not yet run against Slumbot
+
+`eval_pipeline.py`, `tests/test_eval_pipeline.py` and the `evaluation` config section are on
+disk; the battery is 366 tests. `ARCHITECTURE.md` §2.13 describes what was built. Four decisions
+were taken while building it:
+
+1. **"How many hands it took to warm up" is derived, and the derivation is written down.** No
+   single number of that shape exists in the data, so every warm hand records how many hands its
+   vector was fitted from, the run is bucketed by that count (`evaluation.warmup_buckets`), and
+   `warmup_hands` is the first bucket whose BB/100 reaches cold's overall BB/100. `None` — never
+   caught up — is the result, not a missing value.
+2. **The §5.5 fit is windowed** (`evaluation.fit_window`). "The histories observed so far" is not
+   computable over a million hands; the window is config and is set well past the range G1
+   measured, and the warm curve simply stops growing once it saturates.
+3. **A failed hand is written to the log, marked failed, and excluded from the statistics.** It
+   keeps its slot so the per-hand seed does not shift under a resume, and its count is in the
+   report — a run that is quietly failing must not read as a clean one. This is the client's own
+   "one lost hand, no desync, no cascade" policy, applied one level up.
+4. **The selection disclosure is required**, not conventional: `build_report` refuses without
+   `candidates_screened` and `screening_hands_each`. `config.json` ships `1` and `0`, which is the
+   honest description of a first run and must be updated by whoever screens candidates.
+
+**What is untested:** no socket is opened anywhere in the battery. The stub speaks the real
+grammar through `evaluation/protocol.py`, so the action strings are ones the adapter must parse —
+but the retry policy, the live grammar and Slumbot's actual response fields (`bot_hole_cards` in
+particular, which the warm fit's showdown anchor depends on) are unverified until the first
+screening run.
+
 ### Non-goals
 No candidate selection (a manual owner step, OI-7), no automatic feedback of any result into a
 config, a loss, a target or a pool weight (`CLAUDE.md` §1).
@@ -962,13 +1123,15 @@ would tell us it has happened.
 
 | # | Risk | `CONCEPT.md` | Earliest signal |
 |---|---|---|---|
-| **R1** | Variant A does not fit the compute budget; §13's own estimate is ~3 s/label and 10⁶ labels is out of reach | §13 | **S4**, before anything is built on it |
+| **R1** | ~~Variant A does not fit the compute budget~~ — **closed by S4, 2026-08-19.** It fits: 122–141 h per 100 000 labels at `samples_per_action = 128`. The risk that replaced it is R8 | §13 | measured, twice |
 | **R2** | Fictitious play cycles; the last iterate is what we measure and it need not converge | §11.1 | agent *n* losing to agent *n−2* in the pool's own results, visible in S8's PFSP scores |
 | **R3** | The pool spans one dimension, so the embedding classifies members instead of carrying style | §11.3 | the style probe on G1's `fitted_vectors.npz` — zero compute, already saved |
 | **R4** | The showdown heads memorise instead of generalising (**measured**: held-out `class_ce` 5.75 vs `ln 169` = 5.13; strength MSE 0.095 vs a target variance of ~0.085), and the showdown term contributes nothing to the inference fit (−0.007 ± 0.005 nats) | §5.1a, D7 | already observed; the weights are config, so the ablation is a config change once there is a pipeline to run it in |
 | **R5** | The fit is worse than `e = 0` at short observation — measured at −0.195 ± 0.027 relative gain for held-out members with ≤2 of their own decisions observed | §5.5, §11.2 | it is why embedding dropout (§6.2) is mandatory and why §12 reports cold and warm separately; if warm < cold at 1 M hands, this is the reason |
-| **R6** | The joint opponent range is approximated by independent marginals; bias direction unknown | §7.3 | S3's `collision_rate`, logged per label — a high rate means the approximation is working hard |
+| **R6** | The joint opponent range is approximated by independent marginals; bias direction unknown. **Measured proxy (S4, second run): 0–5% collisions heads-up, 33–46% six-handed, 57–82% nine-handed** — so the correction is idle at two players, where it is provably exact, and carries most of the weight at nine. The benchmark slice is the unbiased one; the generality bet lives where it is not | §7.3, §11.4 | S3's `collision_rate`, logged per label — a high rate means the approximation is working hard |
 | **R7** | Conditional architecture satisfies "beats the pool" with a lookup table and no generality | §11.2 | cold BB/100 in §12 — the unconditional policy is the part that cannot be a lookup |
+| **R8** | Label noise is large in the units the loss sees — `SE/pot` ran 0.2–3.4 at 256 samples and the sample budget cannot fix it (`SE ~ n^-0.5`, and `n = 128` is where buying more stops paying) | §13, §6.2 | already measured. The mitigation is the `soft_q` loss, which turns the noise into gradient variance instead of target bias; the signal that it was not enough is the policy's entropy rising with stack depth and table size, which is the shape of "the labels said nothing here" |
+| **R9** | The bootstrap pool is weak — v7 plays ≈ **−90 BB/100** against Slumbot — so every posterior the oracle conditions on is a bad strategy's range, and iteration 0's hero is a bad rollout policy | §4.1, §11.4 | the first §12 evaluation of a v8 agent; and, before that, any measurement whose answer depends on the *shape* of a v7 range should be treated as not transferring (which is why OI-9 is deferred) |
 
 ---
 

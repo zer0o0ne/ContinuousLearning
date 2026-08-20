@@ -47,9 +47,23 @@ whole cost — batch exactly as before.
 **The shards are `.npz` written without timestamps**, so the same seed produces
 byte-identical files. `np.savez` stamps every zip entry with the wall clock,
 which would make reproducibility unverifiable by comparison.
+
+**Labelling resumes at the shard boundary.** It is the longest-running thing in
+the project — `CONCEPT.md` §13 budgets an iteration of it in days — so losing it
+whole to a crash in its middle is not an acceptable failure mode. Every flushed
+shard is followed by a `progress.json` naming how far down the decision list it
+got, and a second call with the same `out_dir` picks up from there. Two things
+make that safe rather than merely convenient: the decision list is a function of
+the sessions, which are a function of the seed, so a resumed run is labelling the
+same decisions in the same order; and every label draws from its own
+`(seed, session, hand, decision)` generator, so a label computed after a resume
+is bit-identical to the one that would have been computed without one. What a
+resume does re-do is the *playing* of the hands and the embedding fits — minutes
+against days, and the price of not storing a corpus of records on disk.
 """
 
 import io
+import json
 import os
 import zipfile
 from dataclasses import fields
@@ -65,6 +79,7 @@ from utils import progress
 
 TAG = "labels"
 HERO_SLOT = 0
+PROGRESS = "progress.json"
 
 
 class _ObservedHero(PoolMember):
@@ -220,7 +235,9 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                     out_dir, log):
     """Play sessions, fit opponent embeddings, label hero's decisions, write shards.
 
-    Returns a manifest dict: shard paths, label count, aggregate `LabelStats`.
+    Returns a manifest dict: shard paths, label count, aggregate `LabelStats`,
+    and `results` — hero's BB and hand count against each member it sat with,
+    which is what §4.4's PFSP is driven by (`_results_by_member`).
 
     Args:
         driver: a `LockstepDriver` over `pool`. Its `pool` attribute is extended
@@ -307,12 +324,45 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
         block_vectors = _play_sessions(
             driver, play_pool, sessions, hero_rec, agent_member, embed_net,
             emb_cfg, weights, max_players, n_actions, R, device, cfg, log)
+        results = _results_by_member(sessions)
         manifest = _label_sessions(
             driver, play_pool, sessions, hero_plain, hero_rec, block_vectors,
             agent_member, ocfg, R, max_players, cfg, out_dir, log)
     finally:
         driver.pool = saved_pool
+    manifest["results"] = results
     return manifest
+
+
+def _results_by_member(sessions):
+    """Hero's result against each member it sat with — `PoolSampler.update`'s input.
+
+    §4.4's PFSP is driven by how hero *does* against a member, and the hands
+    that answer that are the ones this phase already played. Returning them here
+    rather than recomputing them anywhere else is the only way the loop can have
+    them at all: the records live inside this call.
+
+    **A hand is credited to every opponent at the table, in full.** Hero's chip
+    delta in a multiway hand is not divisible between the opponents who produced
+    it — hero played that hand against all of them — and splitting it by the
+    table size would make a nine-handed beating look an eighth as bad as the
+    heads-up one it is being compared against, which is the opposite of what
+    §4.4 samples on. The consequence to keep in mind is the one that follows
+    directly: the number is "hero's BB/100 while member *i* was at the table",
+    so at nine-handed it carries eight opponents' worth of noise. `result_decay`
+    (D10) is what stops that noise from accumulating forever.
+    """
+    out = {}
+    for s in sessions:
+        for h, record in enumerate(s.records):
+            hero_seat = s.seat_of_slot(HERO_SLOT, h)
+            bb = float(record.rewards[hero_seat]) / float(record.spec.big_blind)
+            for slot in range(1, s.num_players):
+                entry = out.setdefault(int(s.members[slot]),
+                                       {"hero_bb": 0.0, "n_hands": 0})
+                entry["hero_bb"] += bb
+                entry["n_hands"] += 1
+    return out
 
 
 def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
@@ -390,6 +440,31 @@ def _hero_decisions(sessions, hero_rec):
     return out
 
 
+def _read_progress(out_dir, n_todo, log):
+    """Where a previous call to this phase got to, if there was one.
+
+    A progress file whose decision count does not match this call's is refused
+    rather than trusted: it means the sessions changed under it — a different
+    seed, a different session count — and resuming would splice two different
+    label sets into one directory. Missing shards are refused for the same
+    reason.
+    """
+    path = os.path.join(out_dir, PROGRESS)
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        done = json.load(fh)
+    assert int(done["n_todo"]) == int(n_todo), (
+        f"{path} was written for {done['n_todo']} hero decisions and this "
+        f"phase has {n_todo} — the sessions are not the same sessions, so "
+        f"there is nothing to resume")
+    missing = [p for p in done["shards"] if not os.path.exists(p)]
+    assert not missing, f"{path} names shards that are not on disk: {missing}"
+    log(f"[{TAG}] resuming after {done['todo_done']}/{n_todo} decisions "
+        f"({done['n_labels']} labels in {len(done['shards'])} shards)")
+    return done
+
+
 def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                     block_vectors, agent_member, ocfg, R, max_players, cfg,
                     out_dir, log):
@@ -397,30 +472,54 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
 
     The bar counts **hero decisions across the whole job** (`CLAUDE.md` §5):
     that is what the phase costs, and a bar per session would answer a question
-    nobody is asking. Playing the hands, above, has its own bar because it
-    happens first and in a different unit; nothing is nested.
+    nobody is asking. A resumed call advances the bar by what it is skipping, so
+    the bar still reaches its total and its ETA still means what it says.
+    Playing the hands, above, has its own bar because it happens first and in a
+    different unit; nothing is nested.
     """
     os.makedirs(out_dir, exist_ok=True)
     todo = _hero_decisions(sessions, hero_rec)
     log(f"[{TAG}] {len(todo)} hero decisions to label")
 
     per_shard = int(cfg["labels_per_shard"])
-    shards, buffer = [], []
-    n_labels = 0
-    forwards = seconds = rollouts = 0
-    collisions, dropped = [], 0
+    done = _read_progress(out_dir, len(todo), log)
+    shards = list(done["shards"]) if done else []
+    start = int(done["todo_done"]) if done else 0
+    n_labels = int(done["n_labels"]) if done else 0
+    dropped = int(done["n_dropped"]) if done else 0
+    forwards = int(done["forwards"]) if done else 0
+    rollouts = int(done["n_rollouts"]) if done else 0
+    seconds = float(done["seconds"]) if done else 0.0
+    collision_sum = float(done["collision_sum"]) if done else 0.0
+    collision_n = int(done["collision_n"]) if done else 0
+    buffer = []
 
-    def flush():
-        if not buffer:
-            return
-        path = os.path.join(out_dir, f"shard_{len(shards):04d}.npz")
-        _write_npz(path, _shard_arrays(buffer))
-        shards.append(path)
-        buffer.clear()
+    def flush(todo_done):
+        """A shard, then the note that says the shard is safely on disk.
+
+        In this order and never the other: a progress file naming a shard that
+        was not written would make the next run skip labels nobody computed.
+        """
+        if buffer:
+            path = os.path.join(out_dir, f"shard_{len(shards):04d}.npz")
+            _write_npz(path, _shard_arrays(buffer))
+            shards.append(path)
+            buffer.clear()
+        with open(os.path.join(out_dir, PROGRESS), "w") as fh:
+            json.dump({"n_todo": len(todo), "todo_done": int(todo_done),
+                       "shards": shards, "n_labels": n_labels,
+                       "n_dropped": dropped, "forwards": forwards,
+                       "n_rollouts": rollouts, "seconds": seconds,
+                       "collision_sum": collision_sum,
+                       "collision_n": collision_n}, fh)
 
     bar = progress(total=len(todo), desc="label", unit="label")
+    if start:
+        bar.update(start)
     current = (None, None)
-    for i, h, d in todo:
+    for pos, (i, h, d) in enumerate(todo):
+        if pos < start:
+            continue
         s = sessions[i]
         block = h // R
         if (i, block) != current:
@@ -442,7 +541,8 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         forwards += stats.forwards
         seconds += stats.seconds
         rollouts += stats.n_rollouts
-        collisions.append(stats.collision_rate)
+        collision_sum += stats.collision_rate
+        collision_n += 1
         bar.update(1)
 
         if not np.isfinite(q[legal]).all():
@@ -464,13 +564,13 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         })
         n_labels += 1
         if len(buffer) >= per_shard:
-            flush()
-    flush()
+            flush(pos + 1)
+    flush(len(todo))
     bar.close()
 
     stats = LabelStats(
         forwards=forwards, seconds=seconds,
-        collision_rate=float(np.mean(collisions)) if collisions else 0.0,
+        collision_rate=(collision_sum / collision_n) if collision_n else 0.0,
         n_rollouts=rollouts)
     log(f"[{TAG}] {n_labels} labels in {len(shards)} shards, {dropped} dropped, "
         f"{stats.forwards} forwards, {stats.seconds:.1f}s of labelling, "

@@ -44,15 +44,22 @@ from train.targets import kl_loss, soft_q_loss
 from utils import progress
 
 
-def steps_for_iteration(cfg, iteration):
+def steps_for_iteration(cfg, iteration, first_key="first_iteration_steps"):
     """Gradient steps for one training cycle.
 
-    `first_iteration_steps` on iteration 0, `steps` on every cycle after it.
-    Omitting the key means the first cycle is trained like the rest.
+    `first_key` on iteration 0, `steps` on every cycle after it. Omitting the
+    key means the first cycle is trained like the rest.
+
+    `first_key` is a parameter because the embedding network needs exactly the
+    same rule under its own name (`first_retrain_steps`, §5.4): its first
+    retrain is the one that starts from a random network *and* produces the
+    vectors iteration 0's labels are stamped with, so it needs the most steps
+    for the same reason iteration 0 of the agent does. Two copies of a
+    three-line rule is the duplication `CLAUDE.md` §5 warns about.
     """
     steps = int(cfg["steps"])
     if int(iteration) == 0:
-        return int(cfg.get("first_iteration_steps", steps))
+        return int(cfg.get(first_key, steps))
     return steps
 
 

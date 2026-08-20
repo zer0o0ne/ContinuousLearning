@@ -1,11 +1,14 @@
 # v8 — Concept
 
 **Status: agreed with the owner 2026-08-16; amended 2026-08-19 (§6.2's second loss, §7.1's
-runout draw, §7.4's withdrawn cost claim, §13's measurement). Gates G1 and G3 have run; the
-agent, the oracle, the targets and the labelling pass are implemented, the outer loop is not.**
-All open items (OI-1 … OI-8) are resolved — see §16, where OI-2 is recorded as revised after
-implementation showed the original not to be implementable. Nothing in this document is waiting
-on a decision. `ARCHITECTURE.md` §4 lists the readings that turning this
+runout draw, §7.4's withdrawn cost claim, §13's measurement) and 2026-08-20 (§5.6's strength head
+and §6.1's trunk warm start, which are one decision; §5.1a's class head weighted to zero on G1's
+own numbers; policy distillation from a v7 member declined). Gates G1 and G3 have run; the whole
+pipeline is implemented.**
+All open items OI-1 … OI-8 are resolved — see §16, where OI-2 is recorded as revised after
+implementation showed the original not to be implementable. One later item, **OI-9** (the
+accuracy of the `max_combos` subsample), is open and deliberately deferred; nothing else in this
+document is waiting on a decision. `ARCHITECTURE.md` §4 lists the readings that turning this
 document into code required.
 
 This document is the design record for v8. It supersedes nothing in the root `CLAUDE.md`
@@ -117,10 +120,25 @@ for an arbitrary legal game situation, batchable on GPU.
 - **v7 networks.** Existing trained checkpoints from `data/v7/`, run through a **vendored frozen
   copy** of v7's agent code (§4.3). Used with `heads={"action"}`, no MCTS and no opponent
   embedding.
+
+  **They are weak, and how weak is load-bearing (owner, 2026-08-19): v7 plays about −90 BB/100
+  against Slumbot.** That does not make the oracle wrong — `Q` is by construction the EV against
+  *this* pool, whatever the pool is, and the whole point of §2 is that a fixed pool makes that
+  exact. What it does mean is that every posterior the oracle conditions on is the range of a
+  bad strategy, so anything whose answer depends on the *shape* of that range — how tight it is,
+  how concentrated its mass — is being measured on an unrepresentative distribution and does not
+  transfer. Two live consequences: the accuracy of the `max_combos` subsample (§7.3) cannot be
+  usefully measured on v7 ranges, and iteration 0's hero is a weak rollout policy, so the first
+  improvement step starts from further back than the §7.1 cold-start argument assumes.
 - **Procedural style variants.** The same base network with a randomly sampled style modifier
   applied to its output distribution (§4.2). This is the cheapest source of pool diversity by a
   wide margin and it is what keeps the embedding space continuous instead of a 20-way
-  classification (§11.3).
+  classification (§11.3). **Every base is also in the pool unmodified** (owner decision
+  2026-08-19): the plain network is the strongest member of its family and the reference point
+  each draw is a perturbation of, so it is an ingredient in its own right rather than a special
+  case of a draw. How many modifications a base contributes stays per-entry config
+  (`bootstrap[i].n_variants`), because 8 draws off a v7 checkpoint and 1 off `always_fold` are
+  different asks. `PLAN_PIPELINE.md` D13 carries the mechanism.
 - **Degenerate strategies.** always-fold, always-call, always-min-raise, maniac (all-in biased),
   nit (folds without a strong hand). No network, no cost, and they pin the corners of the style
   space that iterated agents will never visit on their own.
@@ -134,6 +152,15 @@ will ever contain, and a style draw costs no forward, no parameter and no checkp
 no-multiplication setting and is a legitimate value; the number is config because it changes
 both the pool's composition and the size of the §5.4 embedding table, and nothing in the loop
 should be deciding either.
+
+**A past agent in the pool plays at `e = 0`** (owner decision 2026-08-19, `PLAN_PIPELINE.md`
+D12(a)). Seated as an *opponent* it is a fixed policy like every other member: it plays the
+unconditional policy §6.2's embedding dropout trains explicitly, rather than fitting a vector for
+whoever it happens to be sitting with. The alternative — a §5.5 fit per past agent per table —
+is faithful but nests one fit inside another for every rollout, and nothing has measured a
+difference to pay for it. What it costs is worth naming, because it is not symmetric: hero
+exploits its table and the pool's own agents never do, so the agent is trained against a slightly
+*weaker* version of its predecessors than the ones that produced the labels.
 
 Expected size 500–2000 members at late iterations, bounded by compute, not by design.
 
@@ -197,8 +224,8 @@ v7's agent architecture code is **copied into v8 as a frozen snapshot** under it
 trees define the same top-level package names). The copy is never edited to follow v8 changes.
 
 What must be vendored is not only the model: a v7 checkpoint needs **v7's event format** to be
-fed anything. That format is already present in v8 — `evaluation/slumbot_eval.py::_build_events`
-constructs it (`hand`, `num_players`, `hero_pos`, `acting_pos`, `big_blind`, `small_blind`,
+fed anything. That format is already present in v8 — v7's inherited `slumbot_eval.py::_build_events`
+constructed it (`hand`, `num_players`, `hero_pos`, `acting_pos`, `big_blind`, `small_blind`,
 `stack`, `stacks`, `bets`, `table`, `action`) and is the reference implementation. So a v7 pool
 member is: vendored perception + action head, v7 event builder, `skip_opponent_emb=True`,
 `heads={"action"}`.
@@ -273,8 +300,8 @@ reveal" would have nothing to apply to.
 So the reveal gets a token of its own. A hand that reaches showdown appends **one terminal
 token per revealed player**, after every decision token of that hand. The token carries the
 final board, the revealed player's embedding, the end-of-betting stacks and pot, and a token
-type distinguishing it from a decision. It carries **no cards of the revealed hand** — those
-are its *targets*:
+type distinguishing it from a decision. For every seat **other than the observer** it carries
+**no cards of the revealed hand** — those are its *targets*:
 
 | Head | Target | Loss | What it is for |
 |---|---|---|---|
@@ -304,8 +331,32 @@ state produced by a forward pass; v8's is a latent found by gradient descent at 
 the information has to be in *that* gradient. Both terms are computable at fit time: the hands
 being fitted are finished and their showdowns are public.
 
+**The observer's own showdown token carries the observer's own cards** (owner decision
+2026-08-20). Hiding a player's own hand from that player is the one form of masking that buys
+nothing: the observer knows it at every moment of the hand, §9 is about what the observer could
+have known and never about withholding what it did, and the rule "the observer's own cards
+always, everybody else's never" then holds on every token type instead of having an exception.
+
+What the masking is actually for is worth restating, because it is easy to read it as being about
+the cards rather than about the gradient. Attention is causal and no decision token attends to a
+showdown token, so the *only* channel from a reveal to that player's vector is the gradient of a
+loss whose answer is absent from the input. Unmask another seat's hand and the head becomes a
+hand evaluator — a duplicate of §5.6 on a third of the hands — and the anchor stops producing any
+pressure on the vector at all. That is why the exception stops at the observer.
+
+Its one cost is on the *metric*, not on the model. The observer's own token's strength target is
+now a deterministic function of its own input, so the pooled `showdown_strength_mse` mixes a
+trivial population with the hard one and **is not comparable to G1's 0.095**. Training is
+unaffected — a term the head can already answer stops producing gradient — but the number has to
+be read split, or read as the easy half.
+
 Weights for the two heads are config, used identically in training and in the fit; setting them
-to zero is the ablation that asks whether the anchor earns its keep.
+to zero is the ablation that asks whether the anchor earns its keep. **The 169-way class head is
+weighted to zero as of 2026-08-20** (owner decision) on G1's own numbers: held-out 5.75 nats
+against a marginal entropy of 5.005, i.e. worse than a constant, after sitting exactly on that
+constant for 10 000 steps and then memorising the corpus in the final low-LR phase. The code
+stays — zero is the documented ablation switch, and removing the field would change the shard
+format for no gain.
 
 Two properties recorded rather than fixed:
 
@@ -418,6 +469,58 @@ parameters, and the block-diagonal mask makes the per-hand forwards a batch.
 
 ---
 
+### 5.6 The strength head — the poker prior
+
+**Status: agreed with the owner 2026-08-20**, together with the §6.1 warm start; the two are one
+decision and neither is worth much alone. The alternative offered at the same time — distilling a
+v7 member's policy into the agent as a pretraining phase (§7.1's "recorded alternative") — was
+**declined**, on the ground that it would make the agent resemble v7. So the prior transferred
+here is about *cards* and never about *actions*.
+
+A third head on the trunk of §5, reading the **observer's own** decision tokens and predicting
+the percentile the observer's hand reached on that hand's final board. MSE, weight
+`embedding_net.strength_weight`.
+
+**Why it exists.** The agent reads seven card slots through `Embedding(53, ·)` and an MLP, and
+nothing else about hand strength: no equity, no percentile, no suit or rank structure. Everything
+it knows about which two cards beat which it has to infer from oracle EV labels — whose noise at
+200 BB is, by G3's own numbers, larger than the EV differences between the actions they are
+meant to rank (§13, §11.4). Learning poker's card evaluation from that signal is the most
+expensive possible way to learn it. The same fact is available exactly and for free from played
+hands, so it is learned there instead, on a corpus that costs no rollout at all.
+
+**Why this target and not equity.** `env/showdown.py::strength_percentiles` already computes it,
+exactly, by enumeration, with no seed and no Monte Carlo — it is the §5.1a label with the
+restriction to revealed seats lifted. And scoring on the *final* board rather than the visible
+one is what makes the head learn draws: at a flop decision the conditional distribution of the
+final percentile given the flop **is** the value of the draw, and regressing to a sample of it
+converges on that conditional mean.
+
+**It is a target and never an input**, exactly as §5.1a's are, and §9 is untouched: the token's
+cards, board and scalars are bit-identical to what they were before the head existed. Predicting
+a quantity the observer will only learn later is what a value target does. A hand still in
+progress carries no target, because it has no final board yet.
+
+**Training only — and this is the one place it differs from §5.1a.** The showdown terms belong in
+the §5.5 fit because a revealed holding is evidence about the *revealer's* style. The strength of
+the observer's own cards is evidence about nobody: its gradient into an opponent's vector is
+noise and into the observer's own vector is a channel carrying nothing the vector is for. So the
+term shapes the weights and is absent from the fit objective. What carries it into the agent is
+§6.1's warm start, not the vectors.
+
+**The MSE floor is not zero, and misreading it is the predictable mistake.** The target is one
+runout, not an expectation over runouts, so a perfect head still pays the conditional variance of
+the runout: large preflop, zero on the river. The baseline to read the number against is the
+**marginal variance of the target on the same corpus**. This is §11.4's trap in a second place,
+and it is the same trap the §5.1a heads are already sitting in — G1 measured `showdown_strength`
+at a held-out MSE of 0.095 against a target variance of ≈0.085, and the 169-way class head at
+5.75 nats against a marginal entropy of 5.005, i.e. both worse than a constant, having sat exactly
+on that constant for 10 000 steps before memorising the corpus in the last low-LR phase. The
+strength head is a much easier task — it is scored on cards the observer can see — but it is to be
+read the same way, and `strength_weight = 0` is the ablation that asks whether it earned its keep.
+
+---
+
 ## 6. Entity 3 — Agent v8
 
 ### 6.1 Shape
@@ -443,7 +546,23 @@ they optimise different objectives on different retraining cadences, and shared 
 make every embedding-network retrain silently change the agent's input representation.
 Warm-starting the agent's trunk from the embedding network is a config flag, off by default.
 
-**Initialisation: from scratch** (owner decision 2026-08-16, §16 OI-2 revised). An earlier draft
+**Warm start: the trunk, from the embedding network** (owner decision 2026-08-20). §16 OI-4 left
+this as "a config flag, off by default" and §7.1 noted that, with the v7 warm start withdrawn, it
+is the only architecturally coherent one available. It is now the baseline and the flag is
+`agent_train.warm_start_trunk`. What it copies is `HandEncoder`'s weights, once, at iteration 0,
+after the embedding network's first retrain: the two networks read the same §5.1 token through the
+same tokeniser, so the parameter sets correspond exactly — which is precisely what OI-4 bought by
+sharing the trunk as code and is the thing a v7 checkpoint could not offer (below). The action
+head keeps its initialisation, the weights stay separate objects, and the agent's trunk moves
+under `soft_q` from its first gradient step: this is an initialisation, not a tie.
+
+What it is *for* is §5.6. Without the strength head the warm start transfers a trunk trained to
+predict other people's actions, which is a related but different task; with it, the trunk also
+carries hand evaluation, board texture and the value of a draw, learned from free self-play. That
+is the half of the job the oracle's labels are worst at teaching.
+
+**Initialisation of the head and of everything else: from scratch** (owner decision 2026-08-16,
+§16 OI-2 revised). An earlier draft
 said "from a v7 checkpoint, action head only". That is not implementable and the reason is this
 section itself: the agent consumes the §5.1 token through the tokeniser of OI-4, while a v7
 checkpoint's weights are shaped for v7's input — seven card vectors per *event* through
@@ -494,6 +613,19 @@ near-deterministic policy in big pots and a near-uniform one in small pots. v7's
 was a normalisation bug of exactly this family, not an architecture failure
 (`versions/v7/ARCHITECTURE.md`, "MCTS value-target normalization"). Baseline: divide by
 `pot + facing_bet`, with the divisor itself a config choice.
+
+**A concern the G3 numbers raise about the divisor itself, flagged and not decided
+(2026-08-19).** `pot + facing_bet` does not scale with the stack, but the payoff does — in NLHE
+what can change hands is bounded by the effective stack, not by the pot. G3 measured the label
+error in exactly these units and it ran 0.2–3.4 at 256 samples, i.e. **the noise alone is
+usually larger than the divisor**, and the per-sample chip-delta deviation came out at 0.5–1.4
+of the stack, meaning nearly every rollout is a stack-off. So at depth the normalised target has
+a large dynamic range before any noise is added, which is the same family of problem the
+paragraph above says v7 was bitten by — only from the other side. `DIVISORS` is a config choice
+and `pot` is the only alternative currently implementable from the arguments the function
+receives; anything stack-aware would be a third entry and a new decision. Recorded so that a
+first training run reads a saturated or a near-uniform policy at 300 BB as this rather than as
+an architecture failure.
 
 Illegal and dominated actions are masked before the softmax, using the same legality rule as the
 environment and the data generator — one implementation, not two.
@@ -599,8 +731,28 @@ These are approximations, not exact computations, and are recorded as such:
 - **Joint opponent ranges are approximated by independent marginals with a card-removal
   correction.** The exact joint over 8 opponents is combinatorially impossible. Bias direction
   is unknown and unmeasured.
-- **Combo subsampling.** Importance sampling over the posterior weights with a `max_combos` cap
-  (v7's `gpu_solver_v5` already has this knob and its semantics).
+- **Combo subsampling.** Self-normalised importance sampling over the **prior**, with a
+  `max_combos` cap. (v7's `gpu_solver_v5` drew from the *posterior* and renormalised, which
+  double-counts the mode and saves no policy call; `ARCHITECTURE.md` §2.2b records why the cap
+  is applied before the likelihood pass instead.) **Its accuracy has never been measured** —
+  G3 sweeps the axis for cost only, and the split-half column cannot see a bias by construction.
+  Measured cost: the cap to 128 combos saves about 46% of a label at 32 samples and about 21% at
+  128, which is the only lever on the label's fixed cost.
+
+  The right metric, when it is measured, is **not** total variation against the exact posterior:
+  a subsample of 128 points cannot be close in TV to a distribution over 1225, yet it can
+  estimate expectations perfectly well, which is what it is for. The operative statement is that
+  the cap puts a **ceiling of the subsample's effective sample size on the number of distinct
+  opponent holdings a label can average over, and that ceiling does not rise with
+  `samples_per_action`** — as `n → ∞` the estimate converges to `⟨w_capped, V⟩`, not to
+  `⟨w_exact, V⟩`. If `ESS < n`, the extra samples buy nothing. The predicted failure mode is
+  specific: the proposal is uniform over the prior, so a tight range — 20–50 combos carrying the
+  mass — survives a 128-of-1225 draw with 2–5 combos, and the effective sample size collapses
+  exactly where the range is informative. Flat ranges are carried fine.
+
+  **Deferred, 2026-08-19 (owner).** Measuring this on the bootstrap pool would measure it on v7
+  ranges, and §4.1 records why the shape of those ranges is not to be trusted. The baseline runs
+  the exact posterior, so nothing is blocked by leaving it open.
 - **Monte-Carlo noise** in the rollouts, controlled by samples per action. It covers three
   sources — the opponents' hole cards, the runout, and the action draws of hero and the
   opponents — and only their *differences between actions* reach the target, since the softmax
@@ -709,11 +861,11 @@ to be separable actually are.
 | `bootstrap` | list of entries, each: checkpoint path (into `data/v7/`), `n_variants` (how many random style draws to generate from it), optional explicit style vector (for the hand-designed degenerate strategies), optional label |
 | `style` | the distribution style draws come from — per-block scale for the §4.2 bias vector, temperature and `λ` ranges — and `agent_variants`, how many members each trained agent contributes when it joins the pool (§4.1, owner decision 2026-08-19) |
 | `agent_init` | which pool member sits in hero's seat at iteration 0 (§7.1), the agent itself being trained from scratch. **Deliberately separate from `bootstrap`** — the strongest opponent to have in the pool and the best policy to seat as hero are different questions and need not resolve to the same member |
-| `embedding_net` | model dims, `K` (inference gradient steps), fit learning rate, regularisation toward zero, `R` (recompute interval), amortised-head weight, ablation switch, and the number of table rows reserved for the members the loop will produce (`max_iterations` × `style.agent_variants`, owner decisions 2026-08-19, see §5.4 and §4.1). Nothing in the loop decides that number — it is config, like every other hyperparameter that changes a result |
+| `embedding_net` | model dims, `K` (inference gradient steps), fit learning rate, regularisation toward zero, `R` (recompute interval), amortised-head weight, the §5.6 `strength_weight`, ablation switch, **`first_retrain_steps` — the first retrain's own step count, `steps` being every later one's** (owner decision 2026-08-20; it is the only retrain that starts from a random network *and* the one whose vectors are stamped onto iteration 0's labels, which is the same argument `first_iteration_steps` rests on and it uses the same helper), and the number of table rows reserved for the members the loop will produce (`max_iterations` × `style.agent_variants`, owner decisions 2026-08-19, see §5.4 and §4.1). Nothing in the loop decides that number — it is config, like every other hyperparameter that changes a result |
 | `oracle` | samples per action, `max_combos`, variant (A / C), EV normalisation divisor, temperature `T` |
 | `pool_sampling` | PFSP exponent, uniform floor fraction, dedup cluster count, and the per-iteration decay of accumulated results (`result_decay`, owner decision 2026-08-19). The decay is not a tuning knob but a correctness one: hero changes every iteration, so "hero's BB/100 against member *i*" is a property of a pair and a lifetime mean is a mean over every past agent. Without it a member the early agents crushed keeps a positive score for the length of a whole run, the loop never learns it has stopped beating it, and §11.1's cycling diagnostic is smeared away with it |
 | `game` | `raise_sizes` per street, players range (2–9), stack range (10–300 BB) |
-| `agent_train` | optimiser, embedding-dropout probability, schedule, the gradient steps per cycle — with **iteration 0's count a key of its own** (`first_iteration_steps`, owner decision 2026-08-18), see §8 — and `heldout_fraction`, the share of each iteration's labels withheld from training so the oracle gap can be measured on data the agent did not see (§8) |
+| `agent_train` | optimiser, embedding-dropout probability, `warm_start_trunk` (§6.1), schedule, the gradient steps per cycle — with **iteration 0's count a key of its own** (`first_iteration_steps`, owner decision 2026-08-18), see §8 — and `heldout_fraction`, the share of each iteration's labels withheld from training so the oracle gap can be measured on data the agent did not see (§8) |
 | `evaluation` | Slumbot hands, cold/warm switch, frozen-pool-slice screen (§16, OI-7) |
 
 ---
@@ -807,6 +959,56 @@ than a general style space. That failure would leave B1(b) with nothing to gener
 Procedural style variants and degenerate strategies (§4) are the mitigation, and they are cheap
 enough that there is no reason not to use them from the start.
 
+### 11.4 What the training limit is, and what it is not
+
+Recorded 2026-08-19, after the `soft_q` decision of §6.2, because the question "does this
+converge to the right thing" has a precise answer and three of its parts are easy to assume away.
+
+**What the linear loss buys, and it is worth stating first.** `soft_q`'s gradient is linear in
+`Q̂`, so `E_ε[∇_θ L] = ∇_θ L|_{Q̂ = E[Q̂]}` and `samples_per_action` **drops out of the limit
+entirely** — at `N → ∞` the answer is the same whether a label was built from 32 samples or
+1024. Only the gradient variance, i.e. the rate, depends on it. That is why §13 can pick `n`
+purely on compute efficiency. Under the KL loss of §6.2 `n` would have been a parameter of the
+*fixed point*, which is the failure this decision exists to avoid.
+
+**What the limit actually is.** Even with an unbiased `Q̂`, `N → ∞` gives
+
+```
+argmin_θ  E_s [ T·KL( π_θ(·|s) ‖ softmax(Q(s)/T) ) ]
+```
+
+— the **reverse-KL projection onto what the network can represent**, weighted by the state
+distribution the labels came from. It equals `softmax(Q/T)` pointwise only under realisability,
+the network is non-convex so SGD reaches a stationary point rather than the global one, and
+changing the PFSP weights or the hero seat changes the distribution and therefore the limit. So:
+consistent for a well-defined object, not unbiased for the one §6.2 names.
+
+**Four reasons `E[Q̂] ≠ Q`, none of which `n` or `N` can touch.**
+
+- **Independent marginals (§7.3).** The structural one. It is **exactly zero at two players** —
+  there is one marginal, no joint to approximate, and the rejection performs card removal
+  exactly — and it grows with table size. G3's collision rate is the proxy for how hard the
+  approximation is working: 0–5% heads-up, 33–46% six-handed, 57–82% nine-handed. Worth stating
+  plainly: the slice we measure against Slumbot is the one slice where the oracle is exact, and
+  the generality `CLAUDE.md` §1 is betting on lives where it is not.
+- **The likelihood floor** (`1e-6`) deliberately gives a combo the member would never play a
+  non-zero weight. A fixed smoothing of the range; it does not vanish, and it applies heads-up
+  too.
+- **`max_combos`** is self-normalised importance sampling, biased at finite `m` and consistent
+  only as `m → ∞`. Inactive in the baseline, which uses the exact posterior.
+- **It is `Q^{π_rollout}`, not `Q*`.** The oracle evaluates an action assuming hero plays the
+  rollout policy afterwards, so iteration 0's labels are `Q^{v7}` and training on them is one
+  step of soft improvement over a v7 member — see §4.1 on how weak that member is. Reaching a
+  best response is the outer loop's job, and §11.1 already says that iteration is not guaranteed
+  to converge.
+
+**A practical trap in reading the loss curve.** Under `soft_q` the logged number does not go to
+zero at the perfect solution. At `π = softmax(Q/T)` it logs `T·KL(π ‖ softmax(Q̂/T))`, which for
+small `ε` is about `Var_π(ε) / (2T)`. With the measured `SE/pot ≈ 1.4` and `T = 0.5` that floor
+is of order 2, and it is label noise rather than underfitting. The floor is set by the error on
+the *differences* between actions, so it is the contrast error — not the level error §13
+reports — that predicts where the curve flattens.
+
 ---
 
 ## 12. Evaluation
@@ -830,10 +1032,21 @@ each. Without that, the headline number reads as an unbiased measurement when it
 of several noisy ones. At 50 000 hands a session's standard error is roughly ±2.7 BB/100
 (σ ≈ 6 BB/hand), which is the scale of the bias involved.
 
-`evaluation/slumbot_eval.py` is inherited from v7 and does not import yet. Split it as
-`ARCHITECTURE.md` already describes: keep the protocol layer (HTTP client, action-string grammar,
-token ↔ action mapping, state replay, BB/100 + SE accounting), rewrite the agent adapter against
-v8's observation format.
+**Done 2026-08-19.** The inherited `evaluation/slumbot_eval.py` was split as described and then
+deleted: the protocol layer (HTTP client, action-string grammar, token ↔ action mapping, state
+replay, BB/100 + SE accounting) is `evaluation/protocol.py`, bodies verbatim, and the agent
+adapter was rewritten against v8's observation format as `evaluation/v8_adapter.py`.
+`eval_pipeline.py` plays the hands, runs cold and warm, stamps a short run `SCREENING ONLY` and
+refuses to write a report without the selection disclosure above.
+
+**"How many hands it took to warm up" is a derived number** (2026-08-19): no single quantity of
+that shape exists in the run, so every warm hand records how many hands its vector had been
+fitted from, the run is bucketed by that count, and the reported figure is the first bucket whose
+BB/100 reaches the cold run's overall BB/100. *Never catching up* is reported as such — which,
+read against §11.2's measured result that the fit is worse than `e = 0` at very short observation,
+is a shape to expect rather than a surprise. The fit itself is over the most recent
+`fit_window` hands rather than the whole history, because an unbounded fit over a million hands is
+not computable; the window is config.
 
 ---
 
@@ -859,8 +1072,9 @@ optimisation; the pool is networks only (§4); and variant C (§7.4) is the firs
 budget does not close. **G3 (§14) measures the real figure before any pipeline is built around
 it.**
 
-**Measured, 2026-08-19 (first run, before the §7.1 runout fix and before bf16).** The design
-figure above was right on cost and wrong on both of its terms, by compensating factors:
+**Measured — first run, 2026-08-18** (before the §7.1 runout draw, before the configured hero
+seat, before bf16). The design figure above was right on cost and wrong on both of its terms, by
+compensating factors:
 
 | | design figure | measured |
 |---|---|---|
@@ -879,10 +1093,55 @@ The number that decides the design is not the cost but the noise: split-half `SE
 (heads-up, 20 BB) to 25.7 BB (six-handed, 300 BB) at 256 samples. Since cost is linear in samples
 and error is inverse-square-root, reaching 1 BB needs 108 samples at heads-up 20 BB and 169 000
 at six-handed 300 BB. **Variant A is affordable and its labels are only clean at short stacks.**
-Three things qualify that and are the reason the gate was rerun rather than the design abandoned:
-the runout was pinned (§7.1), the error was measured on levels rather than on the
+Three things qualified that and are the reason the gate was rerun rather than the design
+abandoned: the runout was pinned (§7.1), the error was measured on levels rather than on the
 shift-invariant *differences* the target actually depends on, and hero's rollout policy was
 whoever the hand seated — 29% of the pool being degenerate.
+
+**Measured — second run, 2026-08-19.** 1728 labels over 216 cells, with the §7.1 runout draw, a
+configured v7 hero seat, bf16 in the pool member and the pool composition as a fifth axis. This
+is the run the config is fixed from.
+
+*The noise scales as textbook Monte-Carlo, and that is the load-bearing result.* Fitting
+`SE ~ n^k` over the four sample budgets gives a median `k` of **−0.51** in BB and **−0.46** in
+pot units across the 18 cells, and −0.47 … −0.56 on the aggregates; `SE(32)/SE(256)` is
+2.77–2.82 against a theoretical 2.83. **There is no plateau.** That is the direct evidence the
+pinned board was the problem: with one runout shared by every sample the curve had to flatten
+into an irreducible floor, and it no longer does. Quadrupling the samples halves the noise, and
+nothing else does.
+
+*But samples stop being worth buying at 128.* A label costs `a + b·n`, where `a` is the
+posterior and does not move with `n`. For a fixed second-budget the total noise variance goes as
+`(a/n + b)/C`, so the efficiency of a sample budget is **exactly the share of the label's wall
+clock spent on rollouts rather than on the posterior** — measured at 68% (n=32), 77% (64), 85%
+(128), 91% (256). The same thing read directly, in samples bought per Spark-hour:
+
+| pool | n=32 | n=64 | n=128 | n=256 |
+|---|---|---|---|---|
+| all | 61 120 (58%) | 85 248 (81%) | **104 832 (100%)** | 102 912 (98%) |
+| v7 | 55 840 (61%) | 75 712 (83%) | **91 136 (100%)** | 88 320 (97%) |
+
+The curve peaks at 128 and turns slightly down after it — seconds per label grow marginally
+faster than rollouts on the largest batches. Below 128 the budget is spent re-deriving
+posteriors; above it, on nothing. **`oracle.samples_per_action = 128`** is therefore the answer
+§14 says this gate exists to produce, and it costs 122 h (pool `all`) to 141 h (pool `v7`) for
+100 000 labels.
+
+*The rest of the second run's numbers.* Wall clock splits 6.9% event building, 13.9% tensor
+packing, 68.8% model, 0.3% style, 10.3% driver — 584 µs per policy row at 172 rows per call,
+85% of rows reaching a network. bf16 bought about **1.5×** on the model, not the 2–4× predicted:
+the two runs are not directly comparable (hero, pool mix and hand lengths all changed), so the
+honest normaliser is the model's cost per unit of `events`, which is pure Python proportional to
+sequence length — it fell from 15.3 to 10.0. The packing share came in at 13.9%, against a
+prediction of 2.15× the `events` bucket made from a dev-box calibration; measured 2.02×, so the
+calibration held and packing is now the largest remaining engineering item. Collision rates fell
+to 0–5% (heads-up), 33–46% (six-handed) and 57–82% (nine-handed), because a card of a street
+still to come is no longer dead.
+
+*Pool composition moves both columns, as §4.4 implies it will.* Against the networks-only pool
+the error is about 23% lower in pot units (1.05 against 1.36 at 256 samples) and the label is
+about 15% more expensive. So the uniform draw over a pool that is 29% degenerate was inflating
+the measured variance, and the pipeline's PFSP draw will sit on the quieter side of that.
 
 ---
 
@@ -918,6 +1177,12 @@ the gate sampled uniformly over a pool that is 29% degenerate, so cost and noise
 against a table the pipeline will not set. Hero's rollout policy is a configured member and not
 whoever the hand seated, for the same reason. Output is the label budget that §8 can afford,
 which then fixes the config.
+
+**Answered, 2026-08-19: `oracle.samples_per_action = 128`.** Not because the labels are clean
+there — they are not, §13 has the numbers — but because that is where the sample budget stops
+buying anything: below it the label re-derives a posterior it does not use enough, above it the
+curve of samples-bought-per-Spark-hour is flat and then turns down. §13 carries the derivation,
+the per-budget table and the noise-scaling result the choice rests on.
 
 Two additions to what this section originally asked for, both because a cost without an accuracy
 is not a budget: a split-half standard error of `q`, free because the rollouts are already
@@ -969,6 +1234,13 @@ prefers end-to-end scenarios over unit tests of helpers. What must be covered:
 
 ## 16. Open items
 
+- **OI-9 — accuracy of the `max_combos` subsample. OPEN, deferred 2026-08-19 by the owner.**
+  The cap is the only lever on a label's fixed cost (§7.3) and its accuracy is unmeasured; G3
+  sweeps the axis for cost only. The experiment is cheap — the same decisions, one seed, `Q̂` and
+  the posterior's effective sample size at `max_combos ∈ {128, 512, None}` — but it is deferred
+  because on the bootstrap pool it would be measuring the shape of a −90 BB/100 strategy's range
+  (§4.1). Nothing is blocked: the baseline runs the exact posterior. Revisit once the pool holds
+  a v8 agent that is not obviously weak.
 - **OI-1 — token completeness. RESOLVED 2026-08-16:** `num_players` and the per-seat stack
   vector are both added to the token (§5.1).
 - **OI-2 — oracle cold start. RESOLVED 2026-08-16; REVISED 2026-08-16 by the owner.**
@@ -999,14 +1271,18 @@ prefers end-to-end scenarios over unit tests of helpers. What must be covered:
     (OI-2 revised) this is the only architecturally coherent warm start there is — same
     tokeniser, same token format, and the embedding network is trained first — so whether it
     should become the default is now an open question (§7.1).
+    **Settled 2026-08-20: it is the default** (`agent_train.warm_start_trunk`), and the open
+    question is closed by §5.6 rather than by an experiment — with the strength head in the
+    objective the trunk being copied carries a poker prior and not only an action predictor,
+    which is what makes the copy worth making. §6.1 carries the mechanism.
 - **OI-5 — live style modifiers. APPROVED 2026-08-16.** Design in §4.2: additive logit bias over
   v7's 5 action categories, gated by position and street, plus temperature and a uniform mix;
   ~32 scalars per pool member, drawn randomly at pool construction; equity-gated conditions
   dropped as too expensive inside rollouts.
 - **OI-6 — v7 checkpoint access. RESOLVED 2026-08-16:** vendored frozen copy of v7's agent code
   inside v8, checkpoint paths in config pointing into `data/v7/` (§4.3). Note that v7's **event
-  builder** must be vendored alongside the model — the reference implementation is already in
-  v8 at `evaluation/slumbot_eval.py::_build_events`.
+  builder** must be vendored alongside the model — the reference implementation came from
+  v7's `slumbot_eval.py::_build_events` and now lives at `vendor/v7/events.py`.
 - **OI-8 — showdown information in the embedding. RESOLVED 2026-08-16 by the owner:** a terminal
   reveal token with **both** heads — strength percentile and 169-way preflop class (§5.1a). The
   alternatives were offered and declined: writing the revealed cards into the hand's decision

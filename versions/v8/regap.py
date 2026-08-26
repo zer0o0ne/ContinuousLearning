@@ -13,6 +13,15 @@ running RNG, and the agent is the checkpoint that iteration saved. Every number
 the old `metrics.json` already carries is therefore checked against the
 recomputed one, and a mismatch is an error rather than a silent overwrite.
 
+**The config is the one the iteration ran with, not the one on disk now.**
+`agent.pt` carries the config of its own iteration, and that is what phase D
+read: `oracle.temperature` shapes `π_oracle`, so re-measuring an old checkpoint
+under a temperature that was edited since would silently report `kl` and
+`ev_gap_target` for a target that agent was never trained toward. `--config`
+therefore only locates the experiment (`out_dir`, `experiment`, `n_iterations`);
+every number that enters the measurement comes from the checkpoint, and a
+difference between the two is logged per iteration.
+
 Run::
 
     cd versions/v8 && python3 regap.py --config config.json
@@ -56,16 +65,26 @@ def regap_iteration(config, exp_dir, iteration, device, log):
     assert len(labels) == manifest["n_labels"], (
         f"{len(labels)} labels on disk, manifest says {manifest['n_labels']}")
 
-    train_cfg = config["agent_train"]
-    oracle_cfg = config["oracle"]
+    ckpt = torch.load(agent_path, map_location=device, weights_only=False)
+    run_config = ckpt.get("config") or config
+    for section, key in (("oracle", "temperature"), ("oracle", "divisor"),
+                         ("agent_train", "heldout_fraction"), (None, "seed")):
+        here = (config if section is None else config.get(section, {})).get(key)
+        then = (run_config if section is None
+                else run_config.get(section, {})).get(key)
+        if here != then:
+            log(f"[regap] iteration {iteration}: {section or ''}.{key} was "
+                f"{then!r} when the run measured it and is {here!r} in the "
+                f"config on disk now — measuring with {then!r}")
+
+    train_cfg = run_config["agent_train"]
+    oracle_cfg = run_config["oracle"]
     _train_idx, held_idx = split_heldout(
         len(labels), train_cfg.get("heldout_fraction", 0.0),
-        int(config.get("seed", 0)), iteration)
+        int(run_config.get("seed", 0)), iteration)
 
-    net = frozen_agent_net(
-        torch.load(agent_path, map_location=device,
-                   weights_only=False)["model_state_dict"],
-        config, config["game"], device)
+    net = frozen_agent_net(ckpt["model_state_dict"], run_config,
+                           run_config["game"], device)
     gap = oracle_gap(net, [labels[i] for i in held_idx],
                      float(oracle_cfg["temperature"]),
                      oracle_cfg.get("divisor", "pot_plus_bet"),

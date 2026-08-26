@@ -115,6 +115,10 @@ def _iteration_seed(seed, iteration):
 
 # --------------------------------------------------------------- the oracle gap
 
+#: What `gap_terms` reports and `oracle_gap` averages, in the order §8 lists it.
+GAP_KEYS = ("kl", "ev_agent", "ev_oracle", "q_best",
+            "ev_gap_target", "ev_gap_greedy", "agreement")
+
 
 def gap_terms(q_norm, pi_oracle, log_pi_agent, legal):
     """The four §8 numbers for one decision.
@@ -128,7 +132,10 @@ def gap_terms(q_norm, pi_oracle, log_pi_agent, legal):
             off `legal`, finite on it.
         legal: (n_actions,) bool.
 
-    Returns a dict with `kl`, `ev_gap_target`, `ev_gap_greedy`, `agreement`.
+    Returns a dict with `kl`, `ev_agent`, `ev_oracle`, `q_best`,
+    `ev_gap_target`, `ev_gap_greedy`, `agreement`. The two gaps are differences
+    of the three `ev_*`/`q_best` terms and those terms are reported alongside
+    them, because a gap that moved does not say which of its two sides moved.
     §8 defines all four and, importantly, what they are not: they are scored by
     the oracle's own noisy `Q` on hero's own state distribution, so none of them
     bounds anything about exploitability and the floor of the two gaps is G3's
@@ -152,6 +159,9 @@ def gap_terms(q_norm, pi_oracle, log_pi_agent, legal):
     best = float(q_norm[legal].max())
     return {
         "kl": kl,
+        "ev_agent": ev_agent,
+        "ev_oracle": ev_oracle,
+        "q_best": best,
         "ev_gap_target": ev_oracle - ev_agent,
         "ev_gap_greedy": best - ev_agent,
         "agreement": float(int(np.argmax(pi_a)) == int(np.argmax(pi_o))),
@@ -206,8 +216,7 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log):
     def summarise(subset):
         return {"n": len(subset),
                 **{k: float(np.mean([r[k] for r in subset]))
-                   for k in ("kl", "ev_gap_target", "ev_gap_greedy",
-                             "agreement")}}
+                   for k in GAP_KEYS}}
 
     def grouped(key):
         out = {}
@@ -226,7 +235,9 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log):
     }
     o = report["overall"]
     log(f"[{TAG}] oracle gap over {len(rows)} held-out labels: "
-        f"kl={o['kl']:.4f} ev_gap_target={o['ev_gap_target']:+.4f} "
+        f"kl={o['kl']:.4f} ev_agent={o['ev_agent']:+.4f} "
+        f"ev_oracle={o['ev_oracle']:+.4f} q_best={o['q_best']:+.4f} "
+        f"ev_gap_target={o['ev_gap_target']:+.4f} "
         f"ev_gap_greedy={o['ev_gap_greedy']:.4f} "
         f"agreement={o['agreement']:.3f}")
     return report

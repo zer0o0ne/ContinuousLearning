@@ -41,6 +41,7 @@ versions/v8/
   config_g3.json        the G3 sweep surface — samples × combos × table × stack × pool
   pipeline.py           the outer loop (§8) — labels, training, gap, pool growth   NEW
   eval_pipeline.py      Slumbot: cold and warm, BB/100 ± SE (§12)                  NEW
+  regap.py              re-runs phase D over iterations already on disk (§8)       NEW
   config.json           the experiment surface of a run and its evaluation (§8.1)  NEW
 
   env/                  poker engine, from v7, verbatim
@@ -1127,7 +1128,7 @@ the last two are new code:
 | A | embedding network | plays a corpus of pool self-play and runs §5.4 training over it, every `embedding_net.retrain_every` iterations | `embedding.pt` |
 | B | labels | `train/generate.py` — play, refresh the vectors, label hero's decisions | `labels/*.npz`, `labels.json` |
 | C | agent | `train/agent_train.py` over all but `agent_train.heldout_fraction` of them | `agent.pt` |
-| D | oracle gap | §8's four numbers on the held-out slice | `metrics.json` |
+| D | oracle gap | §8's seven numbers on the held-out slice | `metrics.json` |
 | E | close | PFSP results in, `result_decay` applied, the agent appended to the pool | `state.json` |
 
 **The agent's trunk is warm-started from phase A** (§6.1 OI-4, §5.6), at iteration 0 only, when
@@ -1167,13 +1168,26 @@ opponent.
 iteration *k*'s block starts at `len(pool₀) + k × agent_variants`. A row nobody occupies yet is a
 dead parameter at its initialisation, because no token carries its index.
 
-**The oracle gap** (`gap_terms`, `oracle_gap`) is §8's four numbers — `kl`, `ev_gap_target`,
-`ev_gap_greedy`, `agreement` — on the held-out slice, overall and grouped by table size and by
-stack depth. One agent forward per held-out decision and **no new rollouts**: the oracle's answer
+**The oracle gap** (`gap_terms`, `oracle_gap`) is §8's seven numbers — `kl`, `ev_agent`,
+`ev_oracle`, `q_best`, `ev_gap_target`, `ev_gap_greedy`, `agreement`, the `GAP_KEYS` tuple — on
+the held-out slice, overall and grouped by table size and by stack depth. The two gaps are
+differences of the three terms beside them (`ev_gap_target = ev_oracle − ev_agent`,
+`ev_gap_greedy = q_best − ev_agent`) and those terms are reported for that reason: a gap that
+moved does not say which of its sides moved. One agent forward per held-out decision and **no new rollouts**: the oracle's answer
 is already in the shard. What it answers is whether this iteration's training absorbed this
 iteration's labels; what it does not is anything about exploitability, and its floor is G3's
 Monte-Carlo error rather than zero. `heldout_fraction = 0` reports no gap at all rather than one
 measured on the data the optimiser just saw.
+
+**Phase D can be re-run after the fact** (`regap.py`). It is a `softmax` over the `q` in the
+label shards plus one batched agent forward, so an iteration whose `labels/` and `agent.pt` are
+still on disk can be re-measured without replaying a hand — which is how a metric added to
+`gap_terms` after a run reaches the iterations that ran before it. The held-out split is
+`split_heldout(n, fraction, seed, iteration)` and reads no running RNG, and the checkpoint is the
+one that iteration saved, so the recomputation reproduces the numbers the run wrote; every number
+already in `metrics.json` is asserted against its recomputed value, and a mismatch aborts rather
+than overwriting. It trains nothing and rewrites nothing but `metrics.json` and `report.json`'s
+metric list.
 
 **PFSP is fed from the hands the label phase already played.** `train/generate.py`'s manifest now
 carries hero's BB and hand count against every member it sat with, and phase E hands them to
@@ -1531,7 +1545,7 @@ account for most of the increase. The 30-minute budget from `CLAUDE.md` §4 is b
 | `test_pool_sampling.py` | Pool sampling: a fixed history and seed produce an exact sequence; results accumulate across sessions of different lengths into a mean and the mean into a weight, with a pool of no results and a pool of no spread both flat, and the **magnitude** of a loss — not its sign — moving the weight; a member hero beats the most is reached **only** through the floor — never at `floor_fraction = 0`, every draw uniform at 1; forgetting leaves an unsampled member's estimate exactly where it was and is what lets a member the early agents crushed climb back to the top PFSP weight at all — at `result_decay = 1` it is still winning after forty iterations, at 0.8 it crosses at the twelfth and at 0.5 at the fifth; a member nobody has played is drawn immediately; clustering recovers a hand-built structure and a ten-member blob of near-duplicates does not crowd out a lone style, while a duplicate pair splits one cluster's share; more clusters than members is no clustering; the state round-trips and reproduces the next draw, survives a pool that has since grown by one member and refuses one that has shrunk; and every table size 2–9 gets one member per non-hero seat |
 | `test_targets.py` | Targets, loss and the training cycle: a hand-computed softmax to `1e-12`; exact zeros off the mask and what sits under it never read; the two temperature limits reached in float, not approached; one legal action, equal EVs, no legal action, a `nan` under the mask; **the v7 scar** — two situations differing by a factor of 30 give the same target to `1e-12`, and without the divisor one is near-uniform while the other is near-deterministic; the KL is exactly zero on a match, positive off it, blind to illegal logits, and its gradient reaches the logits and not the target; **the linear loss** — the two losses share a minimiser, averaging the gradients at `Q ± ε` reproduces the gradient at `Q` to `1e-12` for `soft_q` and demonstrably not for `kl`, a constant added to every legal EV changes neither value nor gradient, illegal logits are ignored, a label off the mask is refused, and a toy run reaches its target; dropout at `p = 0` and `p = 1`, reproducible from its generator, and per hand per slot rather than per token; a toy run that reduces the loss, is deterministic, leaves the pool and the embeddings untouched and refuses a hand that is not a pending decision; and the cycle — the first iteration runs its own step count, a later one opens from the weights the previous one left, and three cycles in a row keep improving |
 
-| `test_pipeline.py` | The outer loop end to end at toy scale, including that **a crash in the middle of labelling costs a shard and not the phase** — re-running produces the artefacts an uninterrupted run would have left: two iterations run to completion and write every artefact of every phase; the pool grows by exactly `style.agent_variants` members per iteration, variant 0 unmodified and the rest style draws, with the embedding table reserving `len(pool₀) + max_iterations × agent_variants` rows; **iteration 0 seats the `agent_init` member and iteration 1 seats the agent**, asserted from who was actually asked for an action; the four §8 gap numbers computed by hand, including that `ev_gap_greedy` is zero exactly when the agent's mass sits on the oracle's best action; the held-out slice reaches the metric and never the optimiser, and `heldout_fraction = 0` reports **no gap** rather than one on training data; the split is a partition, deterministic in `(seed, iteration)` and different between iterations; **a run resumed from a crash in the middle of an iteration reproduces an uninterrupted one** — the same shards byte for byte, the same weights tensor for tensor, differing only in wall clocks; table size and stack depth span 2–9 and 10–300 BB with no weighting; and a past agent in the pool answers `hole_override` (two holdings, two answers, a posterior that moves off the prior) while observing only the moment it was asked about |
+| `test_pipeline.py` | The outer loop end to end at toy scale, including that **a crash in the middle of labelling costs a shard and not the phase** — re-running produces the artefacts an uninterrupted run would have left: two iterations run to completion and write every artefact of every phase; the pool grows by exactly `style.agent_variants` members per iteration, variant 0 unmodified and the rest style draws, with the embedding table reserving `len(pool₀) + max_iterations × agent_variants` rows; **iteration 0 seats the `agent_init` member and iteration 1 seats the agent**, asserted from who was actually asked for an action; the seven §8 gap numbers computed by hand, including that `ev_gap_greedy` is zero exactly when the agent's mass sits on the oracle's best action; the held-out slice reaches the metric and never the optimiser, and `heldout_fraction = 0` reports **no gap** rather than one on training data; the split is a partition, deterministic in `(seed, iteration)` and different between iterations; **a run resumed from a crash in the middle of an iteration reproduces an uninterrupted one** — the same shards byte for byte, the same weights tensor for tensor, differing only in wall clocks; table size and stack depth span 2–9 and 10–300 BB with no weighting; and a past agent in the pool answers `hole_override` (two holdings, two answers, a posterior that moves off the prior) while observing only the moment it was asked about |
 
 | `test_slumbot_adapter.py` | The Slumbot seam, entirely off canned action strings — no socket: the mask hero acts under **is `env.legal`'s** on every canned state and reaches the token unchanged, folding is offered facing the blind and refused with nothing to call, and an opponent's all-in leaves no raise; **the chips are Slumbot's and not the abstraction's** — a `b250` that lands on no bin of ours still reads as a 5 BB pot, and every canned state's pot, stack and amount-to-call match the wire to 1e-9; the two seat frames are mirrors, hero holds hero's cards, the first decision of a hand belongs to seat 0 and the first of the flop to seat 1; §9 parity on the built record — only hero's hole cards, a board never ahead of the token's street, no showdown token, the pending decision action-less, and a prefix independent of what came later; **index → wire → index round-trips for every legal action on all four streets with no clamp firing**, while a fold with nothing to call becomes a check, says so in the counter, and is read back as a call; hero's own clamped action is what the next replay sees, and `hero_action_indices` overrides hero's seat only; BB/100 and its standard error against hand-computed values, with Welford's online form agreeing and the zero- and one-hand cases returning zero; a table outside `players_range` / `stack_bb_range` is **refused, not clamped**; and end to end the agent answers every canned state with a legal token, deterministically under its own generator, cold from the zero table and warm from a fitted one, reaching the network through the ordinary `AgentPoolMember` and not a copy of it |
 

@@ -831,14 +831,21 @@ first cycle needs or starve it.
 Immediately after the agent of iteration *k* is trained, the loop reports how far its play is
 from the oracle's on a **held-out slice** of that iteration's own labels — `heldout_fraction` of
 them, withheld from training. This costs one agent forward per held-out decision and **no new
-rollouts**: the oracle's answer is already in the shard. Four numbers, all on the same slice:
+rollouts**: the oracle's answer is already in the shard. Seven numbers, all on the same slice:
 
 | | |
 |---|---|
+| `ev_agent` | `E_{a∼π_agent}[Q_norm]` — the agent's own valuation of the decisions it faced, by the oracle's `Q`. Not a gap and not comparable across iterations whose label distributions differ, but it is the term both gaps are measured *from*, and it is the one that says whether a shrinking gap means the agent improved or the oracle got easier to match |
+| `ev_oracle` | `E_{a∼π_oracle}[Q_norm]` — the same sum under the target, i.e. what the agent is being asked to reach |
+| `q_best` | `max_a Q_norm` over the legal actions — the ceiling the greedy gap is taken from |
 | `kl` | `KL(π_oracle ‖ π_agent)` — the training objective (§6.2) on data the agent did not see. Read against the training loss it is also the memorisation check |
 | `ev_gap_target` | `E_{a∼π_oracle}[Q_norm] − E_{a∼π_agent}[Q_norm]` — what the imperfect fit costs, in the §6.2 pot-normalised units, by the oracle's own valuation. Signed on purpose: negative means the agent is *greedier* than the target it was trained on, which is a different failure from being worse |
 | `ev_gap_greedy` | `max_a Q_norm − E_{a∼π_agent}[Q_norm]` — the classic policy-improvement gap, non-negative by construction. It cannot reach zero, because the target is a softmax and not an argmax; it is the number to watch across iterations, not to compare against zero |
 | `agreement` | fraction of decisions where `argmax π_agent = argmax π_oracle` — coarse, and the one a human reads |
+
+The last four are functions of the first three plus the two distributions, and all seven are
+reported because a gap is a difference: one that moved does not say which of its sides moved.
+`ev_agent`, `ev_oracle` and `q_best` are what disambiguate it.
 
 Broken down by table size and by stack depth, which is free — it is a grouping of the same
 numbers — and is where a failure of the `CLAUDE.md` §1 generalisation bet would show up first.

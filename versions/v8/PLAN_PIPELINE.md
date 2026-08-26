@@ -855,9 +855,12 @@ Iteration *n*:
 ```
 
 **The oracle gap (§8, owner decision 2026-08-19).** Every checkpoint is measured against the
-oracle that taught it, on the slice of that iteration's labels training never saw. Four numbers
-— `kl`, `ev_gap_target`, `ev_gap_greedy`, `agreement` — plus the same four broken down by table
-size and by stack depth, into `iter_<n>/metrics.json`. It costs one agent forward per held-out
+oracle that taught it, on the slice of that iteration's labels training never saw. Seven numbers
+— `kl`, `ev_agent`, `ev_oracle`, `q_best`, `ev_gap_target`, `ev_gap_greedy`, `agreement` (the
+`pipeline.GAP_KEYS` tuple) — plus the same seven broken down by table size and by stack depth,
+into `iter_<n>/metrics.json`. The two gaps are differences of the three terms reported beside
+them, which is why those terms are reported: a gap that moved does not say which of its sides
+moved. It costs one agent forward per held-out
 decision and **no new rollouts**: the oracle's answer is already in the shard, so this is a
 `softmax` over stored `q` and one batched forward, not a second labelling pass. `CONCEPT.md` §8
 carries the definitions and, importantly, what the number is *not* — it is scored by the oracle's
@@ -890,7 +893,7 @@ A 2-iteration toy pipeline on CPU, everything shrunk to seconds:
    inspecting who was queried, not by reading config.
 3b. The held-out labels reach the metric and never the optimiser: the gap is computed on
    decisions absent from every training batch, and a run with `heldout_fraction = 0` reports no
-   gap rather than a gap on training data. On a hand-built pair of distributions the four numbers
+   gap rather than a gap on training data. On a hand-built pair of distributions the seven numbers
    match values computed by hand, and `ev_gap_greedy` is zero exactly when the agent puts all its
    mass on the oracle's best action.
 3c. The pool grows by `style.agent_variants` members per iteration, each with its own embedding

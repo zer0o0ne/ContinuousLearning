@@ -129,8 +129,7 @@ def test_the_loop_runs_and_writes_every_artefact(tmp_path):
         assert m["iteration"] == k
         assert m["n_labels"] > 0
         assert m["gap"]["n_heldout"] > 0
-        assert set(m["gap"]["overall"]) == {
-            "n", "kl", "ev_gap_target", "ev_gap_greedy", "agreement"}
+        assert set(m["gap"]["overall"]) == {"n", *pipeline.GAP_KEYS}
         assert m["gap"]["by_table_size"] and m["gap"]["by_stack_bb"]
         assert 0.0 <= m["gap"]["overall"]["agreement"] <= 1.0
         assert m["gap"]["overall"]["ev_gap_greedy"] >= -1e-12
@@ -203,7 +202,7 @@ def test_iteration_zero_seats_agent_init_and_iteration_one_seats_the_agent(
 # --------------------------------------- 3b: the held-out slice and the gap
 
 
-def test_the_four_gap_numbers_are_the_ones_section_8_defines():
+def test_the_gap_numbers_are_the_ones_section_8_defines():
     """Hand-computed, exactly — the arithmetic is the whole contract."""
     legal = np.array([True, True, True, False])
     q_norm = np.array([1.0, 0.0, -1.0, 0.0])
@@ -217,8 +216,17 @@ def test_the_four_gap_numbers_are_the_ones_section_8_defines():
                     zip(pi_oracle[:3], pi_agent[:3]))
     assert terms["kl"] == pytest.approx(expect_kl, abs=1e-12)
     # ⟨π_o, Q⟩ = 0.5 − 0.2 = 0.3 ; ⟨π_a, Q⟩ = 0.25 − 0.5 = −0.25
+    assert terms["ev_agent"] == pytest.approx(-0.25, abs=1e-12)
+    assert terms["ev_oracle"] == pytest.approx(0.3, abs=1e-12)
+    # the best legal action, and not the illegal one that ties it at 0.0
+    assert terms["q_best"] == pytest.approx(1.0, abs=1e-12)
     assert terms["ev_gap_target"] == pytest.approx(0.55, abs=1e-12)
     assert terms["ev_gap_greedy"] == pytest.approx(1.25, abs=1e-12)
+    # the two gaps are differences of the three terms reported beside them
+    assert (terms["ev_gap_target"]
+            == pytest.approx(terms["ev_oracle"] - terms["ev_agent"], abs=1e-12))
+    assert (terms["ev_gap_greedy"]
+            == pytest.approx(terms["q_best"] - terms["ev_agent"], abs=1e-12))
     assert terms["agreement"] == 0.0
 
     # `ev_gap_greedy` is zero exactly when the agent puts all its mass on the

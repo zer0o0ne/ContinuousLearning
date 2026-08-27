@@ -48,18 +48,37 @@ whole cost — batch exactly as before.
 byte-identical files. `np.savez` stamps every zip entry with the wall clock,
 which would make reproducibility unverifiable by comparison.
 
-**Labelling resumes at the shard boundary.** It is the longest-running thing in
-the project — `CONCEPT.md` §13 budgets an iteration of it in days — so losing it
-whole to a crash in its middle is not an acceptable failure mode. Every flushed
-shard is followed by a `progress.json` naming how far down the decision list it
-got, and a second call with the same `out_dir` picks up from there. Two things
-make that safe rather than merely convenient: the decision list is a function of
-the sessions, which are a function of the seed, so a resumed run is labelling the
-same decisions in the same order; and every label draws from its own
+**Labelling resumes at the hand boundary, and re-plays only what it has to.**
+This is the longest-running thing in the project — `CONCEPT.md` §13 budgets an
+iteration of it in days — so losing it whole to a crash in its middle is not an
+acceptable failure mode. Three files make a resume possible:
+
+* `play.json` and `vectors.npz`, written once the corpus has been played: the
+  configuration of every session, hero's result against each member, and the
+  per-block embedding tables of §5.5. The tables are the whole reason a hand can
+  be re-played on its own — the vectors hero acts under in block *b* are the
+  ones fitted over blocks `0 … b−1`, and reading them off disk gives exactly
+  those vectors back without the hands that produced them.
+* `progress.json`, rewritten after every flushed shard: how many leading *hands*
+  are completely labelled. Hands and not decisions, because the hand is the unit
+  that gets re-played.
+
+A second call with the same `out_dir` therefore plays exactly the hands that are
+not labelled yet, and refits nothing at all. That is not an optimisation. A
+re-played hand is re-derived from the network and from the fits, and neither is
+bit-reproducible across processes on a GPU: one action flipped a few hundred
+hands in gives a *different* hand, and the shards already on disk then belong to
+a corpus that no longer exists — which is how a resume ends up splicing two
+label sets together, or falling over when the decision it is resuming at is not
+there any more. Playing only the unlabelled tail removes the question: a
+labelled hand is read back from its shard and never recomputed.
+
+What still has to agree is the frame around those hands. The sessions are a
+function of the seed and of the sampler; `play.json` records what they were, and
+a directory whose sessions are not this call's sessions is set aside rather than
+resumed into (`_set_aside`). Within a hand, every label draws from its own
 `(seed, session, hand, decision)` generator, so a label computed after a resume
-is bit-identical to the one that would have been computed without one. What a
-resume does re-do is the *playing* of the hands and the embedding fits — minutes
-against days, and the price of not storing a corpus of records on disk.
+is bit-identical to the one that would have been computed without one.
 """
 
 import io
@@ -84,6 +103,8 @@ from utils import progress
 TAG = "labels"
 HERO_SLOT = 0
 PROGRESS = "progress.json"
+PLAY = "play.json"
+VECTORS = "vectors.npz"
 
 
 class _ObservedHero(PoolMember):
@@ -325,19 +346,43 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                 rec[seat] if sos[seat] == HERO_SLOT else s.members[sos[seat]]
                 for seat in range(s.num_players)]
 
+    # What an earlier call to this phase left behind, read before a single hand
+    # is played: the corpus it played (`played`) and how far into the hands it
+    # got labelling (`done`). Both are `None` for a fresh directory, and for one
+    # that cannot be resumed into — which is set aside here, while setting it
+    # aside is still free.
+    os.makedirs(out_dir, exist_ok=True)
+    signature = _play_signature(sessions, seed_base, R, hands_per_session)
+    played, done = _resume_state(out_dir, signature, log)
+    first_hand = _first_hands(done, len(sessions), hands_per_session)
+
     saved_pool = driver.pool
     driver.pool = play_pool
     try:
-        block_vectors = _play_sessions(
-            driver, play_pool, sessions, hero_rec, agent_member, embed_net,
-            emb_cfg, weights, max_players, n_actions, R, device, cfg, log)
-        results = _results_by_member(sessions)
+        if played is None:
+            block_vectors = _play_sessions(
+                driver, play_pool, sessions, hero_rec, agent_member, embed_net,
+                emb_cfg, weights, max_players, n_actions, R, device, cfg, log)
+            results = _results_by_member(sessions)
+            n_hands = sum(len(s.records) for s in sessions)
+            _write_play(out_dir, signature, block_vectors, results, n_hands)
+        else:
+            # The hands already labelled are not re-played, so neither hero's
+            # results nor the hand count can be recomputed from the records
+            # this call holds — they are read back from the call that did play
+            # them, over the whole corpus (`_write_play`).
+            block_vectors, results, n_hands = played
+            _play_sessions(
+                driver, play_pool, sessions, hero_rec, agent_member, embed_net,
+                emb_cfg, weights, max_players, n_actions, R, device, cfg, log,
+                first_hand=first_hand, vectors=block_vectors)
         manifest = _label_sessions(
             driver, play_pool, sessions, hero_plain, hero_rec, block_vectors,
-            agent_member, ocfg, R, max_players, cfg, out_dir, log)
+            agent_member, ocfg, R, max_players, cfg, out_dir, done, log)
     finally:
         driver.pool = saved_pool
     manifest["results"] = results
+    manifest["n_hands"] = n_hands
     return manifest
 
 
@@ -374,23 +419,36 @@ def _results_by_member(sessions):
 
 def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                    embed_net, emb_cfg, weights, max_players, n_actions, R,
-                   device, cfg, log):
+                   device, cfg, log, first_hand=None, vectors=None):
     """Play every session in blocks of `R` hands, refitting between blocks.
 
     Returns, per session, the embedding table in force during each block. The
     table of block *b* is fitted over the hands of blocks `0 … b−1` and over
     nothing else, which is the property `tests/test_label_generation.py` pins.
+
+    A resumed call passes both `first_hand` — the first hand of each session
+    that still needs labelling — and `vectors`, the tables the earlier call
+    fitted. It then plays that tail and nothing else, and fits nothing: the
+    tables of block *b* are a function of the hands before it, so re-fitting
+    them from a corpus whose head is missing would be a different fit, and
+    re-playing the head to avoid that is the thing being avoided (module
+    docstring). `session.records` is padded with `None` up to `first_hand` so
+    that a hand keeps the index it was labelled under.
     """
     hands_per_session = int(cfg["hands_per_session"])
     n_blocks = (hands_per_session + R - 1) // R
     d_emb = embed_net.d_emb
-    block_vectors = [[_pad_vectors(np.zeros((0, d_emb)), max_players, d_emb)]
-                     for _ in sessions]
+    first_hand = ([0] * len(sessions) if first_hand is None
+                  else [int(f) for f in first_hand])
+    fitting = vectors is None
+    block_vectors = ([[_pad_vectors(np.zeros((0, d_emb)), max_players, d_emb)]
+                      for _ in sessions] if fitting else vectors)
 
     # The recorders are built once and keep their observations for the whole
     # job; a refresh swaps the member inside them, so nothing hero saw in an
     # earlier block is thrown away with the vectors that produced it.
-    for s, rec in zip(sessions, hero_rec):
+    for s, rec, start in zip(sessions, hero_rec, first_hand):
+        s.records = [None] * start
         for seat in range(s.num_players):
             play_pool[rec[seat]] = _ObservedHero(
                 None, _slot_of_seat_at(s.num_players, seat), max_players,
@@ -403,35 +461,41 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
     # the bar stands still and *says* what it is standing still for. The ETA
     # stays honest either way, because `smoothing=0` averages the fits into the
     # elapsed time they actually cost.
-    bar = progress(total=len(sessions) * hands_per_session, desc="play",
-                   unit="hand")
+    bar = progress(total=sum(hands_per_session - f for f in first_hand),
+                   desc="play", unit="hand")
     for b in range(n_blocks):
         lo, hi = b * R, min((b + 1) * R, hands_per_session)
-        for s, rec, vectors in zip(sessions, hero_rec, block_vectors):
+        blocks, played = [], []
+        for s, rec, start, vecs in zip(sessions, hero_rec, first_hand,
+                                       block_vectors):
+            if max(lo, start) >= hi:      # every hand of it is already labelled
+                continue
             for seat in range(s.num_players):
                 hero = play_pool[rec[seat]]
-                hero.inner = agent_member(seat, hero.slot_of_seat, vectors[b])
+                hero.inner = agent_member(seat, hero.slot_of_seat, vecs[b])
+            blocks.append(Session(idx=s.idx, num_players=s.num_players,
+                                  stack_bb=s.stack_bb, members=s.members,
+                                  specs=s.specs[max(lo, start):hi]))
+            played.append(s)
 
-        blocks = [Session(idx=s.idx, num_players=s.num_players,
-                          stack_bb=s.stack_bb, members=s.members,
-                          specs=s.specs[lo:hi]) for s in sessions]
-        play(driver, blocks, int(cfg["driver_batch_size"]), log,
-             f"{TAG}:block{b}", bar=False)
-        for s, blk in zip(sessions, blocks):
-            s.records.extend(blk.records)
-        bar.update(sum(len(blk.specs) for blk in blocks))
+        if blocks:
+            play(driver, blocks, int(cfg["driver_batch_size"]), log,
+                 f"{TAG}:block{b}", bar=False)
+            for s, blk in zip(played, blocks):
+                s.records.extend(blk.records)
+            bar.update(sum(len(blk.specs) for blk in blocks))
 
-        if b + 1 == n_blocks:
-            break
+        if b + 1 == n_blocks or not fitting:
+            continue
         every = max(1, len(sessions) // 50)   # ≤ 50 refreshes per refit round
-        for fitted_n, (s, vectors) in enumerate(zip(sessions, block_vectors), 1):
+        for fitted_n, (s, vectors_of) in enumerate(zip(sessions, block_vectors), 1):
             if fitted_n % every == 0 or fitted_n == len(sessions):
                 bar.set_postfix_str(
                     f"fit block {b + 1}: {fitted_n}/{len(sessions)} sessions",
                     refresh=True)
             observed = [t for t in s.tokens(max_players, n_actions) if len(t)]
             if not observed:
-                vectors.append(vectors[-1])
+                vectors_of.append(vectors_of[-1])
                 continue
             batch = collate(observed, device=device)
             fitted = fit_embeddings(
@@ -439,20 +503,30 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                 lr=emb_cfg["fit_lr"], reg=emb_cfg["fit_reg"],
                 init=embed_net.amortised_init(batch, s.num_players),
                 weights=weights)
-            vectors.append(_pad_vectors(fitted.cpu().numpy(), max_players,
-                                        d_emb))
+            vectors_of.append(_pad_vectors(fitted.cpu().numpy(), max_players,
+                                           d_emb))
         bar.set_postfix_str("", refresh=True)
     bar.close()
-    log(f"[{TAG}] played {sum(len(s.records) for s in sessions)} hands over "
-        f"{len(sessions)} sessions in {n_blocks} blocks of {R}")
+    n_played = sum(hands_per_session - f for f in first_hand)
+    log(f"[{TAG}] played {n_played} hands over {len(sessions)} sessions in "
+        f"{n_blocks} blocks of {R}"
+        + ("" if fitting else " (resumed: the labelled hands were not "
+                              "re-played and nothing was refitted)"))
     return block_vectors
 
 
 def _hero_decisions(sessions, hero_rec):
-    """Every decision hero took, as `(session, hand, decision_idx)`."""
+    """Every decision hero took, as `(session, hand, decision_idx)`.
+
+    Over the hands this call *played*: a resumed call holds `None` where an
+    already-labelled hand would be, and those are not decisions it has to label
+    again.
+    """
     out = []
     for i, (s, rec) in enumerate(zip(sessions, hero_rec)):
         for h, record in enumerate(s.records):
+            if record is None:
+                continue
             hero_seat = s.seat_of_slot(HERO_SLOT, h)
             for d, dec in enumerate(record.decisions):
                 if int(dec["acting_pos"]) == hero_seat:
@@ -460,45 +534,162 @@ def _hero_decisions(sessions, hero_rec):
     return out
 
 
-def _read_progress(out_dir, n_todo, seed_base, log):
-    """Where a previous call to this phase got to, if there was one.
+def _play_signature(sessions, seed_base, R, hands_per_session):
+    """What a played corpus has to agree with for its vectors to be reusable.
 
-    A progress file whose decision count does not match this call's is refused
-    rather than trusted: it means the sessions changed under it — a different
-    seed, a different session count — and resuming would splice two different
-    label sets into one directory. Missing shards are refused for the same
-    reason.
-
-    `seed_base` is refused for the same reason and catches the case the count
-    cannot: the phases' seed ranges are laid out end to end, so changing how
-    many hands the *corpus* takes moves where the labelled hands start
-    (`env/session.hand_seed_bases`). The decision count would be unchanged and
-    the resumed half of the directory would be a different set of hands.
+    Every table this phase sits hero at, and the two numbers that decide which
+    hands those tables play: the base their seeds are dealt from
+    (`env/session.hand_seed_bases` — it moves when a phase changes size) and the
+    refresh interval that cuts them into blocks. Two calls that agree on all of
+    it are playing the same sessions; a call that disagrees anywhere is playing
+    different hands, and its labels cannot be spliced onto the ones on disk.
     """
-    path = os.path.join(out_dir, PROGRESS)
-    if not os.path.exists(path):
+    return {
+        "seed_base": int(seed_base), "R": int(R),
+        "hands_per_session": int(hands_per_session),
+        "sessions": [{"idx": int(s.idx), "num_players": int(s.num_players),
+                      "stack_bb": int(s.stack_bb),
+                      "members": [int(m) for m in s.members]}
+                     for s in sessions],
+    }
+
+
+def _write_play(out_dir, signature, block_vectors, results, n_hands):
+    """The corpus a later call needs, once the hands have been played.
+
+    The vectors go to their own `.npz` because they are an array and the rest is
+    not; both are written before the first label, because a call that crashes in
+    the middle of labelling is exactly the call this is for.
+    """
+    _write_npz(os.path.join(out_dir, VECTORS),
+               {"vectors": np.stack([np.stack(v) for v in block_vectors])})
+    with open(os.path.join(out_dir, PLAY), "w") as fh:
+        json.dump({**signature, "n_hands": int(n_hands),
+                   "results": {str(k): v for k, v in results.items()}}, fh)
+
+
+def _set_aside(out_dir, why, log):
+    """Move a labels directory that cannot be resumed out of the way.
+
+    Refusing to splice two label sets is right; killing the run over it is not.
+    The stale directory is *renamed*, never deleted: its shards are real labels
+    that cost real time, and it is not this function's call to destroy them. The
+    name is derived, not timestamped, so the same failure lands in the same place
+    on a rerun.
+    """
+    for n in range(1000):
+        aside = f"{out_dir}.stale" + (f".{n}" if n else "")
+        if not os.path.exists(aside):
+            break
+    else:                                       # pragma: no cover - 1000 stales
+        raise AssertionError(f"{out_dir}: too many set-aside directories")
+    os.rename(out_dir, aside)
+    os.makedirs(out_dir, exist_ok=True)
+    log(f"[{TAG}] WARNING: cannot resume — {why}. The old directory is kept at "
+        f"{aside} and this phase starts from the first hand. Delete it once you "
+        f"are sure you do not want those labels.")
+
+
+def _read_json(path):
+    """`json.load`, or `None` if the file is missing or is not readable JSON."""
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (ValueError, OSError):
         return None
-    with open(path) as fh:
-        done = json.load(fh)
-    assert int(done["n_todo"]) == int(n_todo), (
-        f"{path} was written for {done['n_todo']} hero decisions and this "
-        f"phase has {n_todo} — the sessions are not the same sessions, so "
-        f"there is nothing to resume")
-    assert "seed_base" in done, (
-        f"{path} predates the seed layout of `env/session.hand_seed_bases` and "
-        f"cannot be checked against it. Its hands were dealt from a different "
-        f"range than this phase deals from, so resuming would splice two label "
-        f"sets; delete the directory and let the phase run from the start.")
-    assert int(done["seed_base"]) == int(seed_base), (
-        f"{path} was written for hands seeded from {done['seed_base']} and "
-        f"this phase deals from {seed_base} — the seed layout moved under it "
-        f"(a phase changed size), so these are different hands and resuming "
-        f"would splice two label sets")
-    missing = [p for p in done["shards"] if not os.path.exists(p)]
-    assert not missing, f"{path} names shards that are not on disk: {missing}"
-    log(f"[{TAG}] resuming after {done['todo_done']}/{n_todo} decisions "
-        f"({done['n_labels']} labels in {len(done['shards'])} shards)")
-    return done
+
+
+def _stale_reason(out_dir, signature, before, done, has_progress):
+    """Why this directory cannot be resumed into, or `None` if it can.
+
+    Everything here is a way for the labels on disk to belong to hands this call
+    is not going to play — which is the one failure a resume must never walk
+    into, because nothing downstream can see a corpus spliced out of two runs.
+    """
+    play_path = os.path.join(out_dir, PLAY)
+    if before is None:
+        return (f"{play_path} is not there or cannot be read, so the corpus "
+                f"those shards were labelled from is gone — its hands cannot "
+                f"be replayed and its embedding fits cannot be recovered")
+    for key, value in signature.items():
+        if before.get(key) != value:
+            return (f"{play_path} was written for a different phase: its "
+                    f"`{key}` is not this call's, so these are other sessions "
+                    f"playing other hands")
+    if not os.path.exists(os.path.join(out_dir, VECTORS)):
+        return (f"{play_path} is there but {VECTORS} is not, so the embedding "
+                f"tables hero acted under are gone")
+    if done is None:
+        if has_progress:
+            return (f"{os.path.join(out_dir, PROGRESS)} is there but cannot be "
+                    f"read, so how much of this corpus is labelled is unknown")
+        return None                    # played but never labelled: no shards yet
+    missing = [q for q in done.get("shards", []) if not os.path.exists(q)]
+    if missing:
+        return (f"{os.path.join(out_dir, PROGRESS)} names shards that are not "
+                f"on disk: {missing}")
+    n_hands = int(signature["hands_per_session"]) * len(signature["sessions"])
+    if not 0 <= int(done.get("hands_done", -1)) <= n_hands:
+        return (f"{os.path.join(out_dir, PROGRESS)} says "
+                f"{done.get('hands_done')} of {n_hands} hands are labelled, "
+                f"which is not a place this phase can resume at")
+    return None
+
+
+def _resume_state(out_dir, signature, log):
+    """`(played, done)` — the corpus of an earlier call and its label progress.
+
+    `played` is `(block_vectors, results, n_hands)` when the hands of an earlier
+    call can be picked up, and `None` when they cannot; `done` is the parsed
+    `progress.json` when there are labels to keep, and `None` when there are
+    none. A directory that cannot be resumed into is set aside and both come
+    back `None` — the one thing that must never happen is resuming into it, and
+    the one thing that need not happen is the run dying over it.
+    """
+    prog_path = os.path.join(out_dir, PROGRESS)
+    before = _read_json(os.path.join(out_dir, PLAY))
+    done = _read_json(prog_path)
+    if before is None and done is None and not os.path.exists(prog_path):
+        return None, None                                # a fresh directory
+
+    why = _stale_reason(out_dir, signature, before, done,
+                        os.path.exists(prog_path))
+    if why is not None:
+        _set_aside(out_dir, why, log)
+        return None, None
+
+    with np.load(os.path.join(out_dir, VECTORS)) as z:
+        vectors = z["vectors"]
+    n_blocks = -(-int(signature["hands_per_session"]) // int(signature["R"]))
+    assert vectors.shape[:2] == (len(signature["sessions"]), n_blocks), (
+        f"{os.path.join(out_dir, VECTORS)} holds {vectors.shape[:2]} embedding "
+        f"tables and this phase has {(len(signature['sessions']), n_blocks)} "
+        f"(session, block) pairs")
+    played = ([list(per_session) for per_session in vectors],
+              {int(k): v for k, v in before["results"].items()},
+              int(before["n_hands"]))
+    if done is None:
+        log(f"[{TAG}] the corpus of an earlier call is on disk and no hand of "
+            f"it is labelled yet: replaying every hand, refitting nothing")
+        return played, None
+    log(f"[{TAG}] resuming after {done['hands_done']}/"
+        f"{int(signature['hands_per_session']) * len(signature['sessions'])} "
+        f"hands ({done['n_labels']} labels in {len(done['shards'])} shards); "
+        f"the labelled hands are not replayed")
+    return played, done
+
+
+def _first_hands(done, n_sessions, hands_per_session):
+    """The first hand of each session that still needs labelling.
+
+    `hands_done` is a count of leading hands over the whole job, laid out
+    session by session in the order the labels were written, so it splits into
+    per-session cursors by division. Sessions before the cursor are labelled
+    whole and are not played at all.
+    """
+    frontier = int(done["hands_done"]) if done else 0
+    return [min(max(frontier - i * hands_per_session, 0), hands_per_session)
+            for i in range(n_sessions)]
 
 
 def label_chunks(todo, R, size):
@@ -547,7 +738,7 @@ def _label_requests(chunk, sessions, hero_plain, seed):
     return out
 
 
-def _label_in_parallel(n_workers, todo, start, consume, sessions, play_pool,
+def _label_in_parallel(n_workers, todo, consume, sessions, play_pool,
                        hero_plain, hero_rec, block_vectors, agent_member, ocfg,
                        R, cfg, driver, log, results=None):
     """The §3 layout: `n_workers` CPU processes, this process as the server.
@@ -571,16 +762,15 @@ def _label_in_parallel(n_workers, todo, start, consume, sessions, play_pool,
         mirror_pool, prototype, cfg["game"], _device_of(play_pool), log)
 
     procs, conns, slabs, result_q = spawn_workers(
-        n_workers, [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)
-                    if pos >= start], sessions, block_vectors, pool_spec,
-        hero_spec, hero_plain, hero_rec, runners, cfg["game"], ocfg,
-        int(cfg["seed"]), R, log)
+        n_workers, [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)],
+        sessions, block_vectors, pool_spec, hero_spec, hero_plain, hero_rec,
+        runners, cfg["game"], ocfg, int(cfg["seed"]), R, log)
     server = ForwardServer(runners, slabs, conns, procs, log)
     try:
-        done = collect(server, result_q, procs, todo, start, consume, log,
+        done = collect(server, result_q, procs, todo, 0, consume, log,
                        results=results)
         assert done == len(todo), (
-            f"the workers returned {done - start} of {len(todo) - start} labels")
+            f"the workers returned {done} of {len(todo)} labels")
     finally:
         join_workers(procs, log)
 
@@ -599,27 +789,30 @@ def _device_of(play_pool):
 
 def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                     block_vectors, agent_member, ocfg, R, max_players, cfg,
-                    out_dir, log):
+                    out_dir, done, log):
     """One oracle label per hero decision, sharded to disk.
+
+    `done` is the `progress.json` of an earlier call (`_resume_state`) or
+    `None`. Its hands are not in `sessions` — they were not played — so this
+    call labels the decisions it has and adds its counts to the ones it
+    inherited.
 
     The bar counts **hero decisions across the whole job** (`CLAUDE.md` §5):
     that is what the phase costs, and a bar per session would answer a question
-    nobody is asking. A resumed call advances the bar by what it is skipping, so
+    nobody is asking. A resumed call starts the bar at what it is skipping, so
     the bar still reaches its total and its ETA still means what it says.
     Playing the hands, above, has its own bar because it happens first and in a
     different unit; nothing is nested.
     """
     os.makedirs(out_dir, exist_ok=True)
+    hands_per_session = int(cfg["hands_per_session"])
+    n_hands = len(sessions) * hands_per_session
     todo = _hero_decisions(sessions, hero_rec)
     log(f"[{TAG}] {len(todo)} hero decisions to label")
 
-    # The base this phase's hands were dealt from; `_read_progress` refuses a
-    # directory written from a different one.
-    seed_base = hand_seed_bases(int(cfg["seed"]), phase_hands(cfg))[0]["labels"]
     per_shard = int(cfg["labels_per_shard"])
-    done = _read_progress(out_dir, len(todo), seed_base, log)
     shards = list(done["shards"]) if done else []
-    start = int(done["todo_done"]) if done else 0
+    decisions_done = int(done["decisions_done"]) if done else 0
     n_labels = int(done["n_labels"]) if done else 0
     dropped = int(done["n_dropped"]) if done else 0
     forwards = int(done["forwards"]) if done else 0
@@ -629,11 +822,25 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     collision_n = int(done["collision_n"]) if done else 0
     buffer = []
 
-    def flush(todo_done):
+    # Where each label sits in the job's hands, and which of them are the last
+    # decision of theirs. A shard is flushed **at a hand boundary and never
+    # inside one**: `progress.json` counts whole hands, because the hand is what
+    # a later call re-plays, and a shard cut in the middle of one would leave
+    # that hand's remaining decisions unlabelled with nothing on disk saying so.
+    hand_of = [i * hands_per_session + h for i, h, _d in todo]
+    ends_hand = [p + 1 == len(todo) or hand_of[p + 1] != hand_of[p]
+                 for p in range(len(todo))]
+    # The first hand that is *not* labelled once position `p` is written: the
+    # next label's hand, and the whole job when there is no next label. Hands in
+    # between hold no decision of hero's, so there is nothing there to label.
+    next_hand = [hand_of[p + 1] if p + 1 < len(todo) else n_hands
+                 for p in range(len(todo))]
+
+    def flush(hands, decisions):
         """A shard, then the note that says the shard is safely on disk.
 
         In this order and never the other: a progress file naming a shard that
-        was not written would make the next run skip labels nobody computed.
+        was not written would make the next run skip hands nobody labelled.
         """
         if buffer:
             path = os.path.join(out_dir, f"shard_{len(shards):04d}.npz")
@@ -641,8 +848,8 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             shards.append(path)
             buffer.clear()
         with open(os.path.join(out_dir, PROGRESS), "w") as fh:
-            json.dump({"n_todo": len(todo), "seed_base": int(seed_base),
-                       "todo_done": int(todo_done),
+            json.dump({"n_hands": int(n_hands), "hands_done": int(hands),
+                       "decisions_done": int(decisions),
                        "shards": shards, "n_labels": n_labels,
                        "n_dropped": dropped, "forwards": forwards,
                        "n_rollouts": rollouts, "seconds": seconds,
@@ -652,7 +859,8 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     # `initial` and not `bar.update(start)`: the skipped labels were done by an
     # earlier run and must not be counted as having taken this run's zero
     # seconds — see `utils.progress`.
-    bar = progress(total=len(todo), desc="label", unit="label", initial=start)
+    bar = progress(total=decisions_done + len(todo), desc="label",
+                   unit="label", initial=decisions_done)
 
     buffered = None
 
@@ -683,40 +891,39 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             bar.set_postfix_str(f"{buffered()} held for ordering",
                                 refresh=False)
 
-        if not np.isfinite(q[legal]).all():
+        if np.isfinite(q[legal]).all():
+            hero_seat = s.seat_of_slot(HERO_SLOT, h)
+            tokens = play_pool[hero_rec[i][hero_seat]].seen[(s.idx, h, d)]
+            _stack_bb, pot_bb, to_call_bb = (float(x) for x in
+                                             tokens.scalars[-1])
+            buffer.append({
+                "tokens": tokens, "q": q, "legal": legal,
+                "pot_bb": pot_bb, "facing_bet_bb": to_call_bb,
+                "embeddings": block_vectors[i][h // R],
+                "session": s.idx, "hand": h, "decision": d,
+                "num_players": s.num_players, "stack_bb": s.stack_bb,
+                "hero_seat": hero_seat,
+            })
+            n_labels += 1
+        else:
             # Every joint draw collided, so there is no EV to build a target
             # from (`oracle/rollout.py`). Dropping it is the honest outcome; the
             # count is in the manifest because a large one is a broken run.
             dropped += 1
-            return
-
-        hero_seat = s.seat_of_slot(HERO_SLOT, h)
-        tokens = play_pool[hero_rec[i][hero_seat]].seen[(s.idx, h, d)]
-        _stack_bb, pot_bb, to_call_bb = (float(x) for x in tokens.scalars[-1])
-        buffer.append({
-            "tokens": tokens, "q": q, "legal": legal,
-            "pot_bb": pot_bb, "facing_bet_bb": to_call_bb,
-            "embeddings": block_vectors[i][h // R],
-            "session": s.idx, "hand": h, "decision": d,
-            "num_players": s.num_players, "stack_bb": s.stack_bb,
-            "hero_seat": hero_seat,
-        })
-        n_labels += 1
-        if len(buffer) >= per_shard:
-            flush(pos + 1)
+        if len(buffer) >= per_shard and ends_hand[pos]:
+            flush(next_hand[pos], decisions_done + pos + 1)
 
     n_workers = worker_count(cfg)
-    if n_workers and start < len(todo):
+    if n_workers and todo:
         held = {}
         buffered = held.__len__
-        _label_in_parallel(n_workers, todo, start, consume, sessions,
+        _label_in_parallel(n_workers, todo, consume, sessions,
                            play_pool, hero_plain, hero_rec, block_vectors,
                            agent_member, ocfg, R, cfg, driver, log,
                            results=held)
     else:
         current = (None, None)
-        pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)
-                   if pos >= start]
+        pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)]
         for chunk in label_chunks(pending, R, ocfg.labels_per_batch):
             i, h = chunk[0][1], chunk[0][2]
             block = h // R
@@ -732,7 +939,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                 driver, play_pool, ocfg)
             for (pos, i, h, d), (q, legal, stats) in zip(chunk, answers):
                 consume(pos, i, h, d, q, legal, stats)
-    flush(len(todo))
+    flush(n_hands, decisions_done + len(todo))
     bar.close()
 
     stats = LabelStats(
@@ -743,5 +950,4 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         f"{stats.forwards} forwards, {stats.seconds:.1f}s of labelling, "
         f"collision rate {100 * stats.collision_rate:.1f}%")
     return {"shards": shards, "n_labels": n_labels, "n_dropped": dropped,
-            "n_hands": sum(len(s.records) for s in sessions),
             "n_sessions": len(sessions), "stats": stats}

@@ -19,6 +19,9 @@ What is *not* tested here is throughput, which is the whole point of the
 module and is a property of the Spark (`CLAUDE.md` §3).
 """
 
+import json
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -34,7 +37,9 @@ from pool.degenerate import DEGENERATE_STRATEGIES
 from pool.style import StyleParams
 from pool.v7_member import V7NetworkMember
 from tests.g1_fixtures import MAX_PLAYERS, N_ACTIONS, NET_CFG, make_pool
-from tests.test_label_generation import _cfg, _networks, _run
+import train.generate
+from tests.test_label_generation import (_cfg, _networks, _played_hands,
+                                            _run)
 from tests.test_v7_pool_member import V7_CONFIG
 from train.generate import load_shard
 from vendor.v7.agent import V7Agent, n_actions_from_config
@@ -134,6 +139,54 @@ def test_more_workers_than_sessions_still_labels_everything(tmp_path_factory):
                          cfg=_parallel_cfg(0, n_sessions=2, hands=4),
                          hero=_scripted_hero())
     assert len(labels) == len(expected) > 0
+
+
+def test_a_parallel_run_resumes_without_replaying_a_labelled_hand(
+        tmp_path_factory, monkeypatch):
+    """Resume, through the workers: the same label set, and no hand dealt twice.
+
+    The parallel path owns the ordering (`collect` releases labels in `todo`
+    order) and the sequential path owns the shard boundary, so "a shard ends at
+    a hand boundary" is a claim about both of them. The crash is forced on the
+    second shard's write, in the parent, because a worker is a separate process
+    and does not see a patched module.
+    """
+    cfg = _parallel_cfg(2, n_sessions=4, hands=6)
+    whole, labels = _run(tmp_path_factory.mktemp("whole"), cfg=cfg,
+                         hero=_scripted_hero())
+    assert len(whole["shards"]) >= 3, "the toy run must span several shards"
+
+    part = tmp_path_factory.mktemp("part")
+    real = train.generate._write_npz
+
+    def crash_on_the_second_shard(path, arrays):
+        if os.path.basename(path) == "shard_0001.npz":
+            raise RuntimeError("the box went away")
+        return real(path, arrays)
+
+    monkeypatch.setattr(train.generate, "_write_npz", crash_on_the_second_shard)
+    with pytest.raises(RuntimeError, match="the box went away"):
+        _run(part, cfg=cfg, hero=_scripted_hero())
+    monkeypatch.setattr(train.generate, "_write_npz", real)
+
+    done = json.loads((part / "progress.json").read_text())
+    assert 0 < done["hands_done"] < done["n_hands"]
+
+    played = _played_hands(monkeypatch)
+    resumed, resumed_labels = _run(part, cfg=cfg, hero=_scripted_hero())
+
+    assert sorted(played) == sorted(
+        (i, h) for i in range(4) for h in range(6)
+        if i * 6 + h >= int(done["hands_done"]))
+    assert resumed["n_labels"] == whole["n_labels"]
+    assert resumed["n_hands"] == whole["n_hands"]
+    assert [len(load_shard(q)) for q in resumed["shards"]] == \
+           [len(load_shard(q)) for q in whole["shards"]]
+    for a, b in zip(labels, resumed_labels):
+        assert (a["session"], a["hand"], a["decision"]) == (
+            b["session"], b["hand"], b["decision"])
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-999.0),
+                              np.nan_to_num(b["q"], nan=-999.0))
 
 
 # ------------------------------------------------- the networks, through IPC

@@ -14,6 +14,7 @@ is wrong:
 """
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -164,7 +165,19 @@ def test_a_toy_run_produces_usable_labels(tmp_path):
     assert manifest["n_labels"] == len(labels) > 0
     assert manifest["stats"].n_rollouts > 0
     assert 0.0 <= manifest["stats"].collision_rate <= 1.0
-    assert len(manifest["shards"]) == max(1, -(-len(labels) // 8))
+
+    # A shard is flushed once it is full *and* the hand it is in is finished,
+    # so it holds at least `labels_per_shard` labels rather than exactly that
+    # many, and no hand has its labels split across two of them. That is what
+    # makes `progress.json`'s hand count a place a later call can start from:
+    # the hands before it are labelled whole, in shards that are complete.
+    shards = [load_shard(path) for path in manifest["shards"]]
+    assert sum(len(sh) for sh in shards) == len(labels)
+    assert all(len(sh) >= 8 for sh in shards[:-1])
+    hands = [{(lab["session"], lab["hand"]) for lab in sh} for sh in shards]
+    for i, earlier in enumerate(hands):
+        for later in hands[i + 1:]:
+            assert earlier.isdisjoint(later), "a hand was split across shards"
 
     for lab in labels:
         legal = np.asarray(lab["legal"], dtype=bool)
@@ -345,7 +358,7 @@ def test_a_different_seed_writes_different_labels(tmp_path):
 def test_a_shard_round_trips(tmp_path):
     _manifest, labels = _run(tmp_path)
     reloaded = load_shard(str(tmp_path / "shard_0000.npz"))
-    assert len(reloaded) == min(8, len(labels))
+    assert 8 <= len(reloaded) <= len(labels)
     for got, want in zip(reloaded, labels):
         assert np.array_equal(got["q"], want["q"], equal_nan=True)
         assert np.array_equal(got["legal"], want["legal"])
@@ -406,7 +419,25 @@ def test_hero_is_slot_zero_and_the_sampler_supplies_the_opponents(tmp_path):
 # ------------------------------------------- 7: resuming a crashed phase
 
 
-def test_labelling_resumes_at_the_shard_boundary_and_loses_only_a_shard(
+def _played_hands(monkeypatch):
+    """Every hand the phase deals from here on, as `(session, hand)`.
+
+    The list fills as the phase plays; a resumed call is supposed to leave the
+    hands it has already labelled out of it entirely.
+    """
+    seen = []
+    real = train.generate.play
+
+    def spy(driver, sessions, batch_size, log, tag, bar=True):
+        seen.extend((int(s.idx), int(spec.meta["hand"]))
+                    for s in sessions for spec in s.specs)
+        return real(driver, sessions, batch_size, log, tag, bar=bar)
+
+    monkeypatch.setattr(train.generate, "play", spy)
+    return seen
+
+
+def test_labelling_resumes_at_the_hand_boundary_and_loses_only_a_shard(
         tmp_path, monkeypatch):
     """The phase is budgeted in days (§13); a crash must not cost all of it.
 
@@ -438,12 +469,14 @@ def test_labelling_resumes_at_the_shard_boundary_and_loses_only_a_shard(
     assert survived, "not even one shard survived the crash"
     assert len(survived) < len(whole["shards"]), "nothing was left to resume"
     progress = json.loads((part_dir / "progress.json").read_text())
-    assert progress["todo_done"] > 0
+    assert 0 < progress["hands_done"] < progress["n_hands"]
     assert len(progress["shards"]) == len(survived)
 
     resumed, resumed_labels = _run(part_dir, cfg=cfg)
     assert resumed["n_labels"] == whole["n_labels"]
     assert resumed["n_dropped"] == whole["n_dropped"]
+    assert resumed["n_hands"] == whole["n_hands"]
+    assert resumed["results"] == whole["results"]
     assert len(resumed["shards"]) == len(whole["shards"])
     for a, b in zip(sorted(whole["shards"]), sorted(resumed["shards"])):
         assert open(a, "rb").read() == open(b, "rb").read(), (a, b)
@@ -454,13 +487,137 @@ def test_labelling_resumes_at_the_shard_boundary_and_loses_only_a_shard(
             b["session"], b["hand"], b["decision"])
 
 
-def test_a_progress_file_from_different_sessions_is_refused(tmp_path):
-    """Resuming into a directory whose labels came from another run is a splice."""
-    _manifest, _labels = _run(tmp_path, cfg=_cfg(n_sessions=4, hands=6))
-    with pytest.raises(AssertionError, match="not the same sessions"):
-        _run(tmp_path, cfg=_cfg(n_sessions=3, hands=6))
+def test_a_resumed_call_plays_the_unlabelled_hands_and_no_others(
+        tmp_path, monkeypatch):
+    """The point of keeping the corpus: a labelled hand is never dealt again.
+
+    Not a saving — a correctness property. Re-playing a labelled hand means
+    re-deriving it from the network and the fits, which is not bit-reproducible
+    across processes on a GPU, and one flipped action makes the shards on disk
+    the labels of a corpus that no longer exists.
+    """
+    cfg = _cfg(n_sessions=4, hands=6)
+    out_dir = tmp_path / "part"
+    _crashed_run(out_dir, monkeypatch, cfg)
+    done = json.loads((out_dir / "progress.json").read_text())
+    frontier = int(done["hands_done"])
+    assert 0 < frontier < done["n_hands"], "the crash left nothing to resume"
+
+    played = _played_hands(monkeypatch)
+    _run(out_dir, cfg=cfg)
+
+    assert len(played) == len(set(played)), "a hand was dealt twice"
+    assert sorted(played) == sorted(
+        (i, h) for i in range(4) for h in range(6) if i * 6 + h >= frontier)
 
 
+def test_a_finished_directory_is_handed_back_without_playing_anything(
+        tmp_path, monkeypatch):
+    """The degenerate resume: every hand is labelled, so there is nothing to do.
+
+    It has to come back as the same manifest all the same — the results hero
+    owes §4.4's sampler and the hand count are read from the call that played
+    the corpus, because this call has no records to compute them from.
+    """
+    cfg = _cfg(n_sessions=4, hands=6)
+    out_dir = tmp_path / "labels"
+    whole, labels = _run(out_dir, cfg=cfg)
+
+    played = _played_hands(monkeypatch)
+    again, again_labels = _run(out_dir, cfg=cfg)
+
+    assert played == []
+    assert again["shards"] == whole["shards"]
+    assert again["n_labels"] == whole["n_labels"]
+    assert again["n_dropped"] == whole["n_dropped"]
+    assert again["n_hands"] == whole["n_hands"]
+    assert again["results"] == whole["results"]
+    for a, b in zip(labels, again_labels):
+        assert (a["session"], a["hand"], a["decision"]) == (
+            b["session"], b["hand"], b["decision"])
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-1.0),
+                              np.nan_to_num(b["q"], nan=-1.0))
+
+
+def test_a_resume_holds_when_the_corpus_no_longer_replays_the_same_way(
+        tmp_path, monkeypatch):
+    """The failure this design exists for, forced.
+
+    Hero plays the second call *differently* — the stand-in for a GPU that does
+    not reduce in the same order twice, or a fit that lands a hair off where it
+    landed before. Every hand from the frontier on therefore comes out unlike
+    the one the crashed call played. Nothing about the labels already on disk
+    may move: they are a prefix of the finished set, byte for byte, no decision
+    is labelled twice, and the hands stay in order across the join.
+    """
+    cfg = _cfg(n_sessions=4, hands=6)
+    out_dir = tmp_path / "part"
+    _crashed_run(out_dir, monkeypatch, cfg)
+    before = [lab for path in json.loads(
+        (out_dir / "progress.json").read_text())["shards"]
+        for lab in load_shard(path)]
+    assert before, "the crash left nothing to resume"
+
+    # Jamming from the first hand: not one replayed hand is the hand the
+    # crashed call played.
+    manifest, labels = _run(out_dir, cfg=cfg,
+                            wrap=lambda member: _JamFrom(member, 0))
+
+    keys = [(lab["session"], lab["hand"], lab["decision"]) for lab in labels]
+    assert len(keys) == len(set(keys)), "a decision was labelled twice"
+    assert keys == sorted(keys), "the labels are out of order across the join"
+    assert manifest["n_labels"] == len(labels) == len(keys)
+    for a, b in zip(before, labels):
+        assert (a["session"], a["hand"], a["decision"]) == (
+            b["session"], b["hand"], b["decision"])
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-1.0),
+                              np.nan_to_num(b["q"], nan=-1.0))
+        assert np.array_equal(a["tokens"].cards, b["tokens"].cards)
+
+    tail = labels[len(before):]
+    assert tail, "the resumed call labelled nothing"
+    assert min(lab["session"] * 6 + lab["hand"] for lab in tail) >= max(
+        lab["session"] * 6 + lab["hand"] for lab in before), (
+        "a hand was labelled on both sides of the join")
+
+
+def _assert_relabelled_from_scratch(out_dir, cfg, fresh_dir, stale_before):
+    """The phase set the directory aside and produced a from-scratch label set.
+
+    Two halves, and both matter: the old directory is still there under
+    `.stale` (its shards cost hours and are not this code's to delete), and what
+    the phase wrote is bit-for-bit what a run into an empty directory writes —
+    nothing of the old set was spliced into it.
+    """
+    aside = out_dir.parent / (out_dir.name + ".stale")
+    assert json.loads((aside / "progress.json").read_text()) == stale_before
+
+    manifest = json.loads((out_dir / "progress.json").read_text())
+    assert manifest["hands_done"] == manifest["n_hands"]
+    labels = [lab for path in sorted(manifest["shards"])
+              for lab in load_shard(path)]
+    fresh, fresh_labels = _run(fresh_dir, cfg=cfg)
+    assert manifest["n_labels"] == fresh["n_labels"]
+    assert len(manifest["shards"]) == len(fresh["shards"])
+    for a, b in zip(labels, fresh_labels):
+        assert (a["session"], a["hand"], a["decision"]) == (
+            b["session"], b["hand"], b["decision"])
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-1.0),
+                              np.nan_to_num(b["q"], nan=-1.0))
+
+
+def test_a_directory_from_different_sessions_is_set_aside_and_relabelled(
+        tmp_path):
+    """Resuming into a directory whose labels came from another run would be a
+    splice. The sessions are named in `play.json`, so it is caught before a hand
+    is played: the old directory moves aside and this call labels its own."""
+    out_dir = tmp_path / "labels"
+    _run(out_dir, cfg=_cfg(n_sessions=4, hands=6))
+    stale = json.loads((out_dir / "progress.json").read_text())
+
+    cfg = _cfg(n_sessions=3, hands=6)
+    _run(out_dir, cfg=cfg)
+    _assert_relabelled_from_scratch(out_dir, cfg, tmp_path / "fresh", stale)
 def test_a_resumed_run_does_not_count_the_skipped_labels_as_this_runs_work(
         tmp_path, monkeypatch):
     """The bar's rate is `(n - initial) / elapsed` (`utils.progress`).
@@ -486,7 +643,8 @@ def test_a_resumed_run_does_not_count_the_skipped_labels_as_this_runs_work(
         _run(tmp_path, cfg=cfg)
     monkeypatch.setattr(train.generate, "action_values_batch", real)
 
-    done = json.loads((tmp_path / "progress.json").read_text())["todo_done"]
+    done = json.loads(
+        (tmp_path / "progress.json").read_text())["decisions_done"]
     assert done > 0, "the crash must leave something to resume from"
 
     seen = {}
@@ -584,32 +742,54 @@ def _crashed_run(tmp_path, monkeypatch, cfg, after=12):
     return tmp_path / "progress.json"
 
 
-def test_resuming_after_the_seed_layout_moved_is_refused(tmp_path, monkeypatch):
+def test_resuming_after_the_seed_layout_moved_starts_over(tmp_path, monkeypatch):
     """The phases' ranges are laid end to end, so changing how many hands the
     *corpus* takes moves where the labelled hands start. The recorded base is
-    what catches it; the hands themselves would just quietly be other hands."""
+    what catches it; the hands themselves would just quietly be other hands.
+    Caught, it is the same outcome as any other stale directory: aside, and
+    label again."""
     cfg = _cfg(n_sessions=4, hands=6)
-    path = _crashed_run(tmp_path, monkeypatch, cfg)
+    out_dir = tmp_path / "labels"
+    path = _crashed_run(out_dir, monkeypatch, cfg)
+    stale = json.loads(path.read_text())
 
-    done = json.loads(path.read_text())
-    done["seed_base"] = int(done["seed_base"]) + 1
-    path.write_text(json.dumps(done))
+    play_path = out_dir / "play.json"
+    played = json.loads(play_path.read_text())
+    played["seed_base"] = int(played["seed_base"]) + 1
+    play_path.write_text(json.dumps(played))
 
-    with pytest.raises(AssertionError, match="seed layout moved"):
-        _run(tmp_path, cfg=cfg)
+    _run(out_dir, cfg=cfg)
+    _assert_relabelled_from_scratch(out_dir, cfg, tmp_path / "fresh", stale)
 
 
-def test_a_progress_file_from_before_the_layout_is_refused(tmp_path,
+def test_a_directory_whose_corpus_was_not_kept_starts_over(tmp_path,
                                                            monkeypatch):
-    """The directories already on disk when the layout changed. Their hands came
-    from the old fixed 500 000-per-phase reservation, so they cannot be resumed
-    into the new one — and nothing in them says so except the missing field."""
+    """The directories already on disk when the corpus started being kept, and
+    any directory whose `play.json` is gone. Their hands cannot be replayed and
+    their fits cannot be recovered, so their shards cannot be resumed into —
+    and nothing in them says which hands they are."""
     cfg = _cfg(n_sessions=4, hands=6)
-    path = _crashed_run(tmp_path, monkeypatch, cfg)
+    out_dir = tmp_path / "labels"
+    path = _crashed_run(out_dir, monkeypatch, cfg)
+    stale = json.loads(path.read_text())
 
-    done = json.loads(path.read_text())
-    del done["seed_base"]
-    path.write_text(json.dumps(done))
+    os.remove(out_dir / "play.json")
 
-    with pytest.raises(AssertionError, match="predates the seed layout"):
-        _run(tmp_path, cfg=cfg)
+    _run(out_dir, cfg=cfg)
+    _assert_relabelled_from_scratch(out_dir, cfg, tmp_path / "fresh", stale)
+
+
+def test_a_second_stale_directory_does_not_overwrite_the_first(tmp_path,
+                                                               monkeypatch):
+    """Set-aside names are derived and not timestamped, so two failures in the
+    same place must not land on the same name — the first one's labels would be
+    gone, which is the thing setting them aside was for."""
+    out_dir = tmp_path / "labels"
+    _run(out_dir, cfg=_cfg(n_sessions=4, hands=6))
+    _run(out_dir, cfg=_cfg(n_sessions=3, hands=6))
+    _run(out_dir, cfg=_cfg(n_sessions=2, hands=6))
+
+    first = json.loads((tmp_path / "labels.stale" / "progress.json").read_text())
+    second = json.loads(
+        (tmp_path / "labels.stale.1" / "progress.json").read_text())
+    assert first["n_hands"] != second["n_hands"]

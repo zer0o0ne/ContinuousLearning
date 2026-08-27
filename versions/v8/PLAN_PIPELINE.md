@@ -132,9 +132,17 @@ reportable one. `ARCHITECTURE.md` §5 lists what that leaves unverified.
 
 * **`./run.sh --version=v8` resumes.** It already did at the phase boundary; labelling — the phase
   budgeted in days — now also writes `labels/progress.json` after every flushed shard, so a crash
-  in its middle costs one shard instead of the phase. A mid-labelling resume re-plays the
-  iteration's hands and refits the embeddings (minutes against days) because no corpus of records
-  is kept on disk. `ARCHITECTURE.md` §2.10, §2.11.
+  in its middle costs one shard instead of the phase. `ARCHITECTURE.md` §2.10, §2.11.
+
+  *Amended 2026-08-27, after the first mid-labelling resume on the Spark fell over.* The resume
+  as first written re-played the iteration's hands and refitted the embeddings (minutes against
+  days) because no corpus of records was kept on disk. That is only sound if the replay is the
+  same play, and on a GPU it is not: the hands came back different and the resumed run had no
+  decision where its `progress.json` said to carry on. Phase B now keeps what it needs —
+  `labels/play.json` and `labels/vectors.npz`, the sessions, hero's results and the §5.5 table of
+  every `(session, block)` — and a resumed call **plays exactly the hands that are not labelled
+  yet and refits nothing.** `progress.json` counts whole hands and a shard is cut at a hand
+  boundary, because the hand is the unit that gets replayed.
 * **The Slumbot run is multiprocess**, `evaluation.n_workers`, as v7's was and for the same
   reason: a hand is an HTTP round trip, and threads lose to the GIL and a single CUDA stream on
   batch-of-one forwards. Each worker is a *session* — its own table, its own §5.5 fit, its own

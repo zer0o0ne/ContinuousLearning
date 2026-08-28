@@ -94,6 +94,7 @@ from env.session import (Session, build_sessions, hand_seed_bases,
 from nets.embedding_net import fit_embeddings, loss_weights
 from oracle.parallel import (ForwardServer, collect, join_workers,
                              runner_table, spawn_workers, worker_count)
+from oracle.posterior import PosteriorCache
 from nets.features import HandTokens, collate, hand_tokens
 from oracle.rollout import (LabelStats, OracleConfig,
                             action_values_batch)
@@ -923,6 +924,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                            results=held)
     else:
         current = (None, None)
+        posterior_cache = PosteriorCache()
         pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)]
         for chunk in label_chunks(pending, R, ocfg.labels_per_batch):
             i, h = chunk[0][1], chunk[0][2]
@@ -936,7 +938,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                            block_vectors[i], block, agent_member)
             answers = action_values_batch(
                 _label_requests(chunk, sessions, hero_plain, cfg["seed"]),
-                driver, play_pool, ocfg)
+                driver, play_pool, ocfg, posterior_cache=posterior_cache)
             for (pos, i, h, d), (q, legal, stats) in zip(chunk, answers):
                 consume(pos, i, h, d, q, legal, stats)
     flush(n_hands, decisions_done + len(todo))

@@ -53,7 +53,8 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from oracle.posterior import _visible_board, opponent_posterior
+from oracle.posterior import (PosteriorCache, _visible_board,
+                              opponent_posterior)
 
 FOLD = 0
 N_CARDS = 52
@@ -168,7 +169,8 @@ def _sample_joint(posteriors, dead_mask, n_samples, max_retries, rng):
     return cards, attempts, attempts - len(cards)
 
 
-def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng):
+def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng,
+                posterior_cache=None):
     """Build one label's rollouts without playing them.
 
     Returns a `_LabelPlan`; `action_values` plays it and `_label_q` reduces it
@@ -190,6 +192,9 @@ def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng):
             At iteration 0 a v7 member, from iteration 1 the agent (§7.1).
         cfg: an `OracleConfig`.
         rng: `np.random.Generator` for the combo subsample and the joint draw.
+        posterior_cache: optional `PosteriorCache` shared by consecutive labels
+            of the same hand.  It changes only how repeated prefix likelihoods
+            are computed, not the posterior or rollout samples.
     """
     started = time.perf_counter()
     n_dec = len(record.decisions)
@@ -212,13 +217,22 @@ def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng):
     forwards = 0
     posteriors = []
     for seat in opp_seats:
-        combos, weights = opponent_posterior(
-            record, seat, hero_pos, pool, n_actions,
-            through_decision=decision_idx - 1, floor=cfg.likelihood_floor,
-            max_combos=cfg.max_combos, rng=rng)
-        acted = sum(1 for d in record.decisions[:decision_idx]
-                    if int(d["acting_pos"]) == seat)
-        forwards += len(combos) * acted
+        if posterior_cache is None:
+            combos, weights = opponent_posterior(
+                record, seat, hero_pos, pool, n_actions,
+                through_decision=decision_idx - 1,
+                floor=cfg.likelihood_floor,
+                max_combos=cfg.max_combos, rng=rng)
+            acted = sum(1 for d in record.decisions[:decision_idx]
+                        if int(d["acting_pos"]) == seat)
+            forwards += len(combos) * acted
+        else:
+            combos, weights, rows = posterior_cache.posterior(
+                record, seat, hero_pos, pool, n_actions,
+                through_decision=decision_idx - 1,
+                floor=cfg.likelihood_floor,
+                max_combos=cfg.max_combos, rng=rng)
+            forwards += rows
         posteriors.append((combos, weights))
 
     # Hero's information and no more: the board hero can see at this decision
@@ -299,20 +313,23 @@ def _label_q(plan, played, seconds):
     return q, plan.legal, stats
 
 
-def action_values(record, decision_idx, driver, pool, hero_member_idx, cfg, rng):
+def action_values(record, decision_idx, driver, pool, hero_member_idx, cfg, rng,
+                  posterior_cache=None):
     """Q for every legal action at one decision. See `_label_plan` for the args."""
     plan = _label_plan(record, decision_idx, driver, pool, hero_member_idx,
-                       cfg, rng)
+                       cfg, rng, posterior_cache=posterior_cache)
     started = time.perf_counter()
     played = driver.run(plan.specs, batch_size=cfg.batch_hands)
     return _label_q(plan, played, plan.prepared + time.perf_counter() - started)
 
 
-def action_values_batch(requests, driver, pool, cfg):
+def action_values_batch(requests, driver, pool, cfg, posterior_cache=None):
     """Label several decisions through **one** `driver.run` (§7.1).
 
     `requests` is a list of `(record, decision_idx, hero_member_idx, rng)`, and
     the result is one `(q, legal, stats)` per request, in the same order.
+    `posterior_cache`, when supplied, carries exact prefix ranges across batch
+    boundaries; otherwise a cache local to this batch is used.
 
     **This changes what a label costs, not what it is.** Every rollout hand
     keeps its own deck and its own `_rollout_seed`, and the driver samples each
@@ -334,8 +351,13 @@ def action_values_batch(requests, driver, pool, cfg):
     split by how many hands it contributed; the total over a batch is the batch's
     wall clock.
     """
+    # A local cache benefits labels of the same hand inside this batch.  The
+    # generation pipeline passes a longer-lived instance as well, so a hand
+    # split across label chunks still reuses its previous prefixes.
+    if posterior_cache is None:
+        posterior_cache = PosteriorCache()
     plans = [_label_plan(record, decision_idx, driver, pool, hero_member_idx,
-                         cfg, rng)
+                         cfg, rng, posterior_cache=posterior_cache)
              for record, decision_idx, hero_member_idx, rng in requests]
     specs = [spec for plan in plans for spec in plan.specs]
 

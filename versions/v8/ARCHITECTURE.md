@@ -231,6 +231,16 @@ range needs a larger `m` than v5's mode-seeking draw would. `test_posterior.py` 
 sides of that trade — the mass on pocket pairs in a fixture whose true value is 0.488 comes back
 at 0.491 over 200 seeds at `m = 128`, where v5's scheme returns 0.89.
 
+**The exact path is incremental across a hand.** `PosteriorCache` keeps the last range for each
+live opponent while consecutive hero decisions of one record are labelled. When the board grows,
+it removes combos containing the newly visible cards; then it multiplies only likelihoods of
+opponent actions after the cached prefix. This is Bayes filtering, not an approximation: a test
+compares every cached prefix with a fresh full computation, including all street transitions.
+The cache owns only the current record, so memory is bounded by one range per live opponent, and
+`LabelStats.forwards` counts only policy rows actually evaluated. It is disabled whenever
+`max_combos` is set, because that mode deliberately draws a new per-label prior subsample and
+reusing one would change both the estimator and the label RNG stream.
+
 Only *one* opponent's marginal lives here. §7.3's approximation of the joint by independent
 marginals with a card-removal correction belongs where the joint sample is drawn (the oracle),
 so the exact part stays untangled from the approximate one.
@@ -309,8 +319,8 @@ fewer cards are dead.) So `max_collision_retries` is not a formality at a full r
 label is roughly `1 / P(accept)` draws per usable sample. This is a CPU measurement of the
 sampler, not of the GPU cost — G3 (S4) is what measures the label.
 
-**Not built here** (S3's non-goals): variant C, value bootstrapping, caching a posterior across
-the hero decisions of one hand, and dataset writing (S7).
+**Not built here** (S3's non-goals): variant C and value bootstrapping. Dataset writing belongs
+to S7. The originally deferred posterior cache is now implemented in §2.2b.
 
 ### 2.3 `pool/` — entity 2
 
@@ -1548,7 +1558,7 @@ account for most of the increase. The 30-minute budget from `CLAUDE.md` §4 is b
 | `test_solver_value_bet.py` | Solver value-bet pot construction (from v7) |
 | `test_driver_lockstep.py` | **Lock-step ≡ sequential** (also with a pinned deck and a forced prefix), chip conservation through the driver, the v7 snapshot convention, the max-actions cap, every table size and stack depth, and the legality rule's corner cases |
 | `test_rollout_plumbing.py` | **Replay identity**: a recorded hand replayed from its own deck and action sequence reproduces itself element for element, at every table size and both stack extremes; a forced replay issues zero policy calls; the deck override deals exactly what was asked and is refused if it is not a permutation; a partial prefix is replayed and the rest runs free with chips conserved; an illegal forced action raises naming the seat and the mask; the pending token adds exactly one action-less token, leaves every earlier token bit-identical, shows only the observer's cards, and is refused together with a showdown |
-| `test_posterior.py` | The opponent posterior: a hand-computed two-decision example to `1e-12`; one batched policy call per opponent decision; card removal relative to the observer (`C(45, 2)` on the river, the opponent's real holding still in the universe); every prefix length normalised; **a card-independent member leaves the prior exactly alone** and a card-dependent one does not; the posterior through *k* is bit-identical on a record truncated at *k*; an opponent who has not acted is the prior; a zero likelihood warns and falls back instead of returning NaN; `max_combos` caps, renormalises and is seeded, is spent **before** any member is asked (32-row batches, not 1081), draws the same combos under two different posteriors, reproduces the full posterior restricted to its draw, and recovers a functional of the full posterior to 0.02 over 200 seeds; `hole_override` changes the cards and nothing else |
+| `test_posterior.py` | The opponent posterior: a hand-computed two-decision example to `1e-12`; one batched policy call per opponent decision; **consecutive hero decisions reuse each opponent action once**, match a fresh posterior through street transitions, and report fewer actual rows; card removal relative to the observer (`C(45, 2)` on the river, the opponent's real holding still in the universe); every prefix length normalised; **a card-independent member leaves the prior exactly alone** and a card-dependent one does not; the posterior through *k* is bit-identical on a record truncated at *k*; an opponent who has not acted is the prior; a zero likelihood warns and falls back instead of returning NaN; `max_combos` caps, renormalises and is seeded, deliberately bypasses the cache, is spent **before** any member is asked (32-row batches, not 1081), draws the same combos under two different posteriors, reproduces the full posterior restricted to its draw, and recovers a functional of the full posterior to 0.02 over 200 seeds; `hole_override` changes the cards and nothing else |
 | `test_oracle.py` | The BR oracle, every case exact rather than within a Monte-Carlo tolerance: `q[FOLD]` equals hero's own contribution to `1e-12` at every table size 2–9 and both stack extremes; `Q` equals an enumerated posterior-weighted sum on a fixture where hero's payoff is constant on the range's support and different off it; **hero is never handed a card it could not see** over ~900 rollout queries; every rollout conserves chips; illegal actions carry `nan` and the mask is the recorded one; the same seed gives a bit-identical label; the label is unchanged when the record is truncated at the labelled decision; **the runout is dealt per sample and the visible board is not** — every rollout replays the flop, the turn and river differ between samples, and no opponent is ever handed a card off the visible board or out of hero's hand; eight ranges inside three cards make every joint draw collide by pigeonhole and the label is `nan`; a heads-up river decision cannot collide; dropped samples reduce the divisor instead of counting as zeros; the forward count is a hand count |
 | `test_observation_parity.py` | **The fatal invariant**: only the observer's hole cards, board never ahead of the street, no token carries its own action, scalars from the pre-decision snapshot, prefixes independent of what came later |
 | `test_embedding_net_masking.py` | Causal within a hand, block-diagonal across hands, hand order irrelevant, the embedding is what changes the prediction, padding inert, **a showdown token cannot reach back into any decision**, the action loss ignores showdown tokens, both showdown heads reach the embedding, zero weights reduce the objective to action CE |

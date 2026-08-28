@@ -451,9 +451,9 @@ below is exact, none asserts "within a Monte-Carlo tolerance".
 Tests 1, 2, 3 and 7 pass exactly. `LabelStats` is populated — S4 reads it and nothing else.
 
 ### Non-goals
-No variant C, no value bootstrapping, no caching of posteriors across hero decisions in one hand
-(that is an optimisation S4 may justify, and §7.2 notes the posterior is amortisable — but
-measure first). No dataset writing; that is S7.
+No variant C and no value bootstrapping. No dataset writing; that is S7. Posterior caching was
+deferred from S3 until measurement; it is now implemented for the exact (`max_combos=None`) path,
+with stochastic capped ranges deliberately retaining their independent per-label subsamples.
 
 ---
 

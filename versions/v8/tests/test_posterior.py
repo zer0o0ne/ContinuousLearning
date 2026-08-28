@@ -19,7 +19,8 @@ import numpy as np
 import pytest
 
 from env.driver import DecisionContext, HandSpec, LockstepDriver
-from oracle.posterior import combo_universe, opponent_posterior
+from oracle.posterior import (PosteriorCache, combo_universe,
+                              opponent_posterior)
 from pool.base import PoolMember
 from pool.degenerate import DEGENERATE_STRATEGIES
 from pool.style import StyleParams
@@ -165,6 +166,81 @@ def test_each_opponent_decision_costs_exactly_one_batched_policy_call():
                                     through_decision=k)
 
     assert pool.calls == [len(combos), len(combos)]
+
+
+def test_consecutive_hero_decisions_reuse_the_opponents_prefix_likelihoods():
+    """The cache asks about every opponent action once, not once per label.
+
+    Fresh and cached answers are compared at every hero decision, including
+    decisions after new board cards appear.  The latter pins the less obvious
+    part of the optimisation: restricting the cached universe by card removal
+    is the same posterior as recomputing every old action on the new street.
+    """
+    inner = PairRaiser("pair_raiser", N_ACTIONS, StyleParams.identity())
+    record = _play([inner], forced=[CALL] * 7)
+    hero, opp = 0, 1
+    hero_decisions = _played_by(record, hero)
+    assert len(hero_decisions) >= 3, (
+        "the pinned hand must give hero several labels to share a cache")
+
+    fresh_pool = CountingPool([
+        PairRaiser("fresh", N_ACTIONS, StyleParams.identity())])
+    cached_pool = CountingPool([
+        PairRaiser("cached", N_ACTIONS, StyleParams.identity())])
+    cache = PosteriorCache()
+    fresh_rows = cached_rows = 0
+    combo_counts = []
+
+    for decision_idx in hero_decisions:
+        through = decision_idx - 1
+        fresh_c, fresh_w = opponent_posterior(
+            record, opp, hero, fresh_pool, N_ACTIONS,
+            through_decision=through)
+        cached_c, cached_w, rows = cache.posterior(
+            record, opp, hero, cached_pool, N_ACTIONS,
+            through_decision=through)
+
+        assert np.array_equal(cached_c, fresh_c)
+        np.testing.assert_allclose(cached_w, fresh_w, rtol=0.0, atol=1e-15)
+        acted = sum(1 for d in record.decisions[:decision_idx]
+                    if int(d["acting_pos"]) == opp)
+        fresh_rows += len(fresh_c) * acted
+        cached_rows += rows
+        combo_counts.append(len(cached_c))
+
+    assert len(cached_pool.calls) == sum(
+        int(record.decisions[t]["acting_pos"]) == opp
+        for t in range(hero_decisions[-1]))
+    assert cached_rows < fresh_rows
+    assert len(set(combo_counts)) > 1, (
+        "the fixture must cross a street so newly visible cards are removed")
+
+
+def test_a_capped_posterior_deliberately_bypasses_the_cache():
+    """Independent per-label prior subsamples must keep their RNG semantics."""
+    pool = CountingPool([
+        PairRaiser("pair_raiser", N_ACTIONS, StyleParams.identity())])
+    record = _play(pool, forced=[CALL] * 4)
+    hero, opp = 0, 1
+    decisions = _played_by(record, hero)
+    assert len(decisions) >= 2
+    cache = PosteriorCache()
+
+    answers = []
+    for decision_idx in decisions[:2]:
+        answers.append(cache.posterior(
+            record, opp, hero, pool, N_ACTIONS,
+            through_decision=decision_idx - 1, max_combos=32,
+            rng=np.random.default_rng(decision_idx)))
+
+    # Each answer is still independently capped, and `rows` is the full cost
+    # of its own prefix rather than an incremental/cache-hit count.
+    for decision_idx, (combos, weights, rows) in zip(decisions, answers):
+        acted = sum(1 for d in record.decisions[:decision_idx]
+                    if int(d["acting_pos"]) == opp)
+        assert combos.shape == (32, 2)
+        assert weights.shape == (32,)
+        assert rows == 32 * acted
 
 
 # --------------------------------------------------------------------- 2

@@ -64,6 +64,7 @@ from agent.policy import AgentPoolMember, FrozenAgentMember
 from env.driver import LockstepDriver
 from nets.features import derived_masks
 from oracle.rollout import action_values_batch
+from oracle.posterior import PosteriorCache
 from oracle.transport import Slab, slab_rows, token_fields, v7_fields
 from pool.degenerate import DEGENERATE_STRATEGIES
 from pool.v7_member import V7NetworkMember
@@ -350,6 +351,7 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
     from train.generate import (_label_requests, _seat_hero, label_chunks)
 
     current = (None, None)
+    posterior_cache = PosteriorCache()
     try:
         for chunk in label_chunks(todo, R, ocfg.labels_per_batch):
             i, h = chunk[0][1], chunk[0][2]
@@ -360,7 +362,8 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
                            session_of[i], block_vectors[i], block, hero_factory)
             answers = action_values_batch(
                 _label_requests(chunk, session_of, hero_plain, seed),
-                driver, play_pool, ocfg)
+                driver, play_pool, ocfg,
+                posterior_cache=posterior_cache)
             for (pos, _i, _h, _d), (q, legal, stats) in zip(chunk, answers):
                 result_q.put((pos, q, legal, stats))
     finally:

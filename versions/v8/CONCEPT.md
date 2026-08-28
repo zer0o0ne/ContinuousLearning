@@ -721,6 +721,13 @@ Normalise. This is the same soft-Bayes belief v7 computed in
 `generation/generate_opponent.py`, including its fixes (likelihood floor for unobserved combos,
 card removal relative to the observer).
 
+The exact-posterior implementation reuses that product across consecutive hero decisions of one
+hand. A newly revealed board card only removes conflicting combos from the previous support, and
+only opponent actions after the previous prefix contribute new likelihood factors. This is the
+same Bayes posterior as recomputing the full product; it changes cost, not the oracle. The cache
+is bounded to the current hand and is disabled under `max_combos`, where every label intentionally
+draws its own random prior subsample.
+
 Inside a rollout no further belief computation is needed — each opponent's combo is already
 concrete, and they simply query their own policy.
 

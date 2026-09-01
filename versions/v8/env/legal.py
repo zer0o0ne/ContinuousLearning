@@ -27,6 +27,8 @@ def legal_actions(table):
     * **raise bins** that would not exceed the call amount (``step()`` collapses
       them into a call), that already commit the whole stack (duplicate of the
       explicit all-in), or whose increment is below the NLHE min-raise;
+    * **raise bins the current street does not define** — streets may list
+      different numbers of sizes, and the layout is sized by the widest one;
     * **every raise** when all other live players are already all-in (C.5) —
       the chips could only come back uncalled;
     * **every raise** for a player who had already matched the last full raise
@@ -58,7 +60,7 @@ def legal_actions(table):
                  and not all_others_allin
                  and not short_allin_restricted)
     if can_raise:
-        for i in range(table.n_raise_bins):
+        for i in range(len(table.raise_sizes[table.turn])):
             raise_pct = table.raise_sizes[table.turn][i]
             bet = call_amount + raise_pct * effective_pot
             if bet <= call_amount:

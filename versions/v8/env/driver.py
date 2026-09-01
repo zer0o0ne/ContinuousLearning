@@ -55,8 +55,12 @@ import torch
 
 from env.table import Table
 from env.legal import legal_action_mask
+from env.runout import HandRunout, prime
 from env.showdown import showdown_positions
 from utils import progress
+
+FOLD = 0
+RIVER = 3
 
 
 @dataclass
@@ -84,6 +88,11 @@ class HandRecord:
     decisions: list               # dicts: snap_idx, acting_pos, member, action_idx, legal_mask
     rewards: np.ndarray           # per-seat chip delta over the hand
     truncated: bool               # betting hit the max-actions cap
+    # Same quantity with the card and fold luck subtracted out, when the driver
+    # was given a `runout` config; `None` otherwise. Unbiased for the same
+    # expectation, so a *mean* over hands may be read from it — a single hand's
+    # entry is not a chip count and does not conserve chips (`env/runout.py`).
+    baseline_rewards: np.ndarray = None
     showdown: list = field(default_factory=list)          # seats revealed, §5.1a
     showdown_strength: dict = field(default_factory=dict)  # seat → percentile
     showdown_class: dict = field(default_factory=dict)     # seat → 169-way class
@@ -189,11 +198,16 @@ class LockstepDriver:
     Args:
         pool: sequence of pool members; `HandSpec.seat_members` indexes it.
         n_actions: size of the discrete action set.
+        runout: an `env.runout.RunoutConfig` to also fill `baseline_rewards`
+            with the variance-reduced value of each hand, or None to leave that
+            field empty. It changes nothing about how a hand is dealt or played
+            — the same seeds produce the same hand either way.
     """
 
-    def __init__(self, pool, n_actions):
+    def __init__(self, pool, n_actions, runout=None):
         self.pool = pool
         self.n_actions = n_actions
+        self.runout = runout
 
     def run(self, specs, batch_size=None, desc=None):
         """Play every spec. Returns `HandRecord`s in spec order.
@@ -218,10 +232,17 @@ class LockstepDriver:
                        disable=desc is None)
 
         while cursor < len(pending_specs) or live:
+            started = []
             while len(live) < batch_size and cursor < len(pending_specs):
                 idx, spec = pending_specs[cursor]
                 cursor += 1
-                live.append(self._start(idx, spec))
+                started.append(self._start(idx, spec))
+            live.extend(started)
+            if self.runout is not None and started:
+                # Every board these hands can reach is fixed by their decks, so
+                # they are ranked here, in one batch for the whole wave, rather
+                # than a few hundred rows at a time when a decision asks.
+                prime([s["runout"] for s in started])
 
             queries = []
             for state in live:
@@ -310,6 +331,15 @@ class LockstepDriver:
             "max_actions": max_actions_for(spec.num_players),
             "done": False,
             "ended": False,
+            # Variance reduction (`env/runout.py`). `corr` accumulates the luck
+            # this hand happened to get and is subtracted at the end; `freeze`
+            # holds the integrated value of a hand that ran out of decisions
+            # before it ran out of streets.
+            "runout": (HandRunout(record.deck, spec.num_players, self.runout,
+                                  spec.seed)
+                       if self.runout is not None else None),
+            "corr": np.zeros(spec.num_players, dtype=np.float64),
+            "run_out_from": None,
         }
 
     def _advance_to_decision(self, state):
@@ -349,6 +379,7 @@ class LockstepDriver:
         record = state["record"]
 
         legal = ctx.legal_mask
+        p = None
         if action_idx is None:
             p = np.where(legal, probs, 0.0)
             total = p.sum()
@@ -373,6 +404,7 @@ class LockstepDriver:
         onehot = np.zeros(self.n_actions, dtype=np.float32)
         onehot[action_idx] = 1.0
 
+        decision_idx = len(record.decisions)
         record.decisions.append({
             "snap_idx": ctx.snap_idx,
             "acting_pos": ctx.acting_pos,
@@ -381,15 +413,85 @@ class LockstepDriver:
             "legal_mask": legal.copy(),
         })
 
+        if state["runout"] is not None and probs is not None:
+            self._fold_correction(state, ctx, p, action_idx)
+
+        turn_before = int(table.turn)
         end, several_all_in, _state, _bet = table.step(torch.from_numpy(onehot))
         record.snapshots.append(
             _snapshot(table, active_pos=table.active_player,
                       action=onehot.tolist()))
+        if state["runout"] is not None:
+            self._card_correction(state, decision_idx, turn_before, end)
         if end:
             state["ended"] = True
             state["done"] = True
         elif several_all_in:
             state["done"] = True
+
+    def _fold_correction(self, state, ctx, p, action_idx):
+        """Subtract the luck of *this* fold/no-fold draw (`env/runout.py`).
+
+        The baseline is blind to how much a player bet — chips beyond the call
+        come back once betting freezes — so the only thing a decision can
+        surprise it with is a seat leaving the showdown. Where folding is not
+        legal there is nothing to subtract and the term is exactly zero.
+
+        Its expectation over the draw is zero by construction, whatever the
+        baseline is worth, so this cannot move what the rollout estimates.
+        """
+        table, runout = state["table"], state["runout"]
+        if not ctx.legal_mask[FOLD]:
+            return
+        pos = ctx.acting_pos
+        live = table.players_state >= 0
+        called = np.asarray(table.cumulative_bets, dtype=np.float64).copy()
+        called[pos] += min(table.high_bet - table.bets[pos],
+                           table.credits[pos])
+        still_in = live.copy()
+        still_in[pos] = False
+
+        gap = (runout.baseline(table.turn, still_in, table.cumulative_bets)
+               - runout.baseline(table.turn, live, called))
+        p_fold = float(p[FOLD])
+        state["corr"] += ((1.0 - p_fold) if action_idx == FOLD
+                          else -p_fold) * gap
+
+    def _card_correction(self, state, decision_idx, turn_before, end):
+        """Subtract the luck of the cards this action turned over.
+
+        Two cases, one formula. If decisions remain, the baseline is a
+        martingale over the deal, so the surprise of a new street is exactly the
+        change in the baseline across it. If none remain — everybody left is
+        all-in — every street still to come is one more chance node with nothing
+        between them, so their corrections telescope into a single difference;
+        `_finish` adds it once the board is complete. Where the pot has no side
+        pot that difference cancels the hand's own result and what the rollout
+        reports is the average over every runout it could have had.
+        """
+        table, record = state["table"], state["record"]
+        runout = state["runout"]
+        # Streets dealt while a forced prefix replays are streets hero had
+        # already seen when the labelled decision was taken. They are
+        # conditioned on rather than drawn, so there is no luck to remove and
+        # removing some anyway would be a bias, not a reduction.
+        forced = record.spec.forced_actions
+        if forced is not None and decision_idx < len(forced) - 1:
+            return
+        if end:
+            return
+        live = table.players_state >= 0
+        if table.several_all_in:
+            # No decision is left, so every street still to come is one more
+            # chance node and their corrections telescope. `_finish` adds the
+            # single difference they collapse to, once the board is complete.
+            state["run_out_from"] = (turn_before, live.copy(),
+                                     np.asarray(table.cumulative_bets,
+                                                dtype=np.float64).copy())
+        elif int(table.turn) != turn_before:
+            state["corr"] += (
+                runout.baseline(table.turn, live, table.cumulative_bets)
+                - runout.baseline(turn_before, live, table.cumulative_bets))
 
     def _finish(self, state):
         """Run out any all-in board, then record the per-seat chip delta."""
@@ -410,6 +512,17 @@ class LockstepDriver:
 
         record.rewards = (np.asarray(table.credits, dtype=np.float64)
                           - np.asarray(record.spec.start_credits, dtype=np.float64))
+        if state["runout"] is not None:
+            pending = state["run_out_from"]
+            if pending is not None:
+                turn_before, live, bets = pending
+                runout = state["runout"]
+                # `RIVER` and not `table.turn`: the engine's no-op steps may
+                # stop early, and what the corrections telescope to is the value
+                # on the complete board.
+                state["corr"] += (runout.baseline(RIVER, live, bets)
+                                  - runout.baseline(turn_before, live, bets))
+            record.baseline_rewards = record.rewards - state["corr"]
         # §5.1a: which seats showed their cards. Only the seats — the labels
         # they carry are cards-only and are computed once over the whole corpus
         # by `env.showdown.label_showdowns`, never inside this loop.

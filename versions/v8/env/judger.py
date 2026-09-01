@@ -19,10 +19,10 @@ class Judger:
 
     def share_out(self, deck, active_players_numbers, bets):
         n_players = len(bets)
-        rewards = np.zeros((n_players,))
         deck = list(deck)
         hands = np.array([deck[:5] + deck[5 + i * 2 : 7 + i * 2] for i in active_players_numbers])
         powers = self.eval_hands(active_players_numbers, n_players, hands)
+        rewards = np.zeros((n_players,))
         while np.max(powers) > 0:
             potential_winners = powers.sum(axis = 1) == np.max(powers.sum(axis = 1))
             winners = np.arange(n_players)[potential_winners]
@@ -99,9 +99,6 @@ class Judger:
             if (rank == r).sum() == 4:
                 fourakind = True
                 fourakind_coef = r * 13
-            if (rank == r).sum() >= 2 and threeakind and not full:
-                full = True
-                full_coef = threeakind_coef + r
             if (rank == r).sum() == 3 and not threeakind:
                 threeakind = True
                 threeakind_coef = r * 13
@@ -112,7 +109,12 @@ class Judger:
                 twoakind = True
                 twoakind_coef = r * 13
 
-        if threeakind and not full:
+        # The full house's pair is the *highest* rank other than the trips.
+        # Reading it off the descending loop above picked whichever qualifying
+        # rank happened to come after the trips, i.e. the lowest one, which
+        # mis-ordered a full house whenever a player held a pocket pair below a
+        # board pair (~1 showdown in 10 000).
+        if threeakind:
             three_rank = threeakind_coef // 13
             for r in np.flip(np.unique(rank)):
                 if r != three_rank and (rank == r).sum() >= 2:

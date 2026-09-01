@@ -346,7 +346,7 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
     client = ForwardClient(slab, conn)
     play_pool = [build_mirror(spec, client) for spec in pool_spec]
     hero_factory = hero_mirror(hero_spec, client)
-    driver = LockstepDriver(play_pool, n_actions)
+    driver = LockstepDriver(play_pool, n_actions, runout=ocfg.runout_config())
 
     from train.generate import (_label_requests, _seat_hero, label_chunks)
 

@@ -53,6 +53,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from env.runout import RunoutConfig
 from oracle.posterior import (PosteriorCache, _visible_board,
                               opponent_posterior)
 
@@ -69,6 +70,18 @@ class OracleConfig:
     batch_hands: int = 2048
     max_collision_retries: int = 32
     labels_per_batch: int = 1   # how many labels share one `driver.run` (§7.1)
+    # Variance reduction (`env/runout.py`): subtract the luck of the cards and
+    # of the opponents' fold/no-fold draws from every rollout, and integrate the
+    # board out entirely once a rollout has no decisions left. Unbiased — it
+    # changes the noise on a label, never what the label estimates.
+    control_variate: bool = True
+    runout_samples: int = 16    # boards averaged over; exhaustive when it fits
+
+    def runout_config(self):
+        """What `LockstepDriver` needs to produce the reduced value, or None."""
+        if not self.control_variate:
+            return None
+        return RunoutConfig(samples=int(self.runout_samples))
 
 
 @dataclass
@@ -293,6 +306,21 @@ class _LabelPlan:
     prepared: float
 
 
+def hero_values(played, hero_pos):
+    """Hero's value in each rollout, in chips.
+
+    The variance-reduced one where the driver was configured to produce it
+    (`env/runout.py`), the raw chip delta otherwise. Both are unbiased for the
+    same expectation, so only the noise on the average differs — which is why
+    everything that averages rollouts, the oracle and G3's split-half alike,
+    reads them through here rather than off `rewards`.
+    """
+    return np.asarray(
+        [(r.rewards if r.baseline_rewards is None
+          else r.baseline_rewards)[hero_pos] for r in played],
+        dtype=np.float64)
+
+
 def _label_q(plan, played, seconds):
     """`(q, legal, stats)` from the hands `plan.specs` turned into."""
     q, legal_idx = plan.q, plan.legal_idx
@@ -300,8 +328,7 @@ def _label_q(plan, played, seconds):
     forwards += sum(len(r.decisions) - plan.prefix_len - 1 for r in played)
 
     if played:
-        rewards = np.asarray([r.rewards[plan.hero_pos] for r in played],
-                             dtype=np.float64)
+        rewards = hero_values(played, plan.hero_pos)
         q[legal_idx] = (rewards.reshape(plan.n_samples, len(legal_idx)).mean(axis=0)
                         / plan.big_blind)
 

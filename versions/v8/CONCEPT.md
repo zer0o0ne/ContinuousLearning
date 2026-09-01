@@ -765,6 +765,19 @@ These are approximations, not exact computations, and are recorded as such:
   opponents — and only their *differences between actions* reach the target, since the softmax
   is shift-invariant and the joint sample is common to all actions (§7.1).
 
+  **Two of the three are now subtracted rather than sampled down (2026-09-01).** A rollout is
+  averaged through a control variate: the expected share of the matched pot given the boards
+  still possible, subtracted at every card dealt and at every fold/no-fold draw of a player whose
+  policy is known. Each term has zero mean over the draw it corrects, so this cannot move what a
+  label estimates — it is not a fourth approximation. Where a rollout runs out of decisions the
+  terms telescope and what is left is the average over every runout that could have happened,
+  which is why "integrate the cards out" is not a separate mechanism. Measured on the dev box
+  against the fixture pool: the per-rollout standard deviation falls to 0.41–0.52 of its raw
+  value, i.e. four to six times the sample budget, for 20–50% more wall clock.
+  `ARCHITECTURE.md` §2.2d carries the design and its declared limit (side pots, and the size of
+  a bet). **This makes §13's "quadrupling the samples halves the noise, and nothing else does"
+  false as of this date** — it was true of the sample budget alone.
+
 ### 7.4 Recorded alternatives (not baseline)
 
 Both are recorded because §13 makes it likely that variant A does not fit the compute budget at

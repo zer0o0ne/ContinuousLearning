@@ -59,7 +59,7 @@ import pool.v7_member
 import vendor.v7.perception.perception as v7_perception
 from env.driver import HandSpec, LockstepDriver
 from gates.g1 import raise_sizes_from
-from oracle.rollout import OracleConfig, action_values
+from oracle.rollout import OracleConfig, action_values, hero_values
 from oracle.posterior import _context_of
 from pool.build import build_pool
 from train.targets import DIVISORS
@@ -351,8 +351,8 @@ def measure_label(record, decision_idx, driver, pool, hero_member, cfg, rng):
 
     if n_samples >= 2:
         bb = float(record.spec.big_blind)
-        rewards = np.asarray([r.rewards[hero_pos] for r in played],
-                             dtype=np.float64).reshape(n_samples, n_legal) / bb
+        rewards = (hero_values(played, hero_pos)
+                   .reshape(n_samples, n_legal) / bb)
         half = n_samples // 2
         gap = rewards[:half].mean(axis=0) - rewards[half:2 * half].mean(axis=0)
         # Signed, per action. The squares are all `se_q` needs, but the target
@@ -549,7 +549,12 @@ def run(config, log, out_dir):
 
     pool, descriptors = build_pool(config, rng, device=device, log=log)
     log(f"pool: {len(pool)} members")
-    driver = MeasuringDriver(pool, int(game["n_actions"]))
+    driver = MeasuringDriver(
+        pool, int(game["n_actions"]),
+        runout=OracleConfig(
+            control_variate=bool(oracle_cfg.get("control_variate", True)),
+            runout_samples=int(oracle_cfg.get("runout_samples", 16)),
+        ).runout_config())
 
     # ---- the hands the labelled decisions come out of, one batch, one bar
     hero_kind = sweep.get("hero_kind", "v7")

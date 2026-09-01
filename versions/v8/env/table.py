@@ -19,7 +19,12 @@ class Table:
             self.start_credits = np.asarray(start_credits, dtype=float)
         self.credits = list(self.start_credits)
         self.raise_sizes = raise_sizes  # list of 4 lists (one per street)
-        self.n_raise_bins = len(raise_sizes[0])
+        # The widest street fixes the action layout: bins are a global index
+        # space (`env/legal.py`, `nets/features.py`), and the all-in slot sits
+        # after the last of them. A street that defines fewer sizes simply has
+        # the trailing bins illegal on it — which is how every other
+        # unavailable action is already expressed.
+        self.n_raise_bins = max(len(raise_sizes[t]) for t in range(4))
         self.judger = Judger()
 
     def reset(self, position = None):

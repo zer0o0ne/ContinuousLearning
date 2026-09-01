@@ -47,6 +47,7 @@ versions/v8/
   env/                  poker engine, from v7, verbatim
     legal.py            the one legality rule (§6.2)                    NEW
     driver.py           lock-step vectorised driver + rollout plumbing (§3) NEW
+    runout.py           the rollouts' control variate (§7.3)             NEW
     session.py          sessions: rotation, uniform table draw, play (§8)    NEW
     showdown.py         reveal detection + the two showdown labels (§5.1a)  NEW
   pool/                 entity 2 — the opponent pool (§4)               NEW
@@ -128,6 +129,16 @@ The rule is v7's, ported from `versions/v7/agent/mcts/game_state.py::get_legal_a
 checking is free, raise bins that collapse to a call or to the all-in are dropped, sub-min-raises
 are dropped, all raises are dropped when every other live player is already all-in (C.5) or when
 a short all-in did not reopen the betting (C.7.5).
+
+**Streets may define different numbers of raise sizes.** `game.raise_sizes` is four lists and
+they need not be the same length: the **widest** street fixes the action layout — `n_raise_bins`,
+and with it the all-in slot and `n_actions = n_raise_bins + 3` — and a street that lists fewer
+sizes simply has its trailing bins illegal, which is how every other unavailable action is
+already expressed. Nothing downstream of the mask has to know that the grids differ; the
+network's output width, the one-hot and the Slumbot adapter's `n_actions − 3` all key off the
+widest street. Before this, the bin count was read off the preflop list alone and every street
+was walked to that length, so a shorter later street raised `IndexError` on its first decision
+and a longer one was silently truncated.
 
 ### 2.2 `env/driver.py` — the lock-step vectorised driver
 
@@ -251,7 +262,9 @@ so the exact part stays untangled from the approximate one.
 returns `(q, legal, stats)`: `q` is `(n_actions,)` float64 in **big blinds**, `nan` at every
 illegal action, `legal` is the recorded mask, `stats` is a `LabelStats`. `OracleConfig` carries
 the five knobs (`samples_per_action`, `max_combos`, `likelihood_floor`, `batch_hands`,
-`max_collision_retries`) and every one of them trades cost against noise.
+`max_collision_retries`) and every one of them trades cost against noise — plus
+`control_variate` and `runout_samples`, which buy noise down at four to six times the rate a
+sample does (§2.2d).
 
 One label is:
 
@@ -321,6 +334,113 @@ sampler, not of the GPU cost — G3 (S4) is what measures the label.
 
 **Not built here** (S3's non-goals): variant C and value bootstrapping. Dataset writing belongs
 to S7. The originally deferred posterior cache is now implemented in §2.2b.
+
+### 2.2d `env/runout.py` — the control variate in the rollouts
+
+`CONCEPT.md` §7.3 lists Monte-Carlo noise as the rollouts' one reducible error and §13 measures
+it: `SE(q)` between 0.65 BB and 25.7 BB at 256 samples, and a per-sample chip-delta deviation of
+0.5–1.4 of the stack, because nearly every rollout is a stack-off. Samples buy that down at
+`n^{-1/2}` and nothing else does — which is what this file changes. It is a **control variate**:
+it changes the noise on a label, never what the label estimates.
+
+**The baseline.** `b(s)` is every seat's share of the **matched** pot, weighted by how often it
+holds the best hand over the boards that can still come, minus what it put in. Three properties
+carry the whole design, and each buys one thing:
+
+* **It is an expectation over the cards**, so dealing one and re-averaging gives it back. The
+  correction at a chance node is therefore exactly `b(after) − b(before)` — the card's luck and
+  nothing else — with no expectation left to evaluate.
+* **It ignores chips beyond the call**, which the settlement refunds anyway. So `b` after a
+  raise, an all-in and a call is one number: the correction at a decision node is two numbers
+  rather than one per raise size, and it is **identically zero where folding is illegal**. The
+  only thing a decision can surprise this baseline with is a seat leaving the showdown.
+* **It is cheap** — one pass over the ranking matrix, no pot logic — so its cost does not grow
+  with the table.
+
+**Integrating the cards out is not a second mechanism.** Once a rollout has no decisions left,
+the corrections for the streets still to come telescope into `b(final board) − b(that state)`,
+and the rollout reports `R − that`. With no side pot, `b` on a complete board *is* the
+settlement, the two `R`s cancel, and what is reported is the exact average over every runout that
+could have happened. `tests/test_runout.py` pins that against replaying the hand once per
+possible river through the untouched engine.
+
+**Its declared limit.** With a side pot `b` prices a short all-in as if it could win the whole
+matched pot, so the cancellation is partial and so is the reduction. It is a reduction that gets
+smaller, not an estimate that moves: every correction has zero mean over the draw it corrects
+whatever `b` is worth. The other limit is the same one the bet-size insensitivity buys: the
+*size* of a bet is not something this removes variance from.
+
+**Why not settle exactly.** An earlier version made `b` the engine's own settlement, averaged
+over boards. It is exact everywhere, and it costs one pot settlement per **distinct ranking** of
+the live seats: measured at 46 µs for two live seats and 250 µs for eight, against up to 60
+distinct rankings over 64 boards at a full ring — 8.6 ms per hand of overhead at nine seats, and
+a test battery that went from two minutes to over thirty. The cheap baseline is what a control
+variate actually needs, and the exactness it gives up is exactly the side-pot case above.
+
+**Cost, measured on the dev box** — CPU, which is where it runs: the label workers are CPU-only
+processes. Added wall clock per hand, `samples = 16`, against the fixture pool:
+
+| seats | hand without | added |
+|---|---|---|
+| 2 | 0.26 ms | +0.45 ms |
+| 6 | 1.18 ms | +1.14 ms |
+| 9 | 2.67 ms | +1.38 ms |
+
+**What it buys, on the same rollouts** — the standard deviation of hero's per-rollout value, raw
+against reduced, so the two are compared on identical cards and identical actions:
+
+| table | sd raw (BB) | sd reduced | ratio | samples this is worth |
+|---|---|---|---|---|
+| 2 seats, 200 BB | 60.4 | 31.4 | 0.52 | 3.7× |
+| 3 seats, 100 BB | 27.3 | 11.2 | 0.41 | 5.9× |
+| 6 seats, 50 BB | 21.2 | 10.0 | 0.47 | 4.5× |
+| 9 seats, 30 BB | 14.6 | 6.7 | 0.46 | 4.7× |
+
+So a label's standard error roughly halves, which is four to six times the sample budget, for
+20–50% more wall clock. **Both tables are dev-box measurements against the fixture pool, not the
+real one** — G3 is what produces the number that counts, and its split-half column now reads the
+reduced value, so re-running the gate reports both the new `SE(q)` and the new seconds per label.
+
+`samples` is how many board completions `b` averages over — exhaustive when there are no more
+than that many, a uniform draw otherwise. The runout's variance comes out reduced by about
+`1 − 1/samples`, so 8 buys 88% and 64 buys 98% while costing linearly; 16 is where the curve
+flattens and is the default.
+
+**Ranking is primed, not asked for.** Every board a hand can reach is fixed by its deck, so all
+four streets are ranked before the hand is played and every hand of a lock-step wave together.
+The oracle starts a whole label in one wave, so that is one batched evaluator call for the label
+instead of one per hand per street — a few hundred rows a call, which is the shape §2.2 exists to
+avoid. The waste is the streets a hand never reaches: bounded by four rankings a hand, and it is
+rows rather than calls.
+
+**Where it is wired.** `LockstepDriver(pool, n_actions, runout=RunoutConfig(...))` fills
+`HandRecord.baseline_rewards` alongside `rewards`; with `runout=None` the field stays `None` and
+nothing changes. Corpus play never gets it — those hands are not averaged, and a single hand's
+`baseline_rewards` is not a chip count and does not conserve chips. Both labelling paths do:
+`oracle/parallel.py` builds its driver from `OracleConfig.runout_config()`, and the
+single-process path in `train/generate.py` borrows the corpus driver *configured*, restoring it
+after. `oracle.rollout.hero_values` is the one place that decides which of the two fields an
+average reads, so the oracle and G3's split-half column can never disagree about it.
+
+**Cards a forced prefix turned over carry no correction.** A rollout replays the decisions that
+led to the labelled one, and the streets dealt during that replay are streets hero had already
+seen. They are conditioned on rather than drawn, so there is no luck in them; correcting for them
+anyway would subtract a term whose mean is not zero, which is a bias and not a reduction. The
+driver skips corrections for decisions before the last forced one.
+
+**A fixed bug underneath it.** The engine's hand evaluator read a full house's kicker off a
+descending scan that had already passed the trips, i.e. off the *lowest* qualifying pair, so a
+player holding a pocket pair below a board pair was ranked below one holding junk. Measured at
+~1 showdown in 10 000 — a bias, not noise, and it was in every label and every hand of pool play.
+The batched evaluator was right; they now agree over 123 000 showdowns, including decks
+restricted to a few ranks or suits so that full houses and flushes are constant. It had to be
+fixed before any of this could be trusted: `b` on a complete board stands in for the settlement,
+so a disagreement between the two evaluators would have moved labels rather than quieted them.
+
+**Known, not fixed.** `Judger.get_reward`'s one-live-seat branch does not conserve chips — it
+hands the last seat the whole pot including its own contribution. It is unreachable in v8: the
+engine settles a fold-out itself in `Table.next_turn`, and the only caller of the other branch is
+`env/dealers.py`, which nothing imports. Reported rather than changed.
 
 ### 2.3 `pool/` — entity 2
 
@@ -1563,8 +1683,11 @@ leaves unverified.
 cd versions/v8 && python3 -m pytest tests/ -q
 ```
 
-388 tests, ~118 s on the dev box (CPU-only) — the parallel-evaluation cases spawn processes and
-account for most of the increase. The 30-minute budget from `CLAUDE.md` §4 is barely touched.
+441 tests, ~256 s on the dev box (CPU-only) — the parallel-evaluation cases spawn processes and
+account for most of the increase, and the labelling cases now run the §2.2d control variate. The
+30-minute budget from `CLAUDE.md` §4 is comfortably met; it was *not*, at over thirty minutes,
+while the baseline settled every board through the engine's pot logic, which is the measurement
+that sent it back to the drawing board.
 
 | File | Covers |
 |---|---|
@@ -1580,6 +1703,7 @@ account for most of the increase. The 30-minute budget from `CLAUDE.md` §4 is b
 | `test_inference_fit.py` | The joint fit reaches the loss of the vectors that generated the labels, determinism, `K = 0` is the ablation, network weights untouched, cold start, regularisation, **the showdown terms reach the fitted vector** and zero weights reproduce the action-only fit |
 | `test_observation_parity.py` (§5.1a part) | Showdown tokens exist exactly for the revealed seats and never among the decisions; **another seat's** revealed cards are the target and appear nowhere in its token, while **the observer's own showdown token carries the observer's own hand** — one rule across every token type, checked on decision and showdown tokens together; the labels match the cards shown, the two masks partition the real tokens, a showdown hand with no labels is refused |
 | `test_strength_head.py` | The §5.6 poker prior and the §6.1 warm start: the target is the observer's own percentile on the final board, on the observer's own decision tokens and `-1` everywhere else, matching an independently enumerated value to `1e-12`; §5.1a's showdown labels are that same dict restricted to the revealed seats, so they did not move when the two passes merged; **a hand still in progress carries no target** and neither does a record nobody labelled; **it is a target and not an input** — the same hands tokenised with and without the label differ in `own_strength` alone and the action logits are bit-identical; `collate` masks the padded tail through the sentinel and selects exactly the labelled tokens; the weight shifts the total by exactly its term and 0 removes it while leaving the action CE untouched; a batch with no target is a batch and not an error; the head can actually learn the target, below the variance that is the only baseline it is read against; **the fit never sees the term** — `fit_embeddings` is bit-identical with and without it, and it did move, so that is not two no-ops; `first_retrain_steps` selects the first retrain only, leaves the agent's own key alone, and the trainer runs the count the iteration asks for; and the warm start copies the trunk key for key, leaves the action head at its initialisation, and is an initialisation rather than a tie — one gradient step moves the agent's trunk and not the embedding network's |
+| `test_runout.py` | The rollouts' control variate, every case exact rather than within a tolerance: a hand with no decisions left reports the mean over **all 44 rivers**, checked by replaying it once per river through the untouched engine, while its raw result is a whole stack away; both branches of an exactly 50-50 fold, weighted, land on the true expectation to `1e-9` while the raw pair lands nowhere near it; on a complete board with nobody short the baseline **is** `Judger`'s settlement over random multiway states, and the one case where it deliberately is not — a side pot — is pinned as such; it is unchanged by chips beyond the call (call ≡ raise ≡ all-in) and matches the engine's own fold-out arithmetic on a hand the driver played out; cards a forced prefix turned over carry no correction; turning the estimator on moves neither a card, nor an action, nor a chip; the full-house kicker is the highest other rank, and the engine's evaluator and the batched one rank 16 000 showdowns identically on decks restricted to few ranks or few suits; and a street may define fewer raise sizes than another, with the legal set on each street matching that street's own list |
 | `test_pool_style.py` | The five categories partition the action set, 32-scalar round trip, identity style is a masked softmax, position and street gating, temperature, uniform mix, every draw is a valid distribution over legal actions, each degenerate strategy does what it says |
 | `test_v7_pool_member.py` | The vendored v7 stack constructs and plays legal hands; the v7 event format is built from the acting seat, masked to the street, and stops at its decision; **a `hole_override` reaches the network** — an override naming the real cards reproduces the plain answer, aces and deuce-trey do not, the record is untouched, and end to end a v7 opponent's posterior leaves the prior |
 | `test_g1_gate.py` | The gate end to end: button rotation, uniform 2–9 × 10–300 BB, the four report sections, cold start ≡ `e = 0`, and that the standard error's unit is the session |

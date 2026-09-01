@@ -914,33 +914,42 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         if len(buffer) >= per_shard and ends_hand[pos]:
             flush(next_hand[pos], decisions_done + pos + 1)
 
-    n_workers = worker_count(cfg)
-    if n_workers and todo:
-        held = {}
-        buffered = held.__len__
-        _label_in_parallel(n_workers, todo, consume, sessions,
-                           play_pool, hero_plain, hero_rec, block_vectors,
-                           agent_member, ocfg, R, cfg, driver, log,
-                           results=held)
-    else:
-        current = (None, None)
-        posterior_cache = PosteriorCache()
-        pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)]
-        for chunk in label_chunks(pending, R, ocfg.labels_per_batch):
-            i, h = chunk[0][1], chunk[0][2]
-            block = h // R
-            if (i, block) != current:
-                # Hero plays its own rollouts with the vectors it acted under;
-                # the member is rebuilt per block because the pool slot holds
-                # whichever block was played last.
-                current = (i, block)
-                _seat_hero(play_pool, (hero_plain[i],), sessions[i],
-                           block_vectors[i], block, agent_member)
-            answers = action_values_batch(
-                _label_requests(chunk, sessions, hero_plain, cfg["seed"]),
-                driver, play_pool, ocfg, posterior_cache=posterior_cache)
-            for (pos, i, h, d), (q, legal, stats) in zip(chunk, answers):
-                consume(pos, i, h, d, q, legal, stats)
+    # Rollouts get averaged and corpus hands do not, so the variance-reduced
+    # value belongs to the labelling driver and to nothing else. The parallel
+    # path builds its own driver from the same config (`oracle/parallel.py`);
+    # this path borrows the corpus driver, so it borrows it configured.
+    saved_runout = driver.runout
+    driver.runout = ocfg.runout_config()
+    try:
+        n_workers = worker_count(cfg)
+        if n_workers and todo:
+            held = {}
+            buffered = held.__len__
+            _label_in_parallel(n_workers, todo, consume, sessions,
+                               play_pool, hero_plain, hero_rec, block_vectors,
+                               agent_member, ocfg, R, cfg, driver, log,
+                               results=held)
+        else:
+            current = (None, None)
+            posterior_cache = PosteriorCache()
+            pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)]
+            for chunk in label_chunks(pending, R, ocfg.labels_per_batch):
+                i, h = chunk[0][1], chunk[0][2]
+                block = h // R
+                if (i, block) != current:
+                    # Hero plays its own rollouts with the vectors it acted under;
+                    # the member is rebuilt per block because the pool slot holds
+                    # whichever block was played last.
+                    current = (i, block)
+                    _seat_hero(play_pool, (hero_plain[i],), sessions[i],
+                               block_vectors[i], block, agent_member)
+                answers = action_values_batch(
+                    _label_requests(chunk, sessions, hero_plain, cfg["seed"]),
+                    driver, play_pool, ocfg, posterior_cache=posterior_cache)
+                for (pos, i, h, d), (q, legal, stats) in zip(chunk, answers):
+                    consume(pos, i, h, d, q, legal, stats)
+    finally:
+        driver.runout = saved_runout
     flush(n_hands, decisions_done + len(todo))
     bar.close()
 

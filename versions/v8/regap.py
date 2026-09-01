@@ -4,8 +4,9 @@ Phase D is a `softmax` over the `q` stored in the label shards and one batched
 agent forward — no rollouts and no embedding network — so it can be re-run after
 the fact for any iteration whose `labels/` shards and `agent.pt` are still on
 disk. That is what this script does, for the sole purpose of reporting the terms
-`gap_terms` computes: nothing here trains, and nothing here touches the labels,
-the weights, or the sampler state.
+`gap_terms` computes — warm and cold, exactly as the loop's phase D does:
+nothing here trains, and nothing here touches the labels, the weights, or the
+sampler state.
 
 Determinism is what makes the result the same number the run would have written:
 the held-out split is `split_heldout(n, fraction, seed, iteration)` and reads no
@@ -34,7 +35,8 @@ import os
 import torch
 
 from pipeline import (GAP_KEYS, _iter_dir, _read_json, _write_json,
-                      frozen_agent_net, oracle_gap, split_heldout)
+                      frozen_agent_net, oracle_gap, split_heldout,
+                      winrate_line)
 from train.generate import load_shard
 from utils import Logger, resolve_device
 
@@ -85,21 +87,24 @@ def regap_iteration(config, exp_dir, iteration, device, log):
 
     net = frozen_agent_net(ckpt["model_state_dict"], run_config,
                            run_config["game"], device)
-    gap = oracle_gap(net, [labels[i] for i in held_idx],
-                     float(oracle_cfg["temperature"]),
-                     oracle_cfg.get("divisor", "pot_plus_bet"),
-                     int(train_cfg["batch_hands"]), device, log)
+    gap_args = (net, [labels[i] for i in held_idx],
+                float(oracle_cfg["temperature"]),
+                oracle_cfg.get("divisor", "pot_plus_bet"),
+                int(train_cfg["batch_hands"]), device, log)
+    gaps = {"gap": oracle_gap(*gap_args),
+            "gap_cold": oracle_gap(*gap_args, cold=True)}
 
     metrics_path = os.path.join(it_dir, "metrics.json")
     metrics = _read_json(metrics_path) if os.path.exists(metrics_path) else {}
-    was, now = _flat(metrics.get("gap", {})), _flat(gap)
-    for key in sorted(set(was) & set(now)):
-        assert abs(was[key] - now[key]) < 1e-9, (
-            f"iteration {iteration}: recomputing {'/'.join(key)} gives "
-            f"{now[key]} where metrics.json says {was[key]} — the "
-            f"recomputation is not reproducing the run, so none of its other "
-            f"numbers can be trusted either")
-    metrics.update({"iteration": iteration, "gap": gap})
+    for name, gap in gaps.items():
+        was, now = _flat(metrics.get(name, {})), _flat(gap)
+        for key in sorted(set(was) & set(now)):
+            assert abs(was[key] - now[key]) < 1e-9, (
+                f"iteration {iteration}: recomputing {name}/{'/'.join(key)} "
+                f"gives {now[key]} where metrics.json says {was[key]} — the "
+                f"recomputation is not reproducing the run, so none of its "
+                f"other numbers can be trusted either")
+    metrics.update({"iteration": iteration, **gaps})
     _write_json(metrics_path, metrics)
     return metrics
 
@@ -128,6 +133,8 @@ def main():
             if o:
                 log("[regap] iteration {}: ".format(k)
                     + " ".join(f"{key}={o[key]:+.4f}" for key in GAP_KEYS))
+            log(f"[regap] iteration {k}: "
+                + winrate_line(metrics["gap"], metrics["gap_cold"]))
         report_path = os.path.join(exp_dir, "report.json")
         if metrics_all and os.path.exists(report_path):
             report = _read_json(report_path)

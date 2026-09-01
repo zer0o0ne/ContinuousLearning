@@ -7,7 +7,7 @@ pins is the wiring that is silent when it is wrong:
 * who sits in hero's seat at iteration 0 and who sits there afterwards (§7.1),
   asserted by recording who was actually asked for an action;
 * that the held-out slice reaches the metric and never the optimiser (§8), and
-  that the four gap numbers are the ones §8 defines;
+  that the four gap numbers are the ones §8 defines, warm and cold;
 * that the pool grows by exactly `style.agent_variants` members per iteration
   and that the embedding table has a row reserved for each of them (D9, D11);
 * that a run resumed from a crash produces the same artefacts as one that was
@@ -26,7 +26,7 @@ import torch
 
 import pipeline
 from env.session import build_sessions
-from pipeline import gap_terms, run, split_heldout
+from pipeline import gap_terms, oracle_gap, run, split_heldout, winrate_line
 from pool.style import StyleParams
 from train.generate import load_shard
 from utils import Logger
@@ -133,6 +133,10 @@ def test_the_loop_runs_and_writes_every_artefact(tmp_path):
         assert m["gap"]["by_table_size"] and m["gap"]["by_stack_bb"]
         assert 0.0 <= m["gap"]["overall"]["agreement"] <= 1.0
         assert m["gap"]["overall"]["ev_gap_greedy"] >= -1e-12
+        assert m["gap_cold"]["n_heldout"] == m["gap"]["n_heldout"]
+        assert set(m["gap_cold"]["overall"]) == {"n", *pipeline.GAP_KEYS}
+        assert m["gap_cold"]["by_table_size"] and m["gap_cold"]["by_stack_bb"]
+        assert m["gap_cold"]["overall"]["ev_gap_greedy"] >= -1e-12
 
 
 # ------------------------------------------------- 2 / 3c: the pool and rows
@@ -274,8 +278,62 @@ def test_no_heldout_means_no_gap_rather_than_a_gap_on_training_data(tmp_path):
     cfg["agent_train"] = dict(cfg["agent_train"], heldout_fraction=0.0)
     metrics, _ = _run(tmp_path, cfg)
 
-    assert metrics[0]["gap"] == {"n_heldout": 0}
+    assert metrics[0]["gap"] == metrics[0]["gap_cold"] == {"n_heldout": 0}
     assert metrics[0]["n_train"] == metrics[0]["n_labels"]
+    assert "not measured" in winrate_line(metrics[0]["gap"],
+                                          metrics[0]["gap_cold"])
+
+
+def test_phase_d_scores_the_agent_with_the_fitted_vectors_and_with_zero(tmp_path):
+    """§12's cold/warm pair, on the held-out slice instead of on Slumbot.
+
+    Phase D reports `ev_agent` twice: conditioned on the vectors §5.5 had
+    fitted when hero acted, and with those vectors pinned to zero. The cold
+    number has to be *the same measurement* on the same labels, which is pinned
+    here by rebuilding it along a path that shares no code with `cold=True` —
+    labels whose stored tables are already zero — and by checking that the
+    oracle's own side of it (`ev_oracle`, `q_best`) does not move at all, since
+    nothing about the agent enters it.
+    """
+    cfg = toy_config()
+    metrics, exp_dir = _run(tmp_path, cfg)
+
+    for m in metrics:
+        for key in ("ev_oracle", "q_best"):
+            assert m["gap_cold"]["overall"][key] == pytest.approx(
+                m["gap"]["overall"][key], abs=1e-12)
+
+    k = 0
+    labels = _labels_of(exp_dir, k)
+    _train_idx, held_idx = split_heldout(len(labels), 0.25, cfg["seed"], k)
+    held = [labels[i] for i in held_idx]
+    assert any(np.any(np.asarray(lab["embeddings"]) != 0.0) for lab in held), (
+        "the held-out labels carry no fitted vectors, so this run cannot tell "
+        "a cold measurement from a warm one")
+
+    state = torch.load(os.path.join(exp_dir, f"iter_{k:04d}", "agent.pt"),
+                       map_location="cpu", weights_only=False)
+    net = pipeline.frozen_agent_net(state["model_state_dict"], cfg, GAME, "cpu")
+    rest = (cfg["oracle"]["temperature"], cfg["oracle"]["divisor"],
+            cfg["agent_train"]["batch_hands"], "cpu", lambda _m: None)
+    zeroed = [dict(lab, embeddings=np.zeros_like(lab["embeddings"]))
+              for lab in held]
+
+    warm = oracle_gap(net, held, *rest)["overall"]
+    cold = oracle_gap(net, held, *rest, cold=True)["overall"]
+    by_hand = oracle_gap(net, zeroed, *rest)["overall"]
+
+    assert cold["ev_agent"] == pytest.approx(by_hand["ev_agent"], abs=1e-12)
+    assert cold["kl"] == pytest.approx(by_hand["kl"], abs=1e-12)
+    assert cold["ev_agent"] != warm["ev_agent"]
+    assert warm["ev_agent"] == pytest.approx(
+        metrics[k]["gap"]["overall"]["ev_agent"], abs=1e-12)
+    assert cold["ev_agent"] == pytest.approx(
+        metrics[k]["gap_cold"]["overall"]["ev_agent"], abs=1e-12)
+
+    line = winrate_line(metrics[k]["gap"], metrics[k]["gap_cold"])
+    assert f"{warm['ev_agent']:+.4f}" in line
+    assert f"{cold['ev_agent']:+.4f}" in line
 
 
 def test_the_heldout_split_is_a_partition(tmp_path):

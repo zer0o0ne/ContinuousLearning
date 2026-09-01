@@ -1138,7 +1138,7 @@ the last two are new code:
 | A | embedding network | plays a corpus of pool self-play and runs §5.4 training over it, every `embedding_net.retrain_every` iterations | `embedding.pt` |
 | B | labels | `train/generate.py` — play, refresh the vectors, label hero's decisions | `labels/*.npz`, `labels.json` |
 | C | agent | `train/agent_train.py` over all but `agent_train.heldout_fraction` of them | `agent.pt` |
-| D | oracle gap | §8's seven numbers on the held-out slice | `metrics.json` |
+| D | oracle gap | §8's seven numbers on the held-out slice, twice: conditioned on the fitted vectors and with `e = 0` | `metrics.json` |
 | E | close | PFSP results in, `result_decay` applied, the agent appended to the pool | `state.json` |
 
 **The agent's trunk is warm-started from phase A** (§6.1 OI-4, §5.6), at iteration 0 only, when
@@ -1189,14 +1189,29 @@ iteration's labels; what it does not is anything about exploitability, and its f
 Monte-Carlo error rather than zero. `heldout_fraction = 0` reports no gap at all rather than one
 measured on the data the optimiser just saw.
 
+**It is measured twice, warm and cold** — §12's distinction moved onto the held-out slice.
+`metrics["gap"]` conditions the agent on the vectors §5.5 had fitted when hero acted, which are
+the ones the label carries; `metrics["gap_cold"]` pins them to zero and reads the *unconditional*
+policy §6.2's embedding dropout trains. Same labels, same oracle `Q`, one extra forward per
+label, so `ev_oracle` and `q_best` are identical between the two by construction and only the
+agent's side moves. The iteration's last log line is `winrate_line`: `ev_agent` warm, `ev_agent`
+cold, and their difference. That difference is what says whether conditioning on the opponent is
+paying for itself *at all* — as at §12, a cold number above the warm one is a result to report
+rather than a bug to tune away. Two cautions on reading it: `ev_agent` is not a played BB/100 —
+phase D plays no hands, this is the agent's policy scored by the oracle's own noisy `Q` on hero's
+own state distribution in §6.2's pot-normalised units — and the warm side is scored under vectors
+fitted from at most `R` hands of context, so it is the *early* part of §12's warm-up curve rather
+than its asymptote.
+
 **Phase D can be re-run after the fact** (`regap.py`). It is a `softmax` over the `q` in the
 label shards plus one batched agent forward, so an iteration whose `labels/` and `agent.pt` are
 still on disk can be re-measured without replaying a hand — which is how a metric added to
 `gap_terms` after a run reaches the iterations that ran before it. The held-out split is
 `split_heldout(n, fraction, seed, iteration)` and reads no running RNG, and the checkpoint is the
 one that iteration saved, so the recomputation reproduces the numbers the run wrote; every number
-already in `metrics.json` is asserted against its recomputed value, and a mismatch aborts rather
-than overwriting. It trains nothing and rewrites nothing but `metrics.json` and `report.json`'s
+already in `metrics.json` is asserted against its recomputed value — `gap` and `gap_cold` alike —
+and a mismatch aborts rather than overwriting. An iteration that ran before the cold pass existed
+therefore gains a `gap_cold` from `regap.py` without its `gap` moving. It trains nothing and rewrites nothing but `metrics.json` and `report.json`'s
 metric list.
 
 **PFSP is fed from the hands the label phase already played.** `train/generate.py`'s manifest now

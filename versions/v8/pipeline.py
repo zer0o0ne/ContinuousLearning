@@ -9,7 +9,7 @@ iteration k:
      ↳ at k = 0 only, warm-start the agent's trunk from it    (§6.1 OI-4, §5.6)
   B  play, fit vectors, label hero's decisions                (§8 lines 1–4, train/generate.py)
   C  train the agent on all but `heldout_fraction` of them    (§6.2)
-  D  measure the oracle gap on the held-out slice             (§8)
+  D  measure the oracle gap on the held-out slice, warm and cold  (§8)
   E  age the PFSP results and append the agent to the pool    (§4.4, §4.1)
 ```
 
@@ -169,30 +169,42 @@ def gap_terms(q_norm, pi_oracle, log_pi_agent, legal):
 
 
 @torch.no_grad()
-def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log):
+def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log,
+               cold=False):
     """§8's held-out measurement of one checkpoint against its own oracle.
 
     One agent forward per held-out decision and **no new rollouts** — the
     oracle's answer is already in the shard, so this is a softmax over stored
     `q` and a batched forward, not a second labelling pass.
 
+    `cold` is §12's distinction, on the held-out slice instead of on Slumbot:
+    **warm** (the default) conditions the agent on the vectors the label carries
+    — the ones §5.5 had fitted when hero acted — and **cold** pins them to zero
+    and reads the *unconditional* policy §6.2's embedding dropout trains. The
+    same labels, the same oracle `Q`, one forward each, so `ev_agent` measured
+    both ways says what conditioning on the opponent is worth on this slice.
+
     Returns `{n_heldout, overall, by_table_size, by_stack_bb}`; a run with no
     held-out labels reports `n_heldout = 0` and no numbers at all, rather than a
     gap measured on the data the optimiser just saw.
     """
+    mode = "cold" if cold else "warm"
     if not labels:
-        log(f"[{TAG}] no held-out labels — the oracle gap is not measured")
+        log(f"[{TAG}] no held-out labels — the {mode} oracle gap is not "
+            f"measured")
         return {"n_heldout": 0}
 
     net.eval()
     rows = []
-    bar = progress(total=len(labels), desc="gap", unit="label")
+    bar = progress(total=len(labels), desc=f"gap:{mode}", unit="label")
     for lo in range(0, len(labels), int(batch_hands)):
         chunk = labels[lo:lo + int(batch_hands)]
         batch = collate([lab["tokens"] for lab in chunk], device=device)
         tables = torch.as_tensor(
             np.stack([np.asarray(lab["embeddings"], dtype=np.float32)
                       for lab in chunk]), device=device)
+        if cold:
+            tables = torch.zeros_like(tables)
         logits = net(batch, token_embeddings(tables, batch["slot"], net.d_emb))
         idx = torch.arange(len(chunk), device=logits.device)
         last = batch["mask"].sum(dim=1).long() - 1
@@ -234,13 +246,37 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log):
                                          for r in rows})},
     }
     o = report["overall"]
-    log(f"[{TAG}] oracle gap over {len(rows)} held-out labels: "
+    log(f"[{TAG}] {mode} oracle gap over {len(rows)} held-out labels: "
         f"kl={o['kl']:.4f} ev_agent={o['ev_agent']:+.4f} "
         f"ev_oracle={o['ev_oracle']:+.4f} q_best={o['q_best']:+.4f} "
         f"ev_gap_target={o['ev_gap_target']:+.4f} "
         f"ev_gap_greedy={o['ev_gap_greedy']:.4f} "
         f"agreement={o['agreement']:.3f}")
     return report
+
+
+def winrate_line(gap, gap_cold):
+    """Phase D's headline: the agent's held-out `ev_agent`, warm and cold.
+
+    Two numbers and not one, for the reason §12 reports two against Slumbot: the
+    warm number is the agent conditioned on the vectors §5.5 fitted for the
+    table it was at, the cold one is the same agent with `e = 0`, and only the
+    pair says whether conditioning on the opponent is paying for itself. As at
+    §12, a cold number above the warm one is a result to report rather than a
+    bug to tune away.
+
+    It is `ev_agent` and not a played BB/100: phase D plays no hands. This is
+    the agent's policy scored by the oracle's own `Q` on the held-out labels, in
+    §6.2's pot-normalised units, so it is comparable across iterations and
+    across the two modes and is *not* comparable with a Slumbot BB/100.
+    """
+    warm, cold = gap.get("overall"), gap_cold.get("overall")
+    if not warm or not cold:
+        return "held-out ev_agent: not measured (no held-out labels)"
+    return (f"held-out ev_agent over {warm['n']} labels: "
+            f"warm (fitted vectors) {warm['ev_agent']:+.4f}, "
+            f"cold (e = 0) {cold['ev_agent']:+.4f}, "
+            f"warm − cold {warm['ev_agent'] - cold['ev_agent']:+.4f}")
 
 
 # ------------------------------------------------------------------ the phases
@@ -565,6 +601,9 @@ def run(config, log, exp_dir):
             metrics = _read_json(metrics_path)
         else:
             t0 = time.perf_counter()
+            held = [labels[i] for i in held_idx]
+            gap_args = (agent_net, held, temperature, divisor,
+                        int(train_cfg["batch_hands"]), device, log)
             metrics = {
                 "iteration": k,
                 "n_pool": len(pool),
@@ -572,14 +611,15 @@ def run(config, log, exp_dir):
                 "n_train": int(len(train_idx)),
                 "loss": loss,
                 "label_stats": manifest["stats"],
-                "gap": oracle_gap(agent_net, [labels[i] for i in held_idx],
-                                  temperature, divisor,
-                                  int(train_cfg["batch_hands"]), device, log),
+                "gap": oracle_gap(*gap_args),
+                "gap_cold": oracle_gap(*gap_args, cold=True),
             }
             timings["gap"] = time.perf_counter() - t0
             metrics["timings"] = timings
             _write_json(metrics_path, metrics)
         metrics_all.append(metrics)
+        log(f"[{TAG}] " + winrate_line(metrics.get("gap", {}),
+                                       metrics.get("gap_cold", {})))
 
         # ----------------------------------------- E: results, decay, the pool
         for member, result in manifest["results"].items():

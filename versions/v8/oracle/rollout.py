@@ -56,6 +56,7 @@ import numpy as np
 from env.runout import RunoutConfig
 from oracle.posterior import (PosteriorCache, _visible_board,
                               opponent_posterior)
+from oracle.ranges import HandRangeCache
 
 FOLD = 0
 N_CARDS = 52
@@ -76,12 +77,24 @@ class OracleConfig:
     # changes the noise on a label, never what the label estimates.
     control_variate: bool = True
     runout_samples: int = 16    # boards averaged over; exhaustive when it fits
+    # §5.7 — the belief target that travels with a label. `range_target` off
+    # means no target is produced at all, which is the head's ablation; the
+    # threshold is the support cut of `oracle/ranges.py` and buys forwards.
+    range_target: bool = False
+    range_prune: float = 0.0
 
     def runout_config(self):
         """What `LockstepDriver` needs to produce the reduced value, or None."""
         if not self.control_variate:
             return None
         return RunoutConfig(samples=int(self.runout_samples))
+
+    def range_cache(self):
+        """A `HandRangeCache` for the §5.7 target, or `None` with the head off."""
+        if not self.range_target:
+            return None
+        return HandRangeCache(floor=self.likelihood_floor,
+                              prune=float(self.range_prune))
 
 
 @dataclass
@@ -116,9 +129,18 @@ def _rollout_deck(record, hero_pos, opp_seats, opp_cards, n_visible, rng):
 
     The board hero can see, hero's real cards, the sampled cards at the
     opponents' seats, the streets still to come drawn from what is left, and
-    every card nobody was dealt filled into the remaining slots in ascending
-    order — arbitrary, but a function of the assignment and the runout, so the
-    same assignment and the same runout deal identical hands.
+    every card nobody was dealt shuffled into the slots that are left — the
+    seats that folded before this decision, and the stub.
+
+    That last deal is a shuffle and not a fill, and the reason is the control
+    variate. `env/runout.py` conditions its board completions on every seat's
+    cards, folded seats included, and that is exact only because the runout and
+    the folded seats' cards come out of one remainder: either order gives the
+    same joint. Sorting the remainder into the empty slots breaks exactly that —
+    the folded seats would hold the lowest leftover cards by construction, the
+    completions would then be drawn from a pool systematically missing them, and
+    a correction whose whole claim is a zero mean would acquire a bias. The
+    order costs nothing and it is the difference between a deal and a fill.
     """
     deck = np.full(N_CARDS, -1, dtype=np.int64)
     deck[:n_visible] = [int(c) for c in record.deck[:n_visible]]
@@ -134,7 +156,7 @@ def _rollout_deck(record, hero_pos, opp_seats, opp_cards, n_visible, rng):
         drawn = rng.choice(free, size=n_hidden, replace=False)
         deck[n_visible:5] = drawn
         free = free[~np.isin(free, drawn)]
-    deck[np.flatnonzero(deck < 0)] = free
+    deck[np.flatnonzero(deck < 0)] = rng.permutation(free)
     return deck
 
 

@@ -192,6 +192,31 @@ def max_actions_for(num_players):
     return 6 * num_players + 8
 
 
+def _suppressed(ctx):
+    """True where this decision produces no control-variate correction.
+
+    The same condition `_card_correction` applies, read one step earlier: a
+    decision still inside a forced prefix replays a street hero had already
+    seen, which is conditioned on rather than drawn, and it is played without a
+    policy so there is no fold draw either. Nothing asks for a baseline, so
+    nothing is worth ranking.
+    """
+    forced = ctx.record.spec.forced_actions
+    return forced is not None and len(ctx.record.decisions) < len(forced) - 1
+
+
+def _streets_needed(ctx):
+    """The streets one decision can ask a baseline for before the next round.
+
+    Its own street (the fold correction, and the near side of a card
+    correction); the next one, which is where the card correction lands if the
+    action turns a street over; and the river, where the corrections telescope
+    to if the action leaves everybody all-in. Anything else is ranked on demand
+    by `HandRunout.scores`, correctly and one call at a time.
+    """
+    return (ctx.turn, min(ctx.turn + 1, RIVER), RIVER)
+
+
 class LockstepDriver:
     """Advances many hands together against a fixed pool.
 
@@ -228,21 +253,19 @@ class LockstepDriver:
         pending_specs = list(enumerate(specs))
         cursor = 0
         live = []
+        # Ranking matrices, shared by every hand in flight that was dealt the
+        # same deck (`env/runout.py`) — which, in a label, is every action of
+        # one sample. Dropped as the hands that own them finish, so what it
+        # holds is bounded by `batch_size` and not by the length of the run.
+        scores = {} if self.runout is not None else None
         bar = progress(total=len(specs), desc=desc, unit="hand",
                        disable=desc is None)
 
         while cursor < len(pending_specs) or live:
-            started = []
             while len(live) < batch_size and cursor < len(pending_specs):
                 idx, spec = pending_specs[cursor]
                 cursor += 1
-                started.append(self._start(idx, spec))
-            live.extend(started)
-            if self.runout is not None and started:
-                # Every board these hands can reach is fixed by their decks, so
-                # they are ranked here, in one batch for the whole wave, rather
-                # than a few hundred rows at a time when a decision asks.
-                prime([s["runout"] for s in started])
+                live.append(self._start(idx, spec, scores))
 
             queries = []
             for state in live:
@@ -255,6 +278,10 @@ class LockstepDriver:
                 records[state["idx"]] = self._finish(state)
             bar.update(len(finished))
             live = [s for s in live if not s["done"]]
+            if scores is not None and finished:
+                held = {s["runout"].key for s in live}
+                for key in [k for k in scores if k[0] not in held]:
+                    del scores[key]
 
             if not queries:
                 continue
@@ -268,6 +295,16 @@ class LockstepDriver:
                 k = len(ctx.record.decisions)
                 (forced if fa is not None and k < len(fa) else free).append(
                     (state, ctx))
+            if self.runout is not None:
+                # The boards this round's decisions can ask about, ranked in one
+                # batch rather than a few hundred rows at a time when a
+                # correction asks (`env/runout.py`). A decision inside the
+                # suppressed part of a forced prefix asks about none.
+                prime([(state["runout"], turn)
+                       for state, ctx in forced + free
+                       if not _suppressed(ctx)
+                       for turn in _streets_needed(ctx)])
+
             for state, ctx in forced:
                 fa = ctx.record.spec.forced_actions
                 self._apply(state, ctx, None,
@@ -297,7 +334,7 @@ class LockstepDriver:
 
     # ---------------------------------------------------------------- internals
 
-    def _start(self, idx, spec):
+    def _start(self, idx, spec, scores=None):
         table = Table(
             num_players=spec.num_players,
             raise_sizes=spec.raise_sizes,
@@ -336,7 +373,7 @@ class LockstepDriver:
             # holds the integrated value of a hand that ran out of decisions
             # before it ran out of streets.
             "runout": (HandRunout(record.deck, spec.num_players, self.runout,
-                                  spec.seed)
+                                  scores=scores)
                        if self.runout is not None else None),
             "corr": np.zeros(spec.num_players, dtype=np.float64),
             "run_out_from": None,

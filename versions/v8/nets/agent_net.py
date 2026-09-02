@@ -44,12 +44,23 @@ class AgentNet(nn.Module):
         self.encoder = HandEncoder(cfg, n_actions, max_players)
         self.action_out = nn.Linear(self.d_model, n_actions)
 
-    def forward(self, batch, emb):
-        hidden = self.encoder(batch, emb)
+    def forward(self, batch, emb, seat_emb=None):
+        """(B, n_actions) logits. See `logits_and_range` for the §5.7 head."""
+        return self.logits_and_range(batch, emb, seat_emb)[0]
+
+    def logits_and_range(self, batch, emb, seat_emb=None):
+        """`(action logits, range logits)` — the second is `None` with §5.7 off.
+
+        The agent carries no head of its own for the belief: the head is in the
+        trunk (`nets/range_head.py`), so `warm_start_trunk` hands it over
+        already trained and this network inherits it with the rest of the
+        encoder rather than starting a second one from scratch.
+        """
+        hidden, range_logits = self.encoder(batch, emb, seat_emb)
         mask = batch["mask"]
         lengths = mask.sum(dim=1).long()
         assert int(lengths.min()) > 0, (
             "a row of the batch has no real token at all — `collate` drops "
             "empty hands, so this is a hand-building bug")
         rows = torch.arange(hidden.shape[0], device=hidden.device)
-        return self.action_out(hidden[rows, lengths - 1])
+        return self.action_out(hidden[rows, lengths - 1]), range_logits

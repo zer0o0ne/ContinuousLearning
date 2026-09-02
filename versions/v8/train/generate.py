@@ -85,7 +85,7 @@ import io
 import json
 import os
 import zipfile
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import numpy as np
 
@@ -94,8 +94,10 @@ from env.session import (Session, build_sessions, hand_seed_bases,
 from nets.embedding_net import fit_embeddings, loss_weights
 from oracle.parallel import (ForwardServer, collect, join_workers,
                              runner_table, spawn_workers, worker_count)
+from nets.features import (TOKEN_FIELDS, HandTokens, RangeTargets, collate,
+                           hand_tokens, range_targets)
 from oracle.posterior import PosteriorCache
-from nets.features import HandTokens, collate, hand_tokens
+from oracle.ranges import label_range_target
 from oracle.rollout import (LabelStats, OracleConfig,
                             action_values_batch)
 from pool.base import PoolMember
@@ -196,9 +198,10 @@ def _shard_arrays(labels):
     lengths = [len(t) for t in tokens]
     out = {"tok_offsets": np.concatenate(
         [[0], np.cumsum(lengths)]).astype(np.int64)}
-    for f in fields(HandTokens):
-        out[f"tok_{f.name}"] = np.concatenate(
-            [getattr(t, f.name) for t in tokens], axis=0)
+    for name in TOKEN_FIELDS:
+        out[f"tok_{name}"] = np.concatenate(
+            [getattr(t, name) for t in tokens], axis=0)
+    out.update(_range_arrays(tokens))
 
     tables, index = [], []
     for lab in labels:
@@ -223,6 +226,28 @@ def _shard_arrays(labels):
     return out
 
 
+def _range_arrays(tokens):
+    """§5.7 targets of a shard: four flat arrays and their own offsets.
+
+    A second offset index rather than `tok_offsets`, because these rows are one
+    per (token, seat, surviving combo) and not one per token. A shard whose
+    labels carry no belief target writes none of these keys at all, which is
+    what makes a shard written before §5.7 load unchanged.
+    """
+    if all(t.ranges is None for t in tokens):
+        return {}
+    assert all(t.ranges is not None for t in tokens), (
+        "some labels of this shard carry a §5.7 target and some do not — the "
+        "head is on or off for a whole run, and a half-labelled shard would "
+        "train the belief on an arbitrary subset")
+    counts = [len(t.ranges.token) for t in tokens]
+    out = {"rng_offsets": np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)}
+    for name in ("token", "seat", "combo", "weight"):
+        out[f"rng_{name}"] = np.concatenate(
+            [getattr(t.ranges, name) for t in tokens], axis=0)
+    return out
+
+
 def load_shard(path):
     """The labels of one shard, in the order they were written.
 
@@ -238,8 +263,14 @@ def load_shard(path):
     labels = []
     for i in range(len(offsets) - 1):
         lo, hi = int(offsets[i]), int(offsets[i + 1])
-        tokens = HandTokens(**{f.name: data[f"tok_{f.name}"][lo:hi]
-                               for f in fields(HandTokens)})
+        fields_of = {name: data[f"tok_{name}"][lo:hi] for name in TOKEN_FIELDS}
+        if "rng_offsets" in data:
+            rlo, rhi = (int(data["rng_offsets"][i]),
+                        int(data["rng_offsets"][i + 1]))
+            fields_of["ranges"] = RangeTargets(
+                *(data[f"rng_{name}"][rlo:rhi]
+                  for name in ("token", "seat", "combo", "weight")))
+        tokens = HandTokens(**fields_of)
         labels.append({
             "tokens": tokens,
             "q": data["q"][i],
@@ -297,6 +328,13 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     rollout_keys = {f.name for f in fields(OracleConfig)}
     ocfg = OracleConfig(**{k: v for k, v in cfg.get("oracle", {}).items()
                            if k in rollout_keys})
+    # §5.7 has one source of truth and it is the network's own section: whether
+    # the head exists at all decides whether a label carries its target, and the
+    # support threshold is a property of the target and not of the rollouts. A
+    # second copy under `oracle` would be a way for the two to disagree.
+    ocfg = replace(ocfg,
+                   range_target=bool(emb_cfg.get("range_enabled", False)),
+                   range_prune=float(emb_cfg.get("range_prune_threshold", 0.0)))
     max_players = int(game["max_players"])
     n_actions = int(game["n_actions"])
     hands_per_session = int(cfg["hands_per_session"])
@@ -865,7 +903,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
 
     buffered = None
 
-    def consume(pos, i, h, d, q, legal, stats):
+    def consume(pos, i, h, d, q, legal, stats, ranges=None):
         """One finished label, whoever computed it.
 
         Both paths — the sequential loop below and the workers of
@@ -895,6 +933,10 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         if np.isfinite(q[legal]).all():
             hero_seat = s.seat_of_slot(HERO_SLOT, h)
             tokens = play_pool[hero_rec[i][hero_seat]].seen[(s.idx, h, d)]
+            # §5.7 — the belief the label was taken under, attached to the very
+            # tokens the agent will be trained on. `None` with the head off.
+            if ranges is not None:
+                tokens.ranges = range_targets(ranges, tokens.active_opp)
             _stack_bb, pot_bb, to_call_bb = (float(x) for x in
                                              tokens.scalars[-1])
             buffer.append({
@@ -932,6 +974,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         else:
             current = (None, None)
             posterior_cache = PosteriorCache()
+            range_cache = ocfg.range_cache()
             pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)]
             for chunk in label_chunks(pending, R, ocfg.labels_per_batch):
                 i, h = chunk[0][1], chunk[0][2]
@@ -947,7 +990,9 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                     _label_requests(chunk, sessions, hero_plain, cfg["seed"]),
                     driver, play_pool, ocfg, posterior_cache=posterior_cache)
                 for (pos, i, h, d), (q, legal, stats) in zip(chunk, answers):
-                    consume(pos, i, h, d, q, legal, stats)
+                    consume(pos, i, h, d, q, legal, stats,
+                            label_range_target(range_cache, sessions[i], h, d,
+                                               play_pool, driver.n_actions))
     finally:
         driver.runout = saved_runout
     flush(n_hands, decisions_done + len(todo))

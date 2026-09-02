@@ -11,6 +11,9 @@ that ties all of it together — `pipeline.py` and `config.json` (§8) — now e
 tree is complete from the bootstrap pool to a trained agent joining it. The Slumbot
 adapter and the evaluation runner (§12) exist as well, cold and warm, so **the tree is now
 complete end to end — bootstrap pool → oracle labels → trained agent → BB/100 against Slumbot.**
+The **range head (§5.7)** was added 2026-09-02: the trunk now predicts every live opponent's
+range at every decision and feeds that belief back into its own later layers, in both networks.
+It is off with one config key and nothing has yet been trained with it on.
 Everything below has run only at toy scale on CPU: **no iteration has yet been run at size and
 no hand has yet been played against Slumbot**, so nothing here has yet met an opponent stronger
 than the −90 BB/100 bootstrap pool.**
@@ -62,6 +65,7 @@ versions/v8/
     features.py         §5.1 token features — where observation parity lives
     tokeniser.py        the shared tokeniser MLP (§5.1, OI-4)
     trunk.py            HandEncoder — the §5.1/§5.2 trunk, shared as code    NEW
+    range_head.py       §5.7 — the belief module inside the trunk             NEW
     embedding_net.py    entity 4 — the opponent-embedding network (§5)
     agent_net.py        entity 3 — the agent's policy network (§6.1)         NEW
   agent/                                                                     NEW
@@ -73,6 +77,7 @@ versions/v8/
     embed_train.py      §5.4 training of the embedding network (§5.4, §8)     NEW
   oracle/               entity 5 — the BR oracle (§7)                  NEW
     posterior.py        reach-weighted opponent ranges (§7.2)
+    ranges.py           the same belief as a filter over a whole hand (§5.7) NEW
     rollout.py          variant A: Q(s, ·) by full rollout (§7.1)
     parallel.py         N CPU label workers + one GPU inference server
     transport.py        the shared-memory slab those two talk over
@@ -91,7 +96,7 @@ versions/v8/
   evaluation/
     protocol.py         Slumbot's wire protocol, kept from v7 (§12)             NEW
     v8_adapter.py       the v8 agent as a Slumbot player (§12)                  NEW
-  tests/                22 files, 373 tests, ~111 s
+  tests/                23 files, 459 tests, ~222 s
 ```
 
 ### What was inherited, and why
@@ -277,7 +282,8 @@ One label is:
    **visible** board or in hero's hand;
 4. one `HandSpec` per (legal action, surviving sample): the visible board and hero's real cards
    in the deck, the sampled cards at the opponents' seats, the streets still to come drawn from
-   what the assignment left, the rest filled in ascending order;
+   what the assignment left, and every remaining card **dealt** — shuffled, not sorted — into
+   the slots of the seats that folded and into the stub;
    `forced_actions` = the recorded prefix plus that action; `seat_members` = the real members
    with `hero_member_idx` in hero's seat; `seed` = a `blake2b` hash of
    `(spec.seed, decision_idx, action, sample)`, so a label does not depend on which other
@@ -315,6 +321,19 @@ The residual collision source is now only the one-decision offset: the posterior
 `through_decision = decision_idx − 1`, so its dead set is the board visible at the *previous*
 decision, while step 3 rejects against the board visible at *this* one. A combo containing a card
 that turned over in between still has to die.
+
+**Why the leftover is shuffled into the empty slots and not sorted into them.** The seats that
+folded hold nothing that can change a showdown, so which cards they get looks arbitrary — and for
+the label it is. It is not arbitrary for the control variate: §2.2d conditions its board
+completions on every seat's cards, folded seats included, and that is exact only because the
+runout and those cards come out of one remainder, in either order. Filling the slots in ascending
+order breaks exactly that. The folded seats end up holding the lowest leftover cards by
+construction, the completions are then drawn from a pool systematically missing them, and a
+correction whose whole claim is a zero mean acquires a bias — measured at 5.3 and 5.8 standard
+errors on six-handed labels, and absent on labels with nobody folded and on corpus hands, whose
+decks are real deals. Dealing the leftover costs nothing and restores the exchangeability the
+conditioning assumes; `test_oracle.py` pins it by requiring the cards a folded seat is dealt
+across a label's samples to be the same set the board is dealt.
 
 **Fold is not special-cased.** Hero's chip delta after folding is minus what hero has already
 put in, whatever the opponents hold, so the rollout returns the closed form with zero variance —
@@ -396,9 +415,24 @@ against reduced, so the two are compared on identical cards and identical action
 | 6 seats, 50 BB | 21.2 | 10.0 | 0.47 | 4.5× |
 | 9 seats, 30 BB | 14.6 | 6.7 | 0.46 | 4.7× |
 
-So a label's standard error roughly halves, which is four to six times the sample budget, for
-20–50% more wall clock. **Both tables are dev-box measurements against the fixture pool, not the
-real one** — G3 is what produces the number that counts, and its split-half column now reads the
+**End to end, on the label path** — which is the number that decides whether this is worth having,
+because corpus hands are never reduced. Whole labels, fixture pool, `samples = 16`, the same
+rollouts either way, and the sd is hero's per-rollout value averaged over labels on all four
+streets:
+
+| table | wall clock | sd ratio | effective samples | net |
+|---|---|---|---|---|
+| 2 seats, 200 BB | ×1.61 | 0.663 | ×2.28 | ×1.4 |
+| 6 seats, 200 BB | ×1.53 | 0.566 | ×3.12 | ×2.0 |
+
+Before the ranking was shared and pruned (§2.2c) the same measurement read ×2.15 and ×1.98 of wall
+clock for the same variance — the estimator was a wash at six seats and a small loss heads-up.
+The knob is still there: `runout_samples = 4` costs ×1.47 / ×1.33 and buys ×2.02 / ×2.28, so most
+of the reduction survives a quarter of the ranking, and 64 buys almost nothing more than 16.
+
+So a label's standard error roughly halves, which is two to six times the sample budget, for
+50–60% more wall clock. **All three tables are dev-box measurements against the fixture pool, not
+the real one** — G3 is what produces the number that counts, and its split-half column now reads the
 reduced value, so re-running the gate reports both the new `SE(q)` and the new seconds per label.
 
 `samples` is how many board completions `b` averages over — exhaustive when there are no more
@@ -406,12 +440,34 @@ than that many, a uniform draw otherwise. The runout's variance comes out reduce
 `1 − 1/samples`, so 8 buys 88% and 64 buys 98% while costing linearly; 16 is where the curve
 flattens and is the default.
 
-**Ranking is primed, not asked for.** Every board a hand can reach is fixed by its deck, so all
-four streets are ranked before the hand is played and every hand of a lock-step wave together.
-The oracle starts a whole label in one wave, so that is one batched evaluator call for the label
-instead of one per hand per street — a few hundred rows a call, which is the shape §2.2 exists to
-avoid. The waste is the streets a hand never reaches: bounded by four rankings a hand, and it is
-rows rather than calls.
+**Ranking is shared, and primed for the streets that will be asked.** The evaluator is what this
+estimator actually costs — ranking `samples` boards per street per seat, against the one showdown
+a plain hand pays for — so what is *not* ranked is the whole performance story.
+
+A ranking depends on the cards and the street and on nothing else, and one label rolls every legal
+action out on the **same deck**: an action changes the forced prefix, not a card. So the `|A|`
+hands of one sample are one ranking between them rather than `|A|`, and every hand of a run reads
+and writes one cache keyed by `(deck, street)`. Entries are dropped as the hands that own them
+finish, so what it holds is bounded by the hands in flight and not by the length of the run.
+
+Sharing is what fixes how the completions are drawn: from a generator seeded by **the cards that
+street has already shown** — its board prefix, the holdings, the table size. Two things need
+exactly that. No result may depend on which hand ranked a street first, or `q` would move with
+`batch_hands` (§15, and `test_runout.py` pins it at three batch sizes). And a chance node's
+correction has zero mean only if the boards `b(before)` averaged over were chosen independently of
+the card that node turns over — so a seed lying downstream of that card, the hand's own seed
+included where that seed is what dealt the deck, is the one thing the draw must not use.
+
+What gets primed is what this round's decisions can ask for: their own street, the next one — where
+a card correction lands — and the river, where the corrections telescope to if everybody is left
+all-in. A decision still inside the *suppressed* part of a forced prefix asks for nothing at all,
+so a rollout never pays for the streets that were already visible when the labelled decision was
+taken. Priming remains a batching device and nothing more: a street nobody primed is ranked on
+demand, one call at a time, with the same numbers.
+
+Both together, measured over every label of a fixture corpus at `samples = 16`: 16.4 seven-card
+rows per rollout heads-up, 51.5 at six seats and 83.4 at nine, where ranking all four streets of
+every hand paid 98, 294 and 441 — a factor of 5.3 to 6.0 off the term that dominates the cost.
 
 **Where it is wired.** `LockstepDriver(pool, n_actions, runout=RunoutConfig(...))` fills
 `HandRecord.baseline_rewards` alongside `rewards`; with `runout=None` the field stays `None` and
@@ -766,6 +822,105 @@ river. The number to read it against is the marginal variance of the target on t
 never zero. This is the §11.4 trap in a second place, and the reason `train_embedding_net` logs
 the strength-target count: a corpus nobody labelled would otherwise train the head on nothing
 while the curve looked ordinary.
+
+### 2.4c The range head (§5.7) — `oracle/ranges.py`, `nets/range_head.py`
+
+The fourth head, and the only one that is not a leaf: it sits **between** the
+trunk's two halves of decoder layers, and what it predicts goes back into the
+tokens the remaining layers read. Owner decision 2026-09-02.
+
+**What it predicts.** At every decision token, for every player who is not the
+observer and has not folded, a distribution over the 1326 two-card combos — the
+observer's belief about that player's holding. One query per (token, live
+opponent); the agent's pending token gets one per live opponent too.
+
+**What the target is.** The reach-weighted posterior of §7.2,
+
+```
+w(combo) ∝ prior(combo) · Π_t  max(floor, P_i(a_t | combo, history_t))
+```
+
+run as a **filter** rather than as a batch computation: the weights are carried
+forward, each new action of that opponent multiplies them, each new board card
+removes the combos it blocks. `oracle/ranges.py` is that filter and with
+`range_prune_threshold = 0` it is bit-identical to calling `opponent_posterior`
+at every prefix — `test_range_head.py` pins exactly that, prefix by prefix. One
+definition of "opponent range" in the tree, two consumers.
+
+A hard variant was considered first and rejected: keep the combos whose *modal*
+action is the one that was played. It is degenerate here. Every pool member emits
+finite logits and the style layer mixes in up to 25 % uniform, so no combo ever
+has zero reach and the filter's only content would be card removal — which is a
+deterministic function of the token's own input. Four of the five degenerate
+strategies do not read their cards at all, so their argmax is the same for every
+combo and the set comes out either full or empty. The soft weights cost the
+**same forwards** — both need `P(a | combo)` for every surviving combo — so
+rounding buys nothing and discards the magnitude the belief is for.
+
+**`range_prune_threshold` is the one approximation and it buys forwards.** A
+combo below `prune × max weight` leaves the support permanently, so later streets
+ask the member about fewer combos. Relative to the maximum and not absolute: a
+uniform prior gives every combo `1/C`, so an absolute threshold near that scale
+empties the range at the first token and one below it never bites — the knob
+would do nothing or everything depending on the size of the support.
+`RangeStats.dropped` reports the mass thrown away and `collapsed` the supports a
+board card wiped out, so a threshold set past a tail and into a mode shows up as
+a number rather than as a quietly different target.
+
+**Where the targets come from, and what they cost.**
+
+| | how | cost |
+|---|---|---|
+| embedding corpus | `label_ranges` over the played sessions, once, beside `label_showdowns` | ~1225 policy rows per opponent decision against ~1 today. This is the dominant new cost and it is regulated by the corpus size (owner decision 2026-09-02) |
+| agent labels | `HandRangeCache` in the label worker | one pass of the hand's opponent likelihoods — what the oracle's own posterior already costs, so ≈ +10 % of a heads-up label (G3: 1225 posterior rows in ~11k) |
+
+The label path recomputes rather than reading the oracle's posteriors out of
+`action_values`, whose three-tuple every caller and a dozen tests read. That is
+the trade and it is written down rather than assumed. It runs **in the worker**,
+never in the parent: the parent is the inference server, and serialising ~1200
+policy rows per label behind it is the one thing that must not happen.
+
+**The module is a perceiver decoder, not an MLP on the token.** A range is the
+product of that player's likelihoods over every decision they have taken, and
+those live in earlier tokens. So queries — "player *s*, at moment *t*" — cross-
+attend over the trunk's states across the prefix, `n_range_blocks` times.
+
+Four properties carry it, and each is a way of getting it wrong:
+
+* **The cross-attention is causal.** A query at token *t* sees trunk states at
+  *t' ≤ t* and nothing later. Without it the belief at the third decision reads
+  the seventh, the loss falls beautifully, and at deployment the head is reading
+  actions that have not happened. `test_range_head.py` perturbs the last token
+  and asserts the earlier beliefs do not move.
+* **The query says who and when.** Position embeddings alone would make all `T`
+  queries of one seat the same vector, separated only by their mask. So the query
+  is the seat's learnable position embedding, plus that seat's opponent vector,
+  plus the trunk state at `t`, with RoPE marking the moment. Seats are the axis
+  and not slots, because the seat *is* the poker position — the engine fixes seat
+  0 as SB and rotates the players — and identity comes in through the vector.
+* **What goes back is the probabilities, detached.** Not the head's hidden state:
+  a `d_range`-wide state would let the action loss push arbitrary information
+  around the 1326-wide bottleneck and the stop-grad would be closing the wrong
+  channel. The token attends over its own active seats' belief vectors, so the
+  aggregation is learned and `pos_out` keeps which belief belonged to whom.
+* **Blocked combos are dropped, not learned.** A combo holding a board card or
+  one of the observer's own gets `-inf` before the softmax, the way an illegal
+  action gets an exact zero in a policy target. This is why `own_hole` now rides
+  on **every** token: the observer has always known its own hand, the decision
+  token only ever showed it on the observer's own rows, and the support of a
+  belief is exactly what the board and those two cards leave. The tokeniser does
+  not read it, so the §5.1 observation is unchanged.
+
+**`range_weight` is not the ablation.** With the weight at zero the head still
+runs and still injects, so the layers above it would consume an untrained head's
+output — noise. The ablation is `range_enabled: false`, which removes the module
+from the trunk; `test_range_head.py` asserts that switch reproduces the previous
+trunk exactly, tensor for tensor, and leaves no `range` parameter behind.
+
+**Read the KL, not the cross-entropy.** The support is 990–1225 combos, so a
+perfect head still pays the target's own entropy — ~6.9–7.1 nats. `range_kl` is
+`ce − H(target)`, zero at the optimum, and it is the part the head can move.
+This is the §11.4 trap in a third place, after §5.6's MSE and §5.1a's.
 
 **The agent has no showdown head and no strength head.** `AgentNet` carries `action_out` and
 nothing else, and `train_agent` computes `kl_loss` / `soft_q_loss` and nothing else. Every
@@ -1646,9 +1801,20 @@ shape and nothing else. The second run also changed what is being measured — t
 draw, the configured hero seat, the `pool_kinds` axis and bf16 all landed together — so its
 numbers replace the first run's rather than extending them.
 
-**The G1 checkpoint no longer loads** (§2.8, D3). Extracting the trunk renamed every parameter
-under it, so a `state_dict` saved before the extraction no longer matches
-`OpponentEmbeddingNet`. Nothing on the G1 path needs it — `g1_report.json`, `eval_corpus.pkl`
+**Nothing in §5.7 has been run at size.** The range head, its target and its injection are
+covered behaviourally on CPU at toy scale (`test_range_head.py`), and that is the whole of the
+evidence: no corpus has been labelled with ranges at 2M hands, no belief has been trained past a
+few gradient steps, and the two numbers that would decide whether it earns its keep — `range_kl`
+against its own floor, and the agent's held-out gap with the head on versus `range_enabled:
+false` — do not exist. The cost estimates in §2.4c are arithmetic over G3's measured rows, not a
+measurement of this path. **The cheapest experiment that discriminates it** needs no new labelling
+and no Slumbot run: train the embedding network twice on one corpus, `range_weight` at 0 and at
+0.25, and compare held-out action CE, G1's transfer metrics, and — after `warm_start_trunk` — the
+agent's held-out gap on labels already on disk.
+
+**The G1 checkpoint no longer loads** (§2.8, D3, and again with §5.7). Extracting the trunk
+renamed every parameter under it, and the range head adds parameters inside it, so a `state_dict`
+saved before either change no longer matches `OpponentEmbeddingNet`. Nothing on the G1 path needs it — `g1_report.json`, `eval_corpus.pkl`
 and `fitted_vectors.npz` are what post-hoc analysis reads — but re-evaluating those weights
 would now need a key-remap shim, which does not exist.
 
@@ -1683,7 +1849,7 @@ leaves unverified.
 cd versions/v8 && python3 -m pytest tests/ -q
 ```
 
-441 tests, ~256 s on the dev box (CPU-only) — the parallel-evaluation cases spawn processes and
+459 tests, ~222 s on the dev box (CPU-only) — the parallel-evaluation cases spawn processes and
 account for most of the increase, and the labelling cases now run the §2.2d control variate. The
 30-minute budget from `CLAUDE.md` §4 is comfortably met; it was *not*, at over thirty minutes,
 while the baseline settled every board through the engine's pot logic, which is the measurement
@@ -1713,6 +1879,7 @@ that sent it back to the drawing board.
 | `test_pool_sampling.py` | Pool sampling: a fixed history and seed produce an exact sequence; results accumulate across sessions of different lengths into a mean and the mean into a weight, with a pool of no results and a pool of no spread both flat, and the **magnitude** of a loss — not its sign — moving the weight; a member hero beats the most is reached **only** through the floor — never at `floor_fraction = 0`, every draw uniform at 1; forgetting leaves an unsampled member's estimate exactly where it was and is what lets a member the early agents crushed climb back to the top PFSP weight at all — at `result_decay = 1` it is still winning after forty iterations, at 0.8 it crosses at the twelfth and at 0.5 at the fifth; a member nobody has played is drawn immediately; clustering recovers a hand-built structure and a ten-member blob of near-duplicates does not crowd out a lone style, while a duplicate pair splits one cluster's share; more clusters than members is no clustering; the state round-trips and reproduces the next draw, survives a pool that has since grown by one member and refuses one that has shrunk; and every table size 2–9 gets one member per non-hero seat |
 | `test_targets.py` | Targets, loss and the training cycle: a hand-computed softmax to `1e-12`; exact zeros off the mask and what sits under it never read; the two temperature limits reached in float, not approached; one legal action, equal EVs, no legal action, a `nan` under the mask; **the v7 scar** — two situations differing by a factor of 30 give the same target to `1e-12`, and without the divisor one is near-uniform while the other is near-deterministic; the KL is exactly zero on a match, positive off it, blind to illegal logits, and its gradient reaches the logits and not the target; **the linear loss** — the two losses share a minimiser, averaging the gradients at `Q ± ε` reproduces the gradient at `Q` to `1e-12` for `soft_q` and demonstrably not for `kl`, a constant added to every legal EV changes neither value nor gradient, illegal logits are ignored, a label off the mask is refused, and a toy run reaches its target; dropout at `p = 0` and `p = 1`, reproducible from its generator, and per hand per slot rather than per token; a toy run that reduces the loss, is deterministic, leaves the pool and the embeddings untouched and refuses a hand that is not a pending decision; and the cycle — the first iteration runs its own step count, a later one opens from the weights the previous one left, and three cycles in a row keep improving |
 
+| `test_range_head.py` | §5.7 end to end: **the filter is the posterior** — every prefix of a played hand matched combo for combo against `opponent_posterior`, with the one difference (the board visible at the token, one street ahead of a posterior conditioned through the previous decision) applied to the posterior as card removal; **the target is a prefix function** — truncating the record after `t` leaves every belief at or before `t` bit-identical; a player is in the target at the token they fold and never after; no target puts mass on a combo the board or the observer's own hand blocks, and the head's own mask is the support that target lives on; pruning buys forwards, reports the mass it dropped, keeps the mode, and only bites against a member whose play depends on its cards; the target reaches the batch on exactly the rows `act_idx` names and every untargeted row is zero and masked; the head answers one row per active pair with `-inf` on the blocked combos; **the belief at a token cannot read a later one** — perturbing the last token leaves the earlier beliefs unmoved; **`range_enabled: false` is an exact ablation** — the same hidden states tensor for tensor and no `range` parameter left behind; **the injection is detached** — the action loss reaches nothing upstream of the bottleneck; the term is exactly zero when the prediction is the target and the cross-entropy still pays the target's entropy; a batch with no target scores nothing rather than crashing; the weight is what puts the term in the total; the agent reads the same head at its pending decision; and a whole toy iteration runs with the head on — corpus targets, label targets, the sparse target through a shard and back, and both trainers reporting `range_ce` and `range_kl` |
 | `test_pipeline.py` | The outer loop end to end at toy scale, including that **a crash in the middle of labelling costs a shard and not the phase** — re-running produces the artefacts an uninterrupted run would have left: two iterations run to completion and write every artefact of every phase; the pool grows by exactly `style.agent_variants` members per iteration, variant 0 unmodified and the rest style draws, with the embedding table reserving `len(pool₀) + max_iterations × agent_variants` rows; **iteration 0 seats the `agent_init` member and iteration 1 seats the agent**, asserted from who was actually asked for an action; the seven §8 gap numbers computed by hand, including that `ev_gap_greedy` is zero exactly when the agent's mass sits on the oracle's best action; the held-out slice reaches the metric and never the optimiser, and `heldout_fraction = 0` reports **no gap** rather than one on training data; the split is a partition, deterministic in `(seed, iteration)` and different between iterations; **a run resumed from a crash in the middle of an iteration reproduces an uninterrupted one** — the same shards byte for byte, the same weights tensor for tensor, differing only in wall clocks; table size and stack depth span 2–9 and 10–300 BB with no weighting; and a past agent in the pool answers `hole_override` (two holdings, two answers, a posterior that moves off the prior) while observing only the moment it was asked about |
 
 | `test_slumbot_adapter.py` | The Slumbot seam, entirely off canned action strings — no socket: the mask hero acts under **is `env.legal`'s** on every canned state and reaches the token unchanged, folding is offered facing the blind and refused with nothing to call, and an opponent's all-in leaves no raise; **the chips are Slumbot's and not the abstraction's** — a `b250` that lands on no bin of ours still reads as a 5 BB pot, and every canned state's pot, stack and amount-to-call match the wire to 1e-9; the two seat frames are mirrors, hero holds hero's cards, the first decision of a hand belongs to seat 0 and the first of the flop to seat 1; §9 parity on the built record — only hero's hole cards, a board never ahead of the token's street, no showdown token, the pending decision action-less, and a prefix independent of what came later; **index → wire → index round-trips for every legal action on all four streets with no clamp firing**, while a fold with nothing to call becomes a check, says so in the counter, and is read back as a call; hero's own clamped action is what the next replay sees, and `hero_action_indices` overrides hero's seat only; BB/100 and its standard error against hand-computed values, with Welford's online form agreeing and the zero- and one-hand cases returning zero; a table outside `players_range` / `stack_bb_range` is **refused, not clamped**; and end to end the agent answers every canned state with a legal token, deterministically under its own generator, cold from the zero table and warm from a fitted one, reaching the network through the ordinary `AgentPoolMember` and not a copy of it |

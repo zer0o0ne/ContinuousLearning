@@ -356,6 +356,35 @@ def test_the_estimator_does_not_change_the_hand():
         assert np.isclose(b.rewards.sum(), 0.0)
 
 
+@pytest.mark.parametrize("num_players", [2, 6])
+def test_a_label_does_not_depend_on_how_its_rollouts_were_batched(num_players):
+    """The rankings are shared between hands dealt the same cards, and one
+    label is exactly that case: every legal action is rolled out on the same
+    deck, an action changing the forced prefix and nothing else.
+
+    That sharing is the one place the batch could leak into the answer. If the
+    boards a street averages over were chosen by whichever hand happened to
+    rank it first, `q` would move with `batch_hands` — so this is the test that
+    the completions come from the cards that street has already shown and from
+    nothing else (`env/runout.py`, §15).
+    """
+    pool = make_pool(0)
+    records = play(pool, make_specs(seed=17, n_hands=6, n_members=len(pool),
+                                    num_players=num_players, stack_bb=120))
+    record = next(r for r in records if len(r.decisions) >= 2)
+
+    reference = None
+    for batch_hands in (1, 7, 4096):
+        cfg = OracleConfig(samples_per_action=24, batch_hands=batch_hands,
+                           control_variate=True, runout_samples=8)
+        driver = LockstepDriver(pool, N_ACTIONS, runout=cfg.runout_config())
+        q, _legal, _stats = action_values(record, 1, driver, pool, 0, cfg,
+                                          np.random.default_rng(5))
+        if reference is None:
+            reference = q
+        np.testing.assert_array_equal(q, reference)
+
+
 def test_folding_hero_keeps_its_exact_closed_form():
     """`q[FOLD]` is minus what hero put in — and stays bit-exact with this on.
 

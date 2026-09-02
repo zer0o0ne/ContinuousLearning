@@ -63,6 +63,7 @@ import torch
 from agent.policy import AgentPoolMember, FrozenAgentMember
 from env.driver import LockstepDriver
 from nets.features import derived_masks
+from oracle.ranges import label_range_target
 from oracle.rollout import action_values_batch
 from oracle.posterior import PosteriorCache
 from oracle.transport import Slab, slab_rows, token_fields, v7_fields
@@ -143,7 +144,7 @@ class _AgentNetProxy:
     """Stands in for `nets.agent_net.AgentNet` inside a worker.
 
     `AgentPoolMember` and `FrozenAgentMember` use `net.d_emb` and call
-    `net(batch, emb)`; nothing else of the network reaches them.
+    `net(batch, emb, seat_emb)`; nothing else of the network reaches them.
     """
 
     def __init__(self, key, d_emb, max_players, n_actions, client):
@@ -153,10 +154,11 @@ class _AgentNetProxy:
         self.client = client
         self.fields = token_fields(int(max_players), self.n_actions, self.d_emb)
 
-    def __call__(self, batch, emb):
+    def __call__(self, batch, emb, seat_emb):
         b, t = (int(x) for x in batch["mask"].shape)
         tensors = dict(batch)
         tensors["emb"] = emb
+        tensors["seat_emb"] = seat_emb
         return self.client.request(self.key, AGENT, self.fields, tensors,
                                    b * t, (b, t), t, self.n_actions)
 
@@ -276,10 +278,14 @@ class AgentRunner:
     def run(self, slab, cells, shape, extra):
         views = slab.unpack(self.fields, cells, tuple(shape))
         emb = views.pop("emb")
+        seat_emb = views.pop("seat_emb")
         batch = {k: v.to(self.device) for k, v in views.items()}
         batch.update(derived_masks(batch))
+        b, t = batch["mask"].shape
+        seat_emb = seat_emb.to(self.device).view(
+            b, t, self.net.max_players, self.net.d_emb)
         with torch.no_grad():
-            out = self.net(batch, emb.to(self.device))
+            out = self.net(batch, emb.to(self.device), seat_emb)
         return out.float().cpu()
 
 
@@ -352,6 +358,7 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
 
     current = (None, None)
     posterior_cache = PosteriorCache()
+    range_cache = ocfg.range_cache()
     try:
         for chunk in label_chunks(todo, R, ocfg.labels_per_batch):
             i, h = chunk[0][1], chunk[0][2]
@@ -364,8 +371,14 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
                 _label_requests(chunk, session_of, hero_plain, seed),
                 driver, play_pool, ocfg,
                 posterior_cache=posterior_cache)
-            for (pos, _i, _h, _d), (q, legal, stats) in zip(chunk, answers):
-                result_q.put((pos, q, legal, stats))
+            for (pos, _i, h_, d_), (q, legal, stats) in zip(chunk, answers):
+                # §5.7 — the belief at the labelled decision, computed in the
+                # worker where the pool forwards already live. Doing it in the
+                # parent would serialise ~1200 policy rows per label behind the
+                # inference server, which is the one process that must not wait.
+                ranges = label_range_target(range_cache, session_of[_i],
+                                            h_, d_, play_pool, n_actions)
+                result_q.put((pos, q, legal, stats, ranges))
     finally:
         client.done()
 
@@ -496,11 +509,11 @@ def collect(server, result_q, procs, todo, start, consume, log, results=None):
     # what it queued has been taken off.
     while next_pos < len(todo):
         try:
-            pos, q, legal, stats = result_q.get(timeout=POLL_SECONDS)
+            pos, q, legal, stats, ranges = result_q.get(timeout=POLL_SECONDS)
         except queue_mod.Empty:
             _check_exited(procs)
             continue
-        results[int(pos)] = (q, legal, stats)
+        results[int(pos)] = (q, legal, stats, ranges)
         next_pos = _consume_prefix(results, next_pos, todo, consume)
     assert not results, (
         f"{len(results)} labels came back for positions nobody asked for")
@@ -510,9 +523,9 @@ def collect(server, result_q, procs, todo, start, consume, log, results=None):
 
 def _consume_prefix(results, next_pos, todo, consume):
     while next_pos in results:
-        q, legal, stats = results.pop(next_pos)
+        q, legal, stats, ranges = results.pop(next_pos)
         i, h, d = todo[next_pos]
-        consume(next_pos, i, h, d, q, legal, stats)
+        consume(next_pos, i, h, d, q, legal, stats, ranges)
         next_pos += 1
     return next_pos
 
@@ -529,10 +542,10 @@ def drain_results(result_q, into):
     n = 0
     while True:
         try:
-            pos, q, legal, stats = result_q.get_nowait()
+            pos, q, legal, stats, ranges = result_q.get_nowait()
         except queue_mod.Empty:
             return n
-        into[int(pos)] = (q, legal, stats)
+        into[int(pos)] = (q, legal, stats, ranges)
         n += 1
 
 

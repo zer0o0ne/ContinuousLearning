@@ -21,6 +21,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from attn_utils import build_causal_padding_mask
+from nets.range_head import RangeHead
 from nets.tokeniser import SituationTokeniser
 
 
@@ -41,6 +42,17 @@ class HandEncoder(nn.Module):
         self.d_emb = d_emb
         self.n_actions = n_actions
         self.max_players = max_players
+        self.range_enabled = bool(cfg.get("range_enabled", False))
+        # Two thirds of the stack by default: reading a range is not a shallow
+        # function and needs depth beneath it, and the layers above it are what
+        # get to use the belief. A toy config with two layers therefore gets its
+        # head after the first, rather than after a layer it does not have.
+        self.range_layer = int(cfg.get("range_layer",
+                                       max(1, (n_layers * 2) // 3)))
+        assert 0 <= self.range_layer <= n_layers, (
+            f"range_layer {self.range_layer} is not a cut of a {n_layers}-layer "
+            f"stack; 0 puts the belief before every layer and {n_layers} after "
+            f"all of them")
 
         self.tokeniser = SituationTokeniser(
             d_model=d_model, d_emb=d_emb, n_actions=n_actions,
@@ -64,18 +76,38 @@ class HandEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(qwen, layer_idx=i) for i in range(n_layers)])
         self.norm = Qwen3RMSNorm(d_model, eps=qwen.rms_norm_eps)
+        self.range_head = (RangeHead(cfg, d_model, d_emb, max_players)
+                           if self.range_enabled else None)
 
-    def forward(self, batch, emb):
-        """(B, T, d_model) — one causal pass over each hand independently."""
+    def forward(self, batch, emb, seat_emb=None):
+        """`(hidden, range_logits)` — one causal pass over each hand.
+
+        `hidden` is (B, T, d_model). `range_logits` is (A, 1326) over the active
+        (hand, token, seat) rows of `batch["act_idx"]`, or `None` when the range
+        head is off. `seat_emb` — (B, T, max_players, d_emb), every seat's
+        vector at every token — is required by the head and ignored without it.
+        """
         x = self.tokeniser(batch, emb)
         B, T, _ = x.shape
         position_ids = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
         position_embeddings = self.rope(x, position_ids)
         attn_mask = build_causal_padding_mask(batch["mask"], T, x.dtype, x.device)
 
-        for layer in self.layers:
-            out = layer(x, position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                        attention_mask=attn_mask)
-            x = out[0] if isinstance(out, tuple) else out
-        return self.norm(x)
+        def run(layers, out_x):
+            for layer in layers:
+                out = layer(out_x, position_ids=position_ids,
+                            position_embeddings=position_embeddings,
+                            attention_mask=attn_mask)
+                out_x = out[0] if isinstance(out, tuple) else out
+            return out_x
+
+        if self.range_head is None:
+            return self.norm(run(self.layers, x)), None
+
+        assert seat_emb is not None, (
+            "the range head needs every seat's vector at every token; the "
+            "network that owns this encoder builds it (§5.7)")
+        x = run(self.layers[:self.range_layer], x)
+        range_logits, x = self.range_head(x, batch, seat_emb)
+        x = run(self.layers[self.range_layer:], x)
+        return self.norm(x), range_logits

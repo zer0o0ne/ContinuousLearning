@@ -521,6 +521,70 @@ read the same way, and `strength_weight = 0` is the ablation that asks whether i
 
 ---
 
+### 5.7 The range head — the belief, made explicit
+
+**Status: agreed with the owner 2026-09-02**, architecture included.
+
+A fourth head, and the only one that is **not a leaf**. It sits between the trunk's two halves of
+decoder layers: at every decision token it predicts, for every live opponent, a distribution over
+the 1326 two-card combos, and that prediction is fed back into the tokens the remaining layers
+read.
+
+**Why a belief at all.** DeepStack and ReBeL both make the range a first-class object and hand it
+to the value network as an *input* — in self-play it is computable, so there is nothing to infer.
+Ours is not computable: the players are unknown members of a pool with drawn styles, so the range
+has to be *inferred* from the line. That puts this closer to the belief-prediction auxiliary tasks
+of Hanabi (BAD, SAD, Learned Belief Search) than to the poker systems, and it is the same bet
+those make: a representation forced to carry the belief plays better than one left to discover it
+from the reward. Here the reward is an oracle EV label whose noise at depth is larger than the
+differences it is meant to teach (§13, §11.4), which is the same argument §5.6 makes for the
+strength head.
+
+**The target is §7.2's posterior, run as a filter.** Weights carried forward, each new action of
+that opponent multiplying them, each new board card removing what it blocks. With no pruning it is
+exactly `opponent_posterior` evaluated at every prefix; the two are one estimator with one
+implementation, and the agent's labels get theirs from the same object the oracle already builds
+to sample the rollouts' holdings.
+
+**Why not a hard range.** The first proposal was a set: keep the combos whose *modal* action is
+the one that was played, narrow it street by street. It is degenerate in this pool. Every member
+emits finite logits and the style layer mixes in up to 25 % uniform, so no combo ever has zero
+reach and the surviving set is exactly the card-removal mask — a deterministic function of the
+token's own input. Four of the five degenerate strategies never read their cards, so their argmax
+is identical for every combo and the set comes out either full or empty. And the two cost the
+**same forwards**: both need `P(a | combo)` for every surviving combo, so rounding to 0/1 buys
+nothing and throws away the magnitude, which is the part an EV calculation actually uses. The
+support cut that *does* buy forwards is a threshold on the weights, and it is a knob
+(`range_prune_threshold`) rather than a definition.
+
+**Its cost is real and is paid in hands.** A corpus hand costs ~1 policy row per decision today
+and ~1225 per opponent decision with the target, so the corpus is where this is expensive; the
+owner's decision is to regulate it by the number of hands rather than by sampling a subset. A
+label pays about 10 % more (G3: 1225 posterior rows in ~11k), because the belief is recomputed
+in the label worker rather than threaded out of `action_values`.
+
+**Architecturally it is a perceiver decoder, not an MLP on the token.** A range is the product of
+one player's likelihoods over every decision they have taken, and those live in earlier tokens, so
+the queries — "player *s*, at moment *t*" — cross-attend over the trunk's states across the whole
+prefix. Causally: a query at *t* sees *t' ≤ t* and nothing later, or the belief reads actions that
+have not happened and the deployed agent is strictly worse than its loss curve. The query carries
+the seat's position embedding, that seat's opponent vector, and the trunk state at *t*.
+
+**What goes back into the trunk is the probability vector, detached.** Not the head's hidden
+state: a wide hidden state would let the action loss push arbitrary information around the
+1326-wide bottleneck, and the stop-grad would then be closing the wrong channel. With the detach
+the head is trained by its own target alone and the layers above consume a belief they cannot
+bend. The token attends over its own live opponents' belief vectors, so the aggregation is learned
+and the identity of each belief survives it.
+
+**`range_weight = 0` is not the ablation** — with the weight at zero the head still runs and still
+injects, so the layers above it read an untrained head's output. `range_enabled: false` is the
+ablation, and it removes the module.
+
+**Read the KL, not the cross-entropy.** The support is 990–1225 combos, so a perfect head still
+pays the target's own entropy: ~6.9–7.1 nats. The movable part is `ce − H(target)`. This is
+§11.4's trap in a third place.
+
 ## 6. Entity 3 — Agent v8
 
 ### 6.1 Shape

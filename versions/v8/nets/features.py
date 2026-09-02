@@ -60,6 +60,33 @@ will only learn later is what a value target does rather than a leak. It is
 other token, on every token of a hand still in progress (no final board exists
 yet), and on every token of a record nobody labelled.
 
+**The range target (§5.7).** The observer's belief about every *other* live
+player, at every token: one weight vector over the 1326 two-card combos per
+(token, seat), produced by `oracle/ranges.py`. Like the two above it is a
+**target and never an input** — nothing about anybody else's cards enters the
+token, and the belief is a function of the history the observer has already
+seen, so it carries no future. It is stored sparsely (`RangeTargets`) because a
+concentrated range is a handful of combos and a dense 1326-vector per token per
+seat would be the largest thing in a corpus by an order of magnitude.
+
+`active_opp` says which seats that belief is *about* — seats that are not the
+observer and have not folded yet. It is public information (a fold is public),
+it is needed on every batch and not only on a labelled one, because §5.7's head
+runs in the forward whether or not a target exists, and it excludes showdown
+tokens: the hand is over there and there is no belief left to hold.
+
+`own_hole` carries the observer's own two cards on **every** token, not only on
+the ones where the observer acts. That is not new information — the observer has
+always known its own hand — but the decision token only ever showed it on the
+observer's own rows, and the range head needs it on every row: the support of a
+belief is exactly "the combos the board and the observer's own cards leave", and
+blockers are half of what a range is about. Nothing else reads it; the tokeniser
+does not, so the §5.1 observation is bit-for-bit what it was.
+
+`seat_slot` and `seat_member` are the same naming as `slot`/`member` but for
+**every seat at once** rather than the acting one, because the range head is
+asked about a player who is not the one acting and needs that player's vector.
+
 The token's `member` and `slot` fields are the two ways a player is named. At
 training a player *is* a pool member and its vector is a row of the trainable
 table (§5.4); at inference a player is a seat at the observed table and its
@@ -72,10 +99,22 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from oracle.ranges import N_COMBOS
+
 UNKNOWN_CARD = 52
 TOKEN_DECISION = 0
 TOKEN_SHOWDOWN = 1
 N_TOKEN_TYPES = 2
+
+
+@dataclass
+class RangeTargets:
+    """§5.7 targets of one hand, flat and sparse. `K` entries in total."""
+
+    token: np.ndarray          # (K,) int32 — token index within the hand
+    seat: np.ndarray           # (K,) int16 — the seat the belief is about
+    combo: np.ndarray          # (K,) int16 — canonical index, 0..1325
+    weight: np.ndarray         # (K,) float32 — sums to 1 per (token, seat)
 
 
 @dataclass
@@ -100,9 +139,33 @@ class HandTokens:
     # observer's own decision tokens. `-1` everywhere else, which is the mask:
     # a percentile is in [0, 1], so the sentinel cannot collide with a label.
     own_strength: np.ndarray   # (T,) float32
+    # §5.7 — the observer's own two cards on every token, for the range head's
+    # combo mask and for nothing else.
+    own_hole: np.ndarray       # (T, 2) int64
+    # §5.7 — every seat's slot and member, not only the acting one, and which
+    # seats the range head is asked about at this token.
+    seat_slot: np.ndarray      # (T, max_players) int64
+    seat_member: np.ndarray    # (T, max_players) int64
+    active_opp: np.ndarray     # (T, max_players) bool
+    # §5.7 — the sparse targets. `None` on a hand nobody tracked ranges for,
+    # which is every hand of an evaluation replay and of a corpus built with
+    # the head switched off.
+    ranges: RangeTargets = None
 
     def __len__(self):
         return len(self.decision_idx)
+
+
+# The fields that are one row per token, in the order `collate` and the shard
+# writer walk them. `ranges` is deliberately not here: it is `K` rows and not
+# `T`, so it is padded, sharded and concatenated by its own code.
+TOKEN_FIELDS = tuple(
+    f for f in (
+        "cards", "decision_idx", "acting_pos", "num_players", "scalars",
+        "seat_stacks", "prev_action", "member", "slot", "action", "legal",
+        "token_type", "sd_strength", "sd_class", "own_strength",
+        "own_hole", "seat_slot", "seat_member", "active_opp",
+    ))
 
 
 def _board_as_of(deck, turn):
@@ -116,7 +179,7 @@ def _board_as_of(deck, turn):
 
 
 def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
-                pending=None):
+                pending=None, ranges=None):
     """Tokenise one `HandRecord` from `observer_pos`'s point of view.
 
     Args:
@@ -133,6 +196,11 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
             the context — the moment the *agent* observes (§9), as opposed to
             the completed hand the embedding network observes. A hand with a
             pending decision has no showdown, and passing both is refused.
+        ranges: `{(token, seat): (combo_idx, weight)}` from
+            `oracle.ranges.hand_ranges`, the §5.7 target. Keys naming a
+            (token, seat) this observer has no live opponent at are refused
+            rather than dropped: the two are derived from the same fold rule and
+            a disagreement means one of them is wrong.
     """
     assert 0 <= observer_pos < record.num_players, (
         f"observer seat {observer_pos} is not at this {record.num_players}-handed "
@@ -168,6 +236,26 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
     sd_strength = np.zeros(T, dtype=np.float32)
     sd_class = np.zeros(T, dtype=np.int64)
     own_strength = np.full(T, -1.0, dtype=np.float32)
+    own_hole = np.tile(np.asarray(record.hole_cards(observer_pos),
+                                  dtype=np.int64), (T, 1))
+    seat_slot = np.zeros((T, max_players), dtype=np.int64)
+    seat_member = np.zeros((T, max_players), dtype=np.int64)
+    active_opp = np.zeros((T, max_players), dtype=bool)
+
+    # §5.7 — every seat's naming, constant over the hand, and who the belief is
+    # about at each token. A player who folds at token `t` was still holding
+    # cards while that decision was taken, so they are active *at* `t` and gone
+    # from `t + 1`; dropping them for the whole hand would condition the target
+    # on the future.
+    seat_slot[:, :n] = np.asarray(slot_of_seat, dtype=np.int64)[None, :n]
+    seat_member[:, :n] = np.asarray(record.spec.seat_members,
+                                    dtype=np.int64)[None, :n]
+    folded = set()
+    for t in range(n_dec + (1 if pending is not None else 0)):
+        for seat in range(n):
+            active_opp[t, seat] = seat != observer_pos and seat not in folded
+        if t < n_dec and int(decisions[t]["action_idx"]) == 0:
+            folded.add(int(decisions[t]["acting_pos"]))
 
     def _fill_decision(t, snap_idx, pos):
         """The public part of a decision token — identical for a decision that
@@ -242,7 +330,33 @@ def hand_tokens(record, observer_pos, slot_of_seat, max_players, n_actions,
 
     return HandTokens(cards, decision_idx, acting_pos, num_players, scalars,
                       seat_stacks, prev_action, member, slot, action, legal,
-                      token_type, sd_strength, sd_class, own_strength)
+                      token_type, sd_strength, sd_class, own_strength,
+                      own_hole, seat_slot, seat_member, active_opp,
+                      range_targets(ranges, active_opp))
+
+
+def range_targets(ranges, active_opp):
+    """`{(token, seat): (idx, w)}` → one flat `RangeTargets`. `None` stays `None`."""
+    if ranges is None:
+        return None
+    keys = sorted(ranges)
+    token, seat, combo, weight = [], [], [], []
+    for t, s in keys:
+        assert active_opp[t, s], (
+            f"a range target was produced for seat {s} at token {t}, where "
+            f"that seat is not a live opponent — `oracle.ranges` and "
+            f"`hand_tokens` disagree about who folded when")
+        idx, w = ranges[(t, s)]
+        token.append(np.full(len(idx), t, dtype=np.int32))
+        seat.append(np.full(len(idx), s, dtype=np.int16))
+        combo.append(np.asarray(idx, dtype=np.int16))
+        weight.append(np.asarray(w, dtype=np.float32))
+    if not keys:
+        empty = lambda d: np.zeros(0, dtype=d)
+        return RangeTargets(empty(np.int32), empty(np.int16), empty(np.int16),
+                            empty(np.float32))
+    return RangeTargets(np.concatenate(token), np.concatenate(seat),
+                        np.concatenate(combo), np.concatenate(weight))
 
 
 def empty_batch(B, T, n_actions, max_players):
@@ -272,6 +386,15 @@ def empty_batch(B, T, n_actions, max_players):
         # percentile, and a padded tail scored as "the worst hand possible"
         # would be a target nobody produced.
         "own_strength": torch.full((B, T), -1.0, dtype=torch.float32),
+        # §5.7 — padding with the unknown card leaves the padded tail's combo
+        # mask blocking nothing, which is what an all-masked row wants.
+        "own_hole": torch.full((B, T, 2), UNKNOWN_CARD, dtype=torch.long),
+        # §5.7 — every seat's naming and the seats the belief is about. Seat 0
+        # is a safe index for a seat that does not exist at this table; the
+        # active mask is what keeps it out of every computation.
+        "seat_slot": torch.zeros((B, T, max_players), dtype=torch.long),
+        "seat_member": torch.zeros((B, T, max_players), dtype=torch.long),
+        "active_opp": torch.zeros((B, T, max_players), dtype=torch.bool),
         "mask": torch.zeros((B, T), dtype=torch.float32),
     }
 
@@ -293,25 +416,47 @@ def collate(hands, device="cpu"):
     out = empty_batch(B, T, n_actions, max_players)
     for b, h in enumerate(hands):
         t = len(h)
-        out["token_type"][b, :t] = torch.from_numpy(h.token_type)
-        out["sd_strength"][b, :t] = torch.from_numpy(h.sd_strength)
-        out["sd_class"][b, :t] = torch.from_numpy(h.sd_class)
-        out["own_strength"][b, :t] = torch.from_numpy(h.own_strength)
-        out["cards"][b, :t] = torch.from_numpy(h.cards)
-        out["decision_idx"][b, :t] = torch.from_numpy(h.decision_idx)
-        out["acting_pos"][b, :t] = torch.from_numpy(h.acting_pos)
-        out["num_players"][b, :t] = torch.from_numpy(h.num_players)
-        out["scalars"][b, :t] = torch.from_numpy(h.scalars)
-        out["seat_stacks"][b, :t] = torch.from_numpy(h.seat_stacks)
-        out["prev_action"][b, :t] = torch.from_numpy(h.prev_action)
-        out["member"][b, :t] = torch.from_numpy(h.member)
-        out["slot"][b, :t] = torch.from_numpy(h.slot)
-        out["action"][b, :t] = torch.from_numpy(h.action)
-        out["legal"][b, :t] = torch.from_numpy(h.legal)
+        for name in TOKEN_FIELDS:
+            out[name][b, :t] = torch.from_numpy(getattr(h, name))
         out["mask"][b, :t] = 1.0
 
     out.update(derived_masks(out))
+    out.update(range_batch(hands, out))
     return {k: v.to(device) for k, v in out.items()}
+
+
+def range_batch(hands, out):
+    """The §5.7 target, densified onto the batch's active (hand, token, seat) rows.
+
+    Sparse on disk and in the corpus, dense here: `act_idx` is at most
+    `B · T · max_players` rows and in practice a few hundred, so a
+    `(A, 1326)` block is megabytes where a `(B, T, max_players, 1326)` one would
+    be gigabytes. The rows line up with `act_idx` by construction, so the head
+    and the loss index the same way and no third alignment has to be trusted.
+
+    Returns nothing at all when no hand in the batch carries a target — an
+    inference batch, an evaluation replay, or a corpus built with §5.7 off.
+    """
+    if all(h.ranges is None for h in hands):
+        return {}
+    act = out["act_idx"]
+    A = act.shape[0]
+    row_of = {(int(b), int(t), int(s)): i
+              for i, (b, t, s) in enumerate(act.tolist())}
+    target = torch.zeros((A, N_COMBOS), dtype=torch.float32)
+    has = torch.zeros(A, dtype=torch.bool)
+    for b, h in enumerate(hands):
+        if h.ranges is None:
+            continue
+        rows = np.fromiter(
+            (row_of[(b, int(t), int(s))]
+             for t, s in zip(h.ranges.token, h.ranges.seat)),
+            dtype=np.int64, count=len(h.ranges.token))
+        target[torch.from_numpy(rows),
+               torch.from_numpy(h.ranges.combo.astype(np.int64))] = \
+            torch.from_numpy(h.ranges.weight)
+        has[torch.from_numpy(np.unique(rows))] = True
+    return {"range_target": target, "range_mask": has}
 
 
 def derived_masks(batch):
@@ -323,8 +468,16 @@ def derived_masks(batch):
     them between processes — it rebuilds them here, so there is one statement of
     what they are.
     """
+    decision_mask = batch["mask"] * (batch["token_type"] == TOKEN_DECISION)
+    # §5.7 — the (hand, token, seat) triples the range head answers about, in
+    # row-major order. It is derived and not carried, for the same reason the
+    # three masks are: it is a function of `active_opp` and `mask`, and one
+    # statement of that rule is the point.
+    active = batch["active_opp"] & (decision_mask > 0).unsqueeze(-1)
     return {
-        "decision_mask": batch["mask"] * (batch["token_type"] == TOKEN_DECISION),
+        "decision_mask": decision_mask,
         "showdown_mask": batch["mask"] * (batch["token_type"] == TOKEN_SHOWDOWN),
         "strength_mask": batch["mask"] * (batch["own_strength"] >= 0),
+        "active": active,
+        "act_idx": active.nonzero(),
     }

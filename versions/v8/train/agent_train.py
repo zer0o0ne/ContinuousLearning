@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 from nets.features import collate
+from nets.range_head import range_loss
 from train.targets import kl_loss, soft_q_loss
 from utils import progress
 
@@ -84,6 +85,20 @@ def embedding_dropout(tables, p, generator=None):
 def token_embeddings(tables, slot, d_emb):
     """(B, T, d_emb) — the acting player's vector on each token of each hand."""
     return tables.gather(1, slot.unsqueeze(-1).expand(-1, -1, d_emb))
+
+
+def seat_embeddings(tables, seat_slot):
+    """(B, T, max_players, d_emb) — every seat's vector on every token (§5.7).
+
+    The range head answers about players who are not the one acting, so it reads
+    the whole table's vectors and not just hero's. Dropout has already been
+    applied to `tables`, so a slot the agent is blind to is blind here too — the
+    belief about a player whose vector was dropped is the belief about an
+    unobserved player, which is exactly what §6.2's unconditional policy needs.
+    """
+    B = tables.shape[0]
+    rows = torch.arange(B, device=tables.device).view(B, 1, 1)
+    return tables[rows, seat_slot]
 
 
 def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
@@ -149,6 +164,7 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
     steps = steps_for_iteration(cfg, iteration)
     batch_hands = min(int(cfg["batch_hands"]), n)
     p_drop = float(cfg.get("embedding_dropout", 0.0))
+    w_range = float(cfg.get("range_weight", 0.0))
     log(f"[agent] iteration {iteration}: {steps} steps over {n} labels, "
         f"batch {batch_hands} hands, loss {loss_name}, "
         f"embedding dropout {p_drop}")
@@ -171,7 +187,9 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
             np.stack([np.asarray(embeddings[i], dtype=np.float32)
                       for i in pick]), device=device)
         tables = embedding_dropout(tables, p_drop, generator=gen)
-        logits = net(batch, token_embeddings(tables, batch["slot"], net.d_emb))
+        logits, range_logits = net.logits_and_range(
+            batch, token_embeddings(tables, batch["slot"], net.d_emb),
+            seat_embeddings(tables, batch["seat_slot"]))
 
         rows = torch.arange(len(pick), device=logits.device)
         last = batch["mask"].sum(dim=1).long() - 1
@@ -182,6 +200,15 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
             loss = kl_loss(logits, target, legal)
         else:
             loss = soft_q_loss(logits, target, legal, temperature)
+        policy_loss = float(loss.detach())
+
+        # §5.7 — the belief term, on the labelled decision's own token. The
+        # oracle already computed every live opponent's range there to build
+        # `q`, so this target costs the label nothing extra.
+        scored = (range_loss(range_logits, batch)
+                  if range_logits is not None else None)
+        if scored is not None:
+            loss = loss + w_range * scored[0]
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -193,9 +220,13 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         # Both losses are a KL and both are zero at the optimum, so one key
         # carries either: `kl` reports `KL(target ‖ π)` and `soft_q` reports
         # `T·KL(π ‖ target)`.
-        history.append({"step": step, "kl": float(loss.detach())})
+        row = {"step": step, "kl": policy_loss}
+        if scored is not None:
+            row["range_ce"], row["range_kl"] = scored[1], scored[2]
+        history.append(row)
         if step % cfg.get("log_every", 100) == 0 or step == 1:
             log(f"[agent] step {step}/{steps} "
-                f"{loss_name}={history[-1]['kl']:.4f}")
+                + " ".join(f"{k}={v:.4f}" for k, v in row.items()
+                           if k != "step"))
     net.eval()
     return history

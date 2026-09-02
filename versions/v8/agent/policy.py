@@ -80,8 +80,11 @@ class AgentPoolMember(PoolMember):
 
         batch = collate(hands, device=self.device)
         emb = self.embeddings[batch["slot"]]
+        # §5.7 — the range head is asked about seats the acting player is not,
+        # so it reads every seat's vector, not only hero's own.
+        seat_emb = self.embeddings[batch["seat_slot"]]
         with torch.no_grad():
-            out = self.net(batch, emb)
+            out = self.net(batch, emb, seat_emb)
         return out.float().cpu().numpy().astype(np.float64)
 
 
@@ -156,6 +159,8 @@ class FrozenAgentMember(PoolMember):
                         device=self.device)
         emb = torch.zeros(*batch["mask"].shape, self.net.d_emb,
                           device=self.device)
+        seat_emb = torch.zeros(*batch["seat_slot"].shape, self.net.d_emb,
+                               device=self.device)
         with torch.no_grad():
-            out = self.net(batch, emb)
+            out = self.net(batch, emb, seat_emb)
         return out.float().cpu().numpy().astype(np.float64)

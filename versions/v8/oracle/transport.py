@@ -79,6 +79,15 @@ def token_fields(max_players, n_actions, d_emb):
         ("own_strength", 1, FLOAT),
         ("mask", 1, FLOAT),
         ("emb", d_emb, FLOAT),
+        # §5.7 — what the range head reads. `seat_emb` is every seat's vector
+        # and not only the acting one, so it is `max_players` times as wide as
+        # `emb`; the slab is a shared mapping and pages a run never touches are
+        # never backed, so the width costs address space rather than memory.
+        ("own_hole", 2, INT),
+        ("seat_slot", max_players, INT),
+        ("seat_member", max_players, INT),
+        ("active_opp", max_players, BOOL),
+        ("seat_emb", max_players * d_emb, FLOAT),
     )
 
 

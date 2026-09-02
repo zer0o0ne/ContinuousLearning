@@ -410,6 +410,46 @@ def test_the_runout_is_dealt_per_sample_but_the_visible_board_is_not():
     assert len(runouts) > 1, "every sample got the same turn and river"
 
 
+def test_a_seat_that_folded_is_dealt_out_of_the_same_remainder_as_the_runout():
+    """The cards nobody was dealt are *dealt* into the empty slots, not sorted.
+
+    This one is not about the label at all — it is the assumption the control
+    variate rests on. `env/runout.py` conditions its board completions on every
+    seat's cards, the folded seats included, and calls that exact because the
+    runout and those cards come out of one remainder: either order gives the
+    same joint. Sorting the remainder into the slots is what breaks it. A folded
+    seat would then hold the lowest leftover cards by construction, the
+    completions would be drawn from a pool systematically missing them, and a
+    correction whose whole claim is a zero mean would acquire a bias — measured
+    at over five standard errors on a six-handed label before this was fixed.
+
+    So the check is the one thing sorting cannot produce: across the samples of
+    one label, the cards a folded seat is dealt and the cards the runout is
+    dealt are the same set.
+    """
+    pool = make_pool(0)
+    records = play(pool, make_specs(seed=5, n_hands=4, n_members=len(pool),
+                                    num_players=6, stack_bb=200))
+    record, idx, folded = next(
+        (r, i, f)
+        for r in records
+        for i in range(len(r.decisions))
+        for f in [{int(d["acting_pos"]) for d in r.decisions[:i]
+                   if int(d["action_idx"]) == FOLD}]
+        if f and int(r.snapshots[r.decisions[i]["snap_idx"]]["turn"]) == 0)
+    seat = min(folded)
+
+    driver = CapturingDriver(pool, N_ACTIONS)
+    action_values(record, idx, driver, pool, 0,
+                  OracleConfig(samples_per_action=256), np.random.default_rng(9))
+
+    dealt_to_the_folded_seat, dealt_to_the_board = set(), set()
+    for played in driver.captured:
+        dealt_to_the_folded_seat.update(played.hole_cards(seat))
+        dealt_to_the_board.update(int(c) for c in played.deck[:5])
+    assert dealt_to_the_folded_seat == dealt_to_the_board
+
+
 def test_a_label_whose_every_draw_collides_is_nan():
     """Eight ranges inside three cards: no joint assignment exists at all.
 

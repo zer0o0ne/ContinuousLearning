@@ -47,6 +47,11 @@ class Session:
     members: list                 # pool-member index per slot; slot 0 observes
     specs: list = field(default_factory=list)
     records: list = field(default_factory=list)
+    # §5.7 — one `{(token, seat): (combo_idx, weight)}` per hand, filled by
+    # `oracle.ranges.label_ranges` when the range head is on. Empty means the
+    # corpus carries no belief target, which is the head's ablation and also
+    # every corpus built before §5.7 existed.
+    ranges: list = field(default_factory=list)
 
     def seat_of_slot(self, slot, hand_idx):
         """Slot `slot` sits here in hand `hand_idx` (the button rotates)."""
@@ -64,6 +69,7 @@ class Session:
                 record, observer_pos=self.seat_of_slot(0, h),
                 slot_of_seat=self.slot_of_seat(h),
                 max_players=max_players, n_actions=n_actions,
+                ranges=self.ranges[h] if self.ranges else None,
             ))
         return out
 

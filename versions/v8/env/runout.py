@@ -38,6 +38,7 @@ correctness one: with `M` of them the runout's variance comes out reduced by
 about `1 − 1/M`, and the rest is diminishing returns.
 """
 
+import hashlib
 import itertools
 import math
 from dataclasses import dataclass
@@ -169,18 +170,43 @@ class HandRunout:
     on the betting, so one street's work serves every decision taken on it and
     every hypothetical the control variate needs.
 
-    The draw comes from a generator of its own, seeded from the hand's seed, so
-    switching the estimator on does not move a single card or action of the hand
-    it is measuring — and does not depend on which other hands shared the batch
-    (`env/driver.py`, §15).
+    **The cache is keyed by the deck, not by the hand.** One label rolls every
+    legal action out on the *same* cards — an action changes the forced prefix
+    and nothing else — so the `|A|` hands of one sample carry identical decks
+    and identical rankings. Sharing one `scores` dict between them is what stops
+    the ranking being paid `|A|` times over; the driver hands every hand of a
+    run the same dict.
+
+    That sharing is why a street's completions are drawn from a generator seeded
+    by **the cards that street has already shown** — its board prefix, the
+    holdings and the table size — and by nothing else. Two things follow, and
+    the estimator needs both:
+
+    * whichever hand asks first gets the same boards, so no result depends on
+      the order hands were batched in (§15);
+    * the draw cannot know a card that has not been dealt. A correction at a
+      chance node has zero mean only if the boards `b(before)` averaged over
+      were chosen independently of the card that node turns over, so seeding on
+      anything downstream of it — the hand's own seed included, where that seed
+      is what dealt the deck — is exactly what must not happen.
+
+    The generator is the estimator's own either way, so switching the estimator
+    on does not move a single card or action of the hand it is measuring.
     """
 
-    def __init__(self, deck, num_players, cfg, seed):
+    def __init__(self, deck, num_players, cfg, scores=None):
         self.deck = np.asarray(deck, dtype=np.int64)
         self.num_players = int(num_players)
         self.cfg = cfg
-        self.rng = np.random.default_rng([int(seed) % (2 ** 63), 0x5EED])
-        self._scores = {}
+        self.key = (self.deck.tobytes(), self.num_players)
+        self._scores = {} if scores is None else scores
+
+    def _rng(self, known, holes):
+        """The completion draw of one street: the cards it has already shown."""
+        digest = hashlib.blake2b(
+            np.asarray(known, dtype=np.int64).tobytes() + holes.tobytes()
+            + bytes([self.num_players]), digest_size=8).digest()
+        return np.random.default_rng([int.from_bytes(digest, "big"), 0x5EED])
 
     def _holes(self):
         return self.deck[5:5 + 2 * self.num_players].reshape(-1, 2)
@@ -191,14 +217,18 @@ class HandRunout:
         holes = self._holes()
         return (self.deck[:k], holes,
                 board_completions(self.deck[:k], holes.reshape(-1), 5 - k,
-                                  self.rng, self.cfg))
+                                  self._rng(self.deck[:k], holes), self.cfg))
+
+    def cached(self, turn):
+        """The ranking matrix of one street, or None if nobody has ranked it."""
+        return self._scores.get((self.key, int(turn)))
 
     def scores(self, turn):
-        cached = self._scores.get(int(turn))
+        cached = self.cached(turn)
         if cached is None:
             known, holes, comps = self._job(turn)
             cached = seat_scores(known, holes, comps)
-            self._scores[int(turn)] = cached
+            self._scores[(self.key, int(turn))] = cached
         return cached
 
     def baseline(self, turn, live, bets):
@@ -209,23 +239,37 @@ class HandRunout:
         return equity_baseline(self.scores(turn), live, bets)
 
 
-def prime(hands, chunk_rows=200_000):
-    """Rank every street of every hand in one batch, ahead of any of them.
+def prime(demands, chunk_rows=200_000):
+    """Rank the streets a wave of hands is about to ask for, in one batch.
 
     A hand needs its ranking matrix the moment it takes a decision, and asking
     for it then means one evaluator call per hand per street — a few hundred
-    rows a call, which is the shape `env/driver.py` exists to avoid. Every board
-    a hand can reach is already fixed by its deck, so all four streets can be
-    ranked before the hand is played and all the hands of a wave together: the
-    oracle starts its whole label in one wave, so this is one batched call for
-    the label rather than thousands of tiny ones.
+    rows a call, which is the shape `env/driver.py` exists to avoid. Ranking a
+    whole wave together makes it one call for the label instead of thousands of
+    tiny ones.
 
-    The waste is the streets a hand never reaches. It is bounded by four
-    rankings a hand and it is rows, not calls — which is the term that is cheap.
+    Args:
+        demands: `(HandRunout, turn)` pairs — what the hands of this round can
+            ask for before the next one. The driver knows that, this does not:
+            ranking every street of every hand ahead of time pays for streets a
+            hand folds before reaching, and for a rollout that replays a forced
+            prefix it pays for streets that were already visible when the
+            labelled decision was taken and can never be queried.
+        chunk_rows: how many seven-card rows go to the evaluator at once.
+
+    Deduplicated by `(deck, street)`, so the `|A|` hands one label rolls out on
+    one sample rank their boards once between them.
+
+    It is an optimisation and nothing else: a street nobody primed is ranked on
+    demand by `HandRunout.scores`, one call at a time but with the same numbers.
     """
-    jobs = [(hand, turn) + hand._job(turn)
-            for hand in hands for turn in range(4)
-            if int(turn) not in hand._scores]
+    jobs, seen = [], set()
+    for hand, turn in demands:
+        k = (hand.key, int(turn))
+        if k in seen or hand.cached(turn) is not None:
+            continue
+        seen.add(k)
+        jobs.append((hand, int(turn)) + hand._job(turn))
     batch, rows = [], 0
     for job in jobs:
         block = score_rows(job[2], job[3], job[4])
@@ -245,7 +289,7 @@ def _flush(batch):
     scored = scored.numpy()
     at = 0
     for (hand, turn, _known, holes, comps), block in batch:
-        hand._scores[int(turn)] = scored[at:at + len(block)].reshape(
+        hand._scores[(hand.key, int(turn))] = scored[at:at + len(block)].reshape(
             len(comps), len(holes))
         at += len(block)
     assert at == len(scored), f"{at} of {len(scored)} ranked rows were claimed"

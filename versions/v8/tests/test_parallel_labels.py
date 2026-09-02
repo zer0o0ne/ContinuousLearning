@@ -311,15 +311,21 @@ def test_a_token_batch_survives_the_slab_unchanged():
     b, t = batch["mask"].shape
     slab = Slab(max(b, 8), [fields], N_ACTIONS)
 
+    # §5.7: every seat's vector, not only the acting one, crosses the slab.
+    seat_emb = torch.arange(b * t * MAX_PLAYERS * d_emb, dtype=torch.float32)
+    seat_emb = seat_emb.reshape(b, t, MAX_PLAYERS, d_emb)
+
     tensors = dict(batch)
     tensors["emb"] = emb
+    tensors["seat_emb"] = seat_emb
     slab.pack(fields, tensors, b * t)
     out = slab.unpack(fields, b * t, (b, t))
     for name, _cols, _dtype in fields:
-        assert torch.equal(out[name], tensors[name]), name
-    # The three derived masks are rebuilt, not carried.
+        assert torch.equal(out[name].reshape(tensors[name].shape),
+                           tensors[name]), name
+    # The derived masks and the §5.7 active index are rebuilt, not carried.
     assert set(batch) - set(out) == {"decision_mask", "showdown_mask",
-                                     "strength_mask"}
+                                     "strength_mask", "active", "act_idx"}
 
 
 # ---------------------------------------------------------------- the mirror

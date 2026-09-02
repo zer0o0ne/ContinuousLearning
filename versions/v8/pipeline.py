@@ -82,7 +82,9 @@ from nets.features import collate
 from pool.build import build_pool
 from pool.sampling import PoolSampler
 from pool.style import StyleParams, sample_style
-from train.agent_train import token_embeddings, train_agent
+from train.agent_train import (seat_embeddings, token_embeddings,
+                               train_agent)
+from oracle.ranges import label_ranges
 from train.embed_train import train_embedding_net
 from train.generate import generate_labels, load_shard
 from train.targets import normalised_q, policy_target
@@ -205,7 +207,9 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log,
                       for lab in chunk]), device=device)
         if cold:
             tables = torch.zeros_like(tables)
-        logits = net(batch, token_embeddings(tables, batch["slot"], net.d_emb))
+        logits, _range = net.logits_and_range(
+            batch, token_embeddings(tables, batch["slot"], net.d_emb),
+            seat_embeddings(tables, batch["seat_slot"]))
         idx = torch.arange(len(chunk), device=logits.device)
         last = batch["mask"].sum(dim=1).long() - 1
         legal = batch["legal"][idx, last]
@@ -364,6 +368,17 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration)
         tag="corpus")
     driver = LockstepDriver(pool, int(game["n_actions"]))
     play(driver, sessions, int(config["driver_batch_size"]), log, "corpus")
+    # §5.7 — the belief targets, once over the corpus and never inside the
+    # training loop, exactly where `label_showdowns` sits for the same reason.
+    if emb_cfg.get("range_enabled", False):
+        rstats = label_ranges(
+            sessions, pool, int(game["n_actions"]),
+            floor=float(config.get("oracle", {}).get("likelihood_floor", 1e-6)),
+            prune=float(emb_cfg.get("range_prune_threshold", 0.0)),
+            desc="ranges")
+        log(f"[{TAG}] §5.7 ranges: {rstats.emitted} targets, "
+            f"{rstats.forwards} forwards, {rstats.dropped:.1f} total mass "
+            f"pruned, {rstats.collapsed} supports collapsed")
     torch.manual_seed(it_seed + 500_000)
     return train_embedding_net(embed_net, sessions, emb_cfg, game, device, log,
                                it_seed + 500_000, iteration=iteration)

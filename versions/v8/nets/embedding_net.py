@@ -65,6 +65,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from env.showdown import N_HAND_CLASSES
+from nets.range_head import range_loss
 from nets.trunk import HandEncoder
 
 
@@ -136,15 +137,35 @@ class OpponentEmbeddingNet(nn.Module):
         return torch.zeros(B, T, self.d_emb, device=batch["mask"].device,
                            dtype=self.embeddings.weight.dtype)
 
+    # §5.7 — the same three views for **every seat** rather than the acting
+    # one. The range head is asked about a player who is not the one acting, so
+    # it needs that player's vector; the acting player's view above stays what
+    # the tokeniser reads, unchanged.
+
+    def member_seat_emb(self, batch):
+        return self.embeddings(batch["seat_member"])
+
+    def slot_seat_emb(self, batch, vectors):
+        return vectors[batch["seat_slot"]]
+
+    def zero_seat_emb(self, batch):
+        B, T, P = batch["seat_slot"].shape
+        return torch.zeros(B, T, P, self.d_emb, device=batch["mask"].device,
+                           dtype=self.embeddings.weight.dtype)
+
     # --------------------------------------------------------------- forwards
 
-    def hidden(self, batch, emb):
+    def hidden(self, batch, emb, seat_emb=None):
         """(B, T, d_model) — one causal pass over each hand independently."""
-        return self.encoder(batch, emb)
+        return self.encoder(batch, emb, seat_emb)[0]
 
-    def forward(self, batch, emb):
+    def hidden_and_range(self, batch, emb, seat_emb):
+        """`(hidden, range logits)` — the §5.7 head's output alongside it."""
+        return self.encoder(batch, emb, seat_emb)
+
+    def forward(self, batch, emb, seat_emb=None):
         """(B, T, n_actions) — the action predicted at each decision token."""
-        return self.action_out(self.hidden(batch, emb))
+        return self.action_out(self.hidden(batch, emb, seat_emb))
 
     # ------------------------------------------------------------------ losses
 
@@ -216,7 +237,7 @@ class OpponentEmbeddingNet(nn.Module):
         return F.mse_loss(self.strength_out(hidden[sel]).squeeze(-1),
                           batch["own_strength"][sel])
 
-    def objective(self, batch, emb, weights, hidden=None):
+    def objective(self, batch, emb, weights, hidden=None, seat_emb=None):
         """The loss the embedding is fitted against — training and inference.
 
         One function so the two cannot drift apart. §5.5's inference fit
@@ -227,7 +248,7 @@ class OpponentEmbeddingNet(nn.Module):
         Returns ``(total, parts)``.
         """
         if hidden is None:
-            hidden = self.hidden(batch, emb)
+            hidden = self.hidden(batch, emb, seat_emb)
         ce = self.action_ce(self.action_out(hidden), batch)
         total = ce
         parts = {"action_ce": float(ce.detach())}
@@ -249,8 +270,21 @@ class OpponentEmbeddingNet(nn.Module):
         `e = 0` whose pooled hidden states are the amortised head's input (see
         the module docstring).
         """
-        hidden = self.hidden(batch, self.member_emb(batch))
+        hidden, range_logits = self.hidden_and_range(
+            batch, self.member_emb(batch), self.member_seat_emb(batch))
         total, parts = self.objective(batch, None, weights, hidden=hidden)
+
+        # §5.7 — the belief. In training only, for the same reason §5.6 is: the
+        # §5.5 fit has no target for it. The head still *runs* in the fit — it
+        # is inside the trunk and the layers above it read what it says — so
+        # what is training-only here is the term, not the module.
+        if range_logits is not None:
+            scored = range_loss(range_logits, batch)
+            if scored is not None:
+                loss, ce, kl = scored
+                parts["range_ce"] = ce
+                parts["range_kl"] = kl
+                total = total + weights.get("range", 0.0) * loss
 
         # §5.6 — the poker prior. In training only, never in the §5.5 fit.
         strength = self.strength_loss(hidden, batch)
@@ -260,7 +294,8 @@ class OpponentEmbeddingNet(nn.Module):
 
         amortised_weight = weights.get("amortised", 0.0)
         if amortised_weight > 0.0:
-            hidden0 = self.hidden(batch, self.zero_emb(batch))
+            hidden0 = self.hidden(batch, self.zero_emb(batch),
+                                  self.zero_seat_emb(batch))
             pooled, counts = pool_by_key(hidden0, batch["member"], batch["mask"],
                                          self.n_members)
             seen = counts > 0
@@ -281,7 +316,8 @@ class OpponentEmbeddingNet(nn.Module):
         seat at the observed table and its pool-member identity is unknown.
         """
         with torch.no_grad():
-            hidden0 = self.hidden(batch, self.zero_emb(batch))
+            hidden0 = self.hidden(batch, self.zero_emb(batch),
+                                  self.zero_seat_emb(batch))
             pooled, counts = pool_by_key(hidden0, batch["slot"], batch["mask"],
                                          n_slots)
             init = self.amortised(pooled)
@@ -296,6 +332,12 @@ def loss_weights(cfg):
     are used **both** in training and in the inference-time fit — setting either
     to 0 is the ablation that answers "does the showdown anchor earn its keep".
 
+    `range` weights the §5.7 head and, like `strength`, is read in **training
+    only** — `fit_embeddings` has no belief target to score. Setting it to zero
+    is *not* the §5.7 ablation: the head still runs and still injects. The
+    ablation is `range_enabled: false` in the network config, which removes the
+    module from the trunk altogether.
+
     `strength` weights the §5.6 head and is read in **training only**; the fit
     never sees it (`strength_loss`). 0 is the ablation that asks whether the
     poker prior earns its keep.
@@ -305,6 +347,7 @@ def loss_weights(cfg):
         "showdown_strength": cfg.get("showdown_strength_weight", 0.0),
         "showdown_class": cfg.get("showdown_class_weight", 0.0),
         "strength": cfg.get("strength_weight", 0.0),
+        "range": cfg.get("range_weight", 0.0),
     }
 
 
@@ -345,7 +388,8 @@ def fit_embeddings(net, batch, n_slots, steps, lr, reg, init=None,
         for _ in range(int(steps)):
             opt.zero_grad(set_to_none=True)
             loss, _parts = net.objective(
-                batch, net.slot_emb(batch, vectors), weights)
+                batch, net.slot_emb(batch, vectors), weights,
+                seat_emb=net.slot_seat_emb(batch, vectors))
             loss = loss + reg * vectors.pow(2).sum(-1).mean()
             loss.backward()
             opt.step()
@@ -356,7 +400,7 @@ def fit_embeddings(net, batch, n_slots, steps, lr, reg, init=None,
 
 
 @torch.no_grad()
-def evaluate_ce_by_member(net, batch, emb, members):
+def evaluate_ce_by_member(net, batch, emb, members, seat_emb=None):
     """Mean action-prediction CE in nats for each of `members`, in one forward.
 
     `evaluate_ce` runs the trunk once per member it is asked about. Scoring
@@ -369,7 +413,8 @@ def evaluate_ce_by_member(net, batch, emb, members):
     Returns ``{member: (ce, n_tokens)}``; a member with no scored token gets
     ``(nan, 0)``, exactly as `evaluate_ce` does.
     """
-    per_token = net.action_ce(net(batch, emb), batch, per_token=True)
+    per_token = net.action_ce(net(batch, emb, seat_emb), batch,
+                              per_token=True)
     mask = batch["decision_mask"]
     out = {}
     for m in members:
@@ -383,7 +428,7 @@ def evaluate_ce_by_member(net, batch, emb, members):
 
 
 @torch.no_grad()
-def evaluate_ce(net, batch, emb, member_filter=None):
+def evaluate_ce(net, batch, emb, member_filter=None, seat_emb=None):
     """Mean action-prediction CE in nats, optionally over one player's tokens.
 
     Args:
@@ -391,7 +436,7 @@ def evaluate_ce(net, batch, emb, member_filter=None):
         member_filter: pool-member index; when given, only that player's
             decision tokens count.
     """
-    logits = net(batch, emb)
+    logits = net(batch, emb, seat_emb)
     per_token = net.action_ce(logits, batch, per_token=True)
     weight = batch["decision_mask"]
     if member_filter is not None:

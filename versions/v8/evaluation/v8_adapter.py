@@ -304,25 +304,75 @@ def slumbot_history(action_str, client_pos, hole_cards, board, game,
     return record
 
 
+class AgentMemberFactory:
+    """Entity 3 at Slumbot's table — the hero this file was written for.
+
+    A factory rather than a member because the seat is not known until the hand
+    is: `AgentPoolMember` is built for one seat of one table (`agent/policy.py`),
+    and Slumbot deals hero either side of the button.
+    """
+
+    def __init__(self, net, game, device):
+        self.net = net
+        self.device = device
+        self.max_players = int(game["max_players"])
+        self.n_actions = int(game["n_actions"])
+        self.d_emb = int(net.d_emb)
+
+    def __call__(self, hero_seat, embeddings=None):
+        slot_of_seat = [HERO_SLOT if seat == hero_seat else OPP_SLOT
+                        for seat in range(N_SEATS)]
+        if embeddings is None:
+            embeddings = np.zeros((self.max_players, self.d_emb),
+                                  dtype=np.float32)
+        return AgentPoolMember(self.net, embeddings, slot_of_seat,
+                               self.max_players, self.n_actions, hero_seat,
+                               self.device)
+
+
+class MemberFactory:
+    """Any `PoolMember` at Slumbot's table — a procedural regular, in practice.
+
+    One member serves every seat, because a member that does not read a fitted
+    vector has nothing that depends on which slot it occupies. `d_emb = None`
+    is what says "this hero has no vector", and it is what makes a warm run
+    against it an error rather than a silent no-op.
+    """
+
+    d_emb = None
+
+    def __init__(self, member):
+        self.member = member
+
+    def __call__(self, hero_seat, embeddings=None):
+        assert embeddings is None, (
+            f"{self.member.name!r} reads no opponent vector, so there is "
+            f"nothing for a warm run to fit against it")
+        return self.member
+
+
 class SlumbotAgent:
-    """The v8 agent seated at Slumbot's table.
+    """A pool member seated at Slumbot's table.
 
     Args:
-        net: a trained `AgentNet`.
+        member_factory: `(hero_seat, embeddings) -> PoolMember`. The agent's own
+            factory is `AgentMemberFactory`; a procedural §P3 regular arrives
+            through `MemberFactory` and is the same object every hand.
         game: the `game` config section — the action set, the raise grid and the
             ranges the table is checked against.
-        device: where the forward runs.
+        device: where a forward runs, when the member does one.
         embeddings: `(max_players, d_emb)`, slot 0 hero and slot 1 the opponent.
             Zeros — the §5.5 cold start, and §12's *cold* run — when omitted.
-        rng: `np.random.Generator`. The action is **sampled** from the agent's
+        rng: `np.random.Generator`. The action is **sampled** from the member's
             own distribution, because that distribution is the policy; the
             generator is owned here so a resumed evaluation replays the same
             draws (§12).
     """
 
-    def __init__(self, net, game, device, embeddings=None, rng=None):
+    def __init__(self, member_factory, game, device, embeddings=None,
+                 rng=None):
         check_table_is_in_range(game)
-        self.net = net
+        self.member_factory = member_factory
         self.game = game
         self.device = device
         self.n_actions = int(game["n_actions"])
@@ -330,17 +380,23 @@ class SlumbotAgent:
         self.max_players = int(game["max_players"])
         self.raise_sizes = raise_sizes_from(game)
         self.rng = rng if rng is not None else np.random.default_rng(0)
-        self.embeddings = np.zeros((self.max_players, net.d_emb),
-                                   dtype=np.float32)
+        self.embeddings = None
+        if member_factory.d_emb is not None:
+            self.embeddings = np.zeros((self.max_players,
+                                        member_factory.d_emb),
+                                       dtype=np.float32)
         if embeddings is not None:
             self.set_embeddings(embeddings)
 
     def set_embeddings(self, vectors):
         """Install the fitted vectors — §12's *warm* run, every `R` hands."""
+        d_emb = self.member_factory.d_emb
+        assert d_emb is not None, (
+            "this hero reads no opponent vector; there is nothing to install")
         vectors = np.asarray(vectors, dtype=np.float32)
-        assert vectors.shape == (self.max_players, self.net.d_emb), (
+        assert vectors.shape == (self.max_players, d_emb), (
             f"embeddings are (max_players, d_emb) = "
-            f"({self.max_players}, {self.net.d_emb}); got {vectors.shape}")
+            f"({self.max_players}, {d_emb}); got {vectors.shape}")
         self.embeddings = vectors
 
     def policy(self, action_str, client_pos, hole_cards, board,
@@ -353,12 +409,7 @@ class SlumbotAgent:
         record, ctx, state = slumbot_record(
             action_str, client_pos, hole_cards, board, self.game,
             hero_action_indices=hero_action_indices)
-        hero_seat = _flip(client_pos)
-        slot_of_seat = [HERO_SLOT if seat == hero_seat else OPP_SLOT
-                        for seat in range(N_SEATS)]
-        member = AgentPoolMember(self.net, self.embeddings, slot_of_seat,
-                                 self.max_players, self.n_actions, hero_seat,
-                                 self.device)
+        member = self.member_factory(_flip(client_pos), self.embeddings)
         probs = np.asarray(member.policy([ctx])[0], dtype=np.float64)
         return probs, record, ctx, state
 

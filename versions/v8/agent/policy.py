@@ -27,8 +27,14 @@ the end of every iteration: any seat, any table, `e = 0` (D12), and answering th
 `hole_override` question the §7.2 posterior asks of every member it conditions
 on. They share the network class and the observation builder and nothing else,
 because the two positions have genuinely different contracts.
+
+A past agent plays at `e = 0` by default and may instead be handed the table its
+own §5.5 fit produced (`PLAN_AMORTISED_POOL.md`); which of the two happens is a
+decision of the phase that seats it, and this file only says what a member with
+a table does with it.
 """
 
+import copy
 from dataclasses import replace
 
 import numpy as np
@@ -99,14 +105,12 @@ class FrozenAgentMember(PoolMember):
     both loudly: it is built for one seat of one table and only ever asked about
     the moment it is acting, because that is all hero is ever asked.
 
-    **The vectors are zero** (D12 option (a), the plan's recommendation, taken
-    2026-08-19 when S9 was built). A past agent plays its *unconditional*
-    policy — the one §6.2's embedding dropout trains explicitly — so it is a
-    fixed policy like every other member of the pool: no fit nested inside a
-    fit, no recursion, and no answer needed to "what did agent *k−3* believe
-    about its tablemates". The alternative, giving every past agent its own §5.5
-    fit over the table it is sitting at, has no cheap form and no measurement
-    asking for it yet.
+    **The vectors are zero by default** (D12 option (a), the plan's
+    recommendation, taken 2026-08-19 when S9 was built). A past agent then plays
+    its *unconditional* policy — the one §6.2's embedding dropout trains
+    explicitly — so it is a fixed policy like every other member of the pool: no
+    fit nested inside a fit, no recursion, and no answer needed to "what did
+    agent *k−3* believe about its tablemates".
 
     Two consequences follow from `e = 0` and both are what make this a member
     rather than a second hero:
@@ -117,6 +121,25 @@ class FrozenAgentMember(PoolMember):
     * the style layer applies to it exactly as to a v7 checkpoint (§4.2), so the
       `style.agent_variants` members an agent contributes are `with_style`
       siblings sharing one network by reference (D11).
+
+    **Or it is handed a table** — `(embeddings, own_slot)`, the `K = 0` output
+    of the amortised head over the hands this member's *own* slot observed
+    (`PLAN_AMORTISED_POOL.md`, option (c)). It then conditions on its tablemates
+    exactly as hero does, and neither consequence above is lost:
+
+    * one member still serves every seat, because a member that knows its own
+      slot can *derive* the rotation from the seat it is asked to act at: slot
+      `own_slot` sits at seat `acting_pos` in hand `h` iff
+      `h ≡ own_slot − acting_pos (mod n)`, and that fixes every seat's slot
+      (`_slot_of_seat`). One member per (session, slot, block), not per seat.
+    * `with_vectors` is `with_style`'s sibling pattern with the table swapped
+      instead of the style, so the network is still shared by reference.
+
+    Nothing here decides *which* table is right for a block; that is the block
+    discipline of the phase that seats the member (`train/generate.py`). What
+    the member does decide is **whose network** may compute that table:
+    `embed_net` is its own generation's, frozen, and a member with none is never
+    conditioned at all.
 
     **The observation is rebuilt for the moment being asked about.** A member
     answering a posterior query is handed a *finished* record and a decision
@@ -129,14 +152,77 @@ class FrozenAgentMember(PoolMember):
     driver, acting now, real cards) no copy is made at all.
     """
 
-    def __init__(self, name, n_actions, net, max_players, device, style=None):
+    def __init__(self, name, n_actions, net, max_players, device, style=None,
+                 embeddings=None, own_slot=None, embed_net=None):
         super().__init__(name, n_actions, style)
         self.net = net
+        # The embedding network of *this member's own generation*, frozen: the
+        # one whose vectors its policy was trained to read. `None` means nobody
+        # may condition it. Never the loop's current network — that one is still
+        # training, its coordinates drift, and a frozen policy reading them
+        # would be reading a description in a basis it has never seen. It would
+        # also stop this member from being a fixed algorithm, which is what the
+        # pool is for: the same history has to produce the same action at every
+        # iteration, or hero's accumulated results per member are results
+        # against a moving target.
+        self.embed_net = embed_net
         self.max_players = int(max_players)
         self.device = device
         # Identity, and arbitrary: with `e = 0` the slot only selects which zero
-        # vector is read.
+        # vector is read. With a table the rotation is derived per context
+        # instead, because it depends on the seat being asked about.
         self.slot_of_seat = list(range(self.max_players))
+        self._seat_at(embeddings, own_slot)
+
+    def _seat_at(self, embeddings, own_slot):
+        """Adopt `(max_players, d_emb)` vectors read from slot `own_slot`.
+
+        `None, None` is the `e = 0` member. The two travel together: a table
+        with no slot to read it from cannot be indexed, and a slot with no table
+        would be a rotation nothing uses.
+        """
+        assert (embeddings is None) == (own_slot is None), (
+            "embeddings and own_slot are one thing: a table is read from the "
+            "slot the member occupies, so neither is meaningful alone (§5.5)")
+        if embeddings is None:
+            self.embeddings = None
+            self.own_slot = None
+            return
+        self.embeddings = torch.as_tensor(embeddings, dtype=torch.float32,
+                                          device=self.device)
+        assert self.embeddings.shape == (self.max_players, self.net.d_emb), (
+            f"embeddings must be ({self.max_players}, {self.net.d_emb}) — one "
+            f"vector per slot of the table this member sits at, its own among "
+            f"them (§5.3); got {tuple(self.embeddings.shape)}")
+        self.own_slot = int(own_slot)
+        assert 0 <= self.own_slot < self.max_players, (
+            f"slot {own_slot} is not a slot of a {self.max_players}-slot table")
+
+    def with_vectors(self, name, embeddings, own_slot):
+        """A sibling of this member conditioned on one table, at one slot.
+
+        `with_style`'s pattern (`pool/base.py`): the network and the style are
+        shared by reference and only the table changes, so a refresh costs a
+        `copy.copy` and not a second network.
+        """
+        sibling = copy.copy(self)
+        sibling.name = name
+        sibling._seat_at(embeddings, own_slot)
+        return sibling
+
+    def _slot_of_seat(self, ctx):
+        """Seat → slot for the hand `ctx` is a decision of.
+
+        Identity at `e = 0`, where it cannot change an answer. With a table it
+        is the rotation that puts `own_slot` at the acting seat — the same
+        derivation `Session.slot_of_seat` makes from the hand index, reached
+        from the seat instead, which is all a member is handed.
+        """
+        if self.embeddings is None:
+            return self.slot_of_seat
+        n = int(ctx.record.num_players)
+        hand_idx = (self.own_slot - int(ctx.acting_pos)) % n
+        return [(seat + hand_idx) % n for seat in range(n)]
 
     def _observation(self, ctx):
         record = ctx.record
@@ -151,16 +237,23 @@ class FrozenAgentMember(PoolMember):
                 showdown=[], showdown_strength={}, showdown_class={})
         return hand_tokens(
             record, observer_pos=int(ctx.acting_pos),
-            slot_of_seat=self.slot_of_seat, max_players=self.max_players,
+            slot_of_seat=self._slot_of_seat(ctx), max_players=self.max_players,
             n_actions=self.n_actions, pending=ctx)
 
     def logits(self, contexts):
         batch = collate([self._observation(ctx) for ctx in contexts],
                         device=self.device)
-        emb = torch.zeros(*batch["mask"].shape, self.net.d_emb,
-                          device=self.device)
-        seat_emb = torch.zeros(*batch["seat_slot"].shape, self.net.d_emb,
-                               device=self.device)
+        if self.embeddings is None:
+            emb = torch.zeros(*batch["mask"].shape, self.net.d_emb,
+                              device=self.device)
+            seat_emb = torch.zeros(*batch["seat_slot"].shape, self.net.d_emb,
+                                   device=self.device)
+        else:
+            # The same two gathers hero makes (§5.3, §5.7): the acting seat's
+            # own vector for the decision token, every seat's for the range
+            # head.
+            emb = self.embeddings[batch["slot"]]
+            seat_emb = self.embeddings[batch["seat_slot"]]
         with torch.no_grad():
             out = self.net(batch, emb, seat_emb)
         return out.float().cpu().numpy().astype(np.float64)

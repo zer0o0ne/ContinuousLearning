@@ -1,0 +1,189 @@
+{
+ "name": "pool_conditioning",
+ "seed": 11,
+ "device": "auto",
+ "out_dir": "../../data/v8",
+ "driver_batch_size": 2048,
+ "game": {
+  "n_actions": 17,
+  "max_players": 9,
+  "big_blind": 10,
+  "small_blind": 5,
+  "players_range": [
+   2,
+   2
+  ],
+  "stack_bb_range": [
+   200,
+   200
+  ],
+  "raise_sizes": {
+   "preflop": [
+    1.0,
+    1.33,
+    1.5,
+    1.75,
+    2.0,
+    2.25,
+    2.5,
+    3.0,
+    3.5,
+    3.75,
+    4.0,
+    4.5,
+    5.0,
+    6.0
+   ],
+   "flop": [
+    0.1,
+    0.25,
+    0.33,
+    0.4,
+    0.5,
+    0.67,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    4.0
+   ],
+   "turn": [
+    0.1,
+    0.25,
+    0.33,
+    0.4,
+    0.5,
+    0.67,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    4.0
+   ],
+   "river": [
+    0.1,
+    0.25,
+    0.33,
+    0.4,
+    0.5,
+    0.67,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    4.0
+   ]
+  }
+ },
+ "style": {
+  "uncond_scale": 1.0,
+  "position_scale": 0.5,
+  "street_scale": 0.5,
+  "log_temperature_range": [
+   -0.7,
+   0.7
+  ],
+  "uniform_mix_range": [
+   0.0,
+   0.25
+  ],
+  "agent_variants": 3
+ },
+ "bootstrap": [
+  {
+   "kind": "degenerate",
+   "strategy": "maniac",
+   "n_variants": 2,
+   "label": "maniac_styles"
+  },
+  {
+   "kind": "degenerate",
+   "strategy": "nit",
+   "n_variants": 2,
+   "label": "nit_styles"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/gto_predict/2026_08_06_19_10_02/best.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 3,
+   "label": "v7_pure"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/lag_bluffer/gto_predict/2026_08_07_04_04_21/best.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 3,
+   "label": "v7_bluff"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/value_heavy/gto_predict/2026_08_07_21_58_41/best.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 3,
+   "label": "v7_value"
+  },
+  {
+   "kind": "v7",
+   "checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_agents/gto_pure/mcts_predict/2026_08_14_11_40_25/cycles/cycle_0050.pt",
+   "arch_config": "/home/zer0o0ne/ContinuousLearning/data/v7/v5_solver_train/configs/2026_08_14_11_40_25.json",
+   "n_variants": 3,
+   "label": "v7_pure_mcts_50"
+  }
+ ],
+ "embedding_net": {
+  "d_model": 512,
+  "d_emb": 32,
+  "n_heads": 16,
+  "n_kv_heads": 4,
+  "n_layers": 16,
+  "d_ff": 2048,
+  "d_card": 32,
+  "d_index": 32,
+  "max_decisions": 80,
+  "emb_init_std": 0.02,
+  "K": 150,
+  "fit_lr": 0.02,
+  "fit_reg": 0.01,
+  "R": 25,
+  "pool_agent_window": 100,
+  "max_iterations": 30,
+  "retrain_every": 2,
+  "corpus_sessions": 1000,
+  "corpus_hands_per_session": 2000,
+  "steps": 125000,
+  "first_retrain_steps": 500000,
+  "batch_hands": 64,
+  "lr": 3e-05,
+  "eta_min": 3e-06,
+  "weight_decay": 0.01,
+  "grad_clip": 1.0,
+  "amortised_weight": 3.0,
+  "showdown_strength_weight": 4.5,
+  "showdown_class_weight": 0.0,
+  "strength_weight": 0.75,
+  "range_enabled": true,
+  "range_layer": 10,
+  "n_range_blocks": 4,
+  "range_weight": 4.0,
+  "range_prune_threshold": 0.01,
+  "log_every": 250
+ },
+ "pool_conditioning": {
+  "agent_checkpoint": "../../data/v8/run1_ranges/iter_0000/agent.pt",
+  "embedding_checkpoint": "../../data/v8/run1_ranges/iter_0000/embedding.pt",
+  "agent_name": "agent0",
+  "n_sessions": 200,
+  "hands_per_session": 400,
+  "seed_base": 60000000
+ }
+}

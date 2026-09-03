@@ -286,19 +286,27 @@ def winrate_line(gap, gap_cold):
 # ------------------------------------------------------------------ the phases
 
 
-def agent_variant_members(net, iteration, config, game, device, seed):
+def agent_variant_members(net, iteration, config, game, device, seed,
+                          embed_net=None):
     """The `style.agent_variants` members one trained agent contributes (D11).
 
     Variant 0 is the agent unmodified — the reference point every style draw is
     a perturbation of, and the same rule D13 applies to every v7 base. The rest
     are `with_style` siblings sharing this one network by reference, so they cost
     no forward and no parameter (§4.2).
+
+    `embed_net` is the **frozen embedding network of this generation** — the one
+    that produced the vectors this agent was trained to read. It travels with
+    the member for the whole run, so a phase that lets a past agent read its
+    tablemates reads them through the network the agent understands, and not
+    through whatever the loop has retrained since. `None` when nothing may
+    condition it. See `PLAN_AMORTISED_POOL.md` §0.2.
     """
     style_cfg = config.get("style", {})
     n_variants = int(style_cfg["agent_variants"])
     base = FrozenAgentMember(f"agent{iteration}", int(game["n_actions"]), net,
                              int(game["max_players"]), device,
-                             StyleParams.identity())
+                             StyleParams.identity(), embed_net=embed_net)
     members = [base]
     rng = np.random.default_rng([int(seed), int(iteration), 991])
     for v in range(1, n_variants):
@@ -339,6 +347,60 @@ def frozen_agent_net(state_dict, config, game, device):
     for p in net.parameters():
         p.requires_grad_(False)
     return net
+
+
+def frozen_embedding_net(state_dict, config, game, device):
+    """A snapshot of the embedding network, frozen — one generation's reader.
+
+    The loop holds exactly one embedding network and keeps training it, so a
+    reference to it is a reference to a moving object. A past agent needs the
+    weights as they were when it was trained, which is what this copy is. The
+    member table's height is the checkpoint's own: nothing here reads a trained
+    row, but a state dict does not load into a network of another height.
+    """
+    net = OpponentEmbeddingNet(
+        config["embedding_net"], int(game["n_actions"]),
+        int(game["max_players"]),
+        n_members=int(state_dict["embeddings.weight"].shape[0])).to(device)
+    net.load_state_dict(state_dict)
+    net.eval()
+    for p in net.parameters():
+        p.requires_grad_(False)
+    return net
+
+
+def embedding_vintages(exp_dir, upto, config, game, device, enabled, log):
+    """`{iteration: the embedding network that generation reads}`, on resume.
+
+    The agent of iteration *k* was trained against the network of the most
+    recent retrain at or before *k*, so iterations that shared a retrain share
+    one snapshot object — which is also what makes them share one inference
+    runner when they are mirrored into a label worker.
+
+    `enabled` is the pool-conditioning switch: with it off nothing reads a past
+    agent's vectors, and loading a network per generation would be minutes and
+    gigabytes spent on nothing.
+    """
+    if not enabled:
+        return {k: None for k in range(upto)}
+    out, cache, latest = {}, {}, None
+    for k in range(upto):
+        path = os.path.join(_iter_dir(exp_dir, k), "embedding.pt")
+        if os.path.exists(path):
+            latest = path
+        if latest is None:
+            out[k] = None                # trained before any network existed
+            continue
+        if latest not in cache:
+            cache[latest] = frozen_embedding_net(
+                torch.load(latest, map_location=device,
+                           weights_only=False)["model_state_dict"],
+                config, game, device)
+        out[k] = cache[latest]
+    if cache:
+        log(f"[{TAG}] {len(cache)} frozen embedding generations for the "
+            f"{upto} past agents in the pool")
+    return out
 
 
 def hero_factory(iteration, agent_net, init_member, game, device):
@@ -483,13 +545,16 @@ def run(config, log, exp_dir):
            and os.path.exists(os.path.join(_iter_dir(exp_dir, start),
                                            "state.json"))):
         start += 1
+    conditioned = str(emb_cfg.get("pool_agent_vectors", "zero")) == "amortised"
+    vintages = embedding_vintages(exp_dir, start, config, game, device,
+                                  conditioned, log)
     for k in range(start):
         it_dir = _iter_dir(exp_dir, k)
         state = torch.load(os.path.join(it_dir, "agent.pt"), map_location=device,
                            weights_only=False)["model_state_dict"]
         members, desc = agent_variant_members(
             frozen_agent_net(state, config, game, device), k, config, game,
-            device, seed)
+            device, seed, embed_net=vintages[k])
         pool += members
         descriptors += desc
     if start:
@@ -507,6 +572,11 @@ def run(config, log, exp_dir):
     if start:
         log(f"[{TAG}] resuming at iteration {start}: pool is {len(pool)} "
             f"members, embedding network from iteration {latest_emb}")
+    # The generation an agent appended *now* would belong to: on a fresh run
+    # nothing has been trained yet and iteration 0 retrains before it is used;
+    # on a resume it is the generation the restored network belongs to, which is
+    # the one the last past agent already carries.
+    vintage = vintages.get(start - 1) if start else None
 
     metrics_all = []
     for k in range(start, n_iterations):
@@ -538,6 +608,12 @@ def run(config, log, exp_dir):
                 torch.save({"model_state_dict": embed_net.state_dict(),
                             "config": config, "iteration": k,
                             "history": history}, emb_path)
+            # The generation every agent trained from here on belongs to. Taken
+            # after the retrain and kept frozen: the live network keeps moving,
+            # and a past agent must read the weights it was trained against.
+            if conditioned:
+                vintage = frozen_embedding_net(embed_net.state_dict(), config,
+                                               game, device)
 
         # §6.1 / §5.6: the agent starts from the trunk phase A just trained.
         # Here and not before the loop, because the embedding network has to be
@@ -643,7 +719,8 @@ def run(config, log, exp_dir):
         sampler.end_iteration()
         new_members, new_desc = agent_variant_members(
             frozen_agent_net(agent_net.state_dict(), config, game, device), k,
-            config, game, device, seed)
+            config, game, device, seed,
+            embed_net=vintage if conditioned else None)
         pool += new_members
         descriptors += new_desc
         _write_json(os.path.join(it_dir, "state.json"),

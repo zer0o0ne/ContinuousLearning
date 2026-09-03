@@ -42,6 +42,7 @@ versions/v8/
   config_g1.json        the G1 experiment surface
   config_g1_pilot.json  a shrunk G1 for measuring throughput on the Spark first
   config_g3.json        the G3 sweep surface — samples × combos × table × stack × pool
+  config_pc.json        the pool-conditioning gate's surface (P2)                   NEW
   pipeline.py           the outer loop (§8) — labels, training, gap, pool growth   NEW
   eval_pipeline.py      Slumbot: cold and warm, BB/100 ± SE (§12)                  NEW
   regap.py              re-runs phase D over iterations already on disk (§8)       NEW
@@ -61,6 +62,11 @@ versions/v8/
     action_map.py       nearest-bin transport between two raise grids
     build.py            pool construction from config, fresh style draws
     sampling.py         PFSP + embedding dedup + uniform floor (§4.4)   NEW
+    strength.py         per-board hand strength for procedural members (§2.3a) NEW
+    situation.py        a decision as scalars + preflop-implied ranges (§2.3b) NEW
+    stats.py            VPIP / PFR / c-bet / … over played records (§2.3b)   NEW
+    regular.py          the human-shaped rule cascade (§2.3c)                NEW
+    archetypes.py       ten presets, jitter, and their domains (§2.3d)      NEW
   nets/                 v8's own networks                               NEW
     features.py         §5.1 token features — where observation parity lives
     tokeniser.py        the shared tokeniser MLP (§5.1, OI-4)
@@ -85,6 +91,8 @@ versions/v8/
     g1.py               the G1 experiment (§14)                         NEW
     g1_analysis.py      section A — regrouping a finished g1_report.json NEW
     g3.py               what one oracle label costs (§14, §13)           NEW
+    pool_conditioning.py  is a past agent stronger reading its tablemates? NEW
+    pool_realism.py     are the archetypes diverse, and better than the five? NEW
   vendor/v7/            frozen snapshot of v7's agent code (§4.3)       NEW
     attn_utils.py, perception/*, action/*, modifiers.py   copied verbatim
     agent.py            perception + action-head subset of v7's ASI
@@ -96,7 +104,7 @@ versions/v8/
   evaluation/
     protocol.py         Slumbot's wire protocol, kept from v7 (§12)             NEW
     v8_adapter.py       the v8 agent as a Slumbot player (§12)                  NEW
-  tests/                23 files, 459 tests, ~222 s
+  tests/                31 files, 605 tests, ~317 s
 ```
 
 ### What was inherited, and why
@@ -518,6 +526,190 @@ opponent space is continuous and effectively infinite, which is the answer to §
 maniac, nit. They emit finite-scale logits rather than one-hots so a style draw can still move
 them. The nit's strength test is a hole-card lookup, not an equity evaluation — §4.2 drops
 equity-gated conditions as far too expensive inside rollouts.
+
+### 2.3a Reading the board — `pool/strength.py`
+
+The degenerate members above never look at the board, which is why a nit among them is a nit
+about its *two cards* and nothing else. `PLAN_PROCEDURAL_POOL.md` replaces them with members
+that do read it, and this is the layer they read.
+
+**Everything is a `(1326,)` array.** The §7.2 posterior asks every member "what would you have
+done holding *this*" for every combo consistent with the board — ~1 225 questions at one
+decision — so a quantity is either per decision (pot, stacks, history: identical for all of
+them) or per combo (strength, draws: one row each). `ALL_COMBOS` fixes the row order once, a
+holding becomes a row through `combo_index`, and `DISJOINT` — 1.7 MB of bool, built at import —
+answers "could an opponent hold that while I hold this".
+
+**One board, one table.** `BoardStrength` is one evaluator call over the combos the board has
+not blocked, plus a handful of `1326 × 1326` boolean reductions: ~17 ms on the dev box for a
+flop, and then read by every member, every decision and every posterior query on that board.
+`StrengthCache` keys on the board as a *set*, so two hands that saw the same flop in a different
+order share it, and evicts by insertion order past `max_boards` (a table is ~40 KB; the
+`1326 × 1326` intermediates are never kept).
+
+**The percentile is exact, with card removal.** `hs[h]` counts only the combos an opponent could
+actually hold — not on the board, not sharing a card with `h`. On a monotone board that moves a
+hand's percentile by up to four points against the naive rank, and the hands it moves are
+exactly the ones that block the strong combos, which is what a betting rule cares about. It is
+the same number `env/showdown.py::strength_percentiles` computes one hand at a time on the
+river, and a test pins them equal; `strength_percentiles` keeps its job of labelling showdowns.
+
+`hs` and `range_equity(w)` are one formula — equity against a weighted range, `hs` being its
+uniform case — computed as the same masked reduction, the uniform case by counting rather than
+by a weighted sum only because counts make the river identity exact in floating point.
+
+**What is deliberately crude.** `ehs(n) = hs^n + (1 − hs^n)·p_improve` takes its potential from
+an outs count and the rule of four and two, which is what a human regular does at the table and
+is systematically generous to combo draws and to dominated ones. Sampling runouts instead is
+deferred: the §2.2d control variate already pays 16 runouts per street per sample, and doubling
+that for the pool's benefit is a measured label-cost decision rather than a free improvement.
+`hand_class` — top pair good kicker, overpair, set — is descriptive only: the cascade thresholds
+on `hs`, and mentions a class where a human rule would.
+
+**Preflop is a different object.** There is no board, so there is no table; there is a
+`(169, 8)` Monte-Carlo integral of each starting-hand class's pot share against 1–8 random
+opponents, 2 M deals and ~21 s on the dev box, seeded and written once to
+`/data/v8/tables/preflop_equity_v1.npy` — outside `versions/`, per `CLAUDE.md` §2.
+`preflop_rank_pct(table, n)` turns it into "where does this combo sit in the top-x % of
+*combos*", weighting each class by its 6 / 4 / 12 combos, so a range written as a fraction means
+what published ranges mean and tightens by itself as the table fills up. The repo's existing 169
+*ordering* is not usable for either job: it needs `eval7`, which is not the project's evaluator
+and has no `aarch64` wheel guarantee, and an ordering is not an equity against *n*.
+
+### 2.3b The other half of a decision — `pool/situation.py`, `pool/stats.py`
+
+§2.3a is per *combo*. A rule also needs the part that is identical for all 1 326 of them — am I
+the preflop aggressor, how many players act behind me, what fraction of the pot am I being asked
+for — and nothing in the tree produced that: the tokeniser reads the same record, but into
+tokens. `situation(ctx)` is one pass over the decisions before the pending one, and the cascade
+calls it once per `(record, snap_idx)` group.
+
+**Everything is read off the pot, not off the bets.** A decision that closes a street is stepped
+*before* its snapshot is taken, and the engine zeroes `bets` on a street change and pays the pot
+into `credits` at the end of a hand — so for exactly the decisions that end something, both read
+as nonsense (a call that closes the preflop shows as putting in −10 chips). The pot only ever
+grows by what an action adds, on every street and on the last action of a hand alike, so
+"this decision put in *x* chips" and "it raised" are both derived from it. This cost a debugging
+pass and is the kind of thing that would otherwise show up as a member with a plausible-looking
+but wrong preflop read.
+
+**`facing` is the bet as a fraction of the pot it was bet into**, not of the pot the snapshot
+carries — those differ by the bet itself, and only the first makes `mdf = 1/(1 + facing)` the
+minimum defence frequency the cascade thresholds with. A half-pot bet reads as 0.5.
+
+**It is a function of the prefix**, asserted: a `Situation` built on a finished record equals the
+one built on the record truncated at that decision. This is §9's parity in a second costume —
+the posterior asks about decisions from the middle of finished hands, so a rule that could see
+the rest of the hand would be an oracle rather than a member.
+
+**Ranges are what a regular *assigns*.** Each live opponent's preflop line (unopened / limp /
+call / raise / re-raise) and seat map to a weight vector over the 1 326 combos, through the
+combo percentile of §2.3a — an open widens from 15 % of combos in the first seat to 45 % on the
+button and 75 % heads-up, a re-raise is polar (the top 8 % plus half weight on a band around
+30 %), a call excludes the premiums. They are deliberately the same table for every archetype:
+how well someone reads ranges is not a style axis in v1, and postflop they are not narrowed at
+all — that is the posterior's job and it costs a per-decision update over 1 326 combos per
+opponent.
+
+**`hud_stats`** reports the sixteen PokerTracker frequencies over a list of records, each as
+`(numerator, denominator)` rather than as a ratio, so a band can be checked against a count when
+the denominator is small and a zero denominator is visible instead of being a `nan`. It reads
+decisions through the same pass `situation` does, so "this was a bet" cannot come to mean one
+thing in a member's rules and another in the report on it. It is the primary evidence for §P4's
+realism gate, and the only evidence at all for the table sizes and stack depths where no
+benchmark exists.
+
+### 2.3c A regular, as a cascade — `pool/regular.py`
+
+One class with one set of numbers per archetype. It is not a solver and is not trying to be: it
+plays *recognisably*, and a pool is a fixed diverse population to best-respond to.
+
+**Intents, then bins.** The rules produce a distribution over five intents — fold, check/call, a
+small bet, a big one, all-in — and only then does an intent become an action index. That split
+is what lets one rule set serve any raise grid: a size is a target fraction of the pot and the
+member plays the nearest *legal* bin to it. Where a size cannot be expressed the mass goes to
+all-in if that is legal and to check/call otherwise; folding when checking is free is
+redistributed over what is legal before anything is logged. Preflop the conversion runs the
+other way — a size stated in big blinds ("open to 2.5") or as a multiple of the raise it faces
+("3-bet to 3.2×") becomes a pot fraction against the live pot — so the size a member plays
+drifts with the number of limpers, which is what happens at a real table.
+
+**Thresholds are on quantiles, classes are for reading.** Preflop rules threshold on the share
+of *combos* better than the hand (§2.3a), so a range written once tightens by itself as the
+table fills up; postflop rules threshold on `q = hs^(opponents)`, the probability of holding the
+best hand right now, with a draw's potential folded in separately through `ehs`. Hand classes —
+top pair good kicker, overpair, set — are never thresholded on. They are what a human rule
+*says*; the quantiles are what it does.
+
+**Cost.** A 1 326-row posterior query on a cached board is 4.2 ms and a self-play decision 1–6
+ms. Getting there needed §2.3a's `range_equity` rewritten from a masked `1326 × 1326` reduction
+into inclusion–exclusion on the two cards a combo holds — the same sums in a different order,
+exact, 21 ms → 0.43 ms.
+
+**Three places the design as first written was wrong, and the measurement that showed it.**
+
+* **A "human floor" on equity is a ceiling on style.** "A hand getting the right price never
+  folds" reads well, but with the price measured against a *random* hand it makes every
+  archetype continue with 93 % of its range against a pot-sized bet — a nit and a calling
+  station alike — because most of a preflop range beats a random hand a third of the time. The
+  floor is on the **draw's own odds** instead, which is what a player means when they say it,
+  and the defence frequency comes out at exactly `defend_factor/(1 + bet/pot)`.
+* **Heads-up, the small blind is the button, and a heads-up button is not a six-max button.**
+  Interpolating position from a first seat to a button hands the heads-up small blind the
+  six-max button's range — 45 % for a TAG — while the same tables credit an *opponent* in that
+  seat with 75 %. Scaled to the heads-up norm it opens 74.7 %. This is the table size the
+  committed config trains at.
+* **The c-bet knob is a bluffing frequency, not a betting frequency.** Value bets at
+  `1 − slowplay` whatever it says, so the total bet mass is always above it. The identity that
+  holds — and that the tests pin — is that the air bets at exactly `f · bluff_ratio`.
+* **Preflop and postflop are not the same seat order.** An opening range interpolated on
+  postflop position gives the small blind under-the-gun's range, because postflop it is the
+  earliest seat — while preflop it acts second to last with one player behind it. Every
+  archetype had it at once, which is why a report about how they *differ* could never have
+  caught it. Preflop the small blind now reads as a button, which is also what a regular credits
+  an opponent in that seat with.
+
+### 2.3d Ten of them — `pool/archetypes.py`, `gates/pool_realism.py`
+
+Six archetypes lie in one plane — tightness × aggression × bluff share — and share three
+regularities an agent could learn once and apply to all six: a bet correlates with strength the
+same way, sizes stay between half a pot and a pot, and position bends every range by the same
+shape. The other four exist to break one each: `weak_tight` enters as many pots as a
+loose-passive and then *folds* instead of calling, `trapper` breaks "a check means weakness",
+`polar_reg` breaks the size axis by overbetting, and `stealer` breaks the position curve.
+
+**Jitter is where diversity beyond ten comes from.** A rate is multiplied by a lognormal draw, so
+a zero stays zero — an archetype that never bluffs is not jittered into bluffing — while a size
+or a stack threshold is *shifted*, because a pot fraction of 0.33 and one of 1.5 want the same
+absolute spread and not the same relative one. Every knob is clipped back into its domain.
+
+**The gate answers two questions and gates nothing** (owner decision, 2026-09-03). *Diverse?* —
+all ten sit at one table per size and are dealt a fresh seating every hand, and every archetype's stat line
+is read off the same hands against the same field. One hand is a data point for every seat at
+it, so reading ten stat lines costs what reading one costs, and the numbers are comparable
+rather than ten separate experiments. The seating is *drawn* and not rotated by a fixed step:
+with ten members at a two-handed table a fixed step is two, the even-indexed archetypes never
+leave the button and the odd ones never leave the big blind, and every stat line comes back
+positional — which read a maniac as tighter than a TAG. *Better than the degenerate five?* — each archetype is
+seated against always-fold / always-call / always-min-raise / maniac / nit and measured in
+BB/100 with its standard error. There are no acceptance bands: with two dozen hand-set knobs
+there is no realistic path from a measurement back into a fitted pool, so the machinery that
+would have guarded against one is not built.
+
+**A `regular` bootstrap entry** seats archetypes in the training pool. Its `n_variants` draws
+*parameters* and not styles — the cascade already is the style — so the style defaults to no
+modifier, `spread` is what makes variants differ, and several variants at spread zero are
+refused rather than silently identical. Every regular in one build shares one board cache and
+one preflop table. The labelling workers rebuild them from their parameters (`oracle/parallel.py`
+raises on a member kind it cannot mirror, so without this a run with regulars and more than one
+worker would die on its first iteration); the board cache is the one thing that does not travel,
+because a cache is per process and the worker builds its own.
+
+**It writes as it goes and resumes.** The whole job is twenty-odd minutes of CPU; the report is
+written after every cell, each table size is printed the moment it finishes rather than all at
+the end, and a re-launch with the same settings replays only the cells that are missing. The run
+directory is named and not timestamped, for the same reason the Slumbot run's is: an interrupted
+job is resumed, not started again beside itself.
 
 ### Progress bars that are not lying — `utils.progress`
 
@@ -1137,6 +1329,46 @@ events, 13.9% packing, 68.8% model, 0.3% style, 10.3% driver at 584 µs per poli
 
 ---
 
+### 2.7a `gates/pool_conditioning.py` — is a past agent stronger reading its tablemates?
+
+The measurement `PLAN_AMORTISED_POOL.md` P2 asks for, and the one that decides whether the
+capability P1 built is wired into the phases that seat a past agent (P3, P4). It is **not** an
+agent result and says so on its face: every report it writes carries the stamp
+`POOL MEMBER CONDITIONING — not an agent result`, and `write_report` refuses to write one that
+does not, or one whose numbers carry no standard error.
+
+**The design is the pairing.** One checkpoint sits at slot 0 of the same sessions twice — same
+seeds, same tables, same opponents from the bootstrap pool, same rotation — once at `e = 0` and
+once conditioned on the `K = 0` vectors of its own view, refreshed every `R` hands over
+`embedding_net.pool_agent_window` hands. The hands diverge as soon as the two conditions choose
+differently, which is the effect; the *situations* they are dealt into are identical, which is
+what makes the difference per session meaningful. A single 400-hand session has a standard error
+of tens of BB/100, so the number quoted is the paired difference and its SE over sessions,
+grouped also by table size and by stack depth (`CLAUDE.md` §1's no-cliff claim).
+
+The block discipline is hero's (§2.10): the vectors in force during block *b* are computed over
+blocks `0 … b−1`, and block 0 is the cold start — seated as the *unconditioned* member in both
+halves, because a zero table and no table are bit-identical (§2.8). One reserved pool entry per
+session, not per seat, because a member that knows its own slot derives the rotation from the
+seat it is asked to act at.
+
+Both checkpoints carry the config they were trained under, and the gate asserts the load-bearing
+keys against its own — the action set, the raise grid, the trunk shape — so a checkpoint from
+another run fails loudly instead of producing a number nobody can interpret. The report also
+carries a timing section (`hand_tokens` per call, `amortised_vectors` per hand of window on the
+box it ran on), which is the measurement `PLAN_AMORTISED_POOL.md` §1.1 needs before P4 commits
+to a corpus-scale refresh.
+
+The pre-registered decision rule lives in the plan and is *printed* beside the number rather
+than encoded: the gate reports, the owner decides. **It has not been run, and it is no longer a
+gate on anything.** The owner decided on 2026-09-03 to wire the conditioning in without it: the
+pool is strongly exploitable early, reading the opponent is precisely the mechanism that finds
+those exploits, and measuring the effect on agents that are weak in exactly that way answers a
+different question. The gate stays as a measurement that can be pointed at any two checkpoints —
+its own falsifiable use is the prediction that the advantage *shrinks* as the pool converges.
+
+---
+
 ### 2.8 The agent (§6.1) — `nets/trunk.py`, `nets/agent_net.py`, `agent/policy.py`
 
 Entity 3 exists as a network and as a pool member. It is **untrained**: nothing in the tree
@@ -1203,11 +1435,11 @@ questions every pool member is asked: *what do you do here* (the driver, in play
 oracle's rollouts) and *what would you have done holding this* (the §7.2 posterior). Three things
 follow, and each one is why this is a second class rather than a flag on the first:
 
-* **The vectors are zero** — D12 option (a), the plan's recommendation, taken 2026-08-19. A past
-  agent plays its *unconditional* policy, the one §6.2's embedding dropout trains explicitly, so
-  it is a fixed policy like every other member: no fit nested inside a fit, no recursion, no
-  answer needed to "what did agent *k−3* believe about its tablemates". The alternative — a §5.5
-  fit per past agent per table — has no cheap form and no measurement asking for it.
+* **The vectors are zero by default** — D12 option (a), the plan's recommendation, taken
+  2026-08-19. A past agent then plays its *unconditional* policy, the one §6.2's embedding
+  dropout trains explicitly, so it is a fixed policy like every other member: no fit nested
+  inside a fit, no recursion, no answer needed to "what did agent *k−3* believe about its
+  tablemates".
 * **One member serves every seat**, because with `e = 0` the slot only selects which zero vector
   is read. That is what `PoolMember` requires and what `AgentPoolMember` cannot give.
 * **The observation is rebuilt for the moment being asked about**: the record is truncated at the
@@ -1218,6 +1450,35 @@ follow, and each one is why this is a second class rather than a flag on the fir
 
 The style layer applies to it exactly as to a v7 checkpoint (§4.2), so the `agent_variants`
 members one agent contributes are `with_style` siblings sharing one network by reference (D11).
+
+**Or the member is handed a table** — `(embeddings, own_slot)`, optional and absent by default
+(`PLAN_AMORTISED_POOL.md` P1, the revisit of D12). It is then conditioned on its tablemates the
+way hero is: `emb = embeddings[slot]` and `seat_emb = embeddings[seat_slot]`, the same two
+gathers `AgentPoolMember` makes. Neither of the first two bullets is lost:
+
+* **one member still serves every seat**, because a member that knows *its own* slot derives the
+  rotation from the seat it is asked to act at — slot `own_slot` sits at seat `acting_pos` in
+  hand `h` iff `h ≡ own_slot − acting_pos (mod n)`, and that fixes every seat's slot. One member
+  per (session, slot, block), not one per seat. `test_frozen_agent_vectors.py` asserts the
+  derived rotation against `Session.slot_of_seat` at every table size 2–9 and every hand.
+* **the sibling pattern is `with_style`'s**: `with_vectors(name, embeddings, own_slot)` is a
+  `copy.copy` with the table swapped, so a refresh costs no second network.
+
+A zero table is bit-identical to no table at all, which is what makes the cold start of block 0
+the same policy D12 settled on. Nothing in this class decides *which* table a block should hold;
+that is the block discipline of the phase that seats the member (§2.10).
+
+**The member also carries the embedding network of its own generation** — `embed_net`, frozen at
+the moment that generation entered the pool, and `None` for a member nobody may condition. Never
+the loop's current network: nothing anchors the coordinates of the vector space, the loop keeps
+training the one network it holds, and a frozen policy handed vectors from a later generation
+would be reading a description in a basis that has drifted under it. It would also stop the pool
+from being *fixed* — the same member would play differently at iteration 10 and at iteration 20
+with nobody having changed it, which makes hero's accumulated per-member results (what PFSP
+samples on) results against a moving target, and makes the embedding network describe styles that
+move because it moved. `pipeline.py` freezes one snapshot per retrain, hands it to the members
+that generation contributes, and rebuilds the same mapping on resume from the per-iteration
+checkpoints — one load per generation, about 200 MB each.
 
 ---
 
@@ -1322,6 +1583,15 @@ uniform 2–9 × 10–300 BB, slot 0 is the observer — and a copy would let th
 drift showing up as a train/deploy mismatch nobody could see. The move is behaviour-neutral and
 `test_g1_gate.py` passing unedited is what says so. `play` gained one optional argument,
 `bar=False`, for a caller that plays the corpus in several calls and carries its own global bar.
+`Session.tokens` gained two, `observer_slot=0` and `window=None`, both of them today's
+behaviour: the other slots are the per-observer tokenisation a *non-hero* fit needs, since
+pooling by slot over hero's tokens would show that player hero's hole cards (§9 from the pool's
+side), and the window is the history such a fit is allowed to look at. The §5.7 range targets
+are hero's — their keys name a seat hero has a live opponent at, and `hand_tokens` refuses a key
+another observer has no live opponent at — so they are passed for slot 0 alone.
+`train/generate.py::amortised_vectors` is that tokenisation around one `amortised_init`, i.e.
+`fit_embeddings(steps=0)` with no gradient step, and it returns a `_pad_vectors` table. It is
+the `K = 0` conditioning of `PLAN_AMORTISED_POOL.md`, and this phase is the first caller.
 `loss_weights` moved the same way, from `gates/g1.py` to `nets/embedding_net.py`, for the same
 reason: the §5.5 fit that runs here has to weight the §5.1a terms exactly as the training that
 produced the network did, and production code has no business importing a gate.
@@ -1335,6 +1605,31 @@ decision in block *b* stores that same table. Block 0 is the zero cold start. A 
 over the whole session and attached afterwards would be a future leak that no loss curve could
 ever show, which is why `test_label_generation.py` pins it by replaying with the tail of the
 session changed and requiring the block's vectors to come out bit-identical.
+
+**`pool_agent_vectors` — the pool's own past agents, conditioned or blind.** `"zero"`, the
+default, is D12 option (a): a past agent seated as an opponent reads `e = 0` and plays its
+unconditional policy, and every path below is inert. `"amortised"` gives each past agent at each
+table the `K = 0` reading of *its own* tablemates, on the same block boundaries as hero's fit,
+through the frozen embedding network of its own generation (§2.8). Concretely:
+
+* the phase reserves one play-pool entry per **(session, past-agent slot)** — one per slot and
+  not per seat, because a member that knows its own slot derives the rotation from the seat it
+  is asked to act at — and points that slot's seat at it in every hand;
+* the per-block table grows an observer axis: row 0 is hero's fitted table, unchanged and still
+  the only thing a label stores, and row `slot` is that slot's `K = 0` reading. The axis is one
+  row wide under `"zero"`, so the default writes exactly the vectors it always wrote;
+* the refresh happens where hero's fit happens, from the same records: one tokenisation and one
+  trunk pass per conditioned seat, over `pool_agent_window` hands (`null` = the session so far);
+* the same seating function runs in the play loop, in the sequential label loop and in every
+  worker, and it looks the base member up *through the play pool* — which finds the pool member
+  in the parent and that member's weightless mirror in a worker, so the inference server, the
+  slab and the runners are untouched. The reserved entries are holes in the mirror, exactly as
+  hero's are;
+* both keys are in the play signature, because two runs that disagree on them played different
+  hands however identical their tables, and their labels must never be spliced.
+
+`_results_by_member` and PFSP are indexed by pool member and never see the reserved entries, so
+a past agent is still scored as one member and not as its per-session copies.
 
 **The observation is kept, not rebuilt.** Hero's member is wrapped in a recorder that stores
 `hand_tokens(..., pending=ctx)` for every decision it is asked about, and that stored prefix is
@@ -1574,6 +1869,17 @@ from the replayed state rather than re-deriving legality (`_table_view`). The to
 `nets.features.hand_tokens`. Logits become a played distribution in `PoolMember.policy`, reached
 through the ordinary `AgentPoolMember`. None of the three has a Slumbot branch, and the record
 built here is the only second construction path the file introduces.
+
+**Who plays is a factory, not a network.** `SlumbotAgent` takes
+`(hero_seat, embeddings) -> PoolMember`; the agent's own factory builds an `AgentPoolMember` for
+the seat Slumbot dealt it, and a procedural §2.3d archetype arrives through the same door as one
+member serving every seat. `evaluation.hero` selects it, absent meaning the agent. Two things
+follow and both are said out loud rather than left to fail late: a member with no opponent vector
+declares so (`d_emb is None`), which makes a *warm* run against it an error rather than a silent
+no-op, so the runner drops the warm mode with a logged reason; and a pool member's run needs no
+agent checkpoint and is written under `pool_eval/<archetype>/`, never beside the agent's, because
+the two numbers are not the same kind of thing and a directory is the cheapest place to stop them
+being read as if they were.
 
 **The two seat frames meet here and nowhere else.** Slumbot numbers seats `pos 0 = BB`,
 `pos 1 = SB` with the SB first preflop; v8's `env/table.py` posts the small blind at seat 0 and,
@@ -1818,12 +2124,21 @@ saved before either change no longer matches `OpponentEmbeddingNet`. Nothing on 
 and `fitted_vectors.npz` are what post-hoc analysis reads — but re-evaluating those weights
 would now need a key-remap shim, which does not exist.
 
-**A past agent in the pool plays its unconditional policy, and that is a decision, not a
-detail.** `FrozenAgentMember` (§2.11) seats it at `e = 0` — D12 option (a). It is cheap and it
-has no recursion, but it means the pool's own agents never *exploit* the tables they sit at,
-while hero always does. Whether the loop should instead fit a vector for each past agent (D12
-option (b)) is open; nothing has measured the difference, and it would nest one §5.5 fit inside
-another for every rollout.
+**A past agent in the pool plays its unconditional policy *by default*, and that is a decision,
+not a detail.** `FrozenAgentMember` seats it at `e = 0` — D12 option (a) — so the pool's own
+agents do not *exploit* the tables they sit at while hero always does. `pool_agent_vectors:
+"amortised"` (§2.10) removes that asymmetry: each past agent reads the `K = 0` amortised vectors
+of its own tablemates, through the frozen embedding network of its own generation, refreshed on
+the same block boundaries as hero's fit. The switch is **off in `config.json`** and has never
+been run at size; the labels phase is the only phase it touches, because conditioning the
+embedding corpus would make a player's style non-stationary within a session, which is what the
+single-vector scheme assumes away (owner decision 2026-09-03, `PLAN_AMORTISED_POOL.md` P4).
+
+What is unmeasured: whether a past agent is any *stronger* conditioned. `gates/pool_conditioning.py`
+(§2.7a) is built and can answer it on any two checkpoints, and was deliberately not run — the
+owner's argument is that an early pool is exploitable by construction, so reading the opponent
+must help there, and that the interesting question is instead whether the advantage *decays* as
+the pool converges.
 
 `config_g1.json` ships its `v7` bootstrap entry with placeholder paths
 (`../../data/v7/FILL_ME/…`). They must be filled in before a real G1 run; without them the pool
@@ -1849,7 +2164,7 @@ leaves unverified.
 cd versions/v8 && python3 -m pytest tests/ -q
 ```
 
-459 tests, ~222 s on the dev box (CPU-only) — the parallel-evaluation cases spawn processes and
+605 tests, ~317 s on the dev box (CPU-only) — the parallel-evaluation cases spawn processes and
 account for most of the increase, and the labelling cases now run the §2.2d control variate. The
 30-minute budget from `CLAUDE.md` §4 is comfortably met; it was *not*, at over thirty minutes,
 while the baseline settled every board through the engine's pot logic, which is the measurement
@@ -1870,6 +2185,12 @@ that sent it back to the drawing board.
 | `test_observation_parity.py` (§5.1a part) | Showdown tokens exist exactly for the revealed seats and never among the decisions; **another seat's** revealed cards are the target and appear nowhere in its token, while **the observer's own showdown token carries the observer's own hand** — one rule across every token type, checked on decision and showdown tokens together; the labels match the cards shown, the two masks partition the real tokens, a showdown hand with no labels is refused |
 | `test_strength_head.py` | The §5.6 poker prior and the §6.1 warm start: the target is the observer's own percentile on the final board, on the observer's own decision tokens and `-1` everywhere else, matching an independently enumerated value to `1e-12`; §5.1a's showdown labels are that same dict restricted to the revealed seats, so they did not move when the two passes merged; **a hand still in progress carries no target** and neither does a record nobody labelled; **it is a target and not an input** — the same hands tokenised with and without the label differ in `own_strength` alone and the action logits are bit-identical; `collate` masks the padded tail through the sentinel and selects exactly the labelled tokens; the weight shifts the total by exactly its term and 0 removes it while leaving the action CE untouched; a batch with no target is a batch and not an error; the head can actually learn the target, below the variance that is the only baseline it is read against; **the fit never sees the term** — `fit_embeddings` is bit-identical with and without it, and it did move, so that is not two no-ops; `first_retrain_steps` selects the first retrain only, leaves the agent's own key alone, and the trainer runs the count the iteration asks for; and the warm start copies the trunk key for key, leaves the action head at its initialisation, and is an initialisation rather than a tie — one gradient step moves the agent's trunk and not the embedding network's |
 | `test_runout.py` | The rollouts' control variate, every case exact rather than within a tolerance: a hand with no decisions left reports the mean over **all 44 rivers**, checked by replaying it once per river through the untouched engine, while its raw result is a whole stack away; both branches of an exactly 50-50 fold, weighted, land on the true expectation to `1e-9` while the raw pair lands nowhere near it; on a complete board with nobody short the baseline **is** `Judger`'s settlement over random multiway states, and the one case where it deliberately is not — a side pot — is pinned as such; it is unchanged by chips beyond the call (call ≡ raise ≡ all-in) and matches the engine's own fold-out arithmetic on a hand the driver played out; cards a forced prefix turned over carry no correction; turning the estimator on moves neither a card, nor an action, nor a chip; the full-house kicker is the highest other rank, and the engine's evaluator and the batched one rank 16 000 showdowns identically on decks restricted to few ranks or few suits; and a street may define fewer raise sizes than another, with the legal set on each street matching that street's own list |
+| `test_strength.py` | The per-board table: the combo grid is a bijection and `DISJOINT` matches an explicit check; **the river percentile equals `env/showdown.py`'s** for 50 random (board, holding) pairs — to 1e-6, the rounding being the reference's own float32 arithmetic; card removal moves some hand on a monotone board by more than two points and the moved value is what an explicit loop over the unblocked combos gives; a blocked combo is inert in every array; `range_equity` reproduces `hs` under uniform weights to 1e-12 and against a single-combo range pays 0 to everything it beats and 0.5 where the range is blocked out; hand classes on hand-written boards (top pair by kicker, overpair vs underpair on the same board, set and two pair on a paired board, straight/flush/full house); draws on named hands, no draw surviving the river, outs and `ehs` to the exact number, `ehs(1)` on the river **being** `hs`; texture buckets on the plan's named boards; the preflop integral's combo-weighted mean **is** `1/(n+1)` for every table size, pairs above suited above offsuit, AA between 0.80 and 0.90 against one opponent and falling with more, determinism in the seed and the on-disk cache short-circuiting a second call; `preflop_rank_pct` reproducing a hand-built ordering's cumulative combo mass exactly; and the cache building once per board, sharing a re-ordered board and evicting the oldest |
+| `test_situation.py` | Reading a decision into scalars, every hand played along a scripted line so the numbers are arithmetic and not policy: the acting order and position fractions come out of the engine's own seat rules at 6-max and heads-up; a 6-max hand's live seats, preflop aggressor, limper count, players behind and preflop line per seat; a half-pot bet reads as `facing` 0.5 and `pot_odds` 0.25; barrels counted across streets and *not* counted for the preflop raise; a heads-up 3-bet pot's pot, effective stack and SPR to the chip; an all-in facing with its exact pot odds; all six preflop lines recognised on one hand; **the situation is a function of the prefix** — the finished record and the record truncated at the decision give the same dataclass at every decision of a hand; opening ranges widening with position, a 3-bet range polar with the premiums at full weight, a call range excluding aces, a seat yet to act carrying the whole range, and a percentile of the wrong shape refused |
+| `test_hud_stats.py` | The stat line, every assertion a `(numerator, denominator)` pair countable by hand from the scripted line above it: an opener's and a 3-bettor's preflop counts, including that an opener never records a 3-bet *opportunity* and a seat folding to two raises does not either; a limp is neither a raise nor a fold and checking the option is not VPIP; a steal is an unopened pot from the cutoff, button or small blind — with no cutoff at three seats and the small blind being the button heads-up — and a limper ahead of the button ends the opportunity rather than making one; a c-bet, two barrels and the hands that faced them, with the aggression factor and aggression percentage separating bets from calls from checks; a check-raise and an overbet in one hand, and a half-pot bet not counting as an overbet; showdown stats counting who got there and who won; counts adding up over hands and over seats to the all-seats report; and an empty record list reporting zeros rather than failing |
+| `test_regular.py` | The rule cascade, all of it through `policy()`: a batch equals the concatenation of single calls exactly; legal chip-conserving hands at every table size 2–9 and every depth 10–300 BB, every row a distribution over the legal actions; two members with the same numbers play identically and the style layer still moves them; preflop, aces always raise and 7-2 offsuit always folds, a button opens more combos than a first seat and the heads-up small blind opens over 70 %, a 3-bet range is polar with an empty calling gap between its two bands, a short stack shoves at its table's rate and a deep one never does, a shove is called with the calling range and not the jamming one, a crowded pot is entered less; postflop, a dry board is c-bet more than a wet one and **the air bets at exactly `f · bluff_ratio`** while the total mass does not (and cannot) equal the knob, a second barrel is its own frequency, betting into the aggressor is its own frequency and `donk = 0` means never, six players shrink the c-bet, **the river bluff share is the size's own indifference ratio** at `bluff_ratio = 1` and zero at 0, **the defence frequency is `defend_factor/(1 + bet/pot)` of hero's own range mass** at two sizes and three factors, a draw getting the right price never folds, facing an all-in is a price and nothing else, a low SPR turns value into a shove; and a 1 326-row posterior query on a cached board stays well under the 20 ms budget |
+| `test_archetypes.py` | The ten presets and whether they are ten different players: ten distinct presets, a zero-spread draw *is* the preset, a full-spread draw stays inside every domain over five hundred draws, a knob that is zero stays zero (an archetype that never bluffs is not jittered into bluffing), sizes are shifted while rates are scaled with the right spread, the draw is reproducible from its generator, an unknown archetype is refused; then all ten at one nine-handed table for 1 500 hands, rotating through every chair, each read over the same hands against the same field on **the run's own raise grid** — how many pots they enter orders nit / TAG / bluffer / loose-passive / maniac, how they enter orders the passive ones below the aggressive ones with the limp frequency separating them, aggression orders them by ratios rather than levels, and each of the four added archetypes breaks its own regularity (the trapper checks where a TAG bets, the weak-tight folds where a loose-passive calls, the polar reg is the only one overbetting, the stealer gives up to a 3-bet); and **no two of the ten share a stat line** |
+| `test_pool_realism.py` | The gate that reports those two things: both sections for every archetype and table size, the hands it says it played were played and the short and deep buckets partition them, a stat with no opportunities behind it comes back `nan` rather than as a fabricated zero — `af` being the case that shows why the numerator alone will not do — the strength section is a winrate with a standard error, the report is written and reloads, and the winrate is the hero seat's own chips over a hand-built set of records |
 | `test_pool_style.py` | The five categories partition the action set, 32-scalar round trip, identity style is a masked softmax, position and street gating, temperature, uniform mix, every draw is a valid distribution over legal actions, each degenerate strategy does what it says |
 | `test_v7_pool_member.py` | The vendored v7 stack constructs and plays legal hands; the v7 event format is built from the acting seat, masked to the street, and stops at its decision; **a `hole_override` reaches the network** — an override naming the real cards reproduces the plain answer, aces and deuce-trey do not, the record is untouched, and end to end a v7 opponent's posterior leaves the prior |
 | `test_g1_gate.py` | The gate end to end: button rotation, uniform 2–9 × 10–300 BB, the four report sections, cold start ≡ `e = 0`, and that the standard error's unit is the session |
@@ -1882,9 +2203,14 @@ that sent it back to the drawing board.
 | `test_range_head.py` | §5.7 end to end: **the filter is the posterior** — every prefix of a played hand matched combo for combo against `opponent_posterior`, with the one difference (the board visible at the token, one street ahead of a posterior conditioned through the previous decision) applied to the posterior as card removal; **the target is a prefix function** — truncating the record after `t` leaves every belief at or before `t` bit-identical; a player is in the target at the token they fold and never after; no target puts mass on a combo the board or the observer's own hand blocks, and the head's own mask is the support that target lives on; pruning buys forwards, reports the mass it dropped, keeps the mode, and only bites against a member whose play depends on its cards; the target reaches the batch on exactly the rows `act_idx` names and every untargeted row is zero and masked; the head answers one row per active pair with `-inf` on the blocked combos; **the belief at a token cannot read a later one** — perturbing the last token leaves the earlier beliefs unmoved; **`range_enabled: false` is an exact ablation** — the same hidden states tensor for tensor and no `range` parameter left behind; **the injection is detached** — the action loss reaches nothing upstream of the bottleneck; the term is exactly zero when the prediction is the target and the cross-entropy still pays the target's entropy; a batch with no target scores nothing rather than crashing; the weight is what puts the term in the total; the agent reads the same head at its pending decision; and a whole toy iteration runs with the head on — corpus targets, label targets, the sparse target through a shard and back, and both trainers reporting `range_ce` and `range_kl` |
 | `test_pipeline.py` | The outer loop end to end at toy scale, including that **a crash in the middle of labelling costs a shard and not the phase** — re-running produces the artefacts an uninterrupted run would have left: two iterations run to completion and write every artefact of every phase; the pool grows by exactly `style.agent_variants` members per iteration, variant 0 unmodified and the rest style draws, with the embedding table reserving `len(pool₀) + max_iterations × agent_variants` rows; **iteration 0 seats the `agent_init` member and iteration 1 seats the agent**, asserted from who was actually asked for an action; the seven §8 gap numbers computed by hand, including that `ev_gap_greedy` is zero exactly when the agent's mass sits on the oracle's best action; the held-out slice reaches the metric and never the optimiser, and `heldout_fraction = 0` reports **no gap** rather than one on training data; the split is a partition, deterministic in `(seed, iteration)` and different between iterations; **a run resumed from a crash in the middle of an iteration reproduces an uninterrupted one** — the same shards byte for byte, the same weights tensor for tensor, differing only in wall clocks; table size and stack depth span 2–9 and 10–300 BB with no weighting; and a past agent in the pool answers `hole_override` (two holdings, two answers, a posterior that moves off the prior) while observing only the moment it was asked about |
 
+| `test_label_generation.py` (the conditioned pool, part 8) | `pool_agent_vectors`: **off is off** — a run with the keys absent and one with them present-but-off write byte-identical shards, the window included, and the stored tables stay one observer wide; with it on, a past agent's table for block *b* equals the `K = 0` reading recomputed from the hands the phase actually played, from *its* seat, through *its own* network, for every session, block and slot, while every other slot's row stays zero and block 0 is cold for everyone; the table of a block **ignores every later hand** — hero jams from hand 3 and blocks 0 and 1 come out bit-identical; two runs differing only in the network the past agent carries produce different tables and different labels while hero's own fit is untouched, which is what says the phase reads the member's generation and not the loop's; a member carrying no generation is never conditioned and its run is the switch-off run; the window really caps (equal at one hand of history, different at two); a directory played under the other setting is set aside; and a conditioned run resumes into the run it would have been, reading the stored tables and replaying only the unlabelled tail |
+| `test_parallel_labels.py` (the conditioned pool) | A conditioned past agent labelled sequentially and in two workers produces the same labels and the same shard bytes — the tables are computed once in the parent and shipped, and each worker reseats the member per block exactly as the sequential loop does, which is what the §7.2 posterior requires |
+| `test_pipeline.py` (generations, part 7) | Every past agent is given a **frozen copy of the embedding network of its own generation**, weight for weight the one that iteration wrote to disk, with no trainable parameter left; iterations that shared a retrain share one object and iterations that did not are given different ones; a resumed run rebuilds the same mapping from the checkpoints, so the pool does not change under a restart; with the switch off no snapshot is kept at all; and the whole loop runs with the pool conditioned, seating and labelling against a conditioned member from the first iteration that has one |
+| `test_pool_conditioning_gate.py` | The P2 gate end to end at toy scale: it runs, stamps its report, writes it, and buckets every session by table size and by stack depth exactly once; **the two conditions play the same tables** — the difference is per session and each row carries one table and one stack; **with the vectors forced to zero the paired difference is exactly 0.0** in every session, which is the pairing with the effect removed, and **a table loud enough to move the policy does move the hands**, which is what stops that from being vacuous (at toy scale the real `K = 0` vectors shift the policy by ~5e-4 and flip nothing); the paired mean and standard error are the hand-computed ones, per condition and for the difference; and a report is refused if it loses the stamp or any standard error, as is a checkpoint trained on another action set or another trunk |
+| `test_frozen_agent_vectors.py` | A past agent conditioned on its tablemates (`PLAN_AMORTISED_POOL.md` P1): no table is the member that was always there and a **zero table is bit-identical to it**; a table without a slot, a slot without a table, a mis-shaped table and a slot off the end are each refused; `with_vectors` shares the network and the style by identity, leaves the base's answers and the base's table alone, and its table demonstrably reaches the forward; **the rotation a member derives is the session's own** at every table size 2–9, every slot and every hand, asserted on the slots it labels the seats with; the same tablemates relabelled from another slot are the same table — different tokenisations, identical answers; a row for a slot nobody occupies changes nothing while every seated slot's row changes the answer; the two contracts a past agent already had still hold with a table — `hole_override` gives two holdings two answers and the observation stops at the asked-about decision carrying only the hypothetical holding; slot 0's tokens are byte-for-byte what `Session.tokens` always produced, **every other slot shows that slot's cards and nobody else's**, a window is the last hands and nothing earlier, and the §5.7 targets are refused to every observer but hero; and `amortised_vectors` equals `fit_embeddings(steps=0)` padded, is zero for a slot that has observed nothing and for an empty window, differs between observers, and shrinks with the window |
 | `test_slumbot_adapter.py` | The Slumbot seam, entirely off canned action strings — no socket: the mask hero acts under **is `env.legal`'s** on every canned state and reaches the token unchanged, folding is offered facing the blind and refused with nothing to call, and an opponent's all-in leaves no raise; **the chips are Slumbot's and not the abstraction's** — a `b250` that lands on no bin of ours still reads as a 5 BB pot, and every canned state's pot, stack and amount-to-call match the wire to 1e-9; the two seat frames are mirrors, hero holds hero's cards, the first decision of a hand belongs to seat 0 and the first of the flop to seat 1; §9 parity on the built record — only hero's hole cards, a board never ahead of the token's street, no showdown token, the pending decision action-less, and a prefix independent of what came later; **index → wire → index round-trips for every legal action on all four streets with no clamp firing**, while a fold with nothing to call becomes a check, says so in the counter, and is read back as a call; hero's own clamped action is what the next replay sees, and `hero_action_indices` overrides hero's seat only; BB/100 and its standard error against hand-computed values, with Welford's online form agreeing and the zero- and one-hand cases returning zero; a table outside `players_range` / `stack_bb_range` is **refused, not clamped**; and end to end the agent answers every canned state with a legal token, deterministically under its own generator, cold from the zero table and warm from a fitted one, reaching the network through the ordinary `AgentPoolMember` and not a copy of it |
 
-| `test_eval_pipeline.py` | The evaluation runner against a canned Slumbot that speaks the real grammar through `evaluation/protocol.py` — no socket anywhere; the parallel path really spawns processes, which reach the stub by name: shares add up to the hand count for every split, each worker plays its own share into its own file and the aggregate is their sum, a parallel run resumes per worker, and the clamp counters survive a resume because they ride on the hands rather than being tallied; BB/100 and its standard error hand-computed, agreeing with the batch form, with the zero- and one-hand cases returning zero rather than crashing; **a short run is stamped `SCREENING ONLY` and a run at the threshold is not**, and the selection disclosure is refused when absent or incomplete rather than quietly omitted; **cold pins `e = 0` at every decision** — asserted from the vector the member actually held — and never fits anything; warm refreshes exactly on the configured `R`, records per hand how many hands its vector was fitted from, buckets the run by it, and a fitted vector demonstrably reaches the policy; the warm-up hand count is the first bucket that caught cold up and `None` when it never did; **warm worse than cold is reported in §12's own words**; **a resumed run reproduces an uninterrupted one** — the same BB/100, the same standard error, the same per-bucket curve and the same hands byte for byte; a failed hand is counted, keeps its slot in the file so the index does not shift, and does not enter the statistics; and both modes off, or warm with no embedding checkpoint, are refused |
+| `test_eval_pipeline.py` | The evaluation runner against a canned Slumbot that speaks the real grammar through `evaluation/protocol.py` — no socket anywhere; the parallel path really spawns processes, which reach the stub by name: shares add up to the hand count for every split, each worker plays its own share into its own file and the aggregate is their sum, a parallel run resumes per worker, and the clamp counters survive a resume because they ride on the hands rather than being tallied; BB/100 and its standard error hand-computed, agreeing with the batch form, with the zero- and one-hand cases returning zero rather than crashing; **a short run is stamped `SCREENING ONLY` and a run at the threshold is not**, and the selection disclosure is refused when absent or incomplete rather than quietly omitted; **cold pins `e = 0` at every decision** — asserted from the vector the member actually held — and never fits anything; warm refreshes exactly on the configured `R`, records per hand how many hands its vector was fitted from, buckets the run by it, and a fitted vector demonstrably reaches the policy; the warm-up hand count is the first bucket that caught cold up and `None` when it never did; **warm worse than cold is reported in §12's own words**; **a resumed run reproduces an uninterrupted one** — the same BB/100, the same standard error, the same per-bucket curve and the same hands byte for byte; a failed hand is counted, keeps its slot in the file so the index does not shift, and does not enter the statistics; and both modes off, or warm with no embedding checkpoint, are refused; **a procedural pool member can play the hands instead of the agent** — no agent checkpoint is loaded or required, the run says out loud which member is playing and that it is not an agent result, the warm run is dropped with a reason rather than failing one process deep (and a warm-only run is then refused outright), a member run resumes like any other, an unknown hero kind is refused, and **omitting the hero section reproduces the agent's own report cell for cell** |
 
 `conftest.py` puts `gto_utils/` and the version root on `sys.path` and reseeds
 `random`/`numpy`/`torch` to 42 before every test. `tests/g1_fixtures.py` holds the shared toy

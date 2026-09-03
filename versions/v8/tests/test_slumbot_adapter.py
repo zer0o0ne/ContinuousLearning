@@ -32,9 +32,10 @@ from evaluation.protocol import (
     token_to_action_idx,
 )
 from evaluation.v8_adapter import (
-    N_SEATS, SlumbotAgent, _flip, _table_view, check_table_is_in_range,
-    slumbot_record,
+    AgentMemberFactory, MemberFactory, N_SEATS, SlumbotAgent, _flip,
+    _table_view, check_table_is_in_range, slumbot_record,
 )
+from env.session import raise_sizes_from
 from nets.agent_net import AgentNet
 from nets.features import TOKEN_DECISION, UNKNOWN_CARD, hand_tokens
 from tests.g1_fixtures import (
@@ -350,7 +351,8 @@ def test_a_table_outside_the_training_ranges_is_refused():
     with pytest.raises(AssertionError, match="stack_bb_range"):
         check_table_is_in_range({**GAME, "stack_bb_range": [10, 100]})
     with pytest.raises(AssertionError, match="stack_bb_range"):
-        SlumbotAgent(_net(), {**GAME, "stack_bb_range": [10, 100]}, "cpu")
+        SlumbotAgent(AgentMemberFactory(_net(), GAME, "cpu"),
+                     {**GAME, "stack_bb_range": [10, 100]}, "cpu")
 
 
 # ------------------------------------------------------- 7: the whole path
@@ -361,8 +363,13 @@ def _net(seed=0):
     return AgentNet(NET_CFG, N_ACTIONS, MAX_PLAYERS).eval()
 
 
+def _agent_hero(seed=0):
+    """The default hero: entity 3, reached through its own member factory."""
+    return AgentMemberFactory(_net(seed), GAME, "cpu")
+
+
 def test_the_agent_answers_every_canned_state_with_a_legal_wire_token():
-    agent = SlumbotAgent(_net(), GAME, "cpu", rng=np.random.default_rng(1))
+    agent = SlumbotAgent(_agent_hero(), GAME, "cpu", rng=np.random.default_rng(1))
     for action_str, client_pos, n_board in CANNED:
         h = _hand(action_str, client_pos, n_board)
         probs, _record, ctx, _state = agent.policy(
@@ -381,8 +388,8 @@ def test_the_agent_answers_every_canned_state_with_a_legal_wire_token():
 
 
 def test_the_agent_is_deterministic_under_its_own_generator():
-    a = SlumbotAgent(_net(), GAME, "cpu", rng=np.random.default_rng(7))
-    b = SlumbotAgent(_net(), GAME, "cpu", rng=np.random.default_rng(7))
+    a = SlumbotAgent(_agent_hero(), GAME, "cpu", rng=np.random.default_rng(7))
+    b = SlumbotAgent(_agent_hero(), GAME, "cpu", rng=np.random.default_rng(7))
     h = _hand("b250c/", 0, 3)
     for _ in range(5):
         assert a.act(h["action_str"], h["client_pos"], h["hole_cards"],
@@ -392,7 +399,7 @@ def test_the_agent_is_deterministic_under_its_own_generator():
 
 def test_cold_is_the_zero_table_and_warm_replaces_it():
     net = _net()
-    agent = SlumbotAgent(net, GAME, "cpu")
+    agent = SlumbotAgent(AgentMemberFactory(net, GAME, "cpu"), GAME, "cpu")
     assert not agent.embeddings.any(), "the cold start is the zero vector (§5.5)"
 
     h = _hand("b250c/", 0, 3)
@@ -409,6 +416,53 @@ def test_cold_is_the_zero_table_and_warm_replaces_it():
         agent.set_embeddings(np.zeros((2, net.d_emb)))
 
 
+def _regular_hero(tmp_path):
+    """A procedural §P4 archetype as the hero, on the fixture raise grid."""
+    from pool.archetypes import draw_params
+    from pool.regular import RegularMember
+    from pool.strength import StrengthCache, preflop_equity_table
+
+    table = preflop_equity_table(str(tmp_path / "preflop.npy"), seed=0,
+                                 n_deals=20_000)
+    member = RegularMember("tag", N_ACTIONS, draw_params(
+        "tag", np.random.default_rng(0), 0.0), StrengthCache(64), table,
+        raise_sizes_from(GAME))
+    return MemberFactory(member)
+
+
+def test_a_procedural_member_can_be_the_hero(tmp_path):
+    """§P5: the same wire, the same legality, a different player.
+
+    Nothing about the adapter knows which kind of member is answering — which
+    is the point of the change, and why this test is the same assertions as the
+    agent's own with the hero swapped.
+    """
+    agent = SlumbotAgent(_regular_hero(tmp_path), GAME, "cpu",
+                         rng=np.random.default_rng(2))
+    assert agent.embeddings is None
+
+    for action_str, client_pos, n_board in CANNED:
+        h = _hand(action_str, client_pos, n_board)
+        probs, _record, ctx, _state = agent.policy(
+            h["action_str"], h["client_pos"], h["hole_cards"], h["board"])
+        legal = np.asarray(ctx.legal_mask, dtype=bool)
+        assert probs.sum() == pytest.approx(1.0, abs=1e-9)
+        assert not probs[~legal].any()
+
+        counters = clamp_counters()
+        incr, effective, chosen = agent.act(
+            h["action_str"], h["client_pos"], h["hole_cards"], h["board"],
+            counters=counters)
+        assert legal[chosen] and legal[effective]
+        assert incr == "f" or incr in ("c", "k") or incr.startswith("b")
+
+
+def test_a_procedural_hero_has_no_vector_to_warm_up(tmp_path):
+    agent = SlumbotAgent(_regular_hero(tmp_path), GAME, "cpu")
+    with pytest.raises(AssertionError, match="no opponent vector"):
+        agent.set_embeddings(np.zeros((MAX_PLAYERS, 8)))
+
+
 def test_the_agent_reaches_the_network_through_the_ordinary_pool_member(
         monkeypatch):
     """§6.1, §9: one observation builder and one last mile, not a Slumbot copy."""
@@ -420,7 +474,7 @@ def test_the_agent_reaches_the_network_through_the_ordinary_pool_member(
         return real(self, contexts)
 
     monkeypatch.setattr(AgentPoolMember, "logits", spy)
-    agent = SlumbotAgent(_net(), GAME, "cpu")
+    agent = SlumbotAgent(_agent_hero(), GAME, "cpu")
     h = _hand("b250c/", 0, 3)
     agent.act(h["action_str"], h["client_pos"], h["hole_cards"], h["board"])
     assert seen == [(_flip(0), (1, 0))], seen

@@ -126,13 +126,14 @@ def _hero_factory(agent_net, wrap=None):
     return make
 
 
-def _run(tmp_path, cfg=None, wrap=None, seed=0, hero=None):
+def _run(tmp_path, cfg=None, wrap=None, seed=0, hero=None, pool=None,
+         sampler=None):
     """One `generate_labels` call. Returns (manifest, labels)."""
     cfg = cfg or _cfg()
-    pool = make_pool(seed=seed)
+    pool = make_pool(seed=seed) if pool is None else pool
     embed_net, agent_net = _networks(len(pool), seed=seed)
     driver = LockstepDriver(pool, N_ACTIONS)
-    sampler = _UniformSampler(len(pool), seed=cfg["seed"])
+    sampler = sampler or _UniformSampler(len(pool), seed=cfg["seed"])
     factory = hero or _hero_factory(agent_net, wrap=wrap)
     manifest = generate_labels(driver, pool, sampler, embed_net, factory, cfg,
                                str(tmp_path), log=lambda _m: None)
@@ -724,20 +725,20 @@ def test_a_layout_too_wide_for_the_deck_draw_is_refused():
         assert_seeds_stay_distinct(2 ** 30, 30)
 
 
-def _crashed_run(tmp_path, monkeypatch, cfg, after=12):
+def _crashed_run(tmp_path, monkeypatch, cfg, after=12, **kwargs):
     """A half-finished labels directory: shards on disk, `progress.json` written."""
     calls = {"n": 0}
     real = train.generate.action_values_batch
 
-    def crash_after(requests, *args, **kwargs):
+    def crash_after(requests, *args, **kwargs_):
         calls["n"] += len(requests)
         if calls["n"] > after:
             raise RuntimeError("the box went away")
-        return real(requests, *args, **kwargs)
+        return real(requests, *args, **kwargs_)
 
     monkeypatch.setattr(train.generate, "action_values_batch", crash_after)
     with pytest.raises(RuntimeError):
-        _run(tmp_path, cfg=cfg)
+        _run(tmp_path, cfg=cfg, **kwargs)
     monkeypatch.setattr(train.generate, "action_values_batch", real)
     return tmp_path / "progress.json"
 
@@ -793,3 +794,304 @@ def test_a_second_stale_directory_does_not_overwrite_the_first(tmp_path,
     second = json.loads(
         (tmp_path / "labels.stale.1" / "progress.json").read_text())
     assert first["n_hands"] != second["n_hands"]
+
+
+# --------------- 8: a past agent in the pool that reads its tablemates
+
+
+"""`pool_agent_vectors` (PLAN_AMORTISED_POOL.md P3).
+
+With the switch off a past agent seated as an opponent plays at `e = 0`, which
+is what every test above runs under. With it on it reads the `K = 0` vectors of
+its own tablemates, on the same block boundaries as hero's fit, through the
+embedding network of **its own generation** — never the one the loop is still
+training, whose coordinates drift under it.
+
+Four things must hold and each of them is silent if it does not:
+
+* off is off — the same bytes, to the shard;
+* the table a past agent acts under in block *b* is computed from the hands of
+  blocks `0 … b−1`, from *its* seat, and never from a later hand;
+* it is that member's own network that computes it;
+* everything the resume machinery guarantees for hero's tables it guarantees for
+  these too, because they decide actions the same way.
+"""
+
+
+def _vintage_net(n_members, seed):
+    """An embedding network standing in for one past generation's."""
+    torch.manual_seed(seed)
+    return OpponentEmbeddingNet(NET_CFG, N_ACTIONS, MAX_PLAYERS,
+                                n_members=n_members).eval()
+
+
+def _past_agent(embed_net, seed=9, name="agent0"):
+    from agent.policy import FrozenAgentMember
+    from pool.style import StyleParams
+    torch.manual_seed(seed)
+    net = AgentNet(NET_CFG, N_ACTIONS, MAX_PLAYERS).eval()
+    return FrozenAgentMember(name, N_ACTIONS, net, MAX_PLAYERS, "cpu",
+                             StyleParams.identity(), embed_net=embed_net)
+
+
+def _pool_with_agent(embed_net, seed=0):
+    """The toy pool plus one past agent, which is the last member."""
+    pool = make_pool(seed=seed)
+    return pool + [_past_agent(embed_net)]
+
+
+class _AgentAlwaysSampler(_UniformSampler):
+    """Seats the past agent at every table.
+
+    The uniform sampler would put it at one toy table in four, and a test that
+    silently exercises nothing is worse than no test.
+    """
+
+    def __init__(self, n_members, agent_idx, seed):
+        super().__init__(n_members, seed)
+        self.agent_idx = int(agent_idx)
+
+    def sample_table(self, k):
+        others = [m for m in super().sample_table(self.n_members - 1)
+                  if m != self.agent_idx][:k - 1]
+        return [self.agent_idx] + others
+
+
+def _conditioned(cfg, window=None):
+    cfg["embedding_net"]["pool_agent_vectors"] = "amortised"
+    cfg["embedding_net"]["pool_agent_window"] = window
+    return cfg
+
+
+def _run_conditioned(tmp_path, cfg, pool, **kwargs):
+    sampler = _AgentAlwaysSampler(len(pool), len(pool) - 1, seed=cfg["seed"])
+    return _run(tmp_path, cfg=cfg, pool=pool, sampler=sampler, **kwargs)
+
+
+def _stored_vectors(out_dir):
+    with np.load(os.path.join(str(out_dir), "vectors.npz")) as z:
+        return z["vectors"]
+
+
+def _stored_play(out_dir):
+    with open(os.path.join(str(out_dir), "play.json")) as fh:
+        return json.load(fh)
+
+
+def _shard_bytes(manifest):
+    return [open(p, "rb").read() for p in manifest["shards"]]
+
+
+def _capture_sessions(monkeypatch):
+    """The session objects the phase played, with their records."""
+    held = []
+    real = train.generate._play_sessions
+
+    def spy(driver, play_pool, sessions, *args, **kwargs):
+        held.append(sessions)
+        return real(driver, play_pool, sessions, *args, **kwargs)
+
+    monkeypatch.setattr(train.generate, "_play_sessions", spy)
+    return held
+
+
+def test_with_the_switch_off_the_new_keys_change_nothing(tmp_path):
+    """`"zero"` is D12 option (a) and is the same run, byte for byte.
+
+    Including the window, which is read only when the switch is on: a value
+    there must not reach a single hand.
+    """
+    pool = _pool_with_agent(_vintage_net(16, seed=21))
+    absent = _cfg()
+    zeroed = _cfg()
+    zeroed["embedding_net"]["pool_agent_vectors"] = "zero"
+    zeroed["embedding_net"]["pool_agent_window"] = 2
+
+    m_a, _l = _run_conditioned(tmp_path / "a", absent, pool)
+    m_b, _l = _run_conditioned(tmp_path / "b", zeroed, pool)
+
+    assert _shard_bytes(m_a) == _shard_bytes(m_b), (
+        "turning the switch off is not the run that had no switch")
+    # One observer's tables and not nine: the default writes what it always did.
+    assert _stored_vectors(tmp_path / "a").shape[2] == 1
+
+
+def test_a_past_agents_table_is_the_reading_of_its_own_seat_and_network(
+        tmp_path, monkeypatch):
+    """The exact vectors, recomputed from the hands the phase actually played.
+
+    `K = 0` over the session as *this slot* saw it, through the network this
+    member carries, over the blocks before the one it acts in.
+    """
+    from env.session import Session
+    from train.generate import amortised_vectors
+
+    vintage = _vintage_net(16, seed=21)
+    pool = _pool_with_agent(vintage)
+    agent_idx = len(pool) - 1
+    cfg = _conditioned(_cfg(R=3, hands=6))
+    held = _capture_sessions(monkeypatch)
+    _m, _l = _run_conditioned(tmp_path, cfg, pool)
+
+    sessions = held[0]
+    vectors = _stored_vectors(tmp_path)
+    assert vectors.shape[2] == MAX_PLAYERS
+    checked = 0
+    for i, s in enumerate(sessions):
+        slots = [j for j in range(1, s.num_players)
+                 if int(s.members[j]) == agent_idx]
+        assert slots, "the past agent was not seated at this table"
+        for b in range(vectors.shape[1]):
+            before = Session(idx=s.idx, num_players=s.num_players,
+                             stack_bb=s.stack_bb, members=s.members,
+                             specs=s.specs[:b * 3],
+                             records=s.records[:b * 3])
+            for slot in slots:
+                expected = amortised_vectors(vintage, before, slot, MAX_PLAYERS,
+                                             N_ACTIONS, None, "cpu")
+                assert np.allclose(vectors[i][b][slot], expected, atol=1e-6), (
+                    f"session {i} block {b} slot {slot}")
+                checked += 1
+            if b:
+                assert np.abs(vectors[i][b][slots[0]]).max() > 0, (
+                    "the reading is zero, so the test compares nothing")
+    assert checked > 4
+    # Block 0 is the cold start for every observer, hero included.
+    assert not vectors[:, 0].any()
+    # Nobody else's row is ever filled: a degenerate member has no vectors to
+    # read and hero's own table is row 0.
+    for i, s in enumerate(sessions):
+        for slot in range(1, s.num_players):
+            if int(s.members[slot]) != agent_idx:
+                assert not vectors[i][:, slot].any()
+
+
+def test_the_table_of_a_block_ignores_every_later_hand_for_a_past_agent(
+        tmp_path):
+    """§5.5 for the pool's own agents: hero jams from hand 3 and the tables of
+    blocks 0 and 1 must come out bit-identical anyway."""
+    pool = _pool_with_agent(_vintage_net(16, seed=21))
+    cfg = _conditioned(_cfg(R=3, hands=6))
+
+    _m_a, labels_a = _run_conditioned(tmp_path / "a", cfg, pool)
+    _m_b, labels_b = _run_conditioned(
+        tmp_path / "b", cfg, pool,
+        wrap=lambda inner: _JamFrom(inner, from_hand=3))
+
+    va, vb = _stored_vectors(tmp_path / "a"), _stored_vectors(tmp_path / "b")
+    assert np.array_equal(va[:, 0], vb[:, 0]), "block 0 is not the cold start"
+    assert np.array_equal(va[:, 1], vb[:, 1]), (
+        "a table in force during block 1 moved when block 1's hands changed")
+    assert np.abs(va[:, 1]).max() > 0
+    tail_a = {(l["session"], l["hand"], l["decision"]) for l in labels_a
+              if l["hand"] >= 3}
+    tail_b = {(l["session"], l["hand"], l["decision"]) for l in labels_b
+              if l["hand"] >= 3}
+    assert tail_a != tail_b, "the intervention changed nothing"
+
+
+def test_a_past_agent_reads_its_own_generation_and_not_the_loops_network(
+        tmp_path):
+    """Two runs differing only in the network the past agent carries.
+
+    If the phase used the network the loop is training — the one hero fits with
+    — both runs would be identical, and a frozen policy would be reading a
+    description written in a basis that drifts under it.
+    """
+    cfg = _conditioned(_cfg(R=3, hands=6))
+    m_a, _l = _run_conditioned(tmp_path / "a", cfg,
+                               _pool_with_agent(_vintage_net(16, seed=21)))
+    m_b, _l = _run_conditioned(tmp_path / "b", cfg,
+                               _pool_with_agent(_vintage_net(16, seed=22)))
+
+    va, vb = _stored_vectors(tmp_path / "a"), _stored_vectors(tmp_path / "b")
+    assert np.array_equal(va[:, :, 0], vb[:, :, 0]), (
+        "hero's own fit moved, so the two runs differ by more than the "
+        "generation the past agent carries")
+    assert not np.allclose(va[:, 1:], vb[:, 1:]), (
+        "the past agent's tables are the same under two different networks")
+    assert _shard_bytes(m_a) != _shard_bytes(m_b), (
+        "the tables reached no decision, so nothing was conditioned")
+
+
+def test_a_past_agent_with_no_generation_is_never_conditioned(tmp_path):
+    """A member that carries no network of its own plays at `e = 0`, switch or
+    no switch — there is nothing it could correctly be given."""
+    from agent.policy import FrozenAgentMember
+    from pool.style import StyleParams
+
+    torch.manual_seed(9)
+    net = AgentNet(NET_CFG, N_ACTIONS, MAX_PLAYERS).eval()
+    blind = FrozenAgentMember("agent0", N_ACTIONS, net, MAX_PLAYERS, "cpu",
+                              StyleParams.identity())
+    pool = make_pool(seed=0) + [blind]
+    on = _conditioned(_cfg(R=3, hands=6))
+    off = _cfg(R=3, hands=6)
+
+    m_on, _l = _run_conditioned(tmp_path / "on", on, pool)
+    m_off, _l = _run_conditioned(tmp_path / "off", off, pool)
+    assert _shard_bytes(m_on) == _shard_bytes(m_off)
+    assert _stored_vectors(tmp_path / "on").shape[2] == 1
+
+
+def test_the_window_is_the_history_a_past_agent_may_look_at(tmp_path):
+    """A one-hand window and a whole-session window are different readings.
+
+    Refreshing every hand, the two settings agree at block 1 — one played hand
+    is the whole history there — and part company at block 2, where the capped
+    reading drops the older hand. That is the cost lever the corpus phase needs,
+    and it has to actually cap something.
+    """
+    pool = _pool_with_agent(_vintage_net(16, seed=21))
+    whole, short = (_conditioned(_cfg(R=1, hands=4)),
+                    _conditioned(_cfg(R=1, hands=4), window=1))
+
+    _m_a, _l = _run_conditioned(tmp_path / "a", whole, pool)
+    _m_b, _l = _run_conditioned(tmp_path / "b", short, pool)
+    va, vb = _stored_vectors(tmp_path / "a"), _stored_vectors(tmp_path / "b")
+    assert np.allclose(va[:, 1], vb[:, 1]), (
+        "one hand of history read two different ways")
+    assert not np.allclose(va[:, 2], vb[:, 2]), (
+        "the window capped nothing")
+
+
+def test_a_directory_labelled_under_the_other_setting_is_set_aside(
+        tmp_path, monkeypatch):
+    """Two settings play different hands, so their labels cannot be spliced."""
+    pool = _pool_with_agent(_vintage_net(16, seed=21))
+    out_dir = tmp_path / "labels"
+    cfg = _conditioned(_cfg(n_sessions=4, hands=6))
+    sampler = _AgentAlwaysSampler(len(pool), len(pool) - 1, seed=cfg["seed"])
+    _crashed_run(out_dir, monkeypatch, cfg, pool=pool, sampler=sampler)
+
+    off = _cfg(n_sessions=4, hands=6)
+    _run(out_dir, cfg=off, pool=pool,
+         sampler=_AgentAlwaysSampler(len(pool), len(pool) - 1, seed=off["seed"]))
+    assert (tmp_path / "labels.stale").exists(), (
+        "a directory played with the pool conditioned was resumed into with it "
+        "off")
+
+
+def test_a_conditioned_run_resumes_into_the_run_it_would_have_been(
+        tmp_path, monkeypatch):
+    """The tables a past agent acted under are on disk and are read back.
+
+    Refitting them on resume would be a different fit — the head of the session
+    is not replayed — so they are persisted exactly as hero's are, and the
+    resumed run must produce the same labels the uninterrupted one did.
+    """
+    pool = _pool_with_agent(_vintage_net(16, seed=21))
+    cfg = _conditioned(_cfg(n_sessions=4, hands=6))
+    whole, _l = _run_conditioned(tmp_path / "whole", cfg, pool)
+
+    out_dir = tmp_path / "resumed"
+    _crashed_run(out_dir, monkeypatch, cfg, pool=pool,
+                 sampler=_AgentAlwaysSampler(len(pool), len(pool) - 1,
+                                             seed=cfg["seed"]))
+    dealt = _played_hands(monkeypatch)
+    resumed, _l = _run_conditioned(out_dir, cfg, pool)
+
+    assert not (tmp_path / "resumed.stale").exists(), "the resume was refused"
+    assert _shard_bytes(whole) == _shard_bytes(resumed)
+    assert dealt, "the resumed call played nothing at all"
+    assert len(dealt) < 4 * 6, "the resumed call replayed the whole corpus"

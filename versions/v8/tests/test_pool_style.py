@@ -19,7 +19,8 @@ from pool.style import (
     position_bucket, sample_style,
 )
 from tests.g1_fixtures import (
-    N_ACTIONS, STYLE_CFG, contexts_from, make_pool, make_specs, play,
+    N_ACTIONS, RAISE_SIZES, STYLE_CFG, contexts_from, make_pool, make_specs,
+    play,
 )
 
 
@@ -245,6 +246,79 @@ def test_a_style_sibling_shares_the_base_policy_and_changes_only_the_style():
         "with_style must not touch the base policy")
     assert not np.allclose(base.policy(contexts), sibling.policy(contexts))
     assert base.name == "m" and base.style.is_identity
+
+
+# ------------------------------------------------------- procedural members
+
+
+def _regular_config(tmp_path, entries):
+    from pool.strength import preflop_equity_table
+
+    path = str(tmp_path / "preflop.npy")
+    preflop_equity_table(path, seed=0, n_deals=20_000)
+    for entry in entries:
+        entry.setdefault("preflop_table", path)
+    return {"game": {"n_actions": N_ACTIONS,
+                     "raise_sizes": dict(zip(
+                         ("preflop", "flop", "turn", "river"), RAISE_SIZES))},
+            "style": STYLE_CFG, "bootstrap": entries}
+
+
+def test_a_regular_entry_builds_one_member_per_archetype(tmp_path):
+    from pool.build import build_pool
+    from pool.archetypes import ARCHETYPES
+
+    config = _regular_config(tmp_path, [{"kind": "regular", "archetype": a}
+                                        for a in ("nit", "tag", "maniac")])
+    members, descriptors = build_pool(config, np.random.default_rng(0))
+
+    assert [m.name for m in members] == ["nit", "tag", "maniac"]
+    assert all(d["kind"] == "regular" for d in descriptors)
+    # No style modifier by default: the cascade already is the style, and a
+    # logit bias on top of it would count the same thing twice.
+    assert all(m.style.is_identity for m in members)
+    assert all(m.params == ARCHETYPES[m.name] for m in members)
+    # One board cache for the whole build, which is what makes a board table
+    # cost one evaluator call across members rather than one each.
+    assert members[0].cache is members[1].cache is members[2].cache
+
+
+def test_regular_variants_are_parameter_draws_and_not_style_draws(tmp_path):
+    from dataclasses import astuple
+
+    from pool.build import build_pool
+
+    config = _regular_config(tmp_path, [{"kind": "regular", "archetype": "tag",
+                                         "n_variants": 4, "spread": 1.0}])
+    members, _descriptors = build_pool(config, np.random.default_rng(1))
+    assert [m.name for m in members] == [f"tag#{v}" for v in range(4)]
+    assert all(m.style.is_identity for m in members)
+    assert len({astuple(m.params) for m in members}) == 4
+
+
+def test_identical_variants_are_refused_rather_than_built(tmp_path):
+    from pool.build import build_pool
+
+    config = _regular_config(tmp_path, [{"kind": "regular", "archetype": "tag",
+                                         "n_variants": 3}])
+    with pytest.raises(AssertionError, match="same member"):
+        build_pool(config, np.random.default_rng(0))
+
+    unknown = _regular_config(tmp_path, [{"kind": "regular",
+                                          "archetype": "shark"}])
+    with pytest.raises(AssertionError, match="unknown archetype"):
+        build_pool(unknown, np.random.default_rng(0))
+
+
+def test_an_explicit_style_still_applies_to_a_regular(tmp_path):
+    from pool.build import build_pool
+
+    config = _regular_config(tmp_path, [
+        {"kind": "regular", "archetype": "tag", "label": "tag_folder",
+         "style": [3.0] + [0.0] * 29 + [1.0, 0.0]}])
+    members, _descriptors = build_pool(config, np.random.default_rng(0))
+    assert not members[0].style.is_identity
+    assert members[0].name == "tag_folder"
 
 
 def test_the_pool_holds_more_members_than_the_widest_table():

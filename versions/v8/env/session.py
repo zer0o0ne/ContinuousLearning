@@ -61,15 +61,35 @@ class Session:
         return [(seat + hand_idx) % self.num_players
                 for seat in range(self.num_players)]
 
-    def tokens(self, max_players, n_actions):
-        """Token sequences of every hand, from the observer's (slot 0) view."""
+    def tokens(self, max_players, n_actions, observer_slot=0, window=None):
+        """Token sequences of every hand, from slot `observer_slot`'s view.
+
+        Slot 0 is hero's, and `observer_slot=0, window=None` is what every
+        caller that fits *hero's* vectors asks for. The other slots exist for
+        the §5.5 fit of a player that is not hero — a past agent seated as an
+        opponent conditions on its own tablemates, and doing that from hero's
+        tokens would show it hero's hole cards, which is §9's parity broken from
+        the pool's side. One observer, one tokenisation.
+
+        `window` keeps only the last `window` hands played, the history the fit
+        is allowed to look at; `None` is the whole session so far.
+
+        The §5.7 range targets are hero's: they name a (token, seat) at which
+        hero has a live opponent, and `hand_tokens` refuses a key naming a seat
+        *this* observer has no live opponent at — the observer's own seat among
+        them. They are therefore passed for slot 0 alone; the amortised pass has
+        no use for them.
+        """
+        lo = 0 if window is None else max(0, len(self.records) - int(window))
         out = []
-        for h, record in enumerate(self.records):
+        for h in range(lo, len(self.records)):
             out.append(hand_tokens(
-                record, observer_pos=self.seat_of_slot(0, h),
+                self.records[h],
+                observer_pos=self.seat_of_slot(observer_slot, h),
                 slot_of_seat=self.slot_of_seat(h),
                 max_players=max_players, n_actions=n_actions,
-                ranges=self.ranges[h] if self.ranges else None,
+                ranges=(self.ranges[h]
+                        if self.ranges and observer_slot == 0 else None),
             ))
         return out
 

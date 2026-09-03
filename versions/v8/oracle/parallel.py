@@ -68,6 +68,8 @@ from oracle.rollout import action_values_batch
 from oracle.posterior import PosteriorCache
 from oracle.transport import Slab, slab_rows, token_fields, v7_fields
 from pool.degenerate import DEGENERATE_STRATEGIES
+from pool.regular import RegularMember
+from pool.strength import StrengthCache
 from pool.v7_member import V7NetworkMember
 from vendor.v7.agent import V7Agent
 from vendor.v7.perception.perception import extract_event_tensors
@@ -186,6 +188,14 @@ def mirror_spec(member, key_of_net):
     if isinstance(member, AgentPoolMember):
         return ("hero", member.n_actions, key_of_net(member.net),
                 member.net.d_emb, member.max_players)
+    if isinstance(member, RegularMember):
+        # No network at all: the whole member is its parameters, the raise grid
+        # and a preflop table small enough to ship (169 × 8 floats). What does
+        # *not* travel is the board cache — a cache is per process by
+        # definition, and the worker builds its own.
+        return ("regular", member.name, member.n_actions, member.style,
+                member.params, member.preflop_table, member.raise_sizes,
+                member.cache.max_boards)
     if type(member) in set(DEGENERATE_STRATEGIES.values()):
         return ("degenerate", type(member), member.name, member.n_actions,
                 member.style)
@@ -210,10 +220,27 @@ def build_mirror(spec, client):
         _k, name, n_actions, style, key, d_emb, max_players = spec
         net = _AgentNetProxy(key, d_emb, max_players, n_actions, client)
         return FrozenAgentMember(name, n_actions, net, max_players, "cpu", style)
+    if kind == "regular":
+        _k, name, n_actions, style, params, table, raise_sizes, boards = spec
+        return RegularMember(name, n_actions, params,
+                             _board_cache(boards), table, raise_sizes, style)
     if kind == "degenerate":
         _k, cls, name, n_actions, style = spec
         return cls(name, n_actions, style)
     raise ValueError(f"unknown mirror kind {kind!r}")
+
+
+#: One board-strength cache per worker process, shared by every regular in it —
+#: which is what makes "one evaluator call per board" true across members. It is
+#: process-local state and not a member's, so it is built here and never shipped.
+_BOARD_CACHE = None
+
+
+def _board_cache(max_boards):
+    global _BOARD_CACHE
+    if _BOARD_CACHE is None:
+        _BOARD_CACHE = StrengthCache(int(max_boards))
+    return _BOARD_CACHE
 
 
 def _v7_actions(action_map, n_actions):
@@ -345,8 +372,8 @@ class ForwardServer:
 
 
 def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
-                 hero_plain, hero_rec, n_actions, ocfg, seed, R, slab, conn,
-                 result_q):
+                 hero_plain, hero_rec, pool_slots, n_actions, ocfg, seed, R,
+                 slab, conn, result_q):
     """Label every decision in `todo`. Runs in its own process, CPU only."""
     torch.set_num_threads(1)
     client = ForwardClient(slab, conn)
@@ -354,7 +381,8 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
     hero_factory = hero_mirror(hero_spec, client)
     driver = LockstepDriver(play_pool, n_actions, runout=ocfg.runout_config())
 
-    from train.generate import (_label_requests, _seat_hero, label_chunks)
+    from train.generate import (_label_requests, _seat_conditioned,
+                                label_chunks)
 
     current = (None, None)
     posterior_cache = PosteriorCache()
@@ -365,8 +393,9 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
             block = h // R
             if (i, block) != current:
                 current = (i, block)
-                _seat_hero(play_pool, (hero_plain[i], hero_rec[i]),
-                           session_of[i], block_vectors[i], block, hero_factory)
+                _seat_conditioned(play_pool, (hero_plain[i], hero_rec[i]),
+                                  session_of[i], block_vectors[i], block,
+                                  hero_factory, pool_slots[i])
             answers = action_values_batch(
                 _label_requests(chunk, session_of, hero_plain, seed),
                 driver, play_pool, ocfg,
@@ -421,8 +450,8 @@ def _amp_of(agent):
 
 
 def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
-                  hero_spec, hero_plain, hero_rec, runners, game, ocfg, seed,
-                  R, log):
+                  hero_spec, hero_plain, hero_rec, pool_slots, runners, game,
+                  ocfg, seed, R, log):
     """Start `n_workers` label workers over a session-strided partition.
 
     Sessions rather than decisions, because a worker then reads only its own
@@ -460,8 +489,8 @@ def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
         p = ctx.Process(
             target=_worker_main,
             args=(w, mine, session_of, vectors, pool_spec, hero_spec,
-                  hero_plain, hero_rec, int(game["n_actions"]), ocfg, seed, R,
-                  slab, child_conn, result_q),
+                  hero_plain, hero_rec, pool_slots, int(game["n_actions"]),
+                  ocfg, seed, R, slab, child_conn, result_q),
             daemon=True)
         p.start()
         child_conn.close()

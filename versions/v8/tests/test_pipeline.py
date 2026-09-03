@@ -590,3 +590,172 @@ def test_a_crash_in_the_middle_of_labelling_costs_a_shard_and_not_the_phase(
                 assert torch.equal(a[name][key], b[name][key]), f"{name}:{key}"
         elif not name.endswith("progress.json"):
             assert a[name] == b[name], name
+
+
+# ------------- 7: a past agent carries the network of its own generation
+
+
+"""Whose vectors a past agent reads (`PLAN_AMORTISED_POOL.md` §0.2, ⚠11).
+
+Nothing anchors the coordinates of the embedding space, and the loop keeps
+training the one network it holds. A past agent frozen at iteration *j* was
+trained to read the vectors *that* network produced, so it carries a frozen copy
+of it and reads through that copy for the rest of the run. Handing it the live
+network instead would be two silent failures at once: a frozen policy reading a
+basis that drifts under it, and a pool whose members play differently at
+iteration 10 and at iteration 20 with nobody having changed them.
+"""
+
+
+def _conditioned_config(**overrides):
+    cfg = toy_config(**overrides)
+    cfg["embedding_net"]["pool_agent_vectors"] = "amortised"
+    cfg["embedding_net"]["pool_agent_window"] = None
+    return cfg
+
+
+def _generations(monkeypatch):
+    """`{iteration: the embedding network its members were given}`."""
+    import pipeline as pipe
+    seen = {}
+    real = pipe.agent_variant_members
+
+    def spy(net, iteration, config, game, device, seed, embed_net=None):
+        seen[int(iteration)] = embed_net
+        return real(net, iteration, config, game, device, seed,
+                    embed_net=embed_net)
+
+    monkeypatch.setattr(pipe, "agent_variant_members", spy)
+    return seen
+
+
+def test_every_past_agent_carries_a_frozen_copy_of_its_own_generation(
+        tmp_path, monkeypatch):
+    """Two iterations, one retrain each, so the two agents differ by generation."""
+    import torch as _torch
+
+    seen = _generations(monkeypatch)
+    cfg = _conditioned_config(n_iterations=2)
+    _metrics, exp_dir = _run(tmp_path, cfg)
+
+    assert set(seen) == {0, 1}
+    for k, net in seen.items():
+        assert net is not None, f"iteration {k} was given no generation"
+        assert not any(p.requires_grad for p in net.parameters()), (
+            "the snapshot is trainable, so a later phase could move it")
+        on_disk = _torch.load(os.path.join(exp_dir, f"iter_{k:04d}",
+                                           "embedding.pt"),
+                              map_location="cpu",
+                              weights_only=False)["model_state_dict"]
+        for name, tensor in net.state_dict().items():
+            assert _torch.equal(tensor, on_disk[name]), (
+                f"iteration {k}'s snapshot is not the network of that "
+                f"iteration: {name} differs")
+    assert seen[0] is not seen[1], (
+        "both agents were given one object, so the earlier one is reading a "
+        "network that was trained further after it was frozen")
+
+
+def test_iterations_that_share_a_retrain_share_one_generation(
+        tmp_path, monkeypatch):
+    """The network is retrained every `retrain_every` iterations, so the agents
+    in between were trained against the same one and must share it — one object,
+    one inference runner when they are mirrored into a label worker."""
+    seen = _generations(monkeypatch)
+    cfg = _conditioned_config(n_iterations=2)
+    cfg["embedding_net"]["retrain_every"] = 2
+    _metrics, _exp = _run(tmp_path, cfg)
+
+    assert seen[0] is seen[1] and seen[0] is not None
+
+
+def test_with_the_switch_off_no_generation_is_kept(tmp_path, monkeypatch):
+    """Freezing a 50M-parameter copy per generation to condition nobody is
+    minutes and gigabytes spent on nothing."""
+    seen = _generations(monkeypatch)
+    _metrics, _exp = _run(tmp_path, toy_config(n_iterations=2))
+    assert set(seen) == {0, 1}
+    assert all(net is None for net in seen.values())
+
+
+def test_a_resumed_run_gives_every_past_agent_the_same_generation(
+        tmp_path, monkeypatch):
+    """The mapping is rebuilt from the checkpoints, not guessed at.
+
+    A resumed run reconstructs the pool from disk; if it handed those members
+    the *current* network, the pool would change under a restart — the same
+    corpus, resumed, would be played against different opponents.
+    """
+    import pipeline as pipe
+    import torch as _torch
+
+    cfg = _conditioned_config(n_iterations=2)
+    _metrics, exp_dir = _run(tmp_path, cfg)
+
+    # A second call over the finished directory resumes: every iteration is
+    # already on disk, so the whole pool is rebuilt and nothing is trained.
+    seen = _generations(monkeypatch)
+    vintages = {}
+    real = pipe.embedding_vintages
+
+    def spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        vintages.update(out)
+        return out
+
+    monkeypatch.setattr(pipe, "embedding_vintages", spy)
+    cfg2 = _conditioned_config(n_iterations=2)
+    cfg2["out_dir"] = os.path.dirname(exp_dir)
+    log = Logger(cfg2["out_dir"])
+    try:
+        run(cfg2, lambda _m: None, exp_dir)
+    finally:
+        log.close()
+
+    assert set(vintages) == {0, 1}, "the pool was not rebuilt from disk"
+    for k, net in vintages.items():
+        assert net is not None
+        on_disk = _torch.load(os.path.join(exp_dir, f"iter_{k:04d}",
+                                           "embedding.pt"),
+                              map_location="cpu",
+                              weights_only=False)["model_state_dict"]
+        for name, tensor in net.state_dict().items():
+            assert _torch.equal(tensor, on_disk[name]), (
+                f"the resumed run gave iteration {k} another generation")
+
+
+def test_the_whole_loop_runs_with_the_pool_reading_its_tablemates(tmp_path):
+    """End to end with the switch on: three iterations, every artefact written.
+
+    Iteration 0 has no past agent in the pool at all, iteration 1 has one and
+    iteration 2 has two — so this is also the first run in which a conditioned
+    member is seated, refreshed and labelled against.
+    """
+    cfg = _conditioned_config(n_iterations=3)
+    cfg["embedding_net"]["max_iterations"] = 3
+    metrics, exp_dir = _run(tmp_path, cfg)
+
+    assert len(metrics) == 3
+    for k in range(3):
+        it_dir = os.path.join(exp_dir, f"iter_{k:04d}")
+        for name in ("agent.pt", "metrics.json", "state.json"):
+            assert os.path.exists(os.path.join(it_dir, name)), (k, name)
+        labels = _labels_of(exp_dir, k)
+        assert labels, f"iteration {k} labelled nothing"
+    # The pool grew by `agent_variants` members an iteration, as it always does.
+    assert metrics[2]["n_pool"] - metrics[0]["n_pool"] == \
+        2 * int(cfg["style"]["agent_variants"])
+
+    # ... and a past agent really was seated and conditioned, or the run above
+    # exercised the switch and nothing else. The phase widens its table of
+    # vectors to one row per slot exactly when it has a conditioned seat to
+    # fill, so the shape of what it stored is the evidence.
+    widened = []
+    for k in range(3):
+        with np.load(os.path.join(exp_dir, f"iter_{k:04d}", "labels",
+                                  "vectors.npz")) as z:
+            widened.append(int(z["vectors"].shape[2]))
+    assert widened[0] == 1, "iteration 0 has no past agent to condition"
+    assert max(widened[1:]) > 1, (
+        "no past agent was ever seated, so the loop ran the switch on and "
+        "conditioned nobody")

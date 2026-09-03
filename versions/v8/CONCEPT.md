@@ -153,14 +153,30 @@ no-multiplication setting and is a legitimate value; the number is config becaus
 both the pool's composition and the size of the §5.4 embedding table, and nothing in the loop
 should be deciding either.
 
-**A past agent in the pool plays at `e = 0`** (owner decision 2026-08-19, `PLAN_PIPELINE.md`
-D12(a)). Seated as an *opponent* it is a fixed policy like every other member: it plays the
+**A past agent in the pool plays at `e = 0` by default, and can be given the amortised reading of
+its tablemates instead** (owner decisions 2026-08-19 and 2026-09-03, `PLAN_PIPELINE.md` D12,
+`PLAN_AMORTISED_POOL.md`). At `e = 0` it is a fixed policy like every other member: it plays the
 unconditional policy §6.2's embedding dropout trains explicitly, rather than fitting a vector for
-whoever it happens to be sitting with. The alternative — a §5.5 fit per past agent per table —
-is faithful but nests one fit inside another for every rollout, and nothing has measured a
-difference to pay for it. What it costs is worth naming, because it is not symmetric: hero
-exploits its table and the pool's own agents never do, so the agent is trained against a slightly
-*weaker* version of its predecessors than the ones that produced the labels.
+whoever it happens to be sitting with. That costs an asymmetry worth naming — hero exploits its
+table and the pool's own agents do not, so the agent is trained against a slightly *weaker*
+version of its predecessors than the ones that produced the labels.
+
+The alternative D12 weighed was a full §5.5 fit per past agent per table, and it was rejected as
+nesting one fit inside another for every rollout. The cheap form it did not consider is the
+amortised head with **no gradient step at all** (`K = 0`): one trunk pass over the hands that
+agent has seen *from its own seat*, computed once per refresh block at the driver level exactly
+as hero's fit is, and only read inside a rollout. Turning it on removes the asymmetry — the
+pool's agents then exploit at `K = 0` while hero exploits at `K`.
+
+Two properties make it sound rather than merely cheap. **A past agent reads through the embedding
+network of its own generation**, frozen: nothing anchors the coordinates of the vector space, so
+a frozen policy handed a later generation's vectors would be reading a description in a basis
+that has drifted, and a pool member conditioned by a network that is still training would stop
+being a fixed algorithm at all. And **the embedding corpus is never conditioned** (owner decision
+2026-09-03): every player in it plays one policy for the whole session, so a member's vector
+still means one style. The mismatch that leaves — a network trained to describe static players,
+asked at label time to describe adapting ones — is deliberate, and is the same mismatch that
+exists against any real opponent, none of which are stationary either.
 
 Expected size 500–2000 members at late iterations, bounded by compute, not by design.
 

@@ -96,7 +96,10 @@ class Logger:
 
     def __call__(self, obj):
         text = str(obj)
-        print(text)
+        # Flushed, because a run under `nohup` has a block-buffered stdout: the
+        # log file was live and the redirected console was minutes behind it,
+        # which is the same failure a missing progress bar is.
+        print(text, flush=True)
         self._fh.write(text + "\n")
         self._fh.flush()
 

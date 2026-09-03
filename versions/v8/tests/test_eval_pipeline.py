@@ -443,6 +443,66 @@ def test_the_report_carries_everything_section_12_asks_for(tmp_path):
     assert on_disk["report"]["modes"]["cold"]["hands"] == 8
 
 
+# ------------------------------------------- 4b: a pool member as the hero
+
+
+def _regular_config(tmp_path, **evaluation):
+    """`PLAN_PROCEDURAL_POOL.md` §P5: one archetype plays the hands."""
+    from pool.strength import preflop_equity_table
+
+    path = str(tmp_path / "preflop.npy")
+    preflop_equity_table(path, seed=0, n_deals=20_000)
+    cfg = _config(tmp_path, evaluation={
+        "hero": {"kind": "regular", "archetype": "tag", "variant_seed": 0,
+                 "spread": 0.0, "preflop_table": path},
+        **evaluation})
+    # A procedural member is not the agent and does not need its checkpoint.
+    cfg["evaluation"]["agent_checkpoint"] = str(tmp_path / "not-here.pt")
+    return cfg
+
+
+def test_a_pool_member_can_play_the_hands_without_an_agent(tmp_path):
+    report, _out, lines = _run(tmp_path, _regular_config(tmp_path))
+    assert report["modes"]["cold"]["hands"] == 8
+    assert "warm" not in report["modes"]
+    assert any("no opponent vector" in line for line in lines)
+    assert any("procedural pool member 'tag'" in line for line in lines)
+    assert any("not an agent result" in line for line in lines)
+
+
+def test_the_warm_run_is_dropped_rather_than_failing_one_process_deep(tmp_path):
+    cfg = _regular_config(tmp_path, cold=False, warm=True)
+    with pytest.raises(AssertionError, match="turning both off"):
+        _run(tmp_path, cfg)
+
+
+def test_a_pool_member_run_resumes_like_any_other(tmp_path):
+    whole = _regular_config(tmp_path, hands=10)
+    short = _regular_config(tmp_path, hands=4)
+    full, _out, _lines = _run(tmp_path, whole, name="full")
+    _run(tmp_path, short, name="part")
+    resumed, _out, _lines = _run(tmp_path, whole, name="part")
+    assert (resumed["modes"]["cold"]["bb_per_100"]
+            == full["modes"]["cold"]["bb_per_100"])
+    assert resumed["modes"]["cold"]["hands"] == full["modes"]["cold"]["hands"]
+
+
+def test_no_hero_section_is_the_agent_playing_exactly_as_before(tmp_path):
+    plain = _config(tmp_path, evaluation={"warm": False})
+    named = _config(tmp_path, evaluation={
+        "warm": False, "hero": {"kind": "agent"}})
+    one, _out, _lines = _run(tmp_path, plain, name="plain")
+    two, _out, _lines = _run(tmp_path, named, name="named")
+    assert one["modes"]["cold"] == two["modes"]["cold"]
+
+
+def test_an_unknown_hero_kind_is_refused(tmp_path):
+    cfg = _config(tmp_path, evaluation={
+        "warm": False, "hero": {"kind": "solver"}})
+    with pytest.raises(AssertionError, match="unknown hero kind"):
+        _run(tmp_path, cfg)
+
+
 def test_turning_both_modes_off_is_refused(tmp_path):
     cfg = _config(tmp_path, evaluation={"cold": False, "warm": False})
     with pytest.raises(AssertionError, match="measures nothing"):

@@ -36,7 +36,8 @@ from pool.base import PoolMember
 from pool.degenerate import DEGENERATE_STRATEGIES
 from pool.style import StyleParams
 from pool.v7_member import V7NetworkMember
-from tests.g1_fixtures import MAX_PLAYERS, N_ACTIONS, NET_CFG, make_pool
+from tests.g1_fixtures import (MAX_PLAYERS, N_ACTIONS, NET_CFG, RAISE_SIZES,
+                               contexts_from, make_pool, make_specs, play)
 import train.generate
 from tests.test_label_generation import (_cfg, _networks, _played_hands,
                                             _run)
@@ -226,7 +227,7 @@ def test_a_v7_member_and_the_agent_are_labelled_through_the_server(
                               np.nan_to_num(b["q"], nan=-999.0))
 
 
-def _run_with_pool(out, cfg, pool, hero):
+def _run_with_pool(out, cfg, pool, hero, sampler=None):
     """`_run` with a caller-supplied pool — `tests.test_label_generation`'s
     helper builds its own, and this test needs a v7 member in it."""
     from train.generate import generate_labels
@@ -234,7 +235,7 @@ def _run_with_pool(out, cfg, pool, hero):
 
     embed_net, _agent = _networks(len(pool), seed=0)
     driver = LockstepDriver(pool, N_ACTIONS)
-    sampler = _UniformSampler(len(pool), seed=cfg["seed"])
+    sampler = sampler or _UniformSampler(len(pool), seed=cfg["seed"])
     manifest = generate_labels(driver, pool, sampler, embed_net, hero, cfg,
                                str(out), log=lambda _m: None)
     return manifest, [lab for p in manifest["shards"] for lab in load_shard(p)]
@@ -331,6 +332,45 @@ def test_a_token_batch_survives_the_slab_unchanged():
 # ---------------------------------------------------------------- the mirror
 
 
+def test_a_procedural_member_crosses_the_process_boundary_whole(tmp_path):
+    """A regular has no network, so its mirror is its parameters.
+
+    What must not travel is the board cache: a cache is per process by
+    definition, and every regular in a worker has to share the worker's own —
+    which is what makes "one evaluator call per board" true across members
+    rather than per member.
+    """
+    import pickle
+
+    from oracle.parallel import build_mirror
+    from pool.archetypes import draw_params
+    from pool.regular import RegularMember
+    from pool.strength import StrengthCache, preflop_equity_table
+
+    table = preflop_equity_table(str(tmp_path / "preflop.npy"), seed=0,
+                                 n_deals=20_000)
+    cache = StrengthCache(64)
+    parent = [RegularMember(name, N_ACTIONS,
+                            draw_params(name, np.random.default_rng(0), 0.0),
+                            cache, table, RAISE_SIZES)
+              for name in ("nit", "maniac")]
+
+    specs = pickle.loads(pickle.dumps(
+        [mirror_spec(m, lambda _net: "net0") for m in parent]))
+    workers = [build_mirror(spec, None) for spec in specs]
+
+    assert [m.name for m in workers] == ["nit", "maniac"]
+    assert workers[0].params == parent[0].params
+    assert workers[1].params == parent[1].params
+    assert workers[0].cache is workers[1].cache
+    assert workers[0].cache is not cache
+
+    contexts = contexts_from(play(parent, make_specs(
+        seed=3, n_hands=4, n_members=len(parent), num_players=2)))
+    for here, there in zip(parent, workers):
+        assert np.array_equal(here.policy(contexts), there.policy(contexts))
+
+
 def test_a_member_kind_the_mirror_cannot_rebuild_is_refused():
     with pytest.raises(TypeError, match="no mirror"):
         mirror_spec(_Scripted("scripted", N_ACTIONS), lambda net: "net0")
@@ -410,3 +450,41 @@ def test_batching_and_workers_compose(tmp_path_factory):
     for a, b in zip(one, both):
         assert np.array_equal(np.nan_to_num(a["q"], nan=-999.0),
                               np.nan_to_num(b["q"], nan=-999.0))
+
+
+def test_a_conditioned_past_agent_is_the_same_labels_in_a_worker(
+        tmp_path_factory):
+    """A past agent reading its tablemates, labelled sequentially and in two
+    workers (`PLAN_AMORTISED_POOL.md` P3).
+
+    The worker holds no embedding network and computes no vectors: the tables
+    are computed once in the parent, per block, and shipped with the session.
+    What the worker does is reseat the member per block from those tables — the
+    same reseating the sequential loop does, because the §7.2 posterior has to
+    ask the member that actually took the decision. If the two paths disagreed
+    about which table a block's member holds, the labels would differ here.
+    """
+    from tests.test_label_generation import (_AgentAlwaysSampler, _conditioned,
+                                             _pool_with_agent, _vintage_net)
+
+    pool = _pool_with_agent(_vintage_net(16, seed=21))
+    hero = _scripted_hero()
+
+    def run(out, n_workers):
+        cfg = _conditioned(_parallel_cfg(n_workers, n_sessions=2, hands=4, R=2))
+        sampler = _AgentAlwaysSampler(len(pool), len(pool) - 1, seed=cfg["seed"])
+        return _run_with_pool(out, cfg, pool, hero, sampler=sampler)
+
+    seq_m, seq = run(tmp_path_factory.mktemp("cond_seq"), 0)
+    par_m, par = run(tmp_path_factory.mktemp("cond_par"), 2)
+
+    assert seq, "nothing was labelled"
+    assert len(par) == len(seq)
+    for a, b in zip(seq, par):
+        assert (a["session"], a["hand"], a["decision"]) == \
+               (b["session"], b["hand"], b["decision"])
+        assert np.array_equal(a["legal"], b["legal"])
+        assert np.array_equal(np.nan_to_num(a["q"], nan=-999.0),
+                              np.nan_to_num(b["q"], nan=-999.0))
+    assert [open(p, "rb").read() for p in seq_m["shards"]] == \
+           [open(p, "rb").read() for p in par_m["shards"]]

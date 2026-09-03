@@ -100,6 +100,7 @@ from oracle.posterior import PosteriorCache
 from oracle.ranges import label_range_target
 from oracle.rollout import (LabelStats, OracleConfig,
                             action_values_batch)
+from agent.policy import FrozenAgentMember
 from pool.base import PoolMember
 from utils import progress
 
@@ -153,6 +154,24 @@ def _slot_of_seat_at(num_players, hero_seat):
     return [(seat + hand_idx) % num_players for seat in range(num_players)]
 
 
+def conditioned_slots(pool, session, mode):
+    """Which slots of `session` are past agents that may read their tablemates.
+
+    A slot qualifies when the member sitting in it is a past agent carrying its
+    own generation's embedding network (`agent/policy.py`) — every other member
+    has no vectors to read at all — and when the switch is on. Hero's slot never
+    qualifies: hero is not drawn from the pool and fits its own table.
+    """
+    if mode != "amortised":
+        return []
+    out = []
+    for slot in range(1, session.num_players):
+        member = pool[int(session.members[slot])]
+        if isinstance(member, FrozenAgentMember) and member.embed_net is not None:
+            out.append(slot)
+    return out
+
+
 def _pad_vectors(fitted, max_players, d_emb):
     """A (max_players, d_emb) table from a (num_players, d_emb) fit.
 
@@ -162,6 +181,31 @@ def _pad_vectors(fitted, max_players, d_emb):
     table = np.zeros((max_players, d_emb), dtype=np.float32)
     table[:len(fitted)] = np.asarray(fitted, dtype=np.float32)
     return table
+
+
+def amortised_vectors(embed_net, session, slot, max_players, n_actions, window,
+                      device):
+    """The `K = 0` table of the player at `slot`, from *its* own view (§5.5).
+
+    One trunk pass and no gradient step: `fit_embeddings(steps=0)` is exactly
+    the amortised head's output, and this is that call with the per-observer
+    tokenisation around it — the hands of the session as `slot` saw them, over
+    the last `window` of them (`None` = all of them).
+
+    It is what a past agent seated as an opponent conditions on
+    (`PLAN_AMORTISED_POOL.md`), where hero uses the `K`-step fit below. A slot
+    that has observed no decision yet gets the zero table, which is the same
+    cold start block 0 gives hero.
+    """
+    d_emb = embed_net.d_emb
+    observed = [t for t in session.tokens(max_players, n_actions,
+                                          observer_slot=slot, window=window)
+                if len(t)]
+    if not observed:
+        return _pad_vectors(np.zeros((0, d_emb)), max_players, d_emb)
+    batch = collate(observed, device=device)
+    fitted = embed_net.amortised_init(batch, session.num_players)
+    return _pad_vectors(fitted.cpu().numpy(), max_players, d_emb)
 
 
 # ------------------------------------------------------------------- the shards
@@ -340,6 +384,14 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     hands_per_session = int(cfg["hands_per_session"])
     R = int(emb_cfg["R"])
     assert R > 0, "R is the refresh interval in hands (§5.5) and must be ≥ 1"
+    # §5.5 for the *pool's* past agents: "zero" is D12 option (a), every past
+    # agent playing its unconditional policy; "amortised" gives each of them the
+    # `K = 0` reading of its own tablemates, refreshed on the same block
+    # boundaries as hero's fit (`PLAN_AMORTISED_POOL.md`).
+    pool_mode = str(emb_cfg.get("pool_agent_vectors", "zero"))
+    assert pool_mode in ("zero", "amortised"), (
+        f"pool_agent_vectors is 'zero' or 'amortised', not {pool_mode!r}")
+    pool_window = emb_cfg.get("pool_agent_window")
     device = next(embed_net.parameters()).device
     weights = loss_weights(emb_cfg)
     rng = np.random.default_rng(cfg["seed"])
@@ -378,11 +430,33 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
         hero_rec.append([len(play_pool) + i for i in range(s.num_players)])
         play_pool += [None] * s.num_players
 
-    for s, rec in zip(sessions, hero_rec):
+    # A conditioned past agent is one member per (session, slot): its table is
+    # fitted from the hands *that table* played, so two sessions cannot share
+    # it. One entry per slot and not per seat — the member derives the rotation
+    # from the seat it is asked to act at (`agent/policy.py`). `None` for every
+    # slot that is not a conditioned past agent, which is all of them with the
+    # switch off.
+    pool_slots = []
+    for s in sessions:
+        slots = [None] * s.num_players
+        for slot in conditioned_slots(pool, s, pool_mode):
+            slots[slot] = len(play_pool)
+            play_pool.append(None)
+        pool_slots.append(slots)
+    n_conditioned = sum(1 for slots in pool_slots for idx in slots
+                        if idx is not None)
+    if pool_mode == "amortised":
+        log(f"[{TAG}] {n_conditioned} past-agent seats over {len(sessions)} "
+            f"sessions read their tablemates (K = 0, window "
+            f"{'whole session' if pool_window is None else pool_window})")
+
+    for s, rec, slots in zip(sessions, hero_rec, pool_slots):
         for h, spec in enumerate(s.specs):
             sos = s.slot_of_seat(h)
             spec.seat_members = [
-                rec[seat] if sos[seat] == HERO_SLOT else s.members[sos[seat]]
+                rec[seat] if sos[seat] == HERO_SLOT
+                else (s.members[sos[seat]] if slots[sos[seat]] is None
+                      else slots[sos[seat]])
                 for seat in range(s.num_players)]
 
     # What an earlier call to this phase left behind, read before a single hand
@@ -391,7 +465,8 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     # that cannot be resumed into — which is set aside here, while setting it
     # aside is still free.
     os.makedirs(out_dir, exist_ok=True)
-    signature = _play_signature(sessions, seed_base, R, hands_per_session)
+    signature = _play_signature(sessions, seed_base, R, hands_per_session,
+                                pool_mode, pool_window)
     played, done = _resume_state(out_dir, signature, log)
     first_hand = _first_hands(done, len(sessions), hands_per_session)
 
@@ -401,7 +476,8 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
         if played is None:
             block_vectors = _play_sessions(
                 driver, play_pool, sessions, hero_rec, agent_member, embed_net,
-                emb_cfg, weights, max_players, n_actions, R, device, cfg, log)
+                emb_cfg, weights, max_players, n_actions, R, device, cfg, log,
+                pool_slots=pool_slots)
             results = _results_by_member(sessions)
             n_hands = sum(len(s.records) for s in sessions)
             _write_play(out_dir, signature, block_vectors, results, n_hands)
@@ -414,10 +490,12 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
             _play_sessions(
                 driver, play_pool, sessions, hero_rec, agent_member, embed_net,
                 emb_cfg, weights, max_players, n_actions, R, device, cfg, log,
-                first_hand=first_hand, vectors=block_vectors)
+                first_hand=first_hand, vectors=block_vectors,
+                pool_slots=pool_slots)
         manifest = _label_sessions(
             driver, play_pool, sessions, hero_plain, hero_rec, block_vectors,
-            agent_member, ocfg, R, max_players, cfg, out_dir, done, log)
+            agent_member, ocfg, R, max_players, cfg, out_dir, done, log,
+            pool_slots=pool_slots)
     finally:
         driver.pool = saved_pool
     manifest["results"] = results
@@ -456,9 +534,46 @@ def _results_by_member(sessions):
     return out
 
 
+def _seat_pool_members(play_pool, session, tables, pool_slots):
+    """Seat the conditioned past agents of one `(session, block)`.
+
+    The base member is looked up through the play pool, so this is the same code
+    in the parent process (where it finds the pool member) and inside a label
+    worker (where it finds that member's weightless mirror). The sibling shares
+    the network by reference; only the table changes.
+    """
+    for slot, idx in enumerate(pool_slots):
+        if idx is None:
+            continue
+        base = play_pool[int(session.members[slot])]
+        play_pool[idx] = base.with_vectors(
+            f"{base.name}@s{int(session.idx)}", tables[slot], slot)
+
+
+def _seat_conditioned(play_pool, hero_slots, session, block_vectors, block,
+                      agent_member, pool_slots):
+    """Put every member whose table changes per block into its pool slots.
+
+    Hero's per-seat members read index 0 of the block's tables — its own fitted
+    table, unchanged — and each conditioned past agent reads the row of its own
+    slot. One function, because the three places that reseat (the play loop, the
+    sequential label loop and each worker) must agree exactly: a member answering
+    the §7.2 posterior about a decision of block *b* has to hold the same table
+    it held when it took that decision.
+    """
+    tables = block_vectors[block]
+    for seat in range(session.num_players):
+        sos = _slot_of_seat_at(session.num_players, seat)
+        member = agent_member(seat, sos, tables[0])
+        for slots in hero_slots:
+            play_pool[slots[seat]] = member
+    _seat_pool_members(play_pool, session, tables, pool_slots)
+
+
 def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                    embed_net, emb_cfg, weights, max_players, n_actions, R,
-                   device, cfg, log, first_hand=None, vectors=None):
+                   device, cfg, log, first_hand=None, vectors=None,
+                   pool_slots=None):
     """Play every session in blocks of `R` hands, refitting between blocks.
 
     Returns, per session, the embedding table in force during each block. The
@@ -477,10 +592,18 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
     hands_per_session = int(cfg["hands_per_session"])
     n_blocks = (hands_per_session + R - 1) // R
     d_emb = embed_net.d_emb
+    pool_slots = ([[None] * s.num_players for s in sessions]
+                  if pool_slots is None else pool_slots)
+    pool_window = emb_cfg.get("pool_agent_window")
+    # One row per observer whose table this phase computes: hero alone with the
+    # pool's past agents at `e = 0`, otherwise one row per slot so that a slot's
+    # row can be indexed directly. Hero is row 0 in both cases.
+    n_obs = (max_players if any(idx is not None for slots in pool_slots
+                                for idx in slots) else 1)
     first_hand = ([0] * len(sessions) if first_hand is None
                   else [int(f) for f in first_hand])
     fitting = vectors is None
-    block_vectors = ([[_pad_vectors(np.zeros((0, d_emb)), max_players, d_emb)]
+    block_vectors = ([[np.zeros((n_obs, max_players, d_emb), dtype=np.float32)]
                       for _ in sessions] if fitting else vectors)
 
     # The recorders are built once and keep their observations for the whole
@@ -505,13 +628,14 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
     for b in range(n_blocks):
         lo, hi = b * R, min((b + 1) * R, hands_per_session)
         blocks, played = [], []
-        for s, rec, start, vecs in zip(sessions, hero_rec, first_hand,
-                                       block_vectors):
+        for s, rec, start, vecs, slots in zip(sessions, hero_rec, first_hand,
+                                              block_vectors, pool_slots):
             if max(lo, start) >= hi:      # every hand of it is already labelled
                 continue
             for seat in range(s.num_players):
                 hero = play_pool[rec[seat]]
-                hero.inner = agent_member(seat, hero.slot_of_seat, vecs[b])
+                hero.inner = agent_member(seat, hero.slot_of_seat, vecs[b][0])
+            _seat_pool_members(play_pool, s, vecs[b], slots)
             blocks.append(Session(idx=s.idx, num_players=s.num_players,
                                   stack_bb=s.stack_bb, members=s.members,
                                   specs=s.specs[max(lo, start):hi]))
@@ -527,11 +651,12 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
         if b + 1 == n_blocks or not fitting:
             continue
         every = max(1, len(sessions) // 50)   # ≤ 50 refreshes per refit round
-        for fitted_n, (s, vectors_of) in enumerate(zip(sessions, block_vectors), 1):
+        for fitted_n, (s, vectors_of, slots) in enumerate(
+                zip(sessions, block_vectors, pool_slots), 1):
             if fitted_n % every == 0 or fitted_n == len(sessions):
                 bar.set_postfix_str(
-                    f"fit block {b + 1}: {fitted_n}/{len(sessions)} sessions",
-                    refresh=True)
+                    f"fit block {b + 1}: {fitted_n}/{len(sessions)} sessions"
+                    + (" + amortise" if n_obs > 1 else ""), refresh=True)
             observed = [t for t in s.tokens(max_players, n_actions) if len(t)]
             if not observed:
                 vectors_of.append(vectors_of[-1])
@@ -542,8 +667,19 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                 lr=emb_cfg["fit_lr"], reg=emb_cfg["fit_reg"],
                 init=embed_net.amortised_init(batch, s.num_players),
                 weights=weights)
-            vectors_of.append(_pad_vectors(fitted.cpu().numpy(), max_players,
-                                           d_emb))
+            tables = np.zeros((n_obs, max_players, d_emb), dtype=np.float32)
+            tables[0] = _pad_vectors(fitted.cpu().numpy(), max_players, d_emb)
+            # Each past agent reads its own tablemates through the network of
+            # its own generation, over the hands *it* saw — one tokenisation and
+            # one forward per conditioned seat, no gradient step.
+            for slot, idx in enumerate(slots):
+                if idx is None:
+                    continue
+                member = play_pool[int(s.members[slot])]
+                tables[slot] = amortised_vectors(
+                    member.embed_net, s, slot, max_players, n_actions,
+                    pool_window, device)
+            vectors_of.append(tables)
         bar.set_postfix_str("", refresh=True)
     bar.close()
     n_played = sum(hands_per_session - f for f in first_hand)
@@ -573,7 +709,8 @@ def _hero_decisions(sessions, hero_rec):
     return out
 
 
-def _play_signature(sessions, seed_base, R, hands_per_session):
+def _play_signature(sessions, seed_base, R, hands_per_session, pool_mode,
+                    pool_window):
     """What a played corpus has to agree with for its vectors to be reusable.
 
     Every table this phase sits hero at, and the two numbers that decide which
@@ -586,6 +723,11 @@ def _play_signature(sessions, seed_base, R, hands_per_session):
     return {
         "seed_base": int(seed_base), "R": int(R),
         "hands_per_session": int(hands_per_session),
+        # Two calls that disagree about whether the pool's past agents read
+        # their tablemates played different hands, however identical the tables
+        # they sat at.
+        "pool_agent_vectors": str(pool_mode),
+        "pool_agent_window": None if pool_window is None else int(pool_window),
         "sessions": [{"idx": int(s.idx), "num_players": int(s.num_players),
                       "stack_bb": int(s.stack_bb),
                       "members": [int(m) for m in s.members]}
@@ -756,16 +898,6 @@ def label_chunks(todo, R, size):
         yield chunk
 
 
-def _seat_hero(play_pool, hero_slots, session, block_vectors, block,
-               agent_member):
-    """Put hero's member in its pool slots for one `(session, block)`."""
-    for seat in range(session.num_players):
-        sos = _slot_of_seat_at(session.num_players, seat)
-        member = agent_member(seat, sos, block_vectors[block])
-        for slots in hero_slots:
-            play_pool[slots[seat]] = member
-
-
 def _label_requests(chunk, sessions, hero_plain, seed):
     """`action_values_batch`'s input for one chunk, in todo order."""
     out = []
@@ -779,7 +911,7 @@ def _label_requests(chunk, sessions, hero_plain, seed):
 
 def _label_in_parallel(n_workers, todo, consume, sessions, play_pool,
                        hero_plain, hero_rec, block_vectors, agent_member, ocfg,
-                       R, cfg, driver, log, results=None):
+                       R, cfg, driver, log, pool_slots, results=None):
     """The §3 layout: `n_workers` CPU processes, this process as the server.
 
     Everything about *what* a label is stays where it was — the workers call
@@ -788,22 +920,28 @@ def _label_in_parallel(n_workers, todo, consume, sessions, play_pool,
     workers hold weightless mirrors of the pool and this process runs every
     forward, batching across workers at a barrier. See `oracle/parallel.py`.
     """
-    # Hero's slots are rebuilt inside each worker from the block vectors it
-    # owns, so they are mirrored as holes rather than as members.
+    # Hero's slots — and the conditioned past agents' — are rebuilt inside each
+    # worker from the block vectors it owns, so they are mirrored as holes
+    # rather than as members. Their *base* members are mirrored normally, at
+    # their own pool indices, which is where the worker looks them up.
     mirror_pool = list(play_pool)
     for seats in list(hero_plain) + list(hero_rec):
         for idx in seats:
             mirror_pool[idx] = None
+    for slots in pool_slots:
+        for idx in slots:
+            if idx is not None:
+                mirror_pool[idx] = None
 
     prototype = agent_member(0, _slot_of_seat_at(sessions[0].num_players, 0),
-                             block_vectors[0][0])
+                             block_vectors[0][0][HERO_SLOT])
     runners, pool_spec, hero_spec = runner_table(
         mirror_pool, prototype, cfg["game"], _device_of(play_pool), log)
 
     procs, conns, slabs, result_q = spawn_workers(
         n_workers, [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)],
         sessions, block_vectors, pool_spec, hero_spec, hero_plain, hero_rec,
-        runners, cfg["game"], ocfg, int(cfg["seed"]), R, log)
+        pool_slots, runners, cfg["game"], ocfg, int(cfg["seed"]), R, log)
     server = ForwardServer(runners, slabs, conns, procs, log)
     try:
         done = collect(server, result_q, procs, todo, 0, consume, log,
@@ -828,7 +966,7 @@ def _device_of(play_pool):
 
 def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                     block_vectors, agent_member, ocfg, R, max_players, cfg,
-                    out_dir, done, log):
+                    out_dir, done, log, pool_slots=None):
     """One oracle label per hero decision, sharded to disk.
 
     `done` is the `progress.json` of an earlier call (`_resume_state`) or
@@ -844,6 +982,8 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     different unit; nothing is nested.
     """
     os.makedirs(out_dir, exist_ok=True)
+    pool_slots = ([[None] * s.num_players for s in sessions]
+                  if pool_slots is None else pool_slots)
     hands_per_session = int(cfg["hands_per_session"])
     n_hands = len(sessions) * hands_per_session
     todo = _hero_decisions(sessions, hero_rec)
@@ -942,7 +1082,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             buffer.append({
                 "tokens": tokens, "q": q, "legal": legal,
                 "pot_bb": pot_bb, "facing_bet_bb": to_call_bb,
-                "embeddings": block_vectors[i][h // R],
+                "embeddings": block_vectors[i][h // R][HERO_SLOT],
                 "session": s.idx, "hand": h, "decision": d,
                 "num_players": s.num_players, "stack_bb": s.stack_bb,
                 "hero_seat": hero_seat,
@@ -970,7 +1110,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             _label_in_parallel(n_workers, todo, consume, sessions,
                                play_pool, hero_plain, hero_rec, block_vectors,
                                agent_member, ocfg, R, cfg, driver, log,
-                               results=held)
+                               pool_slots, results=held)
         else:
             current = (None, None)
             posterior_cache = PosteriorCache()
@@ -980,12 +1120,16 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                 i, h = chunk[0][1], chunk[0][2]
                 block = h // R
                 if (i, block) != current:
-                    # Hero plays its own rollouts with the vectors it acted under;
-                    # the member is rebuilt per block because the pool slot holds
-                    # whichever block was played last.
+                    # Hero plays its own rollouts with the vectors it acted
+                    # under, and so does every conditioned past agent at its
+                    # table: the members are rebuilt per block because the pool
+                    # slots hold whichever block was played last, and because
+                    # the §7.2 posterior must ask the member that actually took
+                    # the decision.
                     current = (i, block)
-                    _seat_hero(play_pool, (hero_plain[i],), sessions[i],
-                               block_vectors[i], block, agent_member)
+                    _seat_conditioned(play_pool, (hero_plain[i],), sessions[i],
+                                      block_vectors[i], block, agent_member,
+                                      pool_slots[i])
                 answers = action_values_batch(
                     _label_requests(chunk, sessions, hero_plain, cfg["seed"]),
                     driver, play_pool, ocfg, posterior_cache=posterior_cache)

@@ -9,6 +9,7 @@ policy and how many style draws to make from it:
     {"kind": "degenerate", "strategy": "nit",  "n_variants": 4}
     {"kind": "v7", "checkpoint": "../../data/v7/…/best.pt",
      "arch_config": "../../data/v7/…/config.json", "n_variants": 8}
+    {"kind": "regular", "archetype": "tag", "n_variants": 4, "spread": 1.0}
 
 ``style`` is optional and selects where the draw comes from:
 
@@ -21,6 +22,15 @@ policy and how many style draws to make from it:
 
 The last two describe a single member, so ``n_variants`` must be 1 with them.
 
+**A `regular` entry is the exception to all of that.** Its `n_variants` draws
+*parameters* and not styles: the cascade of `pool/regular.py` already encodes
+its style in two dozen numbers, and a logit bias on top would double-count it.
+So `style` defaults to `"identity"` there, `spread` is what makes the variants
+different, and asking for several variants at spread zero is refused rather
+than silently producing the same member several times. Every regular in one
+build shares one board cache and one preflop table, which is what makes "one
+evaluator call per board" true across members rather than per member.
+
 `build_pool` returns members **and** the descriptor list that the G1 report
 needs to say which style each member was, and which base it came from.
 """
@@ -30,7 +40,10 @@ import os
 
 from env.session import raise_sizes_from
 from pool.action_map import RaiseGridMap
+from pool.archetypes import ARCHETYPES, draw_params
 from pool.degenerate import DEGENERATE_STRATEGIES
+from pool.regular import RegularMember
+from pool.strength import DEFAULT_TABLE_PATH, StrengthCache, preflop_equity_table
 from pool.style import StyleParams, sample_style
 from pool.v7_member import V7NetworkMember
 from vendor.v7.agent import V7Agent
@@ -48,6 +61,21 @@ def _resolve_style(entry, rng, style_cfg):
     if spec == "identity":
         return [StyleParams.identity()]
     return [StyleParams.from_list(spec)]
+
+
+def _regular_styles(entry, rng, style_cfg):
+    """Styles for a `regular` entry, whose `n_variants` are parameter draws.
+
+    The default is no modifier at all: the cascade already is the style. An
+    explicit style is still honoured, and applies to every variant.
+    """
+    n_variants = int(entry.get("n_variants", 1))
+    spec = entry.get("style", "identity")
+    if spec == "identity":
+        return [StyleParams.identity() for _ in range(n_variants)]
+    if isinstance(spec, list):
+        return [StyleParams.from_list(spec) for _ in range(n_variants)]
+    return [sample_style(rng, style_cfg) for _ in range(n_variants)]
 
 
 def _load_v7_agent(entry, device, log, cache=None):
@@ -126,11 +154,13 @@ def build_pool(config, rng, device="cpu", log=print):
     n_actions = None
     members, descriptors = [], []
     v7_cache = {}
+    board_cache = preflop_table = None
 
     for entry in config["bootstrap"]:
         kind = entry["kind"]
         label = entry.get("label")
-        styles = _resolve_style(entry, rng, style_cfg)
+        styles = (_regular_styles(entry, rng, style_cfg) if kind == "regular"
+                  else _resolve_style(entry, rng, style_cfg))
 
         if kind == "degenerate":
             strategy = entry["strategy"]
@@ -141,6 +171,25 @@ def build_pool(config, rng, device="cpu", log=print):
             base_name = label or strategy
             factory = DEGENERATE_STRATEGIES[strategy]
             bases = [factory(base_name, entry_n_actions, styles[0])]
+        elif kind == "regular":
+            archetype = entry["archetype"]
+            assert archetype in ARCHETYPES, (
+                f"unknown archetype {archetype!r}; have {sorted(ARCHETYPES)}")
+            spread = float(entry.get("spread", 0.0))
+            assert spread > 0 or len(styles) == 1, (
+                f"entry {label or archetype!r} asks for {len(styles)} variants "
+                f"at spread 0 — they would all be the same member; set "
+                f"\"spread\" or drop \"n_variants\"")
+            if board_cache is None:
+                board_cache = StrengthCache(int(entry.get("max_boards", 4096)))
+                preflop_table = preflop_equity_table(
+                    entry.get("preflop_table", DEFAULT_TABLE_PATH))
+            entry_n_actions = int(config["game"]["n_actions"])
+            base_name = label or archetype
+            bases = [RegularMember(
+                base_name, entry_n_actions, draw_params(archetype, rng, spread),
+                board_cache, preflop_table, raise_sizes_from(config["game"]))
+                for _ in styles]
         elif kind == "v7":
             agent, v7_game = _load_v7_agent(entry, device, log, cache=v7_cache)
             grid_map = _grid_map(entry, v7_game, agent, config["game"])
@@ -163,10 +212,13 @@ def build_pool(config, rng, device="cpu", log=print):
             f"pool entry {base_name!r} uses {entry_n_actions} actions, the "
             f"pool already uses {n_actions}")
 
-        base = bases[0]
         for v, style in enumerate(styles):
             name = base_name if len(styles) == 1 else f"{base_name}#{v}"
-            member = base if v == 0 else base.with_style(name, style)
+            # One base and several styles for every kind but `regular`, which
+            # is several bases — one per parameter draw — and one style.
+            member = (bases[v] if len(bases) == len(styles)
+                      else bases[0] if v == 0
+                      else bases[0].with_style(name, style))
             member.name = name
             member.style = style
             members.append(member)

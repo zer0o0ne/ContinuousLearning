@@ -76,8 +76,10 @@ from evaluation.protocol import (
     SLUMBOT_BIG_BLIND, SlumbotClient, board_to_ints, card_to_int,
     clamp_counters, stderr_bb_per_100_online,
 )
-from evaluation.v8_adapter import HERO_SLOT, OPP_SLOT, N_SEATS, SlumbotAgent, \
+from evaluation.v8_adapter import AgentMemberFactory, MemberFactory, \
+    HERO_SLOT, OPP_SLOT, N_SEATS, SlumbotAgent, \
     _flip, slumbot_history
+from env.session import raise_sizes_from
 from nets.agent_net import AgentNet
 from nets.embedding_net import OpponentEmbeddingNet, fit_embeddings, loss_weights
 from nets.features import collate, hand_tokens
@@ -144,6 +146,49 @@ def _bucket(hands_observed, edges):
 # ------------------------------------------------------------- the checkpoints
 
 
+def hero_factory(config, device, agent_net, log):
+    """What plays the hands: the agent, or one procedural pool member.
+
+    `evaluation.hero` absent means the agent, which is what every run before
+    `PLAN_PROCEDURAL_POOL.md` §P5 did and what the file is named for. A
+    `regular` hero is one archetype of §P4 — not an agent result, and nothing
+    about it feeds training; it is here because the only external check on
+    whether the archetypes are ordered the way a human would order them is a
+    real opponent.
+    """
+    game = config["game"]
+    spec = config["evaluation"].get("hero") or {"kind": "agent"}
+    kind = spec.get("kind", "agent")
+    if kind == "agent":
+        return AgentMemberFactory(agent_net, game, device)
+
+    assert kind == "regular", f"unknown hero kind {kind!r}"
+    from pool.archetypes import draw_params
+    from pool.regular import RegularMember
+    from pool.strength import (DEFAULT_TABLE_PATH, StrengthCache,
+                               preflop_equity_table)
+
+    archetype = spec["archetype"]
+    seed = int(spec.get("variant_seed", 0))
+    spread = float(spec.get("spread", 0.0))
+    params = draw_params(archetype, np.random.default_rng(seed), spread)
+    member = RegularMember(
+        archetype, int(game["n_actions"]), params,
+        # A worker plays one hand at a time against Slumbot, so three boards
+        # are live at once and a big cache is only memory held per process.
+        StrengthCache(int(spec.get("max_boards", 256))),
+        preflop_equity_table(spec.get("preflop_table",
+                                      DEFAULT_TABLE_PATH)),
+        raise_sizes_from(game))
+    log(f"[{TAG}] hero is the procedural pool member {archetype!r} "
+        f"(spread {spread}, variant seed {seed}) — not an agent result")
+    return MemberFactory(member)
+
+
+def hero_is_the_agent(config):
+    return (config["evaluation"].get("hero") or {}).get("kind", "agent") == "agent"
+
+
 def load_networks(config, device, log, need_embedding):
     """The agent, and the embedding network the warm run fits against.
 
@@ -154,13 +199,15 @@ def load_networks(config, device, log, need_embedding):
     """
     game = config["game"]
     ev = config["evaluation"]
-    agent_state = torch.load(ev["agent_checkpoint"], map_location=device,
-                             weights_only=False)["model_state_dict"]
-    agent_net = AgentNet(config["embedding_net"], int(game["n_actions"]),
-                         int(game["max_players"])).to(device)
-    agent_net.load_state_dict(agent_state)
-    agent_net.eval()
-    log(f"[{TAG}] agent from {ev['agent_checkpoint']}")
+    agent_net = None
+    if hero_is_the_agent(config):
+        agent_state = torch.load(ev["agent_checkpoint"], map_location=device,
+                                 weights_only=False)["model_state_dict"]
+        agent_net = AgentNet(config["embedding_net"], int(game["n_actions"]),
+                             int(game["max_players"])).to(device)
+        agent_net.load_state_dict(agent_state)
+        agent_net.eval()
+        log(f"[{TAG}] agent from {ev['agent_checkpoint']}")
 
     embed_net = None
     if need_embedding:
@@ -316,7 +363,8 @@ def play_shard(mode, worker, n_hands, agent_net, embed_net, config, device,
     window = deque(maxlen=int(ev["fit_window"]))
     seed = int(config.get("seed", 0))
 
-    agent = SlumbotAgent(agent_net, game, device)
+    agent = SlumbotAgent(hero_factory(config, device, agent_net, log), game,
+                         device)
     path = shard_path(out_dir, mode, worker)
     replayed = _read_jsonl(path)
     # Kept for the periodic log line only. The reported numbers are added up
@@ -628,6 +676,12 @@ def run(config, log, out_dir, client=None, client_factory=None):
     """
     ev = config["evaluation"]
     modes = [m for m in MODES if ev.get(m, True)]
+    if not hero_is_the_agent(config) and "warm" in modes:
+        # A procedural member reads no opponent vector, so there is no warm
+        # condition to run — said once, out loud, rather than left to fail one
+        # process deep.
+        log(f"[{TAG}] hero reads no opponent vector: the warm run is skipped")
+        modes = [m for m in modes if m != "warm"]
     assert modes, "§12 reports cold and warm; turning both off measures nothing"
     n_workers = int(ev.get("n_workers", 1))
     os.makedirs(out_dir, exist_ok=True)
@@ -643,8 +697,9 @@ def run(config, log, out_dir, client=None, client_factory=None):
     else:
         # The refusals `load_networks` makes are the run's, not a worker's, and
         # a run that dies one process deep is a worse way to learn about them.
-        assert os.path.exists(ev["agent_checkpoint"]), (
-            f"no agent checkpoint at {ev['agent_checkpoint']!r}")
+        assert not hero_is_the_agent(config) or os.path.exists(
+            ev["agent_checkpoint"]), (
+            f"no agent checkpoint at {ev.get('agent_checkpoint')!r}")
         assert "warm" not in modes or ev.get("embedding_checkpoint"), (
             "the warm run fits an opponent vector (§5.5) and needs the "
             "embedding network that defines the objective; set "
@@ -673,16 +728,35 @@ def run(config, log, out_dir, client=None, client_factory=None):
 def main():
     parser = argparse.ArgumentParser(description="CONCEPT.md §12 — Slumbot")
     parser.add_argument("--config", default="config.json")
+    # Ten archetypes are ten runs of the same config into ten directories
+    # (`PLAN_PROCEDURAL_POOL.md` §P5); this saves editing the file between them
+    # and changes nothing else.
+    parser.add_argument("--hero-archetype", default=None)
     args = parser.parse_args()
 
     with open(args.config) as fh:
         config = json.load(fh)
+    if args.hero_archetype:
+        hero = config["evaluation"].get("hero") or {}
+        assert hero.get("kind") == "regular", (
+            "--hero-archetype names one of the procedural archetypes; the "
+            "config's `evaluation.hero.kind` must already be \"regular\"")
+        hero["archetype"] = args.hero_archetype
+        config["evaluation"]["hero"] = hero
 
     base_dir = config.get("out_dir", "../../data/v8")
     log = Logger(base_dir)
     # Named and not timestamped: a million-hand run is resumed, not restarted.
-    out_dir = os.path.join(base_dir, config["experiment"], "slumbot",
-                           config["evaluation"].get("run", "run0"))
+    # A pool member's run lives under `pool_eval/` and never beside the agent's,
+    # because the two numbers are not the same kind of thing and a directory is
+    # the cheapest place to keep them from being read as if they were.
+    hero = config["evaluation"].get("hero") or {"kind": "agent"}
+    if hero.get("kind", "agent") == "agent":
+        out_dir = os.path.join(base_dir, config["experiment"], "slumbot",
+                               config["evaluation"].get("run", "run0"))
+    else:
+        out_dir = os.path.join(base_dir, "pool_eval", hero["archetype"],
+                               config["evaluation"].get("run", "run0"))
     try:
         run(config, log, out_dir)
     finally:

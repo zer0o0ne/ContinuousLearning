@@ -28,11 +28,12 @@ A member is asked about a hypothetical holding through `DecisionContext`'s
 `hole_override`: the same situation, other cards, so the observation the member
 answers is built by exactly the code that built the real one.
 
-**Independent marginals (§7.3).** This module returns *one* opponent's marginal.
-The joint over several opponents is approximated by independent marginals with a
-card-removal correction, and that correction lives where the joint sample is
-drawn (the oracle), not here — the approximation is easier to reason about when
-the exact part is not tangled with it.
+**Reach factors (§7.3).** This module returns one seat's normalised likelihood
+factor, including its fold if any. It is not that seat's full marginal after
+conditioning on every other player's actions. For fixed policies and frozen
+hand-start memory, the joint is proportional to the product of these factors
+times the indicator of disjoint cards. The oracle samples that joint by
+rejection, including folded seats; it need not enumerate the full joint.
 
 **`max_combos` (§7.3) — self-normalised importance sampling over the prior.**
 v7's `gpu_solver_v5._prepare_range` draws the subsample *from the posterior*

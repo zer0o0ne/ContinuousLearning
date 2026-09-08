@@ -60,6 +60,7 @@ from oracle.ranges import HandRangeCache
 
 FOLD = 0
 N_CARDS = 52
+RANGE_MODEL = "all_seats_reach_v2"
 
 
 @dataclass
@@ -118,29 +119,16 @@ def _rollout_seed(*parts):
     return int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big")
 
 
-def _folded_before(record, decision_idx):
-    """Seats that have given up their cards by `decision_idx`."""
-    return {int(d["acting_pos"]) for d in record.decisions[:decision_idx]
-            if int(d["action_idx"]) == FOLD}
-
-
 def _rollout_deck(record, hero_pos, opp_seats, opp_cards, n_visible, rng):
     """The 52-card deck of one rollout.
 
     The board hero can see, hero's real cards, the sampled cards at the
-    opponents' seats, the streets still to come drawn from what is left, and
-    every card nobody was dealt shuffled into the slots that are left — the
-    seats that folded before this decision, and the stub.
-
-    That last deal is a shuffle and not a fill, and the reason is the control
-    variate. `env/runout.py` conditions its board completions on every seat's
-    cards, folded seats included, and that is exact only because the runout and
-    the folded seats' cards come out of one remainder: either order gives the
-    same joint. Sorting the remainder into the empty slots breaks exactly that —
-    the folded seats would hold the lowest leftover cards by construction, the
-    completions would then be drawn from a pool systematically missing them, and
-    a correction whose whole claim is a zero mean would acquire a bias. The
-    order costs nothing and it is the difference between a deal and a fill.
+    opponents' seats (including folded ones), the streets still to come drawn
+    from what is left, and the undealt stub shuffled into the remaining slots.
+    All hole cards are sampled jointly from reach factors before the runout;
+    `env/runout.py` then conditions its board completions on that same complete
+    assignment. Folded players stay folded in the forced action prefix, but
+    their cards still block both live holdings and future community cards.
     """
     deck = np.full(N_CARDS, -1, dtype=np.int64)
     deck[:n_visible] = [int(c) for c in record.deck[:n_visible]]
@@ -161,18 +149,19 @@ def _rollout_deck(record, hero_pos, opp_seats, opp_cards, n_visible, rng):
 
 
 def _sample_joint(posteriors, dead_mask, n_samples, max_retries, rng):
-    """Draw each opponent's combo from its own marginal (§7.3).
+    """Sample the collision-free product of opponents' reach factors (§7.3).
 
-    The exact joint over eight opponents is combinatorially impossible, so the
-    marginals are treated as independent and the card-removal correction is
-    made by **rejection**: a draw in which two opponents share a card, or in
+    With fixed policies, the public action likelihood factorises by seat.
+    Independent proposals from those factors followed by **rejection** sample
+    the joint exactly: a draw in which two opponents share a card, or in
     which a card is already on the *visible* board or in hero's hand, is thrown
     away and redrawn. A sample that has not survived `max_retries` redraws is dropped —
     it reduces the divisor of the average, it is not an outcome of zero.
 
     Returns `(cards, n_attempts, n_rejected)` with `cards` of shape
-    `(kept, n_opponents, 2)`. Rejection is the approximation, so its rate is
-    returned rather than hidden.
+    `(kept, n_opponents, 2)`. The retry cap reduces sample count, not accuracy
+    of the accepted distribution. Floors and combo subsampling still change
+    the reach factors; rejection does not undo those approximations.
     """
     packs = [(combos, np.cumsum(weights)) for combos, weights in posteriors]
     n_opp = len(packs)
@@ -243,11 +232,10 @@ def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng,
     legal_idx = np.flatnonzero(legal).tolist()
     q = np.full(n_actions, np.nan, dtype=np.float64)
 
-    # A seat that has folded holds nothing that can change a showdown, so it is
-    # not worth a posterior; its slots get filler cards.
-    folded = _folded_before(record, decision_idx)
-    opp_seats = [p for p in range(record.num_players)
-                 if p != hero_pos and p not in folded]
+    # A fold is evidence about two cards still missing from the deck. Include
+    # every opponent's full action likelihood (the fold itself included), so
+    # conditioning changes live ranges and the runout through card removal.
+    opp_seats = [p for p in range(record.num_players) if p != hero_pos]
 
     forwards = 0
     posteriors = []

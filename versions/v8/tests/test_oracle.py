@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from env.driver import HandSpec, LockstepDriver
-from oracle.posterior import opponent_posterior
+from oracle.posterior import PosteriorCache, opponent_posterior
 from oracle.rollout import FOLD, OracleConfig, action_values
 from pool.base import PoolMember
 from pool.style import StyleParams
@@ -90,6 +90,13 @@ class CallsInSet(Deterministic):
 
     def action_for(self, ctx):
         return CALL if set(ctx.hole_cards) <= self.cards else ALLIN
+
+
+class FoldsInSet(CallsInSet):
+    """A deliberately diagnostic policy: fold only with cards in this set."""
+
+    def action_for(self, ctx):
+        return FOLD if set(ctx.hole_cards) <= self.cards else CALL
 
 
 class Recorder(PoolMember):
@@ -410,44 +417,79 @@ def test_the_runout_is_dealt_per_sample_but_the_visible_board_is_not():
     assert len(runouts) > 1, "every sample got the same turn and river"
 
 
-def test_a_seat_that_folded_is_dealt_out_of_the_same_remainder_as_the_runout():
-    """The cards nobody was dealt are *dealt* into the empty slots, not sorted.
+def folded_aces_hand():
+    """Seat 2 folds first; its range is exactly the six AA combos."""
+    pool = [Caller("hero", N_ACTIONS, StyleParams.identity()),
+            Caller("live", N_ACTIONS, StyleParams.identity()),
+            FoldsInSet("folder", N_ACTIONS, range(48, 52),
+                       StyleParams.identity())]
+    deck = deck_with([8, 9, 10, 11, 12], [[4, 5], [6, 7], [48, 49]])
+    record = one_hand(pool, [0, 1, 2], deck=deck)
+    assert record.decisions[0]["acting_pos"] == 2
+    assert record.decisions[0]["action_idx"] == FOLD
+    assert record.decisions[1]["acting_pos"] == 0
+    return pool, record
 
-    This one is not about the label at all — it is the assumption the control
-    variate rests on. `env/runout.py` conditions its board completions on every
-    seat's cards, the folded seats included, and calls that exact because the
-    runout and those cards come out of one remainder: either order gives the
-    same joint. Sorting the remainder into the slots is what breaks it. A folded
-    seat would then hold the lowest leftover cards by construction, the
-    completions would be drawn from a pool systematically missing them, and a
-    correction whose whole claim is a zero mean would acquire a bias — measured
-    at over five standard errors on a six-handed label before this was fixed.
 
-    So the check is the one thing sorting cannot produce: across the samples of
-    one label, the cards a folded seat is dealt and the cards the runout is
-    dealt are the same set.
-    """
-    pool = make_pool(0)
-    records = play(pool, make_specs(seed=5, n_hands=4, n_members=len(pool),
-                                    num_players=6, stack_bb=200))
-    record, idx, folded = next(
-        (r, i, f)
-        for r in records
-        for i in range(len(r.decisions))
-        for f in [{int(d["acting_pos"]) for d in r.decisions[:i]
-                   if int(d["action_idx"]) == FOLD}]
-        if f and int(r.snapshots[r.decisions[i]["snap_idx"]]["turn"]) == 0)
-    seat = min(folded)
-
+@pytest.mark.parametrize("control_variate", [False, True])
+def test_fold_likelihood_blocks_live_hands_and_runouts(control_variate):
+    """An exact support check, not a frequency estimate: a fold means AA."""
+    pool, record = folded_aces_hand()
+    pool[0] = Recorder(pool[0])
     driver = CapturingDriver(pool, N_ACTIONS)
-    action_values(record, idx, driver, pool, 0,
-                  OracleConfig(samples_per_action=256), np.random.default_rng(9))
-
-    dealt_to_the_folded_seat, dealt_to_the_board = set(), set()
+    q, legal, stats = action_values(
+        record, 1, driver, pool, 0,
+        OracleConfig(samples_per_action=16, likelihood_floor=0,
+                     control_variate=control_variate), np.random.default_rng(9))
+    assert stats.n_rollouts == 16 * legal.sum()
+    assert np.isfinite(q[legal]).all()
+    assert pool[0].seen == {(4, 5)}, "sampled opponents' cards leaked to hero"
     for played in driver.captured:
-        dealt_to_the_folded_seat.update(played.hole_cards(seat))
-        dealt_to_the_board.update(int(c) for c in played.deck[:5])
-    assert dealt_to_the_folded_seat == dealt_to_the_board
+        folded = set(played.hole_cards(2))
+        assert len(folded) == 2 and folded <= set(range(48, 52))
+        assert not folded & set(played.hole_cards(1))
+        assert not folded & set(played.deck[:5])
+        assert len(set(played.deck)) == 52
+        assert played.decisions[0]["action_idx"] == FOLD
+        assert played.decisions[0]["acting_pos"] == 2
+        assert all(d["acting_pos"] != 2 for d in played.decisions[1:])
+    # Every action of a sample is compared on the same complete assignment.
+    for offset in range(0, len(driver.captured), int(legal.sum())):
+        block = driver.captured[offset:offset + int(legal.sum())]
+        assert all(np.array_equal(r.deck, block[0].deck) for r in block)
+
+
+def test_fold_conditioning_ignores_real_hidden_cards_and_future_history():
+    pool, record = folded_aces_hand()
+    changed = copy.deepcopy(record)
+    unknown = [i for i in range(52) if i not in (5, 6)]  # hero alone is known
+    changed.deck[unknown] = changed.deck[unknown][::-1]
+    changed.decisions = changed.decisions[:2]
+    cfg = OracleConfig(samples_per_action=8, likelihood_floor=0)
+    a, b = CapturingDriver(pool, N_ACTIONS), CapturingDriver(pool, N_ACTIONS)
+    qa, _, _ = action_values(record, 1, a, pool, 0, cfg, np.random.default_rng(4))
+    qb, _, _ = action_values(changed, 1, b, pool, 0, cfg, np.random.default_rng(4))
+    np.testing.assert_array_equal(qa, qb)
+    assert all(np.array_equal(x.deck, y.deck)
+               for x, y in zip(a.captured, b.captured))
+
+
+def test_cached_fold_range_survives_later_board_reveals():
+    pool, record = folded_aces_hand()
+    cache = PosteriorCache()
+    cfg = OracleConfig(samples_per_action=8, likelihood_floor=1e-6)
+    for idx, dec in enumerate(record.decisions):
+        if dec["acting_pos"] != 0:
+            continue
+        a, b = CapturingDriver(pool, N_ACTIONS), CapturingDriver(pool, N_ACTIONS)
+        qa, _, sa = action_values(record, idx, a, pool, 0, cfg,
+                                  np.random.default_rng(idx))
+        qb, _, sb = action_values(record, idx, b, pool, 0, cfg,
+                                  np.random.default_rng(idx), cache)
+        np.testing.assert_array_equal(qa, qb)
+        assert sa.n_rollouts == sb.n_rollouts
+        assert all(np.array_equal(x.deck, y.deck)
+                   for x, y in zip(a.captured, b.captured))
 
 
 def test_a_label_whose_every_draw_collides_is_nan():

@@ -98,7 +98,7 @@ from nets.features import (TOKEN_FIELDS, HandTokens, RangeTargets, collate,
                            hand_tokens, range_targets)
 from oracle.posterior import PosteriorCache
 from oracle.ranges import label_range_target
-from oracle.rollout import (LabelStats, OracleConfig,
+from oracle.rollout import (RANGE_MODEL, LabelStats, OracleConfig,
                             action_values_batch)
 from agent.policy import FrozenAgentMember
 from pool.base import PoolMember
@@ -500,6 +500,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
         driver.pool = saved_pool
     manifest["results"] = results
     manifest["n_hands"] = n_hands
+    manifest["range_model"] = RANGE_MODEL
     return manifest
 
 
@@ -721,6 +722,9 @@ def _play_signature(sessions, seed_base, R, hands_per_session, pool_mode,
     different hands, and its labels cannot be spliced onto the ones on disk.
     """
     return {
+        # Prevent splicing pre-fix live-seat labels with all-seat labels after
+        # an interrupted run. Completed historical checkpoints remain readable.
+        "range_model": RANGE_MODEL,
         "seed_base": int(seed_base), "R": int(R),
         "hands_per_session": int(hands_per_session),
         # Two calls that disagree about whether the pool's past agents read

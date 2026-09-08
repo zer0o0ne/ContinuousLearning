@@ -85,9 +85,10 @@ from pool.style import StyleParams, sample_style
 from train.agent_train import (seat_embeddings, token_embeddings,
                                train_agent)
 from oracle.ranges import label_ranges
+from oracle.rollout import RANGE_MODEL
 from train.embed_train import train_embedding_net
 from train.generate import generate_labels, load_shard
-from train.targets import normalised_q, policy_target
+from train.targets import ev_loss_budget, normalised_q, policy_target
 from utils import Logger, progress, resolve_device
 
 TAG = "loop"
@@ -172,7 +173,7 @@ def gap_terms(q_norm, pi_oracle, log_pi_agent, legal):
 
 @torch.no_grad()
 def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log,
-               cold=False):
+               cold=False, iteration=0):
     """§8's held-out measurement of one checkpoint against its own oracle.
 
     One agent forward per held-out decision and **no new rollouts** — the
@@ -222,7 +223,8 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log,
             args = (lab["q"], mask, lab["pot_bb"], lab["facing_bet_bb"])
             terms = gap_terms(
                 normalised_q(*args, divisor=divisor),
-                policy_target(*args, temperature=temperature, divisor=divisor),
+                policy_target(*args, temperature=temperature, divisor=divisor,
+                              iteration=iteration),
                 logp[j], mask)
             rows.append({**terms, "num_players": int(lab["num_players"]),
                          "stack_bb": int(lab["stack_bb"])})
@@ -446,7 +448,7 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration)
                                it_seed + 500_000, iteration=iteration)
 
 
-def build_targets(labels, loss, temperature, divisor):
+def build_targets(labels, loss, temperature, divisor, iteration=0):
     """One target row per label — a distribution under `kl`, an EV under `soft_q`.
 
     §6.2's two losses consume different payloads and `train/targets.py` builds
@@ -458,7 +460,7 @@ def build_targets(labels, loss, temperature, divisor):
                 lab["facing_bet_bb"])
         if loss == "kl":
             out.append(policy_target(*args, temperature=temperature,
-                                     divisor=divisor))
+                                     divisor=divisor, iteration=iteration))
         else:
             out.append(normalised_q(*args, divisor=divisor))
     return np.stack(out) if out else np.zeros((0, 0))
@@ -489,12 +491,12 @@ def run(config, log, exp_dir):
     style_cfg = config.get("style", {})
     train_cfg = dict(config["agent_train"])
     oracle_cfg = config["oracle"]
-    temperature = float(oracle_cfg["temperature"])
+    temperature = oracle_cfg["temperature"]
+    ev_loss_budget(temperature)  # validate before expensive corpus generation
     divisor = oracle_cfg.get("divisor", "pot_plus_bet")
-    # §6.2's temperature is one number: the one that builds the `kl` target is
-    # the one the `soft_q` loss is written in. It lives in the `oracle` section
-    # (§8.1) and is handed to the trainer rather than configured twice.
+    # One specification and resolver for targets, training and evaluation.
     train_cfg["temperature"] = temperature
+    train_cfg["divisor"] = divisor
     loss = train_cfg.get("loss", "kl")
 
     n_iterations = int(config["n_iterations"])
@@ -627,8 +629,14 @@ def run(config, log, exp_dir):
 
         # ------------------------------------------------------- B: the labels
         labels_path = os.path.join(it_dir, "labels.json")
-        if os.path.exists(labels_path):
-            blob = _read_json(labels_path)
+        blob = _read_json(labels_path) if os.path.exists(labels_path) else None
+        if (blob is not None
+                and blob["manifest"].get("range_model") != RANGE_MODEL
+                and not os.path.exists(agent_path)):
+            log(f"[{TAG}] labels predate folded-card conditioning; rebuilding "
+                "this unfinished iteration and keeping the old shards aside")
+            blob = None
+        if blob is not None:
             sampler.load_state_dict(blob["sampler"])
             manifest = blob["manifest"]
             timings.update(blob.get("timings", {}))
@@ -666,10 +674,12 @@ def run(config, log, exp_dir):
             len(labels), train_cfg.get("heldout_fraction", 0.0), seed, k)
 
         # ------------------------------------------------------ C: the agent
+        measured_config = config
         if os.path.exists(agent_path):
-            agent_net.load_state_dict(torch.load(
-                agent_path, map_location=device,
-                weights_only=False)["model_state_dict"])
+            checkpoint = torch.load(agent_path, map_location=device,
+                                    weights_only=False)
+            agent_net.load_state_dict(checkpoint["model_state_dict"])
+            measured_config = checkpoint.get("config") or config
             log(f"[{TAG}] agent restored from {agent_path}")
             history = None
         else:
@@ -678,7 +688,7 @@ def run(config, log, exp_dir):
             picked = [labels[i] for i in train_idx]
             history = train_agent(
                 agent_net, [lab["tokens"] for lab in picked],
-                build_targets(picked, loss, temperature, divisor),
+                build_targets(picked, loss, temperature, divisor, iteration=k),
                 [lab["embeddings"] for lab in picked], train_cfg, device, log,
                 seed=_iteration_seed(seed, k), iteration=k)
             timings["agent"] = time.perf_counter() - t0
@@ -692,18 +702,30 @@ def run(config, log, exp_dir):
             metrics = _read_json(metrics_path)
         else:
             t0 = time.perf_counter()
+            # A checkpoint already trained before a restart keeps its own
+            # target and held-out split, even if the next cycle's config changed.
+            measured_train = measured_config["agent_train"]
+            measured_oracle = measured_config["oracle"]
+            train_idx, held_idx = split_heldout(
+                len(labels), measured_train.get("heldout_fraction", 0.0),
+                int(measured_config.get("seed", 0)), k)
             held = [labels[i] for i in held_idx]
-            gap_args = (agent_net, held, temperature, divisor,
-                        int(train_cfg["batch_hands"]), device, log)
+            gap_args = (agent_net, held, measured_oracle["temperature"],
+                        measured_oracle.get("divisor", "pot_plus_bet"),
+                        int(measured_train["batch_hands"]), device, log)
             metrics = {
                 "iteration": k,
                 "n_pool": len(pool),
                 "n_labels": len(labels),
                 "n_train": int(len(train_idx)),
-                "loss": loss,
+                "loss": measured_train.get("loss", "kl"),
+                "temperature": measured_oracle["temperature"],
+                "entropy_ev_loss_budget_bb": ev_loss_budget(
+                    measured_oracle["temperature"], k),
+                "range_model": manifest.get("range_model", "legacy_live_seats"),
                 "label_stats": manifest["stats"],
-                "gap": oracle_gap(*gap_args),
-                "gap_cold": oracle_gap(*gap_args, cold=True),
+                "gap": oracle_gap(*gap_args, iteration=k),
+                "gap_cold": oracle_gap(*gap_args, cold=True, iteration=k),
             }
             timings["gap"] = time.perf_counter() - t0
             metrics["timings"] = timings

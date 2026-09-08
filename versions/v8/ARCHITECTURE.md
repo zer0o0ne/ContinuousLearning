@@ -260,14 +260,16 @@ live opponent while consecutive hero decisions of one record are labelled. When 
 it removes combos containing the newly visible cards; then it multiplies only likelihoods of
 opponent actions after the cached prefix. This is Bayes filtering, not an approximation: a test
 compares every cached prefix with a fresh full computation, including all street transitions.
-The cache owns only the current record, so memory is bounded by one range per live opponent, and
+The cache owns only the current record, so memory is bounded by one range per opponent, and
 `LabelStats.forwards` counts only policy rows actually evaluated. It is disabled whenever
 `max_combos` is set, because that mode deliberately draws a new per-label prior subsample and
 reusing one would change both the estimator and the label RNG stream.
 
-Only *one* opponent's marginal lives here. §7.3's approximation of the joint by independent
-marginals with a card-removal correction belongs where the joint sample is drawn (the oracle),
-so the exact part stays untangled from the approximate one.
+Each returned range is a normalised reach factor, including a seat's fold if
+observed. For fixed policies and hand-start memory the joint density is the
+product of these factors restricted to disjoint cards compatible with hero's
+information. Rejection samples that joint exactly; the factors themselves are
+not its full marginal distributions. Floors and combo caps remain approximations.
 
 ### 2.2c `oracle/rollout.py` — variant A, `Q(s, ·)` by full rollout
 
@@ -283,15 +285,15 @@ One label is:
 
 1. the recorded `legal_mask` — illegal actions are never rolled out, and `nan` rather than zero
    makes a downstream masking bug fail loudly instead of averaging in a value nobody computed;
-2. one `opponent_posterior(..., through_decision=decision_idx − 1)` per **live** opponent (a seat
-   that has folded holds nothing that can change a showdown and gets filler cards);
-3. one **joint sample** — each opponent's combo drawn independently from its own marginal, and
+2. one `opponent_posterior(..., through_decision=decision_idx − 1)` per opponent,
+   **including folded seats and their fold likelihoods**;
+3. one **joint sample** — each opponent's combo proposed independently from its reach factor, and
    the draw rejected and redrawn if two opponents share a card or a card is already on the
    **visible** board or in hero's hand;
 4. one `HandSpec` per (legal action, surviving sample): the visible board and hero's real cards
    in the deck, the sampled cards at the opponents' seats, the streets still to come drawn from
    what the assignment left, and every remaining card **dealt** — shuffled, not sorted — into
-   the slots of the seats that folded and into the stub;
+   the undealt stub;
    `forced_actions` = the recorded prefix plus that action; `seat_members` = the real members
    with `hero_member_idx` in hero's seat; `seed` = a `blake2b` hash of
    `(spec.seed, decision_idx, action, sample)`, so a label does not depend on which other
@@ -325,23 +327,20 @@ that is supposed to size the sample budget. The draw is per **sample**, not per 
 common-random-numbers property above is unaffected: the actions of one sample are still compared
 on one board.
 
-The residual collision source is now only the one-decision offset: the posterior conditions
+In heads-up the residual collision source is the one-decision offset: the posterior conditions
 `through_decision = decision_idx − 1`, so its dead set is the board visible at the *previous*
 decision, while step 3 rejects against the board visible at *this* one. A combo containing a card
 that turned over in between still has to die.
 
-**Why the leftover is shuffled into the empty slots and not sorted into them.** The seats that
-folded hold nothing that can change a showdown, so which cards they get looks arbitrary — and for
-the label it is. It is not arbitrary for the control variate: §2.2d conditions its board
-completions on every seat's cards, folded seats included, and that is exact only because the
-runout and those cards come out of one remainder, in either order. Filling the slots in ascending
-order breaks exactly that. The folded seats end up holding the lowest leftover cards by
-construction, the completions are then drawn from a pool systematically missing them, and a
-correction whose whole claim is a zero mean acquires a bias — measured at 5.3 and 5.8 standard
-errors on six-handed labels, and absent on labels with nobody folded and on corpus hands, whose
-decks are real deals. Dealing the leftover costs nothing and restores the exchangeability the
-conditioning assumes; `test_oracle.py` pins it by requiring the cards a folded seat is dealt
-across a label's samples to be the same set the board is dealt.
+**Fold conditioning (2026-09-08).** Folded cards are no longer random filler.
+The fold and every earlier observed action weight that seat's possible holdings,
+which then block both live opponents' cards and the runout. This restores card
+bunching. The forced prefix keeps those players folded, and sampled cards never
+enter hero's observation. The control variate conditions its board completions
+on the same full assignment, including folded seats. Tests use a policy that
+folds only AA: every rollout must assign it AA and exclude those two aces from
+the live hand and board, with or without variance reduction. Cached ranges are
+checked against fresh conditioning after later board reveals.
 
 **Fold is not special-cased.** Hero's chip delta after folding is minus what hero has already
 put in, whatever the opponents hold, so the rollout returns the closed form with zero variance —
@@ -351,7 +350,7 @@ both stack extremes.
 **`LabelStats` — what S4/G3 reads, and nothing else.** `forwards` counts policy *rows*
 (posterior rows + rollout decisions that were not forced), `seconds` is wall clock,
 `n_rollouts` is hands played, and `collision_rate` is the fraction of joint draws rejected.
-That last one is the size of §7.3's approximation, and it is large: measured on a **9-handed**
+That last one measures rejection cost, not bias. It is large: measured on a **9-handed**
 preflop decision with eight live opponents, **~98.5 % of draws are rejected** — 16 cards drawn
 independently from one 50-card deck almost always repeat. Heads-up on the river it is exactly
 zero. (These are the numbers before the runout change above, which can only lower the rate:
@@ -1499,6 +1498,25 @@ failure. `test_targets.py` pins scale invariance to `1e-12` and shows what the s
 without the divisor. The divisor is a config choice as §6.2 requires; two are implemented,
 `pot_plus_bet` (baseline) and `pot`, which are the only two the signature's inputs can express.
 
+**Local EV-loss annealing (2026-09-08).** The scale invariance above applies to
+legacy scalar T. The default `oracle.temperature` is now
+`{"initial_ev_loss_bb": 1.0}`. `ev_loss_budget` returns
+`eps_k = initial_ev_loss_bb / (k + 1)` for zero-based outer cycle k;
+`decision_temperature` returns `eps_k / (D log A)` for A > 1 legal actions and
+the configured BB divisor D. At A = 1, T = 1 is harmless: the sole action loses
+zero EV. The exact soft optimum obeys `max Q - <pi_T,Q> <= D T log A = eps_k`.
+This bounds entropy smoothing at exact Q and exact optimisation, not oracle
+noise, model fitting error or exploitability. The initial budget and harmonic
+schedule are choices; no claim of an optimal annealing rate is made.
+
+Thus cycles 1, 10 and 30 allow 1, 0.1 and 1/30 BB per decision. The divisor
+cancels in the target under an absolute BB budget but still weights the loss
+across states. T is independent of sampled Q, preserving soft_q's linear
+gradient. The trainer reads each pending token's pot, facing bet and legal
+mask; the loss accepts a vector of temperatures, detaches it and centers Q
+before dividing to avoid overflow at small T. Both targets and warm/cold gaps
+use the same resolver. A scalar config retains the old fixed-T behaviour.
+
 Illegal actions receive **exact** zero, not a small number: they are dropped before the softmax
 rather than suppressed inside it. The mask is the environment's own, carried on the token, and
 §6.2's "dominated" needs no second rule — `env/legal.py` already drops dominated raise bins
@@ -1825,9 +1843,21 @@ are consumed in phase B — is written out with phase B's own artefact and resto
 iteration owns one block of a million hand seeds, split in half between the corpus and the
 labelled sessions, and both halves are asserted to fit rather than assumed to.
 
-**One temperature.** §6.2's `T` builds the `kl` target and is the unit the `soft_q` loss is
-written in; it lives once, in the `oracle` section (§8.1), and is handed to the trainer rather
-than configured twice.
+**One temperature specification.** §6.2's scalar T or local-loss schedule lives
+once in `oracle.temperature`. Targets, training and metrics resolve it with the
+same state scale and outer iteration. Metrics save the specification and the
+resolved BB budget; checkpoints already save the config and iteration. A
+restart continues at the actual cycle, and `regap.py` uses the checkpoint's
+config. Resuming between training and measurement likewise keeps that
+checkpoint's target and held-out split even if the next cycle's config changed.
+
+Labels carry `range_model = all_seats_reach_v2` in their manifest and the
+played-corpus resume signature. A pre-fix partial label set is moved to
+`labels.stale*` before regeneration; old complete labels awaiting training are
+regenerated as well. Existing trained checkpoints keep their historical labels
+for reproducible metrics; completed cycles are not retrained by a config edit.
+New cycles use all-seat conditioning. Start a new experiment if the whole
+training history must use the new temperature and oracle.
 
 `config.json` carries exactly §8.1's sections. Sizes and paths that belong to the run rather than
 to a section — `experiment`, `seed`, `device`, `out_dir`, `n_iterations`, `n_sessions`,

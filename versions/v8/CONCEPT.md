@@ -694,6 +694,29 @@ was a normalisation bug of exactly this family, not an architecture failure
 (`versions/v7/ARCHITECTURE.md`, "MCTS value-target normalization"). Baseline: divide by
 `pot + facing_bet`, with the divisor itself a config choice.
 
+**Annealing by local EV loss (owner decision 2026-09-08).** The default
+`oracle.temperature` is now `{"initial_ev_loss_bb": 1.0}`. At zero-based outer
+cycle `k`, set `eps_k = initial_ev_loss_bb / (k + 1)`, and for each decision
+with `A > 1` legal actions and BB divisor `D`, use `T_k(I) = eps_k / (D log A)`.
+A scalar temperature remains supported as a fixed-T historical mode. With
+one legal action the loss is zero for any T; the implementation uses T = 1.
+
+For exact Q, entropy optimality against a greedy action gives
+`max Q - <pi_T,Q> <= D T H(pi_T) <= D T log A = eps_k`.
+This bounds **entropy smoothing alone at the exact local optimum**. It does
+not bound noisy-oracle error, neural optimisation error, exploitability or a
+whole hand's loss. The harmonic schedule and initial 1 BB budget are explicit
+design choices, not an optimal cooling theorem. The first, tenth and thirtieth
+cycles budget 1, 0.1 and 1/30 BB per decision; the budget tends to zero.
+
+With a fixed BB budget, D cancels in the soft optimum; the legacy scalar-T
+scale-invariance property above intentionally does not apply. Normalised Q
+still determines the relative weight of states in the loss. T depends only on
+the public pot, facing bet, mask and cycle, preserving the soft_q gradient's
+linearity in Q. Both losses, warm/cold metrics and `regap.py` resolve the same
+schedule using the outer cycle, including after a restart. This is local soft
+policy improvement, not CFR and not a guarantee of equilibrium mixing.
+
 **A concern the G3 numbers raise about the divisor itself, flagged and not decided
 (2026-08-19).** `pot + facing_bet` does not scale with the stack, but the payoff does — in NLHE
 what can change hands is bounded by the effective stack, not by the pot. G3 measured the label
@@ -813,11 +836,23 @@ concrete, and they simply query their own policy.
 
 ### 7.3 Declared approximations
 
-These are approximations, not exact computations, and are recorded as such:
+**Joint conditioning, corrected 2026-09-08.** For fixed opponent policies and
+memory frozen for this hand, let `L_j(c)` be the product of opponent j's action
+likelihoods along the observed prefix, including its fold. Then
+`p(c_1,...,c_m | I) ∝ 1[all cards disjoint and compatible with I] * Π_j L_j(c_j)`.
+The separate ranges are normalised reach factors, not full posterior marginals.
+Independent proposals followed by rejection sample this joint exactly when
+the factors are exact. Rejection rate measures cost and lost samples, not bias.
+The retry cap drops failed samples; conditional on accepting any samples, their
+mean has the target expectation. A label with no accepted samples is dropped.
 
-- **Joint opponent ranges are approximated by independent marginals with a card-removal
-  correction.** The exact joint over 8 opponents is combinatorially impossible. Bias direction
-  is unknown and unmeasured.
+**Folded seats are included.** Their conditioned cards are pinned before
+drawing the future board, so both live ranges and runouts retain the information
+in folds (card bunching). Their recorded folds remain forced in the rollout;
+they never re-enter betting or showdown. The previous implementation gave
+folded seats uniformly drawn cards and therefore lost this information.
+
+The remaining range approximations are:
 - **Combo subsampling.** Self-normalised importance sampling over the **prior**, with a
   `max_combos` cap. (v7's `gpu_solver_v5` drew from the *posterior* and renormalised, which
   double-counts the mode and saves no policy call; `ARCHITECTURE.md` §2.2b records why the cap
@@ -1090,14 +1125,11 @@ the network is non-convex so SGD reaches a stationary point rather than the glob
 changing the PFSP weights or the hero seat changes the distribution and therefore the limit. So:
 consistent for a well-defined object, not unbiased for the one §6.2 names.
 
-**Four reasons `E[Q̂] ≠ Q`, none of which `n` or `N` can touch.**
-
-- **Independent marginals (§7.3).** The structural one. It is **exactly zero at two players** —
-  there is one marginal, no joint to approximate, and the rejection performs card removal
-  exactly — and it grows with table size. G3's collision rate is the proxy for how hard the
-  approximation is working: 0–5% heads-up, 33–46% six-handed, 57–82% nine-handed. Worth stating
-  plainly: the slice we measure against Slumbot is the one slice where the oracle is exact, and
-  the generality `CLAUDE.md` §1 is betting on lives where it is not.
+**Two sources of range bias and a distinction in the oracle's objective.**
+Increasing rollout count or training-set size alone cannot remove these.
+As corrected in §7.3, collision rejection itself introduces no range bias;
+folded-seat conditioning is now retained. Historical collision rates describe
+sampling cost, not distance from the true joint distribution.
 - **The likelihood floor** (`1e-6`) deliberately gives a combo the member would never play a
   non-zero weight. A fixed smoothing of the range; it does not vanish, and it applies heads-up
   too.

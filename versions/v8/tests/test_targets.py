@@ -16,13 +16,15 @@ import numpy as np
 import pytest
 import torch
 
+from nets.features import collate
 from tests.g1_fixtures import MAX_PLAYERS, N_ACTIONS, NET_CFG, make_pool
 from tests.test_agent_net import _agent_at_seat_zero, _net
 from train.agent_train import (
     embedding_dropout, steps_for_iteration, token_embeddings, train_agent,
 )
 from train.targets import (
-    kl_loss, normalised_q, policy_target, soft_q_loss,
+    decision_temperature, ev_loss_budget, kl_loss, normalised_q, policy_target,
+    soft_q_loss,
 )
 
 
@@ -582,3 +584,128 @@ def test_a_distribution_is_not_a_valid_payload_for_the_linear_loss():
         train_agent(_net(0), hands, targets, tables, cfg, "cpu", _silent,
                     seed=0, iteration=0)
 
+
+@pytest.mark.parametrize("divisor", ["pot", "pot_plus_bet"])
+def test_scheduled_soft_optimum_obeys_the_local_bb_loss_budget(divisor):
+    """Exact finite decision problems, no sampled EVs or training claims."""
+    spec = {"initial_ev_loss_bb": 0.8}
+    for iteration in (0, 1, 9, 29, 999):
+        budget = 0.8 / (iteration + 1)
+        assert ev_loss_budget(spec, iteration) == budget
+        for n in (2, 3, N_ACTIONS):
+            legal = _legal(*range(n))
+            for pot, bet in ((1.5, 0.5), (100, 50), (1800, 300)):
+                scale = pot + (bet if divisor == "pot_plus_bet" else 0)
+                t = decision_temperature(spec, legal, pot, bet, divisor,
+                                         iteration)
+                assert t * scale * math.log(n) == pytest.approx(budget)
+                for gap in (0, 0.1, 1, 10, 1000):
+                    q = _q({a: 200 - a * gap * budget for a in range(n)})
+                    pi = policy_target(q, legal, pot, bet, spec, divisor,
+                                       iteration)
+                    loss_bb = q[legal].max() - pi[legal] @ q[legal]
+                    assert -1e-12 <= loss_bb <= budget + 1e-12
+
+
+def test_fixed_bb_budget_cancels_the_divisor_in_the_policy():
+    spec, legal = {"initial_ev_loss_bb": 1.0}, _legal(0, 1, 3)
+    q = _q({0: 1.2, 1: 1.0, 3: -0.5})
+    a = policy_target(q, legal, 2, 1, spec, "pot", iteration=2)
+    b = policy_target(q, legal, 300, 70, spec, "pot_plus_bet", iteration=2)
+    np.testing.assert_allclose(a, b, rtol=0, atol=1e-12)
+    # Cooling depends on the outer cycle and resumes at that same cycle.
+    assert a[0] > policy_target(q, legal, 2, 1, spec, iteration=0)[0]
+    assert decision_temperature(0.7, legal, 2, 1, iteration=999) == 0.7
+
+
+def test_a_forced_action_has_zero_loss_under_the_schedule():
+    spec, legal = {"initial_ev_loss_bb": 1.0}, _legal(1)
+    t = decision_temperature(spec, legal, 100, 2, iteration=999)
+    target = policy_target(_q({1: -300}), legal, 100, 2, spec, iteration=999)
+    assert t > 0 and np.isfinite(t)
+    np.testing.assert_array_equal(target, legal.astype(float))
+
+
+@pytest.mark.parametrize("spec", [
+    {}, {"initial_ev_loss_bb": 0}, {"initial_ev_loss_bb": -1},
+    {"initial_ev_loss_bb": float("inf")}, {"initial_ev_loss_bb": float("nan")},
+    {"initial_ev_loss_bb": 1, "typo": 2}])
+def test_invalid_ev_loss_schedules_are_refused(spec):
+    with pytest.raises(AssertionError):
+        decision_temperature(spec, _legal(0, 1), 1, 1)
+
+
+@pytest.mark.parametrize("iteration", [-1, 1.5])
+def test_invalid_schedule_iterations_are_refused(iteration):
+    with pytest.raises(AssertionError, match="iteration"):
+        ev_loss_budget({"initial_ev_loss_bb": 1.0}, iteration)
+
+
+def test_row_temperatures_match_individual_losses_and_preserve_unbiased_gradients():
+    logits, q, legal = _q_setup()
+    logits, q, legal = (x.repeat(3, 1) for x in (logits, q, legal))
+    t = torch.tensor([0.001, 0.2, 2.0], dtype=q.dtype, requires_grad=True)
+    q.requires_grad_(True)
+    batched = soft_q_loss(logits, q, legal, t)
+    individual = torch.stack([
+        soft_q_loss(logits[i:i+1], q[i:i+1], legal[i:i+1], t[i])
+        for i in range(3)]).mean()
+    torch.testing.assert_close(batched, individual, rtol=0, atol=1e-12)
+    at_optimum = q.detach() / t.detach()[:, None]
+    assert abs(float(soft_q_loss(at_optimum, q, legal, t))) < 1e-12
+    eps = torch.where(legal, torch.full_like(q, 0.3), 0)
+    eps[:, 0] *= -2
+    exact = _grad(soft_q_loss, logits, legal, q, t)
+    averaged = (_grad(soft_q_loss, logits, legal, q + eps, t)
+                + _grad(soft_q_loss, logits, legal, q - eps, t)) / 2
+    torch.testing.assert_close(exact, averaged, rtol=0, atol=1e-12)
+    x = logits.clone().requires_grad_(True)
+    soft_q_loss(x, q, legal, t).backward()
+    assert q.grad is None and t.grad is None
+
+
+def test_cold_loss_is_finite_even_when_uncentered_q_over_t_would_overflow():
+    logits, q, legal = _q_setup(dtype=torch.float32)
+    q[legal] += 1e5
+    x = logits.clone().requires_grad_(True)
+    loss = soft_q_loss(x, q, legal, torch.tensor([1e-35]))
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize("t", [[0.1, 0.0], [0.1, float("nan")], [[0.1], [0.2]]])
+def test_bad_row_temperatures_are_refused(t):
+    logits, q, legal = (x.repeat(2, 1) for x in _q_setup())
+    with pytest.raises(AssertionError, match="temperature"):
+        soft_q_loss(logits, q, legal, t)
+
+
+@pytest.mark.parametrize("divisor", ["pot", "pot_plus_bet"])
+def test_trainer_applies_the_bb_budget_to_each_decision_at_the_actual_cycle(divisor):
+    """Check the first objective analytically, before an optimiser can move it."""
+    hands, qn, tables = _labels(loss="soft_q", seed=3)
+    cfg = dict(TRAIN_CFG, loss="soft_q", steps=1, batch_hands=len(hands),
+               embedding_dropout=0.0, divisor=divisor,
+               temperature={"initial_ev_loss_bb": 1.0})
+    for iteration in (1, 9):
+        net = _net(0)
+        net.train()
+        batch = collate(hands, device="cpu")
+        tab = torch.as_tensor(np.asarray(tables), dtype=torch.float32)
+        with torch.no_grad():
+            logits = net(batch, token_embeddings(tab, batch["slot"], net.d_emb))
+            terms = []
+            for j, hand in enumerate(hands):
+                legal = torch.as_tensor(hand.legal[-1])
+                logp = torch.log_softmax(logits[j, legal].double(), dim=-1)
+                q = torch.as_tensor(qn[j, hand.legal[-1]], dtype=torch.float64)
+                _, pot, bet = map(float, hand.scalars[-1])
+                d = pot + (bet if divisor == "pot_plus_bet" else 0)
+                t = (1 / (iteration + 1) / (d * math.log(int(legal.sum())))
+                     if legal.sum() > 1 else 1.0)
+                terms.append(-logp.exp() @ q + t * (logp.exp() @ logp)
+                             + t * torch.logsumexp(q / t, dim=0))
+            expected = float(torch.stack(terms).mean())
+        history = train_agent(net, hands, qn, tables, cfg, "cpu", _silent,
+                              seed=0, iteration=iteration)
+        assert history[0]["kl"] == pytest.approx(expected, rel=1e-5, abs=1e-7)

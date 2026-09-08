@@ -219,7 +219,7 @@
   "max_collision_retries": 32,
   "control_variate": true,
   "runout_samples": 16,
-  "temperature": 1.0,
+    "temperature": {"initial_ev_loss_bb": 1.0},
   "divisor": "pot_plus_bet"
  },
  "pool_sampling": {

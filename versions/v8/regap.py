@@ -88,11 +88,11 @@ def regap_iteration(config, exp_dir, iteration, device, log):
     net = frozen_agent_net(ckpt["model_state_dict"], run_config,
                            run_config["game"], device)
     gap_args = (net, [labels[i] for i in held_idx],
-                float(oracle_cfg["temperature"]),
+                oracle_cfg["temperature"],
                 oracle_cfg.get("divisor", "pot_plus_bet"),
                 int(train_cfg["batch_hands"]), device, log)
-    gaps = {"gap": oracle_gap(*gap_args),
-            "gap_cold": oracle_gap(*gap_args, cold=True)}
+    gaps = {"gap": oracle_gap(*gap_args, iteration=iteration),
+            "gap_cold": oracle_gap(*gap_args, cold=True, iteration=iteration)}
 
     metrics_path = os.path.join(it_dir, "metrics.json")
     metrics = _read_json(metrics_path) if os.path.exists(metrics_path) else {}

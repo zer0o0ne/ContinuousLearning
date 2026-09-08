@@ -41,7 +41,7 @@ import torch
 
 from nets.features import collate
 from nets.range_head import range_loss
-from train.targets import kl_loss, soft_q_loss
+from train.targets import decision_temperature, ev_loss_budget, kl_loss, soft_q_loss
 from utils import progress
 
 
@@ -122,10 +122,11 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
             `first_iteration_steps`, `batch_hands`, `lr`, and optionally
             `loss` (`kl`, the default, or `soft_q`), `temperature` (required by
             `soft_q` and unused by `kl`, which has already spent it building
-            the target), `weight_decay`, `eta_min`, `grad_clip`,
+            the target), `divisor` (default `pot_plus_bet`),
+            `weight_decay`, `eta_min`, `grad_clip`,
             `embedding_dropout`, `log_every`.
-        iteration: which cycle of §8's loop this is. Selects the step count and
-            nothing else.
+        iteration: zero-based cycle of §8's loop. Selects the step count and
+            the EV-loss budget when temperature is a schedule.
 
     Returns the per-step loss history.
     """
@@ -157,7 +158,14 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         assert np.isfinite(targets).all(), (
             "a normalised EV must be finite — `nan` marks illegal actions and "
             "`train.targets.normalised_q` zeroes them")
-        temperature = float(cfg["temperature"])
+        temperatures = np.array([
+            decision_temperature(cfg["temperature"], h.legal[-1],
+                                 h.scalars[-1, 1], h.scalars[-1, 2],
+                                 cfg.get("divisor", "pot_plus_bet"), iteration)
+            for h in hands])
+        budget = ev_loss_budget(cfg["temperature"], iteration)
+        log(f"[agent] temperature {temperatures.min():.6g}.."
+            f"{temperatures.max():.6g}, local entropy EV budget BB: {budget}")
     assert not (targets * ~legal_last).any(), (
         "a target carries a value on an action the environment called illegal")
 
@@ -199,7 +207,7 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         if loss_name == "kl":
             loss = kl_loss(logits, target, legal)
         else:
-            loss = soft_q_loss(logits, target, legal, temperature)
+            loss = soft_q_loss(logits, target, legal, temperatures[pick])
         policy_loss = float(loss.detach())
 
         # §5.7 — the belief term, on the labelled decision's own token. The

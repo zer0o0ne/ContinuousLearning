@@ -36,6 +36,13 @@ makes the target invariant to the scale of the situation, which is the property
 `test_targets.py` pins to 1e-12 and the reason this function exists at all
 rather than a `softmax` at the call site.
 
+That scale invariance describes the legacy **scalar** temperature. The default
+now specifies a decaying absolute BB loss budget: `T = eps / (scale * log A)`.
+The scale then cancels in the target, intentionally: the same BB mistake has
+the same budget in small and large pots. Normalising Q still weights the loss
+across training states. `decision_temperature` is shared by both losses and
+the held-out metric; it never derives T from noisy action values.
+
 The divisor is a config choice (§6.2), so both readings of "the scale of this
 situation" are available: `pot_plus_bet` (baseline) and `pot`, which is the same
 quantity before the bet hero is facing is counted. Nothing else is implementable
@@ -56,6 +63,58 @@ DIVISORS = {
     "pot_plus_bet": lambda pot_bb, facing_bet_bb: pot_bb + facing_bet_bb,
     "pot": lambda pot_bb, facing_bet_bb: pot_bb,
 }
+
+
+def ev_scale(pot_bb, facing_bet_bb, divisor="pot_plus_bet"):
+    """The positive, finite BB scale shared by EVs and their temperature."""
+    assert divisor in DIVISORS, (
+        f"unknown divisor {divisor!r}; choices are {sorted(DIVISORS)}")
+    scale = float(DIVISORS[divisor](float(pot_bb), float(facing_bet_bb)))
+    assert np.isfinite(scale) and scale > 0.0, (
+        f"the {divisor} normaliser must be finite and positive, got {scale}")
+    return scale
+
+
+def ev_loss_budget(temperature, iteration=0):
+    """Harmonic local EV budget in BB, or None for a legacy scalar T.
+
+    `iteration` is the zero-based outer policy-improvement cycle, including on
+    resume. The initial budget is a design choice, not a convergence theorem.
+    """
+    assert isinstance(iteration, (int, np.integer)) and iteration >= 0, (
+        f"iteration must be a non-negative integer, got {iteration}")
+    if not isinstance(temperature, dict):
+        assert np.isfinite(temperature) and temperature > 0, (
+            f"temperature must be finite and positive, got {temperature}")
+        return None
+    assert set(temperature) == {"initial_ev_loss_bb"}, (
+        "temperature schedule must contain only initial_ev_loss_bb")
+    initial = float(temperature["initial_ev_loss_bb"])
+    assert np.isfinite(initial) and initial > 0, (
+        f"initial_ev_loss_bb must be finite and positive, got {initial}")
+    return initial / (int(iteration) + 1)
+
+
+def decision_temperature(temperature, legal, pot_bb, facing_bet_bb,
+                         divisor="pot_plus_bet", iteration=0):
+    """Resolve a scalar T or a local-loss schedule for one decision.
+
+    For A legal actions, scale D and exact Q, the soft optimum satisfies
+    max Q - <softmax(Q/(D*T)), Q> <= D*T*log(A). Thus T = eps/(D*log(A))
+    budgets entropy smoothing alone; it does not bound oracle or fitting error.
+    T depends on the state, never on sampled Q, preserving soft_q's linear
+    gradient in noisy labels. A forced action loses zero EV at any positive T.
+    """
+    budget = ev_loss_budget(temperature, iteration)
+    if budget is None:
+        return float(temperature)
+    legal = np.asarray(legal, dtype=bool)
+    assert legal.ndim == 1 and legal.any(), "a decision needs a legal action"
+    scale = ev_scale(pot_bb, facing_bet_bb, divisor)
+    n_legal = int(legal.sum())
+    t = 1.0 if n_legal == 1 else budget / (scale * np.log(n_legal))
+    assert np.isfinite(t) and t > 0, "scheduled temperature is not representable"
+    return float(t)
 
 
 def normalised_q(q, legal, pot_bb, facing_bet_bb, divisor="pot_plus_bet"):
@@ -81,21 +140,14 @@ def normalised_q(q, legal, pot_bb, facing_bet_bb, divisor="pot_plus_bet"):
         "every legal action needs a finite EV — `nan` marks the illegal ones, "
         "and a `nan` under the mask means the oracle skipped an action it was "
         "asked about")
-    assert divisor in DIVISORS, (
-        f"unknown divisor {divisor!r}; choices are {sorted(DIVISORS)}")
-
-    scale = float(DIVISORS[divisor](float(pot_bb), float(facing_bet_bb)))
-    assert scale > 0.0, (
-        f"the {divisor} normaliser is {scale}, so the target would not be "
-        "defined — every decision has blinds in the pot behind it")
-
+    scale = ev_scale(pot_bb, facing_bet_bb, divisor)
     out = np.zeros_like(q)
     out[legal] = q[legal] / scale
     return out
 
 
 def policy_target(q, legal, pot_bb, facing_bet_bb, temperature,
-                  divisor="pot_plus_bet"):
+                  divisor="pot_plus_bet", iteration=0):
     """softmax(Q_normalised / T) over legal actions (§6.2), for the `kl` loss.
 
     `q` in BB with `nan` at illegal actions. Returns (n_actions,) summing to 1
@@ -103,12 +155,12 @@ def policy_target(q, legal, pot_bb, facing_bet_bb, temperature,
 
     Args:
         q, legal, pot_bb, facing_bet_bb, divisor: see `normalised_q`.
-        temperature: `T`. Positive and finite; the two limits are reached by
-            passing a very small or very large `T`, not by passing 0 or `inf`.
+        temperature: positive scalar T, or {"initial_ev_loss_bb": positive BB}.
+        iteration: zero-based outer cycle for the harmonic EV-loss budget.
     """
-    assert np.isfinite(temperature) and temperature > 0, (
-        f"temperature must be finite and positive, got {temperature}")
     legal = np.asarray(legal, dtype=bool)
+    temperature = decision_temperature(temperature, legal, pot_bb,
+                                       facing_bet_bb, divisor, iteration)
     qn = normalised_q(q, legal, pot_bb, facing_bet_bb, divisor)
 
     out = np.zeros_like(qn)
@@ -178,15 +230,20 @@ def soft_q_loss(logits, q_norm, legal, temperature):
         q_norm: (B, n_actions) — `normalised_q` per row, exact zeros off
             `legal`. Data, so no gradient flows into it.
         legal: (B, n_actions) bool.
-        temperature: `T`, positive and finite.
+        temperature: positive finite scalar T or a (B,) tensor of row-wise T.
+            Detached data, resolved from the state and iteration, not from Q.
     """
     assert logits.shape == q_norm.shape == legal.shape, (
         f"logits {tuple(logits.shape)}, q_norm {tuple(q_norm.shape)} and legal "
         f"{tuple(legal.shape)} must agree")
     assert bool(legal.any(dim=-1).all()), (
         "a row with no legal action cannot be scored")
-    assert float(temperature) > 0.0 and np.isfinite(float(temperature)), (
-        f"temperature must be finite and positive, got {temperature}")
+    t = torch.as_tensor(temperature, dtype=logits.dtype,
+                        device=logits.device).detach()
+    assert t.ndim == 0 or t.shape == logits.shape[:-1], (
+        "temperature must be scalar or have one value per decision")
+    assert bool((torch.isfinite(t) & (t > 0)).all()), (
+        "temperature must be finite and positive in the logits dtype")
     q_norm = q_norm.detach().to(logits.dtype)
     assert not bool((q_norm * ~legal).any()), (
         "q_norm carries a value on an illegal action — it was built with a "
@@ -196,15 +253,18 @@ def soft_q_loss(logits, q_norm, legal, temperature):
         "`nan` marks illegal actions and must have been zeroed by "
         "`normalised_q`")
 
-    t = float(temperature)
     logp = torch.log_softmax(logits.masked_fill(~legal, float("-inf")), dim=-1)
     p = logp.exp()
     # Off `legal` the policy is exactly zero, so the entropy term is zero
     # there; the `where` is what keeps `0 · -inf` from turning it into `nan`.
     plogp = p * torch.where(legal, logp, torch.zeros_like(logp))
 
+    # Center before division: cooling must not overflow the common EV offset.
+    q_centered = q_norm - q_norm.masked_fill(~legal, float("-inf")).amax(
+        dim=-1, keepdim=True)
+    q_centered = q_centered.masked_fill(~legal, 0.0)
     shift = t * torch.logsumexp(
-        (q_norm / t).masked_fill(~legal, float("-inf")), dim=-1)
-    per_row = -(p * q_norm).sum(dim=-1) + t * plogp.sum(dim=-1) + shift
+        (q_centered / t.unsqueeze(-1)).masked_fill(~legal, float("-inf")),
+        dim=-1)
+    per_row = -(p * q_centered).sum(dim=-1) + t * plogp.sum(dim=-1) + shift
     return per_row.mean()
-

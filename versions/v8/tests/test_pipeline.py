@@ -16,6 +16,7 @@ pins is the wiring that is silent when it is wrong:
   weighting toward heads-up or 200 BB (`CLAUDE.md` §1).
 """
 
+import copy
 import json
 import os
 import shutil
@@ -393,20 +394,26 @@ def _artefacts(exp_dir):
     return out
 
 
+@pytest.mark.parametrize("temperature", [0.5, {"initial_ev_loss_bb": 1.0}])
+@pytest.mark.parametrize("loss", ["soft_q", "kl"])
 def test_resume_from_an_interrupted_phase_reproduces_an_uninterrupted_run(
-        tmp_path):
+        tmp_path, temperature, loss):
     """A crash during agent training must cost the training, not the labels."""
-    _metrics, whole = _run(tmp_path, name="whole")
+    cfg = toy_config()
+    cfg["oracle"]["temperature"] = temperature
+    cfg["agent_train"]["loss"] = loss
+    _metrics, whole = _run(tmp_path, copy.deepcopy(cfg), name="whole")
 
     # A run that got as far as iteration 0's labels and then died.
-    _metrics, part = _run(tmp_path, toy_config(n_iterations=1), name="part")
+    part_cfg = copy.deepcopy(cfg)
+    part_cfg["n_iterations"] = 1
+    _metrics, part = _run(tmp_path, part_cfg, name="part")
     it0 = os.path.join(part, "iter_0000")
     for name in ("state.json", "metrics.json", "agent.pt"):
         os.remove(os.path.join(it0, name))
     shutil.rmtree(os.path.join(part, "iter_0001"), ignore_errors=True)
     os.remove(os.path.join(part, "report.json"))
 
-    cfg = toy_config()
     cfg["out_dir"] = str(tmp_path / "part")
     log = Logger(cfg["out_dir"])
     try:
@@ -423,6 +430,59 @@ def test_resume_from_an_interrupted_phase_reproduces_an_uninterrupted_run(
                 assert torch.equal(a[name][key], b[name][key]), f"{name}:{key}"
         else:
             assert a[name] == b[name], name
+
+
+def test_scheduled_gap_uses_the_cycle_and_regap_uses_the_checkpoint_config(tmp_path):
+    from regap import regap_iteration
+
+    cfg = toy_config()
+    cfg["oracle"]["temperature"] = {"initial_ev_loss_bb": 1.0}
+    metrics, exp_dir = _run(tmp_path, cfg)
+    changed = copy.deepcopy(cfg)
+    changed["oracle"]["temperature"] = 0.9
+    for k, original in enumerate(metrics):
+        labels = _labels_of(exp_dir, k)
+        _, held_idx = split_heldout(len(labels), 0.25, cfg["seed"], k)
+        expected_evs = []
+        for i in held_idx:
+            lab = labels[i]
+            q = lab["q"][lab["legal"]]
+            # BB formula independent of pipeline's temperature resolver.
+            z = (q - q.max()) * np.log(len(q)) * (k + 1)
+            p = np.exp(z) / np.exp(z).sum()
+            expected_evs.append(p @ q / (lab["pot_bb"] + lab["facing_bet_bb"]))
+        assert original["gap"]["overall"]["ev_oracle"] == pytest.approx(
+            np.mean(expected_evs), abs=1e-12)
+        recomputed = regap_iteration(changed, exp_dir, k, "cpu", lambda _m: None)
+        assert recomputed["gap"] == original["gap"]
+        assert recomputed["gap_cold"] == original["gap_cold"]
+
+    # Resume between C and D after changing the temperature on disk: this
+    # checkpoint must still be measured against the target it was trained on.
+    it = os.path.join(exp_dir, "iter_0001")
+    os.remove(os.path.join(it, "state.json"))
+    os.remove(os.path.join(it, "metrics.json"))
+    resumed = run(changed, lambda _m: None, exp_dir)
+    assert resumed[-1]["gap"] == metrics[-1]["gap"]
+    assert resumed[-1]["temperature"] == cfg["oracle"]["temperature"]
+
+
+def test_untrained_legacy_labels_are_set_aside_before_training(tmp_path):
+    cfg = toy_config(n_iterations=1)
+    _, exp_dir = _run(tmp_path, cfg)
+    it = os.path.join(exp_dir, "iter_0000")
+    for name in ("labels.json", "labels/play.json"):
+        path = os.path.join(it, name)
+        with open(path) as fh:
+            blob = json.load(fh)
+        (blob["manifest"] if name == "labels.json" else blob).pop("range_model")
+        with open(path, "w") as fh:
+            json.dump(blob, fh)
+    for name in ("state.json", "metrics.json", "agent.pt"):
+        os.remove(os.path.join(it, name))
+    metrics = run(cfg, lambda _m: None, exp_dir)
+    assert os.path.exists(os.path.join(it, "labels.stale", "progress.json"))
+    assert metrics[0]["range_model"] == "all_seats_reach_v2"
 
 
 # -------------------------------------------------- 5: the CLAUDE.md §1 rule

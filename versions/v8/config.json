@@ -244,14 +244,14 @@
   "log_every": 250
  },
  "evaluation": {
-  "run": "run0",
-  "agent_checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v8/run0/iter_0003/agent.pt",
-  "embedding_checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v8/run0/iter_0002/embedding.pt",
+  "run": "run2_ranges",
+  "agent_checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v8/run2_ranges/iter_0007/agent.pt",
+  "embedding_checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v8/run2_ranges/iter_0006/embedding.pt",
   "hands": 100000,
   "min_reportable_hands": 100000,
   "cold": true,
-  "warm": true,
-  "n_workers": 8,
+  "warm": false,
+  "n_workers": 6,
   "fit_window": 500,
   "warmup_buckets": [
    0,

@@ -243,6 +243,22 @@
   "heldout_fraction": 0.05,
   "log_every": 250
  },
+ "pool_evaluation": {
+  "enabled": true,
+  "run": "pilot_v2",
+  "benchmarks": ["current", "anchor"],
+  "cold_blocks": 16000,
+  "warm_sessions": 160,
+  "warm_hands_per_session": 100,
+  "blocks_per_batch": 512,
+  "batch_hands": 2048,
+  "control_variate": true,
+  "runout_samples": 16,
+  "fit_window": 500,
+  "confidence": 0.95,
+  "target_halfwidth_bb100": 10.0,
+  "seed": 1729
+ },
  "evaluation": {
   "run": "run2_ranges",
   "agent_checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v8/run2_ranges/iter_0007/agent.pt",

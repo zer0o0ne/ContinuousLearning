@@ -99,7 +99,7 @@ from nets.features import (TOKEN_FIELDS, HandTokens, RangeTargets, collate,
 from oracle.posterior import PosteriorCache
 from oracle.ranges import label_range_target
 from oracle.rollout import (RANGE_MODEL, LabelStats, OracleConfig,
-                            action_values_batch)
+                            action_values_batch, estimator_signature)
 from agent.policy import FrozenAgentMember
 from pool.base import PoolMember
 from utils import progress
@@ -467,6 +467,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     os.makedirs(out_dir, exist_ok=True)
     signature = _play_signature(sessions, seed_base, R, hands_per_session,
                                 pool_mode, pool_window)
+    signature["q_estimator"] = estimator_signature(cfg.get("oracle", {}), emb_cfg)
     played, done = _resume_state(out_dir, signature, log)
     first_hand = _first_hands(done, len(sessions), hands_per_session)
 
@@ -501,6 +502,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     manifest["results"] = results
     manifest["n_hands"] = n_hands
     manifest["range_model"] = RANGE_MODEL
+    manifest["q_estimator"] = signature["q_estimator"]
     return manifest
 
 

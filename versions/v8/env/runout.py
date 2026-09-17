@@ -1,41 +1,17 @@
-"""What the hand is worth if the betting stops here and the board runs out.
+"""Card/fold control variates with independent auxiliary board samples.
 
-The control variate the rollouts are averaged through (`CONCEPT.md` §7.3 —
-Monte-Carlo noise is the one reducible error in a label, and §13 measures it at
-0.5–1.4 of the stack per sample, because nearly every rollout is a stack-off).
+For fixed live seats and matched contributions, the exact equity baseline B
+is a martingale as public cards are revealed. A uniform M-board estimate
+b(s, U) satisfies E_U[b(s, U)] = B(s), so the card correction
+b(after, U) - b(before, U) has zero expectation over game and auxiliary draws.
+U must be independent of the game trajectory and refreshed per outer sample.
+Seeding only by visible cards freezes an MC error and violates this identity.
 
-``b(s)`` is every seat's share of the **matched** pot, weighted by how often it
-holds the best hand over the boards that can still come, minus what it put in.
-Three properties are all that is used, and each buys one thing:
-
-* **It is an expectation over the cards**, so dealing one and re-averaging gives
-  it back. The correction at a chance node is therefore exactly
-  ``b(after) − b(before)`` — the card's luck and nothing else — with no
-  expectation left to evaluate.
-* **It ignores chips beyond the call**, which the settlement returns anyway. So
-  ``b`` after a raise, an all-in and a call is one number, the correction at a
-  decision node is two numbers rather than one per raise size, and it is
-  identically zero where folding is not legal.
-* **It is cheap**: one pass over the ranking matrix, no pot logic, so its cost
-  does not grow with the table.
-
-**Integrating the cards out is not a second mechanism.** Once a rollout has no
-decisions left — everybody still in is all-in — the corrections for the streets
-still to come telescope into ``b(final board) − b(that state)``, and what the
-rollout reports is ``R − that``. Where the pot has no side pots, ``b`` on a
-complete board *is* the settlement, the two ``R``s cancel, and the rollout
-reports the exact average over every runout that could have happened. Where
-there are side pots ``b`` prices a short all-in as if it could win the whole
-matched pot, so the cancellation is partial and so is the reduction — never the
-correctness.
-
-**Correctness does not rest on any of that.** Each correction has zero mean over
-the draw it corrects, whatever ``b`` is worth, so an inaccurate baseline removes
-less noise and can never move what a rollout estimates. That is why `samples` —
-how many board completions ``b`` averages over, exhaustive when there are no more
-than that many and a uniform draw otherwise — is a cost knob and not a
-correctness one: with `M` of them the runout's variance comes out reduced by
-about `1 − 1/M`, and the rest is diminishing returns.
+The fold correction is explicitly centred by the policy's fold probability;
+it has zero conditional expectation even for an approximate baseline. With
+all players all-in and no side pots, corrected rewards equal the sampled
+baseline at the all-in state (exact only when completions are enumerated).
+Side pots affect variance reduction, not the zero-mean correction argument.
 """
 
 import hashlib
@@ -55,13 +31,12 @@ BOARD_AT_TURN = (0, 3, 4, 5)
 
 @dataclass
 class RunoutConfig:
-    """How finely the board is integrated over.
-
-    16 is where the curve flattens on the dev box: the runout's variance comes
-    out reduced by about `1 − 1/samples`, so 8 buys 88% and 64 buys 98%, while
-    the cost is linear in it and roughly doubles between 16 and 64.
-    """
+    """Number of auxiliary boards; enumerate if the support fits this budget."""
     samples: int = 16
+
+    def __post_init__(self):
+        if int(self.samples) != self.samples or self.samples <= 0:
+            raise ValueError("runout samples must be a positive integer")
 
 
 def board_completions(known, dead, n_needed, rng, cfg):
@@ -137,11 +112,10 @@ def equity_baseline(scores, live, bets):
     side pots — a short all-in is priced as if it could win the whole matched
     pot — so it is *not* a settlement and is never used as one.
 
-    That is sound because a control variate's correction has zero mean whatever
-    baseline it is built from: an inaccurate baseline removes less noise and can
-    never move the estimate. What it must be is (a) a function of the state and
-    (b) an expectation over the cards, so that dealing one and re-averaging
-    gives it back — both hold here, and neither needs the pot logic.
+    Card corrections require an expectation over future cards for fixed bets
+    and live seats. That property holds after averaging independent auxiliary
+    draws. It does not require this heuristic to equal the side-pot settlement.
+    Fold corrections are centred explicitly by the actual action probability.
 
     It costs one pass over the ranking matrix instead of one pot settlement per
     distinct ranking, which at a full ring is the difference between a few tens
@@ -164,49 +138,31 @@ def equity_baseline(scores, live, bets):
 
 
 class HandRunout:
-    """`V` for one hand in flight, with the board rankings cached per street.
+    """Baseline with rankings cached by deck, auxiliary seed and sample count.
 
-    The completions and the rankings depend on the street and on the cards, not
-    on the betting, so one street's work serves every decision taken on it and
-    every hypothetical the control variate needs.
-
-    **The cache is keyed by the deck, not by the hand.** One label rolls every
-    legal action out on the *same* cards — an action changes the forced prefix
-    and nothing else — so the `|A|` hands of one sample carry identical decks
-    and identical rankings. Sharing one `scores` dict between them is what stops
-    the ranking being paid `|A|` times over; the driver hands every hand of a
-    run the same dict.
-
-    That sharing is why a street's completions are drawn from a generator seeded
-    by **the cards that street has already shown** — its board prefix, the
-    holdings and the table size — and by nothing else. Two things follow, and
-    the estimator needs both:
-
-    * whichever hand asks first gets the same boards, so no result depends on
-      the order hands were batched in (§15);
-    * the draw cannot know a card that has not been dealt. A correction at a
-      chance node has zero mean only if the boards `b(before)` averaged over
-      were chosen independently of the card that node turns over, so seeding on
-      anything downstream of it — the hand's own seed included, where that seed
-      is what dealt the deck — is exactly what must not happen.
-
-    The generator is the estimator's own either way, so switching the estimator
-    on does not move a single card or action of the hand it is measuring.
+    Supply an independent runout_seed per outer sample; alternatives of that
+    sample share it. The default seed supports deterministic direct callers.
+    The driver supplies a separate stream even for ordinary hands. Future
+    cards may identify cache entries but never seed the auxiliary sampler.
+    Policies do not observe this seed or the baseline.
     """
 
-    def __init__(self, deck, num_players, cfg, scores=None):
+    def __init__(self, deck, num_players, cfg, scores=None, runout_seed=0):
         self.deck = np.asarray(deck, dtype=np.int64)
         self.num_players = int(num_players)
         self.cfg = cfg
-        self.key = (self.deck.tobytes(), self.num_players)
+        self.runout_seed = int(runout_seed)
+        self.key = (self.deck.tobytes(), self.num_players, self.runout_seed,
+                    int(cfg.samples))
         self._scores = {} if scores is None else scores
 
     def _rng(self, known, holes):
-        """The completion draw of one street: the cards it has already shown."""
+        """Visible cards plus an independent auxiliary draw for this sample."""
         digest = hashlib.blake2b(
             np.asarray(known, dtype=np.int64).tobytes() + holes.tobytes()
             + bytes([self.num_players]), digest_size=8).digest()
-        return np.random.default_rng([int.from_bytes(digest, "big"), 0x5EED])
+        return np.random.default_rng([
+            self.runout_seed, int.from_bytes(digest, "big"), 0x5EED])
 
     def _holes(self):
         return self.deck[5:5 + 2 * self.num_players].reshape(-1, 2)
@@ -257,8 +213,8 @@ def prime(demands, chunk_rows=200_000):
             labelled decision was taken and can never be queried.
         chunk_rows: how many seven-card rows go to the evaluator at once.
 
-    Deduplicated by `(deck, street)`, so the `|A|` hands one label rolls out on
-    one sample rank their boards once between them.
+    Deduplicated by `(deck, auxiliary seed, sample count, street)`, so all
+    actions of one outer sample rank their boards once between them.
 
     It is an optimisation and nothing else: a street nobody primed is ranked on
     demand by `HandRunout.scores`, one call at a time but with the same numbers.

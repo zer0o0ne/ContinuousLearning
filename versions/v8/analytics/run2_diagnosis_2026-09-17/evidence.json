@@ -1,0 +1,352 @@
+{
+  "oracle_counterexample": {
+    "board_ids": [
+      2,
+      13,
+      28,
+      19
+    ],
+    "hero_hole_ids": [
+      27,
+      8
+    ],
+    "opponent_hole_ids": [
+      51,
+      30
+    ],
+    "forced_actions": [
+      15,
+      6,
+      1,
+      11,
+      7,
+      1,
+      16,
+      1
+    ],
+    "stack_bb": 200.0,
+    "pot_bb": 354.35,
+    "call_bb": 45.65,
+    "rivers_enumerated": 44,
+    "exact_q_call_bb": -127.27272727272728,
+    "q_fold_bb": -154.35,
+    "cv_q_call_bb": -175.0,
+    "true_call_advantage_bb": 27.077272727272714,
+    "oracle_call_advantage_bb": -20.650000000000006,
+    "checks": [
+      {
+        "likelihood_floor": 0.0,
+        "runout_samples": 16,
+        "samples_per_action": 128,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -175.0
+      },
+      {
+        "likelihood_floor": 0.0,
+        "runout_samples": 16,
+        "samples_per_action": 1024,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -175.0
+      },
+      {
+        "likelihood_floor": 0.0,
+        "runout_samples": 64,
+        "samples_per_action": 128,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -127.27272727272737
+      },
+      {
+        "likelihood_floor": 0.0,
+        "runout_samples": 64,
+        "samples_per_action": 1024,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -127.27272727272891
+      },
+      {
+        "likelihood_floor": 1e-06,
+        "runout_samples": 16,
+        "samples_per_action": 128,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -175.0
+      },
+      {
+        "likelihood_floor": 1e-06,
+        "runout_samples": 16,
+        "samples_per_action": 1024,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -175.0
+      },
+      {
+        "likelihood_floor": 1e-06,
+        "runout_samples": 64,
+        "samples_per_action": 128,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -127.27272727272737
+      },
+      {
+        "likelihood_floor": 1e-06,
+        "runout_samples": 64,
+        "samples_per_action": 1024,
+        "q_fold_bb": -154.35,
+        "q_call_bb": -127.27272727272891
+      }
+    ],
+    "floored_posterior_main_combo_mass": 0.9989670680516346,
+    "true_call_bounds_with_floor_bb": [
+      -127.34784959624476,
+      -126.9346768168986
+    ],
+    "asymptotic_cv_call_bounds_with_floor_bb": [
+      -175.02582329870913,
+      -174.61265051936297
+    ],
+    "independent_eval7_wins_ties_losses": [
+      8,
+      0,
+      36
+    ],
+    "non_allin_transition": {
+      "exact_ev_bb": -98.22272727272727,
+      "cv_ev_bb": -135.05625
+    },
+    "loss_versus_true_ev": [
+      {
+        "fold_probability": 0.5,
+        "soft_q_loss": 0.025500000000000016,
+        "true_ev_bb": -140.81136363636364
+      },
+      {
+        "fold_probability": 0.999,
+        "soft_q_loss": 4.806007570704344e-05,
+        "true_ev_bb": -154.32292272727273
+      }
+    ]
+  },
+  "synthetic_turn_stress": {
+    "distribution": "1000 uniform fixed-holding HU turn matchups; NOT run2 labels",
+    "seed": 20260917,
+    "n": 1000,
+    "runout_samples": 16,
+    "mean_signed_error_bb": -0.8068181818181815,
+    "mean_absolute_error_bb": 21.518181818181816,
+    "rmse_bb": 30.452722129950335,
+    "max_absolute_error_bb": 119.31818181818181,
+    "strict_fold_call_reversals_by_call_bb": {
+      "20.0": 67,
+      "50.0": 66,
+      "100.0": 23,
+      "150.0": 15,
+      "199.0": 15
+    }
+  },
+  "log_metrics": [
+    {
+      "iteration": 0,
+      "warm": {
+        "kl": 0.6061,
+        "ev_agent": 1.6989,
+        "ev_oracle": 2.4704,
+        "q_best": 2.8955,
+        "ev_gap_target": 0.7715,
+        "ev_gap_greedy": 1.1966,
+        "agreement": 0.387
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_04_10_57_25.txt:497",
+      "cold": {
+        "kl": 0.6074,
+        "ev_agent": 1.6998,
+        "ev_oracle": 2.4704,
+        "q_best": 2.8955,
+        "ev_gap_target": 0.7706,
+        "ev_gap_greedy": 1.1957,
+        "agreement": 0.393
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_04_10_57_25.txt:498",
+      "train_policy_last5_mean": 0.40490000000000004,
+      "train_range_last5_mean": 0.10654,
+      "target_weighted_geomean_policy_prob_upper": 0.5447654194527218
+    },
+    {
+      "iteration": 1,
+      "warm": {
+        "kl": 0.5659,
+        "ev_agent": 0.3924,
+        "ev_oracle": 1.2037,
+        "q_best": 1.8009,
+        "ev_gap_target": 0.8113,
+        "ev_gap_greedy": 1.4084,
+        "agreement": 0.516
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_04_10_57_25.txt:562",
+      "cold": {
+        "kl": 0.5551,
+        "ev_agent": 0.4066,
+        "ev_oracle": 1.2037,
+        "q_best": 1.8009,
+        "ev_gap_target": 0.7971,
+        "ev_gap_greedy": 1.3943,
+        "agreement": 0.521
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_04_10_57_25.txt:563",
+      "train_policy_last5_mean": 0.46824,
+      "train_range_last5_mean": 0.13782,
+      "target_weighted_geomean_policy_prob_upper": 0.574014856840582
+    },
+    {
+      "iteration": 2,
+      "warm": {
+        "kl": 0.5701,
+        "ev_agent": 0.8561,
+        "ev_oracle": 1.3614,
+        "q_best": 1.9128,
+        "ev_gap_target": 0.5053,
+        "ev_gap_greedy": 1.0567,
+        "agreement": 0.63
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_04_10_57_25.txt:782",
+      "cold": {
+        "kl": 0.5729,
+        "ev_agent": 0.8282,
+        "ev_oracle": 1.3614,
+        "q_best": 1.9128,
+        "ev_gap_target": 0.5332,
+        "ev_gap_greedy": 1.0846,
+        "agreement": 0.627
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_04_10_57_25.txt:783",
+      "train_policy_last5_mean": 0.46298,
+      "train_range_last5_mean": 0.07446,
+      "target_weighted_geomean_policy_prob_upper": 0.5638877906646772
+    },
+    {
+      "iteration": 3,
+      "warm": {
+        "kl": 3.5504,
+        "ev_agent": 1.219,
+        "ev_oracle": 1.7186,
+        "q_best": 1.7193,
+        "ev_gap_target": 0.4997,
+        "ev_gap_greedy": 0.5003,
+        "agreement": 0.704
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_08_16_53_35.txt:71",
+      "cold": {
+        "kl": 3.6022,
+        "ev_agent": 1.2071,
+        "ev_oracle": 1.7186,
+        "q_best": 1.7193,
+        "ev_gap_target": 0.5115,
+        "ev_gap_greedy": 0.5122,
+        "agreement": 0.701
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_08_16_53_35.txt:72",
+      "train_policy_last5_mean": 0.47382,
+      "train_range_last5_mean": 0.06228,
+      "target_weighted_geomean_policy_prob_upper": 0.027263676332853003
+    },
+    {
+      "iteration": 4,
+      "warm": {
+        "kl": 5.921,
+        "ev_agent": 1.6212,
+        "ev_oracle": 3.0531,
+        "q_best": 3.0573,
+        "ev_gap_target": 1.4319,
+        "ev_gap_greedy": 1.4361,
+        "agreement": 0.384
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_10_10_52_30.txt:225",
+      "cold": {
+        "kl": 5.9481,
+        "ev_agent": 1.6165,
+        "ev_oracle": 3.0531,
+        "q_best": 3.0573,
+        "ev_gap_target": 1.4366,
+        "ev_gap_greedy": 1.4408,
+        "agreement": 0.378
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_10_10_52_30.txt:226",
+      "train_policy_last5_mean": 1.6738,
+      "train_range_last5_mean": 0.03662,
+      "target_weighted_geomean_policy_prob_upper": 0.0026107963219159356
+    },
+    {
+      "iteration": 5,
+      "warm": {
+        "kl": 7.15,
+        "ev_agent": 2.2195,
+        "ev_oracle": 3.6515,
+        "q_best": 3.6527,
+        "ev_gap_target": 1.432,
+        "ev_gap_greedy": 1.4331,
+        "agreement": 0.368
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_10_10_52_30.txt:291",
+      "cold": {
+        "kl": 7.3131,
+        "ev_agent": 2.1404,
+        "ev_oracle": 3.6515,
+        "q_best": 3.6527,
+        "ev_gap_target": 1.5111,
+        "ev_gap_greedy": 1.5123,
+        "agreement": 0.353
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_10_10_52_30.txt:292",
+      "train_policy_last5_mean": 1.56162,
+      "train_range_last5_mean": 0.16488,
+      "target_weighted_geomean_policy_prob_upper": 0.0006667469295580784
+    },
+    {
+      "iteration": 6,
+      "warm": {
+        "kl": 6.9781,
+        "ev_agent": 1.832,
+        "ev_oracle": 3.488,
+        "q_best": 3.4898,
+        "ev_gap_target": 1.6559,
+        "ev_gap_greedy": 1.6577,
+        "agreement": 0.32
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_14_22_56_24.txt:71",
+      "cold": {
+        "kl": 7.3208,
+        "ev_agent": 1.6848,
+        "ev_oracle": 3.488,
+        "q_best": 3.4898,
+        "ev_gap_target": 1.8032,
+        "ev_gap_greedy": 1.805,
+        "agreement": 0.293
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_14_22_56_24.txt:72",
+      "train_policy_last5_mean": 1.90556,
+      "train_range_last5_mean": 0.13094,
+      "target_weighted_geomean_policy_prob_upper": 0.000661632693278721
+    },
+    {
+      "iteration": 7,
+      "warm": {
+        "kl": 8.4314,
+        "ev_agent": 2.4279,
+        "ev_oracle": 3.6413,
+        "q_best": 3.6422,
+        "ev_gap_target": 1.2134,
+        "ev_gap_greedy": 1.2143,
+        "agreement": 0.333
+      },
+      "warm_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_14_22_56_24.txt:137",
+      "cold": {
+        "kl": 8.8522,
+        "ev_agent": 2.328,
+        "ev_oracle": 3.6413,
+        "q_best": 3.6422,
+        "ev_gap_target": 1.3132,
+        "ev_gap_greedy": 1.3141,
+        "agreement": 0.302
+      },
+      "cold_source": "/Users/zer0o0ne/Downloads/logs_poker/2026_09_14_22_56_24.txt:138",
+      "train_policy_last5_mean": 1.11884,
+      "train_range_last5_mean": 0.10924,
+      "target_weighted_geomean_policy_prob_upper": 0.0001430666431859722
+    }
+  ]
+}

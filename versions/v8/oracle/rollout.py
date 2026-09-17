@@ -61,6 +61,22 @@ from oracle.ranges import HandRangeCache
 FOLD = 0
 N_CARDS = 52
 RANGE_MODEL = "all_seats_reach_v2"
+Q_ESTIMATOR = "independent_runout_cv_v1"
+
+
+def estimator_signature(oracle, embedding=None):
+    """Label semantics, excluding batch sizes and execution scheduling.
+
+    Target temperature/divisor operate on stored Q and do not require new
+    rollouts. The range target is configured by the embedding section.
+    """
+    defaults = OracleConfig()
+    keys = ("samples_per_action", "max_combos", "likelihood_floor",
+            "max_collision_retries", "control_variate", "runout_samples")
+    return {"version": Q_ESTIMATOR, "range_model": RANGE_MODEL,
+            **{k: oracle.get(k, getattr(defaults, k)) for k in keys},
+            "range_target": bool((embedding or {}).get("range_enabled", False)),
+            "range_prune": float((embedding or {}).get("range_prune_threshold", 0.0))}
 
 
 @dataclass
@@ -221,6 +237,13 @@ def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng,
             are computed, not the posterior or rollout samples.
     """
     started = time.perf_counter()
+    # Split before conditioning on any sampled cards. Independent repeats of
+    # a label must refresh auxiliary cards AND action draws. Each action of
+    # one outer sample shares the auxiliary stream, but different samples do
+    # not reuse a deterministic 16-board approximation.
+    streams = np.random.SeedSequence(
+        rng.integers(0, 2**32, size=4).tolist()).spawn(3)
+    rng, auxiliary_rng, action_rng = [np.random.default_rng(s) for s in streams]
     n_dec = len(record.decisions)
     assert 0 <= decision_idx < n_dec, (
         f"decision {decision_idx} is not a decision of a hand with {n_dec}")
@@ -276,6 +299,8 @@ def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng,
     seat_members[hero_pos] = int(hero_member_idx)
 
     specs = []
+    runout_seeds = auxiliary_rng.integers(0, 2**63, size=len(samples))
+    action_seeds = action_rng.integers(0, 2**63, size=len(samples))
     for s in range(len(samples)):
         deck = _rollout_deck(record, hero_pos, opp_seats, samples[s],
                              len(visible), rng)
@@ -283,7 +308,9 @@ def _label_plan(record, decision_idx, driver, pool, hero_member_idx, cfg, rng,
             specs.append(replace(
                 record.spec, seat_members=seat_members, deck=deck,
                 forced_actions=prefix + [a],
-                seed=_rollout_seed(record.spec.seed, decision_idx, a, s)))
+                runout_seed=int(runout_seeds[s]),
+                seed=_rollout_seed(record.spec.seed, decision_idx, a, s,
+                                   int(action_seeds[s]))))
 
     return _LabelPlan(specs=specs, q=q, legal=legal, legal_idx=legal_idx,
                       n_samples=len(samples), hero_pos=hero_pos,

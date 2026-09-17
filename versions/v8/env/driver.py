@@ -77,6 +77,9 @@ class HandSpec:
     # Rollout plumbing (PLAN_PIPELINE.md S1). Both are None for an ordinary hand.
     deck: np.ndarray = None       # 52 ints; overrides the dealt deck
     forced_actions: list = None   # action indices, consumed in decision order
+    # Auxiliary card integration, independent of the deck/action streams.
+    # Oracle alternatives for one outer sample share this seed.
+    runout_seed: int = None
 
 
 @dataclass
@@ -360,6 +363,10 @@ class LockstepDriver:
             rewards=np.zeros(spec.num_players, dtype=np.float64),
             truncated=False,
         )
+        runout_seed = spec.runout_seed
+        if self.runout is not None and runout_seed is None:
+            runout_seed = int(np.random.SeedSequence([int(spec.seed), 0x4356])
+                              .generate_state(1, dtype=np.uint64)[0])
         return {
             "idx": idx,
             "table": table,
@@ -373,7 +380,7 @@ class LockstepDriver:
             # holds the integrated value of a hand that ran out of decisions
             # before it ran out of streets.
             "runout": (HandRunout(record.deck, spec.num_players, self.runout,
-                                  scores=scores)
+                                  scores=scores, runout_seed=runout_seed)
                        if self.runout is not None else None),
             "corr": np.zeros(spec.num_players, dtype=np.float64),
             "run_out_from": None,
@@ -497,14 +504,13 @@ class LockstepDriver:
     def _card_correction(self, state, decision_idx, turn_before, end):
         """Subtract the luck of the cards this action turned over.
 
-        Two cases, one formula. If decisions remain, the baseline is a
-        martingale over the deal, so the surprise of a new street is exactly the
-        change in the baseline across it. If none remain — everybody left is
+        The baseline averaged over independent auxiliary draws is a
+        martingale over the deal, so its change has zero mean. If none remain — everybody left is
         all-in — every street still to come is one more chance node with nothing
         between them, so their corrections telescope into a single difference;
         `_finish` adds it once the board is complete. Where the pot has no side
         pot that difference cancels the hand's own result and what the rollout
-        reports is the average over every runout it could have had.
+        reports is the auxiliary sample average (exact when enumerated).
         """
         table, record = state["table"], state["record"]
         runout = state["runout"]

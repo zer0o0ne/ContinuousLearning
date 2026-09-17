@@ -485,6 +485,56 @@ def test_untrained_legacy_labels_are_set_aside_before_training(tmp_path):
     assert metrics[0]["range_model"] == "all_seats_reach_v2"
 
 
+def test_estimator_config_change_rebuilds_untrained_labels(tmp_path):
+    cfg = toy_config(n_iterations=1)
+    _, exp_dir = _run(tmp_path, cfg)
+    it = os.path.join(exp_dir, "iter_0000")
+    before = json.load(open(os.path.join(it, "labels.json")))["manifest"]
+    for name in ("state.json", "metrics.json", "agent.pt"):
+        os.remove(os.path.join(it, name))
+    changed = copy.deepcopy(cfg)
+    changed["oracle"]["runout_samples"] = 3
+    metrics = run(changed, lambda _m: None, exp_dir)
+    after = json.load(open(os.path.join(it, "labels.json")))["manifest"]
+    assert before["q_estimator"]["runout_samples"] == 16
+    assert after["q_estimator"]["runout_samples"] == 3
+    assert os.path.exists(os.path.join(it, "labels.stale", "progress.json"))
+    state = torch.load(os.path.join(it, "agent.pt"), weights_only=False)
+    assert state["q_estimator"] == after["q_estimator"] == metrics[0]["q_estimator"]
+
+
+def test_pool_evaluation_runs_after_training_without_changing_training(tmp_path):
+    cfg = copy.deepcopy(toy_config())
+    cfg["game"]["players_range"] = [2, 2]
+    cfg["game"]["stack_bb_range"] = [10, 10]
+    baseline, baseline_dir = _run(tmp_path, cfg, name="without_eval")
+    cfg["pool_evaluation"] = {
+        "enabled": True, "run": "test", "benchmarks": ["current", "anchor"],
+        "cold_blocks": 2, "warm_sessions": 1, "warm_hands_per_session": 3,
+        "blocks_per_batch": 2, "batch_hands": 64, "runout_samples": 2}
+    measured, measured_dir = _run(tmp_path, cfg, name="with_eval")
+    for k in range(2):
+        assert measured[k]["gap"] == baseline[k]["gap"]
+        report = measured[k]["pool_evaluation"]
+        assert report["total_hands"] == 40
+        assert report["benchmarks"]["current"]["cold"]["units"] == 2
+        states = [torch.load(os.path.join(root, f"iter_{k:04d}", "agent.pt"),
+                             weights_only=False)["model_state_dict"]
+                  for root in (baseline_dir, measured_dir)]
+        for key in states[0]:
+            torch.testing.assert_close(states[0][key], states[1][key], rtol=0, atol=0)
+        samplers = [json.load(open(os.path.join(root, f"iter_{k:04d}", "state.json")))
+                    for root in (baseline_dir, measured_dir)]
+        assert samplers[0] == samplers[1]
+    from pool_eval_pipeline import run_saved
+    cfg["pool_evaluation"]["run"] = "standalone"
+    separate = run_saved(cfg, measured_dir, 1, reference=0, log=lambda _: None)
+    for benchmark, modes in separate["benchmarks"].items():
+        for mode in modes:
+            assert modes[mode]["units"] == measured[1]["pool_evaluation"]["benchmarks"][benchmark][mode]["units"]
+    assert separate["candidates"] == ["agent1", "agent0"]
+
+
 # -------------------------------------------------- 5: the CLAUDE.md §1 rule
 
 

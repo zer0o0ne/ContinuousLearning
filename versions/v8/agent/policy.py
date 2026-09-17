@@ -241,19 +241,34 @@ class FrozenAgentMember(PoolMember):
             n_actions=self.n_actions, pending=ctx)
 
     def logits(self, contexts):
-        batch = collate([self._observation(ctx) for ctx in contexts],
-                        device=self.device)
-        if self.embeddings is None:
-            emb = torch.zeros(*batch["mask"].shape, self.net.d_emb,
-                              device=self.device)
-            seat_emb = torch.zeros(*batch["seat_slot"].shape, self.net.d_emb,
-                                   device=self.device)
-        else:
-            # The same two gathers hero makes (§5.3, §5.7): the acting seat's
-            # own vector for the decision token, every seat's for the range
-            # head.
-            emb = self.embeddings[batch["slot"]]
-            seat_emb = self.embeddings[batch["seat_slot"]]
-        with torch.no_grad():
-            out = self.net(batch, emb, seat_emb)
-        return out.float().cpu().numpy().astype(np.float64)
+        return logits_for_members([self] * len(contexts), contexts)
+
+
+def logits_for_members(members, contexts):
+    """One forward for sessions sharing a network, with their own observations.
+
+    Evaluation must batch across tables without mixing their fitted vectors.
+    The ordinary frozen-member path uses the same observation and gathers.
+    """
+    first = members[0]
+    assert len(members) == len(contexts)
+    assert all(m.net is first.net for m in members)
+    batch = collate([m._observation(ctx) for m, ctx in zip(members, contexts)],
+                    device=first.device)
+    if all(m.embeddings is None for m in members):
+        emb = torch.zeros(*batch["mask"].shape, first.net.d_emb, device=first.device)
+        seat_emb = torch.zeros(*batch["seat_slot"].shape, first.net.d_emb,
+                               device=first.device)
+    elif all(m is first for m in members):
+        emb = first.embeddings[batch["slot"]]
+        seat_emb = first.embeddings[batch["seat_slot"]]
+    else:
+        zero = torch.zeros(first.max_players, first.net.d_emb, device=first.device)
+        tables = torch.stack([zero if m.embeddings is None else m.embeddings
+                              for m in members])
+        row = torch.arange(len(members), device=first.device)
+        emb = tables[row[:, None], batch["slot"]]
+        seat_emb = tables[row[:, None, None], batch["seat_slot"]]
+    with torch.no_grad():
+        out = first.net(batch, emb, seat_emb)
+    return out.float().cpu().numpy().astype(np.float64)

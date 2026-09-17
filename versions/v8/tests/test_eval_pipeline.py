@@ -143,6 +143,20 @@ def _checkpoints(tmp_path):
     return a_path, e_path
 
 
+def test_resume_refuses_a_changed_checkpoint_without_appending(tmp_path):
+    cfg = _config(tmp_path, evaluation={"hands": 2, "warm": False})
+    _report, directory, _lines = _run(tmp_path, cfg)
+    path = os.path.join(directory, "cold_w00.jsonl")
+    before = open(path, "rb").read()
+    checkpoint = torch.load(cfg["evaluation"]["agent_checkpoint"], weights_only=False)
+    first = next(iter(checkpoint["model_state_dict"].values()))
+    first.add_(.1)
+    torch.save(checkpoint, cfg["evaluation"]["agent_checkpoint"])
+    with pytest.raises(ValueError, match="identity changed"):
+        _run(tmp_path, cfg)
+    assert open(path, "rb").read() == before
+
+
 def _config(tmp_path, **overrides):
     a_path, e_path = _checkpoints(tmp_path)
     cfg = {

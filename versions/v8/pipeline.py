@@ -85,7 +85,7 @@ from pool.style import StyleParams, sample_style
 from train.agent_train import (seat_embeddings, token_embeddings,
                                train_agent)
 from oracle.ranges import label_ranges
-from oracle.rollout import RANGE_MODEL
+from oracle.rollout import RANGE_MODEL, estimator_signature
 from train.embed_train import train_embedding_net
 from train.generate import generate_labels, load_shard
 from train.targets import ev_loss_budget, normalised_q, policy_target
@@ -272,14 +272,14 @@ def winrate_line(gap, gap_cold):
     bug to tune away.
 
     It is `ev_agent` and not a played BB/100: phase D plays no hands. This is
-    the agent's policy scored by the oracle's own `Q` on the held-out labels, in
-    §6.2's pot-normalised units, so it is comparable across iterations and
-    across the two modes and is *not* comparable with a Slumbot BB/100.
+    the agent's policy scored by the oracle's own `Q` on the held-out labels.
+    Its distribution and continuation policy change between iterations; it is
+    a dimensionless diagnostic, not a played-policy winrate.
     """
     warm, cold = gap.get("overall"), gap_cold.get("overall")
     if not warm or not cold:
         return "held-out ev_agent: not measured (no held-out labels)"
-    return (f"held-out ev_agent over {warm['n']} labels: "
+    return (f"held-out ev_agent (normalised Q, dimensionless) over {warm['n']} labels: "
             f"warm (fitted vectors) {warm['ev_agent']:+.4f}, "
             f"cold (e = 0) {cold['ev_agent']:+.4f}, "
             f"warm − cold {warm['ev_agent'] - cold['ev_agent']:+.4f}")
@@ -477,10 +477,57 @@ def split_heldout(n, fraction, seed, iteration):
     return np.sort(perm[n_held:]), np.sort(perm[:n_held])
 
 
+def pool_evaluation(pool, descriptors, agent_net, embed_net, measured_config,
+                    config, exp_dir, iteration, anchor_size, device, log,
+                    reference_iteration=None):
+    """Compare the completed checkpoint with the preceding policy, no feedback."""
+    from evaluation.pool_eval import Candidate, configuration, evaluate
+
+    cfg = configuration(config)
+    if cfg is None:
+        return None
+    game = config["game"]
+    reference = iteration - 1 if reference_iteration is None else reference_iteration
+    if not -1 <= reference < iteration:
+        raise ValueError("reference_iteration must precede the evaluated iteration (-1 means agent_init)")
+    new = FrozenAgentMember(f"agent{iteration}", game["n_actions"], agent_net,
+                             game["max_players"], device, embed_net=embed_net)
+    if reference >= 0:
+        variants = int(config["style"]["agent_variants"])
+        base = pool[anchor_size + reference * variants]
+        previous = torch.load(os.path.join(_iter_dir(exp_dir, reference), "agent.pt"),
+                              map_location="cpu", weights_only=False)
+        old_config = previous.get("config") or config
+        old_embedding = base.embed_net
+        if cfg["warm_sessions"] and old_embedding is None:
+            paths = [os.path.join(_iter_dir(exp_dir, k), "embedding.pt")
+                     for k in range(reference + 1)]
+            path = next((p for p in reversed(paths) if os.path.exists(p)), None)
+            if path is None:
+                raise ValueError("Previous checkpoint has no embedding generation for warm evaluation")
+            old_embedding = frozen_embedding_net(
+                torch.load(path, map_location=device, weights_only=False)["model_state_dict"],
+                old_config, game, device)
+        old = FrozenAgentMember(f"agent{reference}", game["n_actions"], base.net,
+                                 game["max_players"], device, embed_net=old_embedding)
+    else:
+        members, _ = build_pool(
+            {"bootstrap": [config["agent_init"]], "game": game, "style": config["style"]},
+            np.random.default_rng(int(config.get("seed", 0)) + 1), device=device, log=log)
+        old, old_config = members[0], config
+    candidates = [Candidate(new, measured_config["embedding_net"]),
+                  Candidate(old, old_config["embedding_net"])]
+    return evaluate(pool, descriptors, candidates, config,
+                    os.path.join(_iter_dir(exp_dir, iteration), "pool_evaluation"),
+                    iteration, anchor_size, log)
+
+
 # -------------------------------------------------------------------- the loop
 
 
 def run(config, log, exp_dir):
+    from evaluation.pool_eval import configuration as evaluation_configuration
+    evaluation_configuration(config)  # validate before the expensive phases
     game = config["game"]
     seed = int(config.get("seed", 0))
     device = resolve_device(config.get("device", "auto"))
@@ -631,9 +678,11 @@ def run(config, log, exp_dir):
         labels_path = os.path.join(it_dir, "labels.json")
         blob = _read_json(labels_path) if os.path.exists(labels_path) else None
         if (blob is not None
-                and blob["manifest"].get("range_model") != RANGE_MODEL
+                and (blob["manifest"].get("range_model") != RANGE_MODEL
+                     or blob["manifest"].get("q_estimator") !=
+                     estimator_signature(oracle_cfg, emb_cfg))
                 and not os.path.exists(agent_path)):
-            log(f"[{TAG}] labels predate folded-card conditioning; rebuilding "
+            log(f"[{TAG}] labels use an incompatible Q estimator; rebuilding "
                 "this unfinished iteration and keeping the old shards aside")
             blob = None
         if blob is not None:
@@ -693,7 +742,8 @@ def run(config, log, exp_dir):
                 seed=_iteration_seed(seed, k), iteration=k)
             timings["agent"] = time.perf_counter() - t0
             torch.save({"model_state_dict": agent_net.state_dict(),
-                        "config": config, "iteration": k, "history": history},
+                        "config": config, "iteration": k, "history": history,
+                        "q_estimator": manifest.get("q_estimator", "legacy")},
                        agent_path)
 
         # ------------------------------------------------- D: the oracle gap
@@ -723,6 +773,8 @@ def run(config, log, exp_dir):
                 "entropy_ev_loss_budget_bb": ev_loss_budget(
                     measured_oracle["temperature"], k),
                 "range_model": manifest.get("range_model", "legacy_live_seats"),
+                "q_estimator": manifest.get("q_estimator", "legacy"),
+                "gap_units": "dimensionless_normalised_oracle_q",
                 "label_stats": manifest["stats"],
                 "gap": oracle_gap(*gap_args, iteration=k),
                 "gap_cold": oracle_gap(*gap_args, cold=True, iteration=k),
@@ -730,9 +782,22 @@ def run(config, log, exp_dir):
             timings["gap"] = time.perf_counter() - t0
             metrics["timings"] = timings
             _write_json(metrics_path, metrics)
-        metrics_all.append(metrics)
         log(f"[{TAG}] " + winrate_line(metrics.get("gap", {}),
                                        metrics.get("gap_cold", {})))
+
+        # Independent played-policy benchmark. It never updates PFSP, labels,
+        # targets or checkpoint selection. A stopped run resumes completed
+        # independent evaluation units before marking this iteration complete.
+        if config.get("pool_evaluation", {}).get("enabled", False):
+            t0 = time.perf_counter()
+            evaluation = pool_evaluation(
+                pool, descriptors, agent_net, embed_net, measured_config,
+                config, exp_dir, k, n_pool0, device, log)
+            timings["pool_evaluation"] = time.perf_counter() - t0
+            metrics["pool_evaluation"] = evaluation
+            metrics["timings"] = timings
+            _write_json(metrics_path, metrics)
+        metrics_all.append(metrics)
 
         # ----------------------------------------- E: results, decay, the pool
         for member, result in manifest["results"].items():

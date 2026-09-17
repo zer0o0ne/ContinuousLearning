@@ -80,6 +80,7 @@ from evaluation.v8_adapter import AgentMemberFactory, MemberFactory, \
     HERO_SLOT, OPP_SLOT, N_SEATS, SlumbotAgent, \
     _flip, slumbot_history
 from env.session import raise_sizes_from
+from evaluation.identity import check_identity, file_digest
 from nets.agent_net import AgentNet
 from nets.embedding_net import OpponentEmbeddingNet, fit_embeddings, loss_weights
 from nets.features import collate, hand_tokens
@@ -685,6 +686,27 @@ def run(config, log, out_dir, client=None, client_factory=None):
     assert modes, "§12 reports cold and warm; turning both off measures nothing"
     n_workers = int(ev.get("n_workers", 1))
     os.makedirs(out_dir, exist_ok=True)
+    # Hand budgets can grow on resume, but a different checkpoint or session
+    # protocol must never append to an existing run's winrate.
+    identity = {"version": "slumbot_identity_v1", "game": config["game"],
+                "seed": config.get("seed", 0),
+                "workers": n_workers, "hero": ev.get("hero") or {"kind": "agent"},
+                "fit_window": ev.get("fit_window"),
+                "embedding_config": config["embedding_net"]}
+    if hero_is_the_agent(config):
+        identity["agent"] = file_digest(ev["agent_checkpoint"])
+    if "warm" in modes:
+        assert ev.get("embedding_checkpoint"), "warm requires evaluation.embedding_checkpoint"
+    for mode in modes:
+        mode_identity = {**identity, "mode": mode}
+        if mode == "warm":
+            mode_identity["embedding"] = file_digest(ev["embedding_checkpoint"])
+        directory = os.path.join(out_dir, "identities", mode)
+        if not os.path.exists(os.path.join(directory, "identity.json")):
+            import glob
+            if glob.glob(os.path.join(out_dir, f"{mode}_w*.jsonl")):
+                raise ValueError("Unversioned Slumbot results; use a new evaluation.run name")
+        check_identity(directory, mode_identity)
 
     # With workers, the parent holds no network and touches no GPU: the
     # checkpoints are loaded inside each worker from their paths.

@@ -1760,6 +1760,23 @@ belongs to it from the moment it is first seated as hero" points at — is not s
 measured, and the row still exists and is still read the moment that agent is seated as an
 opponent.
 
+**The embedding corpus uses PFSP for every seat**, including the observer, through
+the same `PoolSampler` as label collection: PFSP weights, embedding clusters and
+the uniform floor from `pool_sampling`. It reads the results and clusters saved
+at the previous iteration boundary; new pool members start with maximum PFSP
+weight in their own clusters. At iteration 0 there are no results or trained
+clusters, so the distribution is uniform. Members may repeat at a table.
+The corpus uses a separate RNG seeded by `(seed, iteration, 12)`, leaving the
+label sampler unchanged when phase A runs or is skipped on resume. Corpus
+self-play results do not update the current hero's PFSP scores. Table sizes,
+stacks, hand seeds and seat rotation still come from `env.session.build_sessions`.
+
+`embedding_net.first_corpus_sessions` sets the corpus size at iteration 0;
+`corpus_sessions` sets it on later retrains. Omitting the first key uses
+`corpus_sessions` for both. The main config uses 300 sessions initially and 30
+on later retrains, with 2000 hands per session. The hand-seed layout reserves
+the larger count on every iteration so the different sizes cannot overlap.
+
 **Row *i* of the embedding table is pool member *i*.** The table is sized
 `len(pool₀) + max_iterations × agent_variants` up front (D9) and the pool grows by exactly
 `agent_variants` members per iteration (D11), so the two indices coincide by construction and

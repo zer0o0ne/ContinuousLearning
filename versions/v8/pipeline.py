@@ -63,6 +63,7 @@ Run::
 """
 
 import argparse
+import copy
 import json
 import os
 import time
@@ -421,16 +422,25 @@ def hero_factory(iteration, agent_net, init_member, game, device):
         int(game["n_actions"]), observer_pos, device)
 
 
-def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration):
-    """§5.4 training over a fresh corpus of pool self-play (phase A)."""
+def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
+                    sampler):
+    """§5.4 training over a fresh PFSP corpus of pool self-play (phase A)."""
     emb_cfg = config["embedding_net"]
     it_seed = _iteration_seed(seed, iteration)
+    n_sessions = int(emb_cfg["corpus_sessions"])
+    if int(iteration) == 0:
+        n_sessions = int(emb_cfg.get("first_corpus_sessions", n_sessions))
+    # Share the restored results and clusters, but not phase B's RNG stream:
+    # resuming after embedding.pt skips these draws entirely. Corpus self-play
+    # has no current hero, so its results must not update hero's PFSP scores.
+    corpus_sampler = copy.deepcopy(sampler)
+    corpus_sampler.rng = np.random.default_rng([int(seed), int(iteration), 12])
     sessions = build_sessions(
         np.random.default_rng([int(seed), int(iteration), 11]),
-        list(range(len(pool))), game, int(emb_cfg["corpus_sessions"]),
+        list(range(len(pool))), game, n_sessions,
         int(emb_cfg["corpus_hands_per_session"]),
         seed_base=hand_seed_bases(it_seed, phase_hands(config))[0]["corpus"],
-        tag="corpus")
+        tag="corpus", sampler=corpus_sampler)
     driver = LockstepDriver(pool, int(game["n_actions"]))
     play(driver, sessions, int(config["driver_batch_size"]), log, "corpus")
     # §5.7 — the belief targets, once over the corpus and never inside the
@@ -706,7 +716,7 @@ def run(config, log, exp_dir):
             else:
                 t0 = time.perf_counter()
                 history = embedding_phase(embed_net, pool, config, game, device,
-                                          log, seed, k)
+                                          log, seed, k, sampler)
                 timings["embedding"] = time.perf_counter() - t0
                 torch.save({"model_state_dict": embed_net.state_dict(),
                             "config": config, "iteration": k,

@@ -355,10 +355,10 @@ class PoolSampler:
         return int(self.rng.choice(idx, p=wc / wc.sum()))
 
     def sample_table(self, n_opponents):
-        """`n_opponents` member indices, one per non-hero seat (§4.4).
+        """`n_opponents` pool-member indices for the requested seats (§4.4).
 
-        Hero is not drawn from the pool — it occupies slot 0 of every session
-        (`env/session.py`) — so this is asked for `num_players - 1` seats.
+        Label collection requests `num_players - 1` seats, excluding hero.
+        The embedding corpus requests all `num_players` seats for self-play.
         Seats are drawn independently; see the module docstring.
         """
         k = int(n_opponents)

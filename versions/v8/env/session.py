@@ -103,16 +103,17 @@ HAND_PHASES = ("labels", "corpus")
 
 
 def phase_hands(cfg):
-    """How many hands each phase of one iteration deals, from the config.
+    """Reserve enough hand seeds for each phase on any iteration.
 
-    Read from the same keys the phases themselves read, so the seed layout
-    cannot describe a run different from the one that happens.
+    The corpus may have different first and later session counts. Reserve
+    their maximum to keep a fixed stride and disjoint seeds across iterations.
     """
     emb = cfg["embedding_net"]
+    corpus_sessions = max(int(emb["corpus_sessions"]),
+                          int(emb.get("first_corpus_sessions", emb["corpus_sessions"])))
     return {
         "labels": int(cfg["n_sessions"]) * int(cfg["hands_per_session"]),
-        "corpus": (int(emb["corpus_sessions"])
-                   * int(emb["corpus_hands_per_session"])),
+        "corpus": corpus_sessions * int(emb["corpus_hands_per_session"]),
     }
 
 
@@ -125,8 +126,8 @@ def hand_seed_bases(iteration_seed, hands):
     make the embedding corpus and the labelled set correlated in a way nothing
     downstream could see.
 
-    The ranges are laid out end to end and each is exactly as long as its phase
-    asks for, so the layout scales with the config instead of capping it. An
+    The ranges are laid out end to end and each reserves its phase's maximum
+    hand count, so the layout scales with the config instead of capping it. An
     earlier version reserved a fixed 500 000 seeds per phase and refused any run
     that wanted more, which is a limit on the experiment imposed by its
     bookkeeping — the wrong way round.
@@ -164,8 +165,14 @@ def raise_sizes_from(game):
 
 
 def build_sessions(rng, member_ids, game, n_sessions, hands_per_session,
-                   seed_base, tag):
-    """Uniform over 2–9 players and 10–300 BB, independently (`CLAUDE.md` §1)."""
+                   seed_base, tag, *, sampler=None):
+    """Uniform table sizes and stacks, with optional sampling of all seats.
+
+    Without `sampler`, members are uniform and distinct (the G1 corpus).
+    A pool sampler may repeat members, including in the observer's slot.
+    Keep the original uniform draws so table configurations and hand seeds
+    stay identical when the member distribution changes.
+    """
     lo_p, hi_p = game["players_range"]
     lo_s, hi_s = game["stack_bb_range"]
     bb, sb = game["big_blind"], game["small_blind"]
@@ -183,6 +190,11 @@ def build_sessions(rng, member_ids, game, n_sessions, hands_per_session,
         stack_bb = int(rng.integers(lo_s, hi_s + 1))
         members = [int(m) for m in
                    rng.choice(member_ids, size=num_players, replace=False)]
+        if sampler is not None:
+            members = [int(m) for m in sampler.sample_table(num_players)]
+            assert len(members) == num_players, (
+                f"the sampler returned {len(members)} members for a "
+                f"{num_players}-handed session")
         session = Session(idx=s, num_players=num_players, stack_bb=stack_bb,
                           members=members)
         for h in range(hands_per_session):

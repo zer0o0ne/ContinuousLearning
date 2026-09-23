@@ -28,6 +28,7 @@ import torch
 import pipeline
 from env.session import build_sessions
 from pipeline import gap_terms, oracle_gap, run, split_heldout, winrate_line
+from pool.sampling import PoolSampler
 from pool.style import StyleParams
 from train.generate import load_shard
 from utils import Logger
@@ -138,6 +139,69 @@ def test_the_loop_runs_and_writes_every_artefact(tmp_path):
         assert set(m["gap_cold"]["overall"]) == {"n", *pipeline.GAP_KEYS}
         assert m["gap_cold"]["by_table_size"] and m["gap_cold"]["by_stack_bb"]
         assert m["gap_cold"]["overall"]["ev_gap_greedy"] >= -1e-12
+
+
+@pytest.mark.parametrize("floor_fraction", [0.0, 0.25, 1.0])
+def test_embedding_corpus_uses_pfsp_for_every_seat_without_changing_label_sampler(
+        monkeypatch, floor_fraction):
+    """Only the hard member survives without the floor, even at repeated seats.
+
+    Check the hands actually played and tokenised, not just the session's
+    member list: forgetting to reseat HandSpecs would silently train on uniform
+    data while reporting PFSP tables.
+    """
+    cfg = toy_config()
+    cfg["embedding_net"].update(corpus_sessions=12, corpus_hands_per_session=2,
+                                steps=1)
+    cfg["pool_sampling"]["floor_fraction"] = floor_fraction
+    pool, _ = pipeline.build_pool(cfg, np.random.default_rng(0), device="cpu",
+                                  log=lambda _: None)
+    net = pipeline.OpponentEmbeddingNet(cfg["embedding_net"], N_ACTIONS,
+                                       MAX_PLAYERS, n_members=len(pool))
+    sampler = PoolSampler(len(pool), cfg["pool_sampling"],
+                          np.random.default_rng(17))
+    for i in range(len(pool)):
+        sampler.update(i, -100 if i == 1 else 100, 10)
+    sampler.set_vectors(np.array([[0.0]] * 7 + [[1.0], [2.0]]))
+    before = copy.deepcopy(sampler.state_dict())
+    seed, iteration = cfg["seed"], 1
+    expected_sampler = copy.deepcopy(sampler)
+    expected_sampler.rng = np.random.default_rng([seed, iteration, 12])
+    uniform = build_sessions(
+        np.random.default_rng([seed, iteration, 11]), list(range(len(pool))),
+        GAME, cfg["embedding_net"]["corpus_sessions"],
+        cfg["embedding_net"]["corpus_hands_per_session"],
+        seed_base=pipeline.hand_seed_bases(
+            pipeline._iteration_seed(seed, iteration),
+            pipeline.phase_hands(cfg))[0]["corpus"], tag="corpus")
+    real_train = pipeline.train_embedding_net
+    seen = []
+
+    def inspect(net, sessions, *args, **kwargs):
+        for session, baseline in zip(sessions, uniform):
+            assert session.num_players == baseline.num_players
+            assert session.stack_bb == baseline.stack_bb
+            assert session.members == expected_sampler.sample_table(session.num_players)
+            seen.extend(session.members)
+            for h, (spec, original) in enumerate(zip(session.specs, baseline.specs)):
+                assert spec.seed == original.seed
+                assert spec.seat_members == [
+                    session.members[slot] for slot in session.slot_of_seat(h)]
+            for tokens in session.tokens(MAX_PLAYERS, N_ACTIONS):
+                active = tokens.member >= 0
+                assert np.array_equal(tokens.member[active],
+                                      np.asarray(session.members)[tokens.slot[active]])
+        return real_train(net, sessions, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "train_embedding_net", inspect)
+    history = pipeline.embedding_phase(net, pool, cfg, GAME, "cpu", lambda _: None,
+                                       seed, iteration, sampler)
+    assert history
+    assert sampler.state_dict() == before
+    if floor_fraction == 0:
+        assert set(seen) == {1}
+    else:
+        assert 1 in seen and set(seen) - {1}
 
 
 # ------------------------------------------------- 2 / 3c: the pool and rows
@@ -423,6 +487,64 @@ def test_resume_from_an_interrupted_phase_reproduces_an_uninterrupted_run(
 
     a, b = _artefacts(whole), _artefacts(part)
     assert sorted(a) == sorted(b)
+    for name in a:
+        if name.endswith(".pt"):
+            assert sorted(a[name]) == sorted(b[name]), name
+            for key in a[name]:
+                assert torch.equal(a[name][key], b[name][key]), f"{name}:{key}"
+        else:
+            assert a[name] == b[name], name
+
+
+def test_resume_after_pfsp_embedding_corpus_preserves_label_draws(tmp_path, monkeypatch):
+    """Resume with saved PFSP scores and a grown pool, skipping phase A."""
+    cfg = toy_config()
+    _metrics, whole = _run(tmp_path, copy.deepcopy(cfg), name="whole")
+    real_labels = pipeline.generate_labels
+    real_embedding = pipeline.embedding_phase
+    calls = 0
+
+    def inspect_embedding(net, pool, config, game, device, log, seed, iteration,
+                          sampler):
+        if iteration == 1:
+            previous = json.load(open(tmp_path / "part" / "toy" / "iter_0000"
+                                      / "state.json"))["sampler"]
+            n_old = previous["n_members"]
+            assert any(previous["hands"])
+            assert sampler.state_dict()["bb"][:n_old] == previous["bb"]
+            assert sampler.state_dict()["hands"][:n_old] == previous["hands"]
+            assert sampler.state_dict()["cluster_of"][:n_old] == previous["cluster_of"]
+            assert sampler.n_members > n_old
+            assert np.all(sampler.weights()[n_old:] == 1)
+        return real_embedding(net, pool, config, game, device, log, seed,
+                              iteration, sampler)
+
+    def interrupt(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("stopped after embedding corpus")
+        return real_labels(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "embedding_phase", inspect_embedding)
+    monkeypatch.setattr(pipeline, "generate_labels", interrupt)
+    part_cfg = copy.deepcopy(cfg)
+    with pytest.raises(RuntimeError, match="after embedding corpus"):
+        _run(tmp_path, part_cfg, name="part")
+    part = str(tmp_path / "part" / "toy")
+    assert os.path.exists(os.path.join(part, "iter_0001", "embedding.pt"))
+    assert not os.path.exists(os.path.join(part, "iter_0001", "labels.json"))
+
+    monkeypatch.setattr(pipeline, "generate_labels", real_labels)
+    monkeypatch.setattr(pipeline, "embedding_phase",
+                        lambda *a, **kw: pytest.fail("replayed the saved corpus"))
+    run(part_cfg, lambda _: None, part)
+    a, b = _artefacts(whole), _artefacts(part)
+    assert sorted(a) == sorted(b)
+    # The top-level report lists only iterations processed by this invocation;
+    # compare every per-iteration artefact, including both metrics files.
+    a.pop("report.json")
+    b.pop("report.json")
     for name in a:
         if name.endswith(".pt"):
             assert sorted(a[name]) == sorted(b[name]), name

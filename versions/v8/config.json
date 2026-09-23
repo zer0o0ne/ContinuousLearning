@@ -1,5 +1,5 @@
 {
- "experiment": "run2_ranges",
+ "experiment": "run3",
  "seed": 7,
  "device": "auto",
  "out_dir": "../../data/v8",
@@ -247,7 +247,7 @@
   "enabled": true,
   "run": "pilot_v2",
   "benchmarks": ["current", "anchor"],
-  "cold_blocks": 16000,
+  "cold_blocks": 128000,
   "warm_sessions": 160,
   "warm_hands_per_session": 100,
   "blocks_per_batch": 512,
@@ -260,7 +260,7 @@
   "seed": 1729
  },
  "evaluation": {
-  "run": "run2_ranges",
+  "run": "run3",
   "agent_checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v8/run2_ranges/iter_0007/agent.pt",
   "embedding_checkpoint": "/home/zer0o0ne/ContinuousLearning/data/v8/run2_ranges/iter_0006/embedding.pt",
   "hands": 100000,

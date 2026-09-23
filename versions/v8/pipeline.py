@@ -75,6 +75,7 @@ from agent.policy import AgentPoolMember, FrozenAgentMember
 from env.driver import LockstepDriver
 from env.session import (assert_seeds_stay_distinct, build_sessions,
                          hand_seed_bases, phase_hands, play)
+from evaluation.identity import atomic_json
 from gates.g1 import _stack_bucket
 from nets.agent_net import AgentNet
 from nets.embedding_net import OpponentEmbeddingNet
@@ -491,15 +492,39 @@ def load_training_distribution(config, labels_path, n_members):
 
 def log_pool_distribution(pool, distribution, iteration, log):
     log(f"[{TAG}] iteration {iteration} training pool weights "
-        "(p = seat probability after PFSP, clustering and uniform floor):")
+        "(p = seat probability after PFSP, clustering and uniform floor; hero = PFSP score):")
+    evaluation_values = distribution.get("evaluation_bb_per_100", [None] * len(pool))
+    evaluation_shares = distribution.get("evaluation_mix", [0.0] * len(pool))
     for i, member in enumerate(pool):
         p = distribution["probabilities"][i]
         w = distribution["pfsp_weights"][i]
         cluster = distribution["cluster_of"][i]
         mean = distribution["hero_bb_per_100"][i]
         score = "unplayed" if mean is None else f"{mean:+.2f} BB/100"
+        evaluation, share = evaluation_values[i], evaluation_shares[i]
+        extra = "" if evaluation is None else f", eval={evaluation:+.2f} BB/100, eval_mix={share:.3f}"
         log(f"[{TAG}] pool[{i}] {member.name}: p={p:.8f} ({100*p:.4f}%), "
-            f"pfsp={w:.6f}, cluster={cluster}, hero={score}")
+            f"pfsp={w:.6f}, cluster={cluster}, hero={score}{extra}")
+
+
+def apply_evaluation_feedback(sampler, report, iteration, log):
+    """Called only by the training loop after evaluation; standalone is read-only."""
+    from evaluation.pool_eval import training_warm_feedback
+
+    if not sampler.evaluation_weight or report is None:
+        return None
+    if report["iteration"] != iteration or report["candidates"][0] != f"agent{iteration}":
+        raise ValueError("PFSP evaluation feedback must describe the current iteration's agent")
+    feedback = training_warm_feedback(report)
+    if feedback is None:
+        log(f"[{TAG}] PFSP feedback skipped: no training/warm evaluation")
+        return None
+    applied = sampler.update_evaluation(iteration, feedback["by_member"])
+    log(f"[{TAG}] PFSP training/warm feedback: current agent, {feedback['estimator']}, "
+        f"{feedback['units']} independent sessions, {len(feedback['by_member'])} opponents, "
+        f"evaluation_weight={sampler.evaluation_weight:g}, applied={applied}")
+    return {**feedback, "iteration": iteration, "run": report["run"],
+            "evaluation_weight": sampler.evaluation_weight, "applied": applied}
 
 
 def pool_evaluation(pool, descriptors, agent_net, embed_net, measured_config,
@@ -824,9 +849,9 @@ def run(config, log, exp_dir):
         log(f"[{TAG}] " + winrate_line(metrics.get("gap", {}),
                                        metrics.get("gap_cold", {})))
 
-        # Independent played-policy benchmark. It never updates PFSP, labels,
-        # targets or checkpoint selection. A stopped run resumes completed
-        # independent evaluation units before marking this iteration complete.
+        # The mixture stays fixed throughout evaluation. Only after completion
+        # can training/warm results feed the next iteration's PFSP state.
+        evaluation = None
         if config.get("pool_evaluation", {}).get("enabled", False):
             t0 = time.perf_counter()
             evaluation = pool_evaluation(
@@ -844,15 +869,18 @@ def run(config, log, exp_dir):
             sampler.update(int(member), float(result["hero_bb"]),
                            int(result["n_hands"]))
         sampler.end_iteration()
+        feedback = apply_evaluation_feedback(sampler, evaluation, k, log)
         new_members, new_desc = agent_variant_members(
             frozen_agent_net(agent_net.state_dict(), config, game, device), k,
             config, game, device, seed,
             embed_net=vintage if conditioned else None)
         pool += new_members
         descriptors += new_desc
-        _write_json(os.path.join(it_dir, "state.json"),
+        # Commit the feedback and its iteration marker together. A crash before
+        # this atomic commit resumes the original pre-update sampler instead.
+        atomic_json(os.path.join(it_dir, "state.json"),
                     {"sampler": sampler.state_dict(), "n_pool": len(pool),
-                     "iteration": k})
+                     "iteration": k, "evaluation_feedback": feedback})
         log(f"[{TAG}] iteration {k} done in "
             f"{sum(timings.values()):.1f}s ({timings}); pool is now "
             f"{len(pool)} members")

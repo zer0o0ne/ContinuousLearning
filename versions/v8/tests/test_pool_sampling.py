@@ -321,3 +321,66 @@ def test_every_table_size_gets_one_member_per_non_hero_seat():
         assert len(seats) == num_players - 1
         assert all(0 <= m < 6 for m in seats)
     assert s.sample_table(0) == []
+
+
+def test_evaluation_uses_a_separate_budget_independent_smoothed_estimate():
+    cfg = dict(CFG, result_decay=.5, evaluation_weight=.5)
+    small = PoolSampler(3, cfg, np.random.default_rng(1))
+    large = PoolSampler(3, cfg, np.random.default_rng(1))
+    for sampler, units in ((small, 1), (large, 100000)):
+        sampler.update(0, 100., 100)  # collection +100 BB/100
+        sampler.update(1, 0., 100)
+        sampler.end_iteration()
+        before = sampler.state_dict()
+        assert sampler.update_evaluation(0, {"0": {"bb_per_100": -100., "units": units}})
+        assert sampler.mean_bb_per_100()[0] == 0.  # equal source shares
+        assert sampler.state_dict()["hands"] == before["hands"]
+        assert sampler.state_dict()["bb"] == before["bb"]
+        assert sampler.state_dict()["rng_state"] == before["rng_state"]
+        # Without a fresh observation the evaluation share fades towards collection.
+        sampler.end_iteration()
+        assert sampler.mean_bb_per_100()[0] == 50.
+        assert sampler.update_evaluation(1, {"0": {"bb_per_100": -300., "units": units}})
+        assert sampler.evaluation_mean_bb_per_100()[0] == pytest.approx(-350 / 1.5)
+        assert sampler.mean_bb_per_100()[0] == pytest.approx((100 - 350 / 1.5) / 2)
+        assert sampler.mean_bb_per_100()[1] == 0.
+        assert np.isnan(sampler.mean_bb_per_100()[2])
+    assert small.state_dict() == large.state_dict()
+    assert small.distribution() == large.distribution()
+
+
+def test_evaluation_is_applied_once_and_survives_resume_pool_growth_and_legacy_state():
+    cfg = dict(CFG, evaluation_weight=.5)
+    sampler = PoolSampler(2, cfg, np.random.default_rng(1))
+    observation = {"0": {"bb_per_100": -50., "units": 3}}
+    assert sampler.update_evaluation(2, observation)
+    state = sampler.state_dict()
+    assert not sampler.update_evaluation(2, observation)
+    assert not sampler.update_evaluation(1, observation)
+    assert sampler.state_dict() == state
+    grown = PoolSampler(3, cfg, np.random.default_rng(9))
+    grown.load_state_dict(state)
+    assert not grown.update_evaluation(2, observation)
+    assert grown.mean_bb_per_100()[0] == -50.  # evaluation is the only evidence
+    assert np.isnan(grown.mean_bb_per_100()[1:]).all()
+    assert grown.state_dict()["evaluation"]["mass"] == [1., 0., 0.]
+
+    legacy = dict(state)
+    del legacy["evaluation"]
+    grown.load_state_dict(legacy)
+    assert np.isnan(grown.mean_bb_per_100()).all()
+    assert grown.update_evaluation(2, {})  # no surviving sessions is valid
+    assert not grown.update_evaluation(2, observation)
+
+
+def test_evaluation_weight_zero_keeps_the_original_pfsp():
+    sampler = _sampler()
+    state = sampler.state_dict()
+    assert not sampler.update_evaluation(0, {"0": {"bb_per_100": -1e6, "units": 10}})
+    assert sampler.state_dict() == state
+
+
+@pytest.mark.parametrize("weight", [-.1, 1.1, float("nan")])
+def test_invalid_evaluation_weight_is_rejected(weight):
+    with pytest.raises(ValueError, match="evaluation_weight"):
+        PoolSampler(2, dict(CFG, evaluation_weight=weight), np.random.default_rng(0))

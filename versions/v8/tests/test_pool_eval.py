@@ -260,3 +260,28 @@ def test_truncated_hands_are_discarded_in_pairs_and_resume(tmp_path, monkeypatch
     resumed = evaluate(pool, desc, candidates, cfg, tmp_path, 0, 8,
                        training_distribution=distribution(cfg, pool))
     assert resumed["benchmarks"] == report["benchmarks"]
+
+
+@pytest.mark.parametrize("control_variate", [True, False])
+def test_feedback_selects_only_new_training_warm_session_means(control_variate):
+    rows = [
+        {"raw": [10., 1000.], "cv": [2., 999.] if control_variate else None,
+         "hands": 20, "seconds": 1, "opponents": [0, 0]},
+        {"raw": [30., -1000.], "cv": [6., -999.] if control_variate else None,
+         "hands": 2000, "seconds": 1, "opponents": [0, 1]},
+        {"raw": None, "cv": None, "hands": 0, "seconds": 1, "opponents": [2]},
+    ]
+    warm = pool_eval.summarise(rows, .95, 10.)
+    warm["by_opponent"] = {str(i): pool_eval.summarise(
+        [r for r in rows if i in r["opponents"]], .95, 10.) for i in range(3)}
+    report = {"benchmarks": {"training": {"warm": warm, "cold": {"poison": True}},
+                             "current": {"warm": {"poison": True}}}}
+    feedback = pool_eval.training_warm_feedback(report)
+    # Equal session weights, no extra weight from longer hands or repeated seats.
+    assert feedback["by_member"] == {
+        "0": {"bb_per_100": 400. if control_variate else 2000., "units": 2},
+        "1": {"bb_per_100": 600. if control_variate else 3000., "units": 1}}
+    assert feedback["units"] == 2
+    assert feedback["estimator"] == ("cv" if control_variate else "raw")
+    del report["benchmarks"]["training"]["warm"]
+    assert pool_eval.training_warm_feedback(report) is None

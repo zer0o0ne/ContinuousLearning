@@ -78,6 +78,12 @@ right shape rather than a patch:
 `result_decay = 1.0` is the lifetime accumulation, kept reachable because it is
 the honest way to turn the mechanism off.
 
+Optional `evaluation_weight` blends in a separate, decayed estimate from the
+current agent's training/warm evaluation. Each iteration contributes one mean
+per opponent, over independent sessions, regardless of physical hand count.
+Evaluation never adds pseudo-hands to the collection accumulators. Missing
+evaluation coverage gradually loses influence as its accumulated mass decays.
+
 **The floor is an independent coin flip per draw.** A deterministic schedule
 ("every fifth draw") gives the same mean with less variance, and was the first
 implementation, but it aligns with table structure: at a fixed table size and a
@@ -146,7 +152,7 @@ class PoolSampler:
             the larger `n_members` and `load_state_dict` the smaller one's state
             into it (see `load_state_dict`).
         cfg: the `pool_sampling` config section (§8.1) — `pfsp_exponent`,
-            `floor_fraction`, `n_clusters`, `result_decay`.
+            `floor_fraction`, `n_clusters`, `result_decay`, `evaluation_weight`.
         rng: `np.random.Generator`. Owned by the sampler: its state is part of
             `state_dict`, so a restart resumes the same stream.
     """
@@ -158,6 +164,9 @@ class PoolSampler:
         self.floor_fraction = float(cfg["floor_fraction"])
         self.n_clusters = int(cfg["n_clusters"])
         self.result_decay = float(cfg["result_decay"])
+        self.evaluation_weight = float(cfg.get("evaluation_weight", 0.0))
+        if not 0 <= self.evaluation_weight <= 1:
+            raise ValueError("pool_sampling.evaluation_weight must be in [0, 1]")
         assert 0.0 <= self.floor_fraction <= 1.0, (
             f"floor_fraction is a fraction of draws, got {self.floor_fraction}")
         assert 0.0 < self.result_decay <= 1.0, (
@@ -168,6 +177,9 @@ class PoolSampler:
         # count is an *effective* number of hands, not a tally.
         self._hands = np.zeros(self.n_members, dtype=np.float64)
         self._bb = np.zeros(self.n_members, dtype=np.float64)
+        self._evaluation_sum = np.zeros(self.n_members, dtype=np.float64)
+        self._evaluation_mass = np.zeros(self.n_members, dtype=np.float64)
+        self._last_evaluation_iteration = -1
         # Until `set_vectors` is called there is no embedding space to cluster
         # in, so every member is its own cluster and the dedup step is a no-op.
         self._cluster_of = np.arange(self.n_members, dtype=np.int64)
@@ -199,12 +211,61 @@ class PoolSampler:
         """
         self._hands *= self.result_decay
         self._bb *= self.result_decay
+        self._evaluation_sum *= self.result_decay
+        self._evaluation_mass *= self.result_decay
 
-    def mean_bb_per_100(self):
-        """Hero's BB/100 against each member; `nan` where there is no result."""
+    def update_evaluation(self, iteration, by_member):
+        """Add this generation's session means once, after end_iteration().
+
+        `units` counts independent sessions, not hands or cyclic seatings. It
+        establishes that an estimate exists; it does not scale that generation's
+        contribution. More evaluation improves the estimate's precision without
+        increasing its mixture weight. Empty observations still mark the
+        generation consumed, so a rerun cannot later insert it twice.
+        """
+        if not self.evaluation_weight or iteration <= self._last_evaluation_iteration:
+            return False
+        values = []
+        for member, result in by_member.items():
+            i, units, mean = int(member), result["units"], result["bb_per_100"]
+            if (not 0 <= i < self.n_members or int(units) != units or units <= 0
+                    or mean is None or not np.isfinite(mean)):
+                raise ValueError("Evaluation feedback needs a finite mean over valid sessions per member")
+            values.append((i, float(mean)))
+        for i, mean in values:
+            self._evaluation_sum[i] += mean
+            self._evaluation_mass[i] += 1.0
+        self._last_evaluation_iteration = int(iteration)
+        return True
+
+    def collection_mean_bb_per_100(self):
+        """Hero's BB/100 from label collection only; NaN when unplayed."""
         out = np.full(self.n_members, np.nan, dtype=np.float64)
         played = self._hands > 0
         out[played] = 100.0 * self._bb[played] / self._hands[played]
+        return out
+
+    def evaluation_mean_bb_per_100(self):
+        out = np.full(self.n_members, np.nan, dtype=np.float64)
+        np.divide(self._evaluation_sum, self._evaluation_mass, out=out,
+                  where=self._evaluation_mass > 0)
+        return out
+
+    def evaluation_mix(self):
+        """Effective evaluation share, fading if this opponent is not revisited."""
+        share = self.evaluation_weight * np.minimum(1.0, self._evaluation_mass)
+        # With no collection evidence, evaluation is the only known result.
+        share[(self._hands == 0) & (share > 0)] = 1.0
+        return share
+
+    def mean_bb_per_100(self):
+        """The collection/evaluation mixture PFSP ranks; NaN when unplayed."""
+        out = self.collection_mean_bb_per_100()
+        share = self.evaluation_mix()
+        seen = share > 0
+        prior = np.where(np.isfinite(out), out, 0.0)
+        out[seen] = ((1 - share[seen]) * prior[seen]
+                     + share[seen] * self.evaluation_mean_bb_per_100()[seen])
         return out
 
     def hardness(self):
@@ -265,11 +326,16 @@ class PoolSampler:
 
     def distribution(self):
         """JSON-safe snapshot of the mixture used to collect training labels."""
+        def finite(values):
+            return [float(x) if np.isfinite(x) else None for x in values]
+
         return {"probabilities": self.probabilities().tolist(),
                 "pfsp_weights": self.weights().tolist(),
                 "cluster_of": self._cluster_of.tolist(),
-                "hero_bb_per_100": [float(x) if np.isfinite(x) else None
-                                    for x in self.mean_bb_per_100()]}
+                "hero_bb_per_100": finite(self.mean_bb_per_100()),
+                "collection_bb_per_100": finite(self.collection_mean_bb_per_100()),
+                "evaluation_bb_per_100": finite(self.evaluation_mean_bb_per_100()),
+                "evaluation_mix": self.evaluation_mix().tolist()}
 
     def _draw_pfsp(self):
         """One member: a cluster by mean weight, then a member inside it."""
@@ -315,6 +381,9 @@ class PoolSampler:
             "bb": self._bb.tolist(),
             "cluster_of": self._cluster_of.tolist(),
             "rng_state": self.rng.bit_generator.state,
+            "evaluation": {"sum_bb_per_100": self._evaluation_sum.tolist(),
+                           "mass": self._evaluation_mass.tolist(),
+                           "last_iteration": self._last_evaluation_iteration},
         }
 
     def load_state_dict(self, state):
@@ -336,6 +405,12 @@ class PoolSampler:
         self._bb = np.zeros(self.n_members, dtype=np.float64)
         self._hands[:n_old] = np.asarray(state["hands"], dtype=np.float64)
         self._bb[:n_old] = np.asarray(state["bb"], dtype=np.float64)
+        evaluation = state.get("evaluation", {})
+        self._evaluation_sum = np.zeros(self.n_members, dtype=np.float64)
+        self._evaluation_mass = np.zeros(self.n_members, dtype=np.float64)
+        self._evaluation_sum[:n_old] = evaluation.get("sum_bb_per_100", [0.0] * n_old)
+        self._evaluation_mass[:n_old] = evaluation.get("mass", [0.0] * n_old)
+        self._last_evaluation_iteration = int(evaluation.get("last_iteration", -1))
         clusters = np.asarray(state["cluster_of"], dtype=np.int64)
         self._cluster_of = np.arange(self.n_members, dtype=np.int64)
         self._cluster_of[:n_old] = clusters

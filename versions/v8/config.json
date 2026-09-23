@@ -226,7 +226,8 @@
   "pfsp_exponent": 2.0,
   "floor_fraction": 0.2,
   "n_clusters": 32,
-  "result_decay": 0.8
+  "result_decay": 0.8,
+  "evaluation_weight": 0.5
  },
  "agent_train": {
   "loss": "soft_q",

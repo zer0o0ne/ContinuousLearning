@@ -166,6 +166,27 @@ def configuration(config):
     return out
 
 
+def training_warm_feedback(report):
+    """Current-policy session means for PFSP; all other measurements stay out.
+
+    `by_opponent` counts a session once even when that member occupies several
+    seats. Its new-policy mean already averages cyclic rotations within each
+    session and then weights the surviving sessions equally.
+    """
+    warm = report["benchmarks"].get("training", {}).get("warm")
+    if warm is None:
+        return None
+    estimator = "cv" if warm["cv"] is not None else "raw"
+    by_member = {}
+    for member, summary in warm["by_opponent"].items():
+        values = summary[estimator]
+        if values is not None and values["new"]["units"]:
+            new = values["new"]
+            by_member[member] = {"bb_per_100": new["bb_per_100"], "units": new["units"]}
+    return {"source": "training/warm", "estimator": estimator,
+            "units": warm["units"], "by_member": by_member}
+
+
 def _identity(pool, descriptors, candidates, game, emb_cfg, cfg, iteration, bootstrap_size,
               training_probabilities):
     cache = {}

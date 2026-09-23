@@ -546,6 +546,7 @@ def test_all_truncated_hands_do_not_stop_training_or_evaluation(tmp_path, monkey
     import env.driver
     monkeypatch.setattr(env.driver, "max_actions_for", lambda _n: 1)
     cfg = copy.deepcopy(toy_config(n_iterations=1))
+    cfg["pool_sampling"]["evaluation_weight"] = .5
     cfg["game"]["players_range"] = [2, 2]
     cfg["game"]["stack_bb_range"] = [10, 10]
     # Calling prevents a one-action fold from legitimately finishing a hand.
@@ -563,6 +564,9 @@ def test_all_truncated_hands_do_not_stop_training_or_evaluation(tmp_path, monkey
     assert metrics[0]["n_labels"] == 0
     assert metrics[0]["gap"] == {"n_heldout": 0}
     assert os.path.exists(os.path.join(exp_dir, "iter_0000", "state.json"))
+    state = json.load(open(os.path.join(exp_dir, "iter_0000", "state.json")))
+    assert state["evaluation_feedback"]["by_member"] == {}
+    assert state["sampler"]["evaluation"]["last_iteration"] == 0
     assert any("no complete corpus hands" in m for m in messages)
     assert any("no valid training labels" in m for m in messages)
     assert any("pool[0]" in m and "p=" in m for m in messages)
@@ -584,6 +588,67 @@ def test_legacy_training_distribution_uses_labels_state_before_result_update(tmp
     assert sampler.distribution() != expected
     restored = pipeline.load_training_distribution(cfg, labels_path, 3)
     assert restored == expected
+
+
+def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, monkeypatch):
+    from evaluation import pool_eval
+    from pool_eval_pipeline import run_saved
+
+    cfg = copy.deepcopy(toy_config())
+    cfg["game"]["players_range"] = [2, 2]
+    cfg["game"]["stack_bb_range"] = [10, 10]
+    cfg["pool_sampling"]["evaluation_weight"] = .5
+    cfg["pool_evaluation"] = {
+        "enabled": True, "run": "feedback", "benchmarks": ["current", "training"],
+        "cold_blocks": 2, "warm_sessions": 6, "warm_hands_per_session": 3,
+        "runout_samples": 2}
+    measured, exp_dir = _run(tmp_path, cfg)
+    states = [json.load(open(os.path.join(exp_dir, f"iter_{k:04d}", "state.json")))
+              for k in range(2)]
+    labels = [json.load(open(os.path.join(exp_dir, f"iter_{k:04d}", "labels.json")))
+              for k in range(2)]
+    for k in range(2):
+        feedback = states[k]["evaluation_feedback"]
+        assert feedback["source"] == "training/warm"
+        assert feedback["applied"] is True
+        assert feedback["by_member"]
+        assert states[k]["sampler"]["evaluation"]["last_iteration"] == k
+        assert measured[k]["pool_evaluation"]["training_distribution"] == labels[k]["pool_distribution"]
+        assert labels[k]["sampler"]["evaluation"]["last_iteration"] == k - 1
+    for member, result in states[0]["evaluation_feedback"]["by_member"].items():
+        i = int(member)
+        assert labels[1]["pool_distribution"]["evaluation_bb_per_100"][i] == result["bb_per_100"]
+        share = 1. if labels[1]["pool_distribution"]["collection_bb_per_100"][i] is None else .5
+        assert labels[1]["pool_distribution"]["evaluation_mix"][i] == share
+
+    # Even with feedback enabled in the config, standalone evaluation cannot
+    # rewrite the training sampler or consume another observation.
+    state_path = os.path.join(exp_dir, "iter_0001", "state.json")
+    before = open(state_path, "rb").read()
+    standalone = copy.deepcopy(cfg)
+    standalone["pool_evaluation"]["run"] = "standalone"
+    run_saved(standalone, exp_dir, 1, log=lambda _: None)
+    assert open(state_path, "rb").read() == before
+
+    # Simulate a crash after feedback was computed but before its atomic commit.
+    os.remove(state_path)
+    real_commit = pipeline.atomic_json
+    def interrupt(path, payload):
+        if str(path) == state_path:
+            assert payload["sampler"]["evaluation"]["last_iteration"] == 1
+            raise RuntimeError("interrupted before sampler commit")
+        return real_commit(path, payload)
+    monkeypatch.setattr(pipeline, "atomic_json", interrupt)
+    monkeypatch.setattr(pipeline, "train_agent", lambda *a, **kw: pytest.fail("retrained a checkpoint"))
+    monkeypatch.setattr(pool_eval, "_play_units", lambda *a: pytest.fail("replayed completed evaluation"))
+    with pytest.raises(RuntimeError, match="before sampler commit"):
+        run(cfg, lambda _: None, exp_dir)
+    assert not os.path.exists(state_path)
+    monkeypatch.setattr(pipeline, "atomic_json", real_commit)
+    run(cfg, lambda _: None, exp_dir)
+    assert json.load(open(state_path)) == states[1]
+    assert run(cfg, lambda _: None, exp_dir) == []
+    assert json.load(open(state_path)) == states[1]
 
 
 # -------------------------------------------------- 5: the CLAUDE.md §1 rule

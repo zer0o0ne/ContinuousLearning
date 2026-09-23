@@ -37,6 +37,31 @@ from tests.g1_fixtures import (
     make_pool,
 )
 
+
+def test_truncated_source_hand_is_absent_from_tokens_labels_and_pfsp():
+    from env.session import Session, play
+    from tests.g1_fixtures import make_specs
+    from train.generate import _hero_decisions, _results_by_member
+
+    pool = make_pool()
+    specs = make_specs(n_hands=3, n_members=len(pool), num_players=3)
+    session = Session(0, 3, 100, [-1, 0, 1], specs=specs)
+    play(LockstepDriver(pool, N_ACTIONS), [session], 3, lambda _: None, "test")
+    session.records[1].truncated = True
+    session.records[1].rewards[:] = 1e12
+    tokens = session.tokens(MAX_PLAYERS, N_ACTIONS)
+    assert len(tokens) == 2
+    # Discarding hand 1 must not renumber hand 2 and rotate its hero seat.
+    from nets.features import hand_tokens
+    expected = hand_tokens(session.records[2], session.seat_of_slot(0, 2),
+                           session.slot_of_seat(2), MAX_PLAYERS, N_ACTIONS)
+    np.testing.assert_array_equal(tokens[1].cards, expected.cards)
+    assert all(h != 1 for _, h, _ in _hero_decisions([session], [[0, 1, 2]]))
+    results = _results_by_member([session])
+    expected_bb = sum(session.records[h].rewards[session.seat_of_slot(0, h)]
+                      / BIG_BLIND for h in (0, 2))
+    assert results == {i: {"hero_bb": expected_bb, "n_hands": 2} for i in (0, 1)}
+
 GAME = {
     "n_actions": N_ACTIONS,
     "max_players": MAX_PLAYERS,

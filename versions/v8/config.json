@@ -245,8 +245,8 @@
  },
  "pool_evaluation": {
   "enabled": true,
-  "run": "pilot_v2",
-  "benchmarks": ["current", "anchor"],
+  "run": "weighted_v1",
+  "benchmarks": ["current", "training"],
   "cold_blocks": 128000,
   "warm_sessions": 160,
   "warm_hands_per_session": 100,

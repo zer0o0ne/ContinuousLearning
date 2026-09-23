@@ -468,6 +468,8 @@ def build_targets(labels, loss, temperature, divisor, iteration=0):
 
 def split_heldout(n, fraction, seed, iteration):
     """(train, held-out) index arrays. Deterministic in `(seed, iteration)`."""
+    if n == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
     rng = np.random.default_rng([int(seed), int(iteration), 23])
     perm = rng.permutation(int(n))
     n_held = int(round(float(fraction) * int(n)))
@@ -477,9 +479,32 @@ def split_heldout(n, fraction, seed, iteration):
     return np.sort(perm[n_held:]), np.sort(perm[:n_held])
 
 
+def load_training_distribution(config, labels_path, n_members):
+    """Read the pre-update mixture, including for checkpoints predating snapshots."""
+    saved = _read_json(labels_path)
+    if "pool_distribution" in saved:
+        return saved["pool_distribution"]
+    sampler = PoolSampler(n_members, config["pool_sampling"], np.random.default_rng(0))
+    sampler.load_state_dict(saved["sampler"])
+    return sampler.distribution()
+
+
+def log_pool_distribution(pool, distribution, iteration, log):
+    log(f"[{TAG}] iteration {iteration} training pool weights "
+        "(p = seat probability after PFSP, clustering and uniform floor):")
+    for i, member in enumerate(pool):
+        p = distribution["probabilities"][i]
+        w = distribution["pfsp_weights"][i]
+        cluster = distribution["cluster_of"][i]
+        mean = distribution["hero_bb_per_100"][i]
+        score = "unplayed" if mean is None else f"{mean:+.2f} BB/100"
+        log(f"[{TAG}] pool[{i}] {member.name}: p={p:.8f} ({100*p:.4f}%), "
+            f"pfsp={w:.6f}, cluster={cluster}, hero={score}")
+
+
 def pool_evaluation(pool, descriptors, agent_net, embed_net, measured_config,
-                    config, exp_dir, iteration, anchor_size, device, log,
-                    reference_iteration=None):
+                    config, exp_dir, iteration, bootstrap_size, device, log,
+                    reference_iteration=None, training_distribution=None):
     """Compare the completed checkpoint with the preceding policy, no feedback."""
     from evaluation.pool_eval import Candidate, configuration, evaluate
 
@@ -494,7 +519,7 @@ def pool_evaluation(pool, descriptors, agent_net, embed_net, measured_config,
                              game["max_players"], device, embed_net=embed_net)
     if reference >= 0:
         variants = int(config["style"]["agent_variants"])
-        base = pool[anchor_size + reference * variants]
+        base = pool[bootstrap_size + reference * variants]
         previous = torch.load(os.path.join(_iter_dir(exp_dir, reference), "agent.pt"),
                               map_location="cpu", weights_only=False)
         old_config = previous.get("config") or config
@@ -517,9 +542,13 @@ def pool_evaluation(pool, descriptors, agent_net, embed_net, measured_config,
         old, old_config = members[0], config
     candidates = [Candidate(new, measured_config["embedding_net"]),
                   Candidate(old, old_config["embedding_net"])]
+    if "training" in cfg["benchmarks"] and training_distribution is None:
+        training_distribution = load_training_distribution(
+            measured_config, os.path.join(_iter_dir(exp_dir, iteration), "labels.json"), len(pool))
+        log_pool_distribution(pool, training_distribution, iteration, log)
     return evaluate(pool, descriptors, candidates, config,
                     os.path.join(_iter_dir(exp_dir, iteration), "pool_evaluation"),
-                    iteration, anchor_size, log)
+                    iteration, bootstrap_size, log, training_distribution=training_distribution)
 
 
 # -------------------------------------------------------------------- the loop
@@ -697,6 +726,7 @@ def run(config, log, exp_dir):
             # rows are excluded: nobody has ever occupied them.
             sampler.set_vectors(
                 embed_net.embeddings.weight[:len(pool)].detach().cpu().numpy())
+            log_pool_distribution(pool, sampler.distribution(), k, log)
             t0 = time.perf_counter()
             manifest = generate_labels(
                 LockstepDriver(pool, int(game["n_actions"])), pool, sampler,
@@ -713,6 +743,7 @@ def run(config, log, exp_dir):
             manifest = {**manifest, "stats": asdict(manifest["stats"])}
             _write_json(labels_path, {"manifest": manifest,
                                       "sampler": sampler.state_dict(),
+                                      "pool_distribution": sampler.distribution(),
                                       "timings": timings})
 
         labels = [lab for path in manifest["shards"] for lab in load_shard(path)]
@@ -735,16 +766,24 @@ def run(config, log, exp_dir):
             t0 = time.perf_counter()
             torch.manual_seed(_iteration_seed(seed, k))
             picked = [labels[i] for i in train_idx]
-            history = train_agent(
-                agent_net, [lab["tokens"] for lab in picked],
-                build_targets(picked, loss, temperature, divisor, iteration=k),
-                [lab["embeddings"] for lab in picked], train_cfg, device, log,
-                seed=_iteration_seed(seed, k), iteration=k)
+            if picked:
+                history = train_agent(
+                    agent_net, [lab["tokens"] for lab in picked],
+                    build_targets(picked, loss, temperature, divisor, iteration=k),
+                    [lab["embeddings"] for lab in picked], train_cfg, device, log,
+                    seed=_iteration_seed(seed, k), iteration=k)
+            else:
+                history = []
+                log(f"[{TAG}] no valid training labels; keeping the agent weights for iteration {k}")
             timings["agent"] = time.perf_counter() - t0
             torch.save({"model_state_dict": agent_net.state_dict(),
                         "config": config, "iteration": k, "history": history,
                         "q_estimator": manifest.get("q_estimator", "legacy")},
                        agent_path)
+
+        training_distribution = load_training_distribution(measured_config, labels_path, len(pool))
+        if blob is not None:
+            log_pool_distribution(pool, training_distribution, k, log)
 
         # ------------------------------------------------- D: the oracle gap
         metrics_path = os.path.join(it_dir, "metrics.json")
@@ -792,7 +831,8 @@ def run(config, log, exp_dir):
             t0 = time.perf_counter()
             evaluation = pool_evaluation(
                 pool, descriptors, agent_net, embed_net, measured_config,
-                config, exp_dir, k, n_pool0, device, log)
+                config, exp_dir, k, n_pool0, device, log,
+                training_distribution=training_distribution)
             timings["pool_evaluation"] = time.perf_counter() - t0
             metrics["pool_evaluation"] = evaluation
             metrics["timings"] = timings

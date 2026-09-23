@@ -26,7 +26,7 @@ def run_saved(config, exp_dir, iteration, reference=None, log=print):
     device = resolve_device(config.get("device", "auto"))
     seed = int(config.get("seed", 0))
     pool, descriptors = build_pool(config, np.random.default_rng(seed), device=device, log=log)
-    anchor_size = len(pool)
+    bootstrap_size = len(pool)
     generations = embedding_vintages(str(exp_dir), iteration+1, config, game, device, True, log)
     conditioned = config["embedding_net"].get("pool_agent_vectors", "zero") == "amortised"
     new_net = measured = None
@@ -43,7 +43,7 @@ def run_saved(config, exp_dir, iteration, reference=None, log=print):
             pool.extend(members)
             descriptors.extend(desc)
     return pool_evaluation(pool, descriptors, new_net, generations[iteration], measured,
-                            config, str(exp_dir), iteration, anchor_size, device, log,
+                            config, str(exp_dir), iteration, bootstrap_size, device, log,
                             reference_iteration=reference)
 
 

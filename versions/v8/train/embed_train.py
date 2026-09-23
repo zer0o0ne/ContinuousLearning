@@ -66,6 +66,10 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
     n_strength = sum(int((t.own_strength >= 0).sum()) for t in corpus)
     log(f"[train] corpus: {len(corpus)} hands, {n_decision} decision tokens, "
         f"{n_showdown} showdown tokens, {n_strength} strength targets")
+    if not corpus:
+        log("[train] no complete corpus hands; skipping embedding update")
+        net.eval()
+        return []
 
     steps = steps_for_iteration(cfg, iteration, "first_retrain_steps")
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["lr"],

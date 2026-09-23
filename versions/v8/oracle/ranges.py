@@ -323,6 +323,10 @@ def label_ranges(sessions, pool, n_actions, floor=1e-6, prune=0.0, desc=None):
     for session in sessions:
         session.ranges = []
         for h, record in enumerate(session.records):
+            if record is None or record.truncated:
+                session.ranges.append({})
+                bar.update(1)
+                continue
             ranges, one = hand_ranges(
                 record, observer_pos=session.seat_of_slot(0, h), pool=pool,
                 n_actions=n_actions, floor=floor, prune=prune)

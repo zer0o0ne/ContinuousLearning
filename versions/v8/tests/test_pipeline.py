@@ -509,7 +509,7 @@ def test_pool_evaluation_runs_after_training_without_changing_training(tmp_path)
     cfg["game"]["stack_bb_range"] = [10, 10]
     baseline, baseline_dir = _run(tmp_path, cfg, name="without_eval")
     cfg["pool_evaluation"] = {
-        "enabled": True, "run": "test", "benchmarks": ["current", "anchor"],
+        "enabled": True, "run": "test", "benchmarks": ["current", "training"],
         "cold_blocks": 2, "warm_sessions": 1, "warm_hands_per_session": 3,
         "blocks_per_batch": 2, "batch_hands": 64, "runout_samples": 2}
     measured, measured_dir = _run(tmp_path, cfg, name="with_eval")
@@ -533,6 +533,57 @@ def test_pool_evaluation_runs_after_training_without_changing_training(tmp_path)
         for mode in modes:
             assert modes[mode]["units"] == measured[1]["pool_evaluation"]["benchmarks"][benchmark][mode]["units"]
     assert separate["candidates"] == ["agent1", "agent0"]
+    # Evaluation restores the collection mixture, not the sampler after the
+    # iteration's results/decay, nor newly edited sampling settings.
+    saved = json.load(open(os.path.join(measured_dir, "iter_0001", "labels.json")))
+    assert separate["training_distribution"] == saved["pool_distribution"]
+    cfg["pool_sampling"]["floor_fraction"] = 1.0
+    repeated = run_saved(cfg, measured_dir, 1, reference=0, log=lambda _: None)
+    assert repeated["benchmarks"] == separate["benchmarks"]
+
+
+def test_all_truncated_hands_do_not_stop_training_or_evaluation(tmp_path, monkeypatch):
+    import env.driver
+    monkeypatch.setattr(env.driver, "max_actions_for", lambda _n: 1)
+    cfg = copy.deepcopy(toy_config(n_iterations=1))
+    cfg["game"]["players_range"] = [2, 2]
+    cfg["game"]["stack_bb_range"] = [10, 10]
+    # Calling prevents a one-action fold from legitimately finishing a hand.
+    cfg["bootstrap"] = [{"kind": "degenerate", "strategy": "always_call",
+                         "style": "identity", "label": f"caller{i}"} for i in range(9)]
+    cfg["agent_init"] = {"kind": "degenerate", "strategy": "always_call", "style": "identity"}
+    cfg["pool_evaluation"] = {
+        "enabled": True, "run": "test", "benchmarks": ["current", "training"],
+        "cold_blocks": 2, "warm_sessions": 1, "warm_hands_per_session": 3,
+        "runout_samples": 2}
+    messages = []
+    exp_dir = str(tmp_path / "all_truncated")
+    metrics = run(cfg, messages.append, exp_dir)
+    assert len(metrics) == 1
+    assert metrics[0]["n_labels"] == 0
+    assert metrics[0]["gap"] == {"n_heldout": 0}
+    assert os.path.exists(os.path.join(exp_dir, "iter_0000", "state.json"))
+    assert any("no complete corpus hands" in m for m in messages)
+    assert any("no valid training labels" in m for m in messages)
+    assert any("pool[0]" in m and "p=" in m for m in messages)
+
+
+def test_legacy_training_distribution_uses_labels_state_before_result_update(tmp_path):
+    from pool.sampling import PoolSampler
+    cfg = toy_config()
+    sampler = PoolSampler(3, cfg["pool_sampling"], np.random.default_rng(0))
+    sampler.set_vectors(np.array([[0.], [0.], [10.]]))
+    sampler.update(0, -10., 100)
+    sampler.update(1, 10., 100)
+    sampler.update(2, 0., 100)
+    expected = sampler.distribution()
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(json.dumps({"sampler": sampler.state_dict()}))
+    sampler.update(0, 1000., 100)  # the end-of-iteration mixture is different
+    sampler.end_iteration()
+    assert sampler.distribution() != expected
+    restored = pipeline.load_training_distribution(cfg, labels_path, 3)
+    assert restored == expected
 
 
 # -------------------------------------------------- 5: the CLAUDE.md §1 rule

@@ -61,7 +61,7 @@ from oracle.ranges import HandRangeCache
 FOLD = 0
 N_CARDS = 52
 RANGE_MODEL = "all_seats_reach_v2"
-Q_ESTIMATOR = "independent_runout_cv_v1"
+Q_ESTIMATOR = "independent_runout_cv_v2_skip_truncated"
 
 
 def estimator_signature(oracle, embedding=None):
@@ -121,6 +121,7 @@ class LabelStats:
     seconds: float         # wall clock of the whole call
     collision_rate: float  # fraction of joint draws rejected (§7.3)
     n_rollouts: int        # hands actually played
+    discarded_rollouts: int = 0  # includes other actions of a truncated sample
 
 
 def _rollout_seed(*parts):
@@ -350,11 +351,14 @@ def hero_values(played, hero_pos):
     (`env/runout.py`), the raw chip delta otherwise. Both are unbiased for the
     same expectation, so only the noise on the average differs — which is why
     everything that averages rollouts, the oracle and G3's split-half alike,
-    reads them through here rather than off `rewards`.
+    reads them through here rather than off `rewards`. Truncated hands return
+    NaN: their unfinished chip deltas are not outcomes. `_label_q` drops the
+    whole common-randomness sample before comparing its actions.
     """
     return np.asarray(
-        [(r.rewards if r.baseline_rewards is None
-          else r.baseline_rewards)[hero_pos] for r in played],
+        [np.nan if r.truncated else
+         (r.rewards if r.baseline_rewards is None else r.baseline_rewards)[hero_pos]
+         for r in played],
         dtype=np.float64)
 
 
@@ -362,18 +366,21 @@ def _label_q(plan, played, seconds):
     """`(q, legal, stats)` from the hands `plan.specs` turned into."""
     q, legal_idx = plan.q, plan.legal_idx
     forwards = plan.forwards
-    forwards += sum(len(r.decisions) - plan.prefix_len - 1 for r in played)
+    forwards += sum(max(0, len(r.decisions) - plan.prefix_len - 1) for r in played)
 
+    discarded = 0
     if played:
-        rewards = hero_values(played, plan.hero_pos)
-        q[legal_idx] = (rewards.reshape(plan.n_samples, len(legal_idx)).mean(axis=0)
-                        / plan.big_blind)
+        rewards = hero_values(played, plan.hero_pos).reshape(plan.n_samples, len(legal_idx))
+        valid = np.isfinite(rewards).all(axis=1)
+        discarded = int((~valid).sum()) * len(legal_idx)
+        if valid.any():
+            q[legal_idx] = rewards[valid].mean(axis=0) / plan.big_blind
 
     stats = LabelStats(
         forwards=forwards,
         seconds=seconds,
         collision_rate=(plan.rejected / plan.attempts) if plan.attempts else 0.0,
-        n_rollouts=len(played))
+        n_rollouts=len(played), discarded_rollouts=discarded)
     return q, plan.legal, stats
 
 

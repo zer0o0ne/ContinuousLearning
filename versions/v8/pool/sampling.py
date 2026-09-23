@@ -252,6 +252,25 @@ class PoolSampler:
 
     # ---------------------------------------------------------------- sampling
 
+    def probabilities(self):
+        """Exact marginal seat probabilities, including dedup and uniform floor.
+
+        P(cluster) * P(member | cluster) reduces to w_i / cluster_size_i,
+        normalised across all members. Reading it does not advance the RNG.
+        """
+        counts = np.bincount(self._cluster_of)
+        weighted = self.weights() / counts[self._cluster_of]
+        return (self.floor_fraction / self.n_members
+                + (1 - self.floor_fraction) * weighted / weighted.sum())
+
+    def distribution(self):
+        """JSON-safe snapshot of the mixture used to collect training labels."""
+        return {"probabilities": self.probabilities().tolist(),
+                "pfsp_weights": self.weights().tolist(),
+                "cluster_of": self._cluster_of.tolist(),
+                "hero_bb_per_100": [float(x) if np.isfinite(x) else None
+                                    for x in self.mean_bb_per_100()]}
+
     def _draw_pfsp(self):
         """One member: a cluster by mean weight, then a member inside it."""
         w = self.weights()

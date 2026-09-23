@@ -10,6 +10,7 @@ by measurement.
 """
 
 import copy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +26,26 @@ from tests.g1_fixtures import (BIG_BLIND, N_ACTIONS, RAISE_SIZES, SMALL_BLIND,
 CALL = 1
 ALLIN = N_ACTIONS - 1
 HARD = 1e9          # softmaxes to an exact one-hot, so a rollout is a function
+
+
+@pytest.mark.parametrize("all_truncated", [False, True])
+def test_oracle_drops_capped_samples_for_every_action(all_truncated):
+    from oracle.rollout import _label_q
+    plan = SimpleNamespace(q=np.full(3, np.nan), legal_idx=[0, 2],
+                           legal=np.array([True, False, True]), forwards=0,
+                           prefix_len=0, n_samples=2, hero_pos=0,
+                           big_blind=10., rejected=0, attempts=2)
+    # Sample 0 has one broken action: its other action must also be dropped.
+    records = [SimpleNamespace(rewards=np.array([value]), baseline_rewards=None,
+                               truncated=bad, decisions=[{}])
+               for value, bad in [(1e12, True), (1e12, False),
+                                   (20., all_truncated), (40., False)]]
+    q, legal, stats = _label_q(plan, records, 0.)
+    assert stats.discarded_rollouts == (4 if all_truncated else 2)
+    if all_truncated:
+        assert np.isnan(q[legal]).all()  # label generation drops this target
+    else:
+        np.testing.assert_array_equal(q[legal], [2., 4.])
 
 
 # ------------------------------------------------------------------- members

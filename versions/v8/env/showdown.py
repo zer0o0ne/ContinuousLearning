@@ -151,6 +151,8 @@ def label_showdowns(records, device="cpu", desc=None):
     labelled = 0
     for record in progress(records, desc=desc, unit="hand",
                            disable=desc is None):
+        if record.truncated:
+            continue
         seats = list(range(record.num_players))
         holes = np.array([record.hole_cards(p) for p in seats], dtype=np.int64)
         strengths = strength_percentiles(record.deck[:5], holes, device=device)

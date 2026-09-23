@@ -22,6 +22,23 @@ CFG = {"pfsp_exponent": 2.0, "floor_fraction": 0.2, "n_clusters": 3,
        "result_decay": 1.0}
 
 
+def test_seat_probabilities_include_cluster_sizes_zero_weights_and_floor():
+    s = PoolSampler(4, CFG, np.random.default_rng(0))
+    # Three equal hard opponents in one cluster; one easy singleton.
+    s.set_vectors(np.array([[0.], [0.], [0.], [10.]]))
+    for i, score in enumerate([-10., -10., -10., 10.]):
+        s.update(i, score, 100)
+    before = s.state_dict()
+    np.testing.assert_allclose(s.probabilities(), [.05 + .8/3]*3 + [.05])
+    assert s.distribution()["hero_bb_per_100"] == [-10., -10., -10., 10.]
+    assert s.state_dict() == before
+
+    fresh = PoolSampler(4, CFG, np.random.default_rng(0))
+    fresh.set_vectors(np.array([[0.], [0.], [0.], [10.]]))
+    np.testing.assert_allclose(fresh.probabilities(), [.05 + .4/3]*3 + [.45])
+    assert fresh.distribution()["hero_bb_per_100"] == [None]*4
+
+
 def _sampler(cfg=CFG, n_members=6, seed=7):
     """A pool hero loses 5 BB/100 to member 0, 1 BB/100 to member 1, and beats
     every other member by 10 BB/100.

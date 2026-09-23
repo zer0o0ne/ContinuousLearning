@@ -73,6 +73,7 @@ class Session:
 
         `window` keeps only the last `window` hands played, the history the fit
         is allowed to look at; `None` is the whole session so far.
+        Truncated hands are excluded without renumbering later hands or seats.
 
         The §5.7 range targets are hero's: they name a (token, seat) at which
         hero has a live opponent, and `hand_tokens` refuses a key naming a seat
@@ -83,6 +84,8 @@ class Session:
         lo = 0 if window is None else max(0, len(self.records) - int(window))
         out = []
         for h in range(lo, len(self.records)):
+            if self.records[h] is None or self.records[h].truncated:
+                continue
             out.append(hand_tokens(
                 self.records[h],
                 observer_pos=self.seat_of_slot(observer_slot, h),
@@ -215,14 +218,14 @@ def play(driver, sessions, batch_size, log, tag, bar=True):
     for s in sessions:
         s.records = records[cursor:cursor + len(s.specs)]
         cursor += len(s.specs)
-        n_decisions += sum(len(r.decisions) for r in s.records)
+        n_decisions += sum(len(r.decisions) for r in s.records if not r.truncated)
         truncated += sum(1 for r in s.records if r.truncated)
     # §5.1a: the showdown labels are cards-only, so they are computed once here
     # over the whole set and never again inside a training or fitting loop.
     n_reveals = label_showdowns(records,
                                 desc=f"showdown:{tag}" if bar else None)
-    n_showdown_hands = sum(1 for r in records if r.showdown)
+    n_showdown_hands = sum(1 for r in records if r.showdown and not r.truncated)
     log(f"[{tag}] {n_decisions} decisions, {n_reveals} reveals over "
         f"{n_showdown_hands} showdown hands, {truncated} hands hit the "
-        f"max-actions cap")
+        f"max-actions cap and were discarded")
     return n_decisions

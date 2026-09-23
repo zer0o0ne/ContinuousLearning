@@ -2,9 +2,10 @@
 
 Each independent unit draws a table and plays every cyclic seating for both
 candidates on common decks/action uniforms/auxiliary CV streams. Warm units
-are complete sessions; every seating and candidate owns its own history.
+span whole sessions; every seating and candidate owns its own history.
+If any lane hits the action cap, that paired hand is discarded in every lane.
 The point estimate weights units equally, not individual correlated hands.
-Current and fixed bootstrap pools are separate, explicitly uniform benchmarks.
+Current-uniform and training-weighted pools are separate benchmarks.
 """
 
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -31,7 +32,7 @@ from pool.base import PoolMember
 from train.generate import _pad_vectors, amortised_vectors
 from utils import progress
 
-VERSION = "paired_pool_sessions_v1"
+VERSION = "paired_pool_sessions_v2"
 
 
 @dataclass
@@ -104,8 +105,14 @@ def sample_summary(values, confidence, target_halfwidth):
 
 
 def summarise(rows, confidence, target_halfwidth):
-    out = {"units": len(rows), "hands": sum(r["hands"] for r in rows),
+    out = {"attempted_units": len(rows),
+           "attempted_hands": sum(r.get("attempted_hands", r["hands"]) for r in rows),
+           "hands": sum(r["hands"] for r in rows),
+           "truncated_hands": sum(r.get("truncated_hands", 0) for r in rows),
+           "discarded_hands": sum(r.get("discarded_hands", 0) for r in rows),
            "seconds": sum(r["seconds"] for r in rows)}
+    rows = [r for r in rows if r["raw"] is not None]
+    out["units"] = len(rows)
     for kind in ("raw", "cv"):
         if not rows or rows[0][kind] is None:
             out[kind] = None
@@ -122,7 +129,7 @@ def configuration(config):
     cfg = config.get("pool_evaluation", {})
     if not cfg.get("enabled", False):
         return None
-    defaults = {"run": "pilot_v1", "benchmarks": ["current", "anchor"],
+    defaults = {"run": "weighted_v1", "benchmarks": ["current", "training"],
                 "cold_blocks": 1000, "warm_sessions": 10,
                 "warm_hands_per_session": 100, "blocks_per_batch": 16,
                 "batch_hands": 2048, "control_variate": True,
@@ -135,8 +142,8 @@ def configuration(config):
     out = {**defaults, **cfg}
     if not out["benchmarks"] or len(set(out["benchmarks"])) != len(out["benchmarks"]):
         raise ValueError("pool_evaluation.benchmarks must be nonempty and unique")
-    if set(out["benchmarks"]) - {"current", "anchor"}:
-        raise ValueError("pool_evaluation.benchmarks accepts current and anchor")
+    if set(out["benchmarks"]) - {"current", "training"}:
+        raise ValueError("pool_evaluation.benchmarks accepts current and training (anchor was removed)")
     if not out["run"] or Path(out["run"]).name != out["run"] or out["run"] in (".", ".."):
         raise ValueError("pool_evaluation.run must be a directory name")
     for key in ("cold_blocks", "warm_sessions"):
@@ -159,7 +166,8 @@ def configuration(config):
     return out
 
 
-def _identity(pool, descriptors, candidates, game, emb_cfg, cfg, iteration, anchor_size):
+def _identity(pool, descriptors, candidates, game, emb_cfg, cfg, iteration, bootstrap_size,
+              training_probabilities):
     cache = {}
 
     def network(net):
@@ -190,8 +198,12 @@ def _identity(pool, descriptors, candidates, game, emb_cfg, cfg, iteration, anch
     # JSON round-trip normalises tuples and numpy scalar values before an
     # identity is compared with its persisted representation.
     return json.loads(json.dumps({"version": VERSION, "q_estimator": Q_ESTIMATOR, "iteration": int(iteration),
-            "game": game, "anchor_size": anchor_size,
-            "sampling": "uniform tables/stacks, opponents without replacement",
+            "game": game, "bootstrap_size": bootstrap_size,
+            "sampling": {"tables_stacks": "uniform",
+                         "current": "uniform opponents without replacement",
+                         "training": "independent seats with replacement",
+                         "training_probabilities": training_probabilities},
+            "truncation": "discard the same hand across both candidates and all rotations",
             "settings": {k: v for k, v in cfg.items()
                          if k not in ("blocks_per_batch", "batch_hands")},
             "embedding_config": emb_cfg,
@@ -207,14 +219,17 @@ def _rng(cfg, iteration, benchmark, mode, block):
         [int(cfg["seed"]), int(iteration), int(block), int.from_bytes(name[:8], "big")]))
 
 
-def _plan(cfg, game, iteration, benchmark, mode, count, member_ids):
+def _plan(cfg, game, iteration, benchmark, mode, count, member_ids, probabilities=None):
     units = []
     hands = 1 if mode == "cold" else int(cfg["warm_hands_per_session"])
     for block in range(count):
         rng = _rng(cfg, iteration, benchmark, mode, block)
         n = int(rng.integers(game["players_range"][0], game["players_range"][1] + 1))
         stack = int(rng.integers(game["stack_bb_range"][0], game["stack_bb_range"][1] + 1))
-        opponents = [int(x) for x in rng.choice(member_ids, n - 1, replace=False)]
+        if benchmark == "training" and probabilities is None:
+            raise ValueError("Training benchmark requires the label collection probabilities")
+        opponents = [int(x) for x in rng.choice(
+            member_ids, n - 1, replace=benchmark == "training", p=probabilities)]
         # Three separate streams; no seed is derived from realised game cards.
         streams = np.random.SeedSequence(rng.integers(0, 2**32, 4).tolist()).spawn(3)
         cards, actions, auxiliary = [np.random.default_rng(s) for s in streams]
@@ -291,6 +306,7 @@ def _play_units(units, pool, candidates, config, cfg, mode, bar):
     driver = LockstepDriver([RoutedMember(m, lanes) for m in bases], game["n_actions"],
                             runout=RunoutConfig(cfg["runout_samples"])
                             if cfg["control_variate"] else None)
+    truncated_counts = [0] * len(units)
     length = units[0]["length"]
     at = 0
     while at < length:
@@ -308,8 +324,18 @@ def _play_units(units, pool, candidates, config, cfg, mode, bar):
             end = length
         specs = [s for lane in lanes for s in lane.session.specs[at:end]]
         records = driver.run(specs, batch_size=int(cfg["batch_hands"]))
-        if any(r.truncated for r in records):
-            raise RuntimeError("Pool evaluation hit the action cap; no truncated result was recorded")
+        offset = 0
+        for u, unit in enumerate(units):
+            width = end - at
+            group = records[offset:offset + 2 * unit["players"] * width]
+            truncated_counts[u] += sum(r.truncated for r in group)
+            bad_hands = {r.spec.meta["hand"] for r in group if r.truncated}
+            # Keep positions for seat rotation, but discard this paired hand
+            # from both candidates' histories and scores.
+            for record in group:
+                if record.spec.meta["hand"] in bad_hands:
+                    record.truncated = True
+            offset += len(group)
         if mode == "warm":
             label_showdowns(records)
         for i, lane in enumerate(lanes):
@@ -318,25 +344,32 @@ def _play_units(units, pool, candidates, config, cfg, mode, bar):
         bar.set_postfix_str("", refresh=False)
         at = end
     out, offset = [], 0
-    for unit in units:
+    for u, unit in enumerate(units):
         n = unit["players"]
+        kept = sum(not r.truncated for r in lanes[offset].session.records)
         values = {"raw": [], "cv": []}
         for candidate in range(2):
             candidate_lanes = lanes[offset + candidate*n:offset + (candidate+1)*n]
             for key, attr in (("raw", "rewards"), ("cv", "baseline_rewards")):
                 if key == "cv" and not cfg["control_variate"]:
                     continue
-                values[key].append(float(np.mean([
-                    getattr(record, attr)[lane.session.seat_of_slot(0, h)] / record.spec.big_blind
-                    for lane in candidate_lanes for h, record in enumerate(lane.session.records)])))
+                if kept:
+                    values[key].append(float(np.mean([
+                        getattr(record, attr)[lane.session.seat_of_slot(0, h)] / record.spec.big_blind
+                        for lane in candidate_lanes for h, record in enumerate(lane.session.records)
+                        if not record.truncated])))
         out.append({"block": unit["block"], "players": n, "stack_bb": unit["stack_bb"],
-                    "opponents": unit["opponents"], "hands": 2*n*unit["length"],
-                    "raw": values["raw"], "cv": values["cv"] or None})
+                    "opponents": unit["opponents"], "hands": 2*n*kept,
+                    "attempted_hands": 2*n*unit["length"],
+                    "truncated_hands": truncated_counts[u],
+                    "discarded_hands": 2*n*(unit["length"] - kept),
+                    "raw": values["raw"] or None, "cv": values["cv"] or None})
         offset += 2*n
     return out
 
 
-def evaluate(pool, descriptors, candidates, config, out_dir, iteration, anchor_size, log=print):
+def evaluate(pool, descriptors, candidates, config, out_dir, iteration, bootstrap_size, log=print,
+             training_distribution=None):
     started = time.perf_counter()
     cfg = configuration(config)
     if cfg is None:
@@ -348,27 +381,41 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, anchor_s
             if isinstance(candidate.member, FrozenAgentMember) and candidate.member.embed_net is None:
                 raise ValueError("Warm evaluation requires each candidate's embedding generation")
     max_opponents = int(config["game"]["players_range"][1]) - 1
-    if len(pool) < max_opponents or ("anchor" in cfg["benchmarks"] and anchor_size < max_opponents):
+    if not pool or ("current" in cfg["benchmarks"] and len(pool) < max_opponents):
         raise ValueError("Evaluation pool is too small for the configured table sizes")
+    probabilities = None
+    if "training" in cfg["benchmarks"]:
+        if training_distribution is None:
+            raise ValueError("Training benchmark requires the label collection distribution")
+        p = np.asarray(training_distribution["probabilities"], dtype=np.float64)
+        if (p.shape != (len(pool),) or not np.isfinite(p).all() or (p < 0).any()
+                or not np.isclose(p.sum(), 1.0, rtol=0, atol=1e-12)):
+            raise ValueError("Invalid training pool probabilities")
+        probabilities = p.tolist()
     out_dir = Path(out_dir) / cfg["run"]
     identity = _identity(pool, descriptors, candidates, config["game"],
-                         config["embedding_net"], cfg, iteration, anchor_size)
+                         config["embedding_net"], cfg, iteration, bootstrap_size, probabilities)
     check_identity(out_dir, identity)
     modes = [("cold", int(cfg["cold_blocks"])), ("warm", int(cfg["warm_sessions"]))]
     jobs = []
     for benchmark in cfg["benchmarks"]:
-        ids = list(range(anchor_size if benchmark == "anchor" else len(pool)))
+        ids = list(range(len(pool)))
         for mode, count in modes:
             if count:
-                units = _plan(cfg, config["game"], iteration, benchmark, mode, count, ids)
+                units = _plan(cfg, config["game"], iteration, benchmark, mode, count, ids,
+                              probabilities if benchmark == "training" else None)
                 jobs.append((benchmark, mode, units))
     total = sum(2*u["players"]*u["length"] for _, _, us in jobs for u in us)
     bar = progress(total=total, desc="pool evaluation", unit="hand")
     report = {"version": VERSION, "run": cfg["run"], "iteration": iteration,
               "candidates": [c.member.name for c in candidates],
+              "training_distribution": training_distribution if probabilities is not None else None,
+              "pool_members": [m.name for m in pool],
               "confidence": cfg["confidence"], "interval": "normal approximation over independent units",
               "target_halfwidth_bb100": cfg["target_halfwidth_bb100"],
-              "note": "Fixed-budget evaluation. Size recommendations are for a fresh independent run.",
+              "note": ("Fixed-budget evaluation; capped hands are discarded across both candidates "
+                       "and all rotations. Estimates use surviving hands/units. "
+                       "Size recommendations are for a fresh independent run."),
               "benchmarks": {}}
     networks = {id(net): net for m in list(pool) + [c.member for c in candidates]
                 for net in (getattr(m, "net", getattr(m, "agent", None)),
@@ -386,7 +433,7 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, anchor_s
                 if path.exists():
                     row = json.loads(path.read_text())
                     rows.append(row)
-                    bar.update(row["hands"])
+                    bar.update(row["attempted_hands"])
                 else:
                     pending.append(unit)
             width = int(cfg["blocks_per_batch"])
@@ -395,9 +442,9 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, anchor_s
                 t0 = time.perf_counter()
                 completed = _play_units(chunk, pool, candidates, config, cfg, mode, bar)
                 elapsed = time.perf_counter() - t0
-                n_hands = sum(r["hands"] for r in completed)
+                n_hands = sum(r["attempted_hands"] for r in completed)
                 for row in completed:
-                    row["seconds"] = elapsed * row["hands"] / n_hands
+                    row["seconds"] = elapsed * row["attempted_hands"] / n_hands
                     atomic_json(directory / f"{row['block']:08d}.json", row)
                     rows.append(row)
             rows.sort(key=lambda r: r["block"])
@@ -413,6 +460,12 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, anchor_s
             summary["opponent_note"] = "Hero return conditional on this opponent being seated; multiway rows overlap."
             report["benchmarks"].setdefault(benchmark, {})[mode] = summary
             chosen = summary["cv"] if summary["cv"] is not None else summary["raw"]
+            log(f"[pool-eval] {benchmark}/{mode}: discarded {summary['discarded_hands']} "
+                f"paired hands ({summary['truncated_hands']} hit the action cap) "
+                f"out of {summary['attempted_hands']} attempted")
+            if chosen is None:
+                log(f"[pool-eval] {benchmark}/{mode}: no complete paired hands; estimate unavailable")
+                continue
             delta = chosen["delta"]
             log(f"[pool-eval] {benchmark}/{mode}: {summary['hands']} hands, "
                 f"{summary['units']} independent units; new={chosen['new']['bb_per_100']:+.2f}, "
@@ -423,7 +476,8 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, anchor_s
         for key, net in networks.items():
             net.train(states[key])
     report["invocation_seconds"] = time.perf_counter() - started
-    report["total_hands"] = total
+    report["attempted_hands"] = total
+    report["total_hands"] = sum(s["hands"] for modes in report["benchmarks"].values() for s in modes.values())
     report["play_seconds"] = sum(s["seconds"] for modes in report["benchmarks"].values() for s in modes.values())
     report["hands_per_second"] = total/report["play_seconds"] if report["play_seconds"] else None
     atomic_json(out_dir / "report.json", report)

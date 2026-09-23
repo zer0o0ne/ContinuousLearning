@@ -527,6 +527,8 @@ def _results_by_member(sessions):
     out = {}
     for s in sessions:
         for h, record in enumerate(s.records):
+            if record is None or record.truncated:
+                continue
             hero_seat = s.seat_of_slot(HERO_SLOT, h)
             bb = float(record.rewards[hero_seat]) / float(record.spec.big_blind)
             for slot in range(1, s.num_players):
@@ -703,7 +705,7 @@ def _hero_decisions(sessions, hero_rec):
     out = []
     for i, (s, rec) in enumerate(zip(sessions, hero_rec)):
         for h, record in enumerate(s.records):
-            if record is None:
+            if record is None or record.truncated:
                 continue
             hero_seat = s.seat_of_slot(HERO_SLOT, h)
             for d, dec in enumerate(record.decisions):
@@ -1002,6 +1004,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     dropped = int(done["n_dropped"]) if done else 0
     forwards = int(done["forwards"]) if done else 0
     rollouts = int(done["n_rollouts"]) if done else 0
+    discarded_rollouts = int(done.get("discarded_rollouts", 0)) if done else 0
     seconds = float(done["seconds"]) if done else 0.0
     collision_sum = float(done["collision_sum"]) if done else 0.0
     collision_n = int(done["collision_n"]) if done else 0
@@ -1037,7 +1040,8 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                        "decisions_done": int(decisions),
                        "shards": shards, "n_labels": n_labels,
                        "n_dropped": dropped, "forwards": forwards,
-                       "n_rollouts": rollouts, "seconds": seconds,
+                       "n_rollouts": rollouts, "discarded_rollouts": discarded_rollouts,
+                       "seconds": seconds,
                        "collision_sum": collision_sum,
                        "collision_n": collision_n}, fh)
 
@@ -1057,12 +1061,13 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
         by one piece of code and the two paths cannot drift apart in what they
         write.
         """
-        nonlocal n_labels, dropped, forwards, seconds, rollouts
+        nonlocal n_labels, dropped, forwards, seconds, rollouts, discarded_rollouts
         nonlocal collision_sum, collision_n
         s = sessions[i]
         forwards += stats.forwards
         seconds += stats.seconds
         rollouts += stats.n_rollouts
+        discarded_rollouts += stats.discarded_rollouts
         collision_sum += stats.collision_rate
         collision_n += 1
         bar.update(1)
@@ -1095,8 +1100,8 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             })
             n_labels += 1
         else:
-            # Every joint draw collided, so there is no EV to build a target
-            # from (`oracle/rollout.py`). Dropping it is the honest outcome; the
+            # Every joint draw collided or hit the action cap, leaving no EV
+            # to build a target from (`oracle/rollout.py`). The
             # count is in the manifest because a large one is a broken run.
             dropped += 1
         if len(buffer) >= per_shard and ends_hand[pos]:
@@ -1151,9 +1156,10 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     stats = LabelStats(
         forwards=forwards, seconds=seconds,
         collision_rate=(collision_sum / collision_n) if collision_n else 0.0,
-        n_rollouts=rollouts)
+        n_rollouts=rollouts, discarded_rollouts=discarded_rollouts)
     log(f"[{TAG}] {n_labels} labels in {len(shards)} shards, {dropped} dropped, "
         f"{stats.forwards} forwards, {stats.seconds:.1f}s of labelling, "
-        f"collision rate {100 * stats.collision_rate:.1f}%")
+        f"collision rate {100 * stats.collision_rate:.1f}%; "
+        f"{discarded_rollouts} rollout hands discarded with their paired samples")
     return {"shards": shards, "n_labels": n_labels, "n_dropped": dropped,
             "n_sessions": len(sessions), "stats": stats}

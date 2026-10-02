@@ -1727,7 +1727,7 @@ the last two are new code:
 | B | labels | `train/generate.py` — play, refresh the vectors, label hero's decisions | `labels/*.npz`, `labels.json` |
 | C | agent | `train/agent_train.py` over all but `agent_train.heldout_fraction` of them | `agent.pt` |
 | D | oracle gap | §8's seven numbers on the held-out slice, twice: conditioned on the fitted vectors and with `e = 0` | `metrics.json` |
-| E | close | PFSP results in, `result_decay` applied, the agent appended to the pool | `state.json` |
+| E | close | even iterations update/decay PFSP and apply evaluation feedback; every iteration appends its agent | `state.json` |
 
 **The agent's trunk is warm-started from phase A** (§6.1 OI-4, §5.6), at iteration 0 only, when
 `agent_train.warm_start_trunk` is set. `pipeline.py::warm_start_trunk` copies
@@ -1743,8 +1743,31 @@ iteration already has an `agent.pt` on disk, because a resumed run loads that on
 `agent_init` member — built through `build_pool` so it is an ordinary member, and deliberately
 *not* part of `bootstrap` — sits in hero's seat, so the labelled states come from a competent
 policy rather than a random walk. From iteration 1 hero is the agent and the labels are
-on-policy. Training continues across iterations; only iteration 0 starts from random weights and
-gets its own `first_iteration_steps`.
+on-policy. Only iteration 0 starts from random weights and gets its own
+`first_iteration_steps`.
+
+**Paired policy updates (2026-10-02).** Iterations 1 and 2 both initialise hero
+and the trainable weights from `agent0`; iterations 3 and 4 from `agent2`, and
+so on. The even iteration sees the intervening odd checkpoint in the pool.
+Weights are restored before collecting hands, so oracle continuations also use
+the selected parent. Both `labels.json` and `agent.pt` record `hero_iteration`.
+The embedding retrain schedule and pool growth stay as configured.
+
+**Odd checkpoints leave PFSP evidence unchanged.** Their collection results
+are not accumulated, `result_decay` is not applied, and evaluation feedback is
+not consumed. Evaluation still runs and is saved. The next iteration expands
+the sampler for the new pool member, initially unplayed with maximum hardness;
+normalisation and clustering can therefore change seat probabilities even
+though the old members' result accumulators are unchanged. Sampler RNG state
+continues to advance normally. Even iterations, including iteration 0, perform
+the existing result update, decay and evaluation feedback.
+
+Resume restores the same even parent for both collection and training. For an
+even iteration without a completed `agent.pt`, legacy labels collected using
+the immediately preceding odd hero are rebuilt; partial label directories are
+kept under `labels.stale*`. Their parent is part of the play signature, so a
+partial shard cannot be spliced into the new policy's rollouts. Completed
+checkpoints remain readable and are not retrained.
 
 **The embedding network is the first phase, not a later one.** §8 says it "can be trained before
 any v8 agent exists, on hands played by pool members among themselves — that is both gate G1 and
@@ -1820,8 +1843,9 @@ therefore gains a `gap_cold` from `regap.py` without its `gap` moving. It trains
 metric list.
 
 **PFSP is fed from the hands the label phase already played.** `train/generate.py`'s manifest now
-carries hero's BB and hand count against every member it sat with, and phase E hands them to
-`PoolSampler.update` before `end_iteration` ages them (D10). A hand is credited to **every**
+carries hero's BB and hand count against every member it sat with, and on even
+iterations phase E hands them to `PoolSampler.update` before `end_iteration`
+ages them (D10). A hand is credited to **every**
 opponent at the table in full: hero's chip delta in a multiway hand is not divisible between the
 opponents who produced it, and splitting it by table size would make a nine-handed beating look
 an eighth as bad as the heads-up one it is being compared against. The cost is that the
@@ -2285,7 +2309,7 @@ data/v8/
       embedding.pt                  only on the iterations that retrained it
       agent.pt                      the checkpoint this iteration produced
       metrics.json                  the §8 oracle gap, overall and by table size and stack depth
-      state.json                    sampler state after the decay; the phase boundary resume reads
+      state.json                    sampler state after phase E; odd iterations skip updates/decay
     iter_0001/ …
     slumbot/<run>/                one evaluation (`eval_pipeline.py`)
       cold_w00.jsonl …            one file per worker per mode; a resume reads these

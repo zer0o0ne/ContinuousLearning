@@ -268,6 +268,139 @@ def test_iteration_zero_seats_agent_init_and_iteration_one_seats_the_agent(
     assert seen[1] == {"AgentPoolMember"}, seen
 
 
+def _paired_config(n_iterations=5):
+    cfg = copy.deepcopy(toy_config(n_iterations=n_iterations, n_sessions=1,
+                                   hands_per_session=2))
+    cfg["game"].update(players_range=[6, 6], stack_bb_range=[10, 10])
+    cfg["style"]["agent_variants"] = 1
+    cfg["embedding_net"].update(max_iterations=n_iterations, retrain_every=2,
+                                corpus_sessions=1, corpus_hands_per_session=2,
+                                steps=1, K=0)
+    cfg["agent_train"].update(steps=2, first_iteration_steps=2)
+    return cfg
+
+
+def test_pairs_collect_and_train_from_the_same_even_parent_in_six_max(
+        tmp_path, monkeypatch):
+    collected, trained, pools = {}, {}, []
+    real_factory, real_train = pipeline.hero_factory, pipeline.train_agent
+    real_labels = pipeline.generate_labels
+
+    def factory(iteration, net, *args):
+        collected[iteration] = copy.deepcopy(net.state_dict())
+        return real_factory(iteration, net, *args)
+
+    def train(net, *args, **kwargs):
+        trained[kwargs["iteration"]] = copy.deepcopy(net.state_dict())
+        return real_train(net, *args, **kwargs)
+
+    def labels(driver, pool, *args):
+        pools.append([member.name for member in pool])
+        return real_labels(driver, pool, *args)
+
+    monkeypatch.setattr(pipeline, "hero_factory", factory)
+    monkeypatch.setattr(pipeline, "train_agent", train)
+    monkeypatch.setattr(pipeline, "generate_labels", labels)
+    cfg = _paired_config()
+    metrics, exp_dir = _run(tmp_path, cfg)
+    checkpoints = [torch.load(os.path.join(exp_dir, f"iter_{k:04d}", "agent.pt"),
+                               weights_only=False) for k in range(5)]
+    assert [c["hero_iteration"] for c in checkpoints] == [None, 0, 0, 2, 2]
+    assert set(collected) == set(trained) == set(range(5))
+    n_bootstrap = metrics[0]["n_pool"]
+    for k in range(1, 5):
+        expected = checkpoints[0 if k <= 2 else 2]["model_state_dict"]
+        for key, value in expected.items():
+            assert torch.equal(collected[k][key], value), (k, key, "hero")
+            assert torch.equal(trained[k][key], value), (k, key, "training")
+        assert pools[k][n_bootstrap:] == [f"agent{j}" for j in range(k)]
+    assert any(not torch.equal(checkpoints[0]["model_state_dict"][key], value)
+               for key, value in checkpoints[1]["model_state_dict"].items())
+
+    for k in range(5):
+        directory = os.path.join(exp_dir, f"iter_{k:04d}")
+        before = json.load(open(os.path.join(directory, "labels.json")))
+        after = json.load(open(os.path.join(directory, "state.json")))["sampler"]
+        expected_hands = np.array(before["sampler"]["hands"])
+        expected_bb = np.array(before["sampler"]["bb"])
+        if k % 2 == 0:
+            for member, result in before["manifest"]["results"].items():
+                expected_hands[int(member)] += result["n_hands"]
+                expected_bb[int(member)] += result["hero_bb"]
+            expected_hands *= cfg["pool_sampling"]["result_decay"]
+            expected_bb *= cfg["pool_sampling"]["result_decay"]
+        np.testing.assert_array_equal(after["hands"], expected_hands)
+        np.testing.assert_array_equal(after["bb"], expected_bb)
+
+
+@pytest.mark.parametrize("phase", ["labels", "training"])
+def test_even_iteration_resume_restores_the_parent_for_collection_and_training(
+        tmp_path, monkeypatch, phase):
+    cfg = _paired_config(n_iterations=3)
+    _, whole = _run(tmp_path, copy.deepcopy(cfg), name="whole")
+    target = "generate_labels" if phase == "labels" else "train_agent"
+    real = getattr(pipeline, target)
+    calls = 0
+
+    def interrupt(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("interrupted even iteration")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, target, interrupt)
+    with pytest.raises(RuntimeError, match="interrupted even iteration"):
+        _run(tmp_path, copy.deepcopy(cfg), name="part")
+    monkeypatch.setattr(pipeline, target, real)
+    if phase == "training":
+        monkeypatch.setattr(pipeline, "generate_labels",
+                            lambda *a, **kw: pytest.fail("replayed saved paired labels"))
+    _, part = _run(tmp_path, copy.deepcopy(cfg), name="part")
+    a, b = _artefacts(whole), _artefacts(part)
+    a.pop("report.json")
+    b.pop("report.json")
+    assert sorted(a) == sorted(b)
+    for name in a:
+        if name.endswith(".pt"):
+            for key in a[name]:
+                assert torch.equal(a[name][key], b[name][key]), (name, key)
+        else:
+            assert a[name] == b[name], name
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_even_iteration_rebuilds_labels_from_the_legacy_previous_hero(
+        tmp_path, monkeypatch, partial):
+    cfg = _paired_config(n_iterations=3)
+    _, exp_dir = _run(tmp_path, cfg)
+    directory = os.path.join(exp_dir, "iter_0002")
+    # Legacy sequential runs did not record a parent. Their even iteration's
+    # completed or partial labels must not survive a change of rollout policy.
+    for name in ("labels.json", "labels/play.json"):
+        path = os.path.join(directory, name)
+        blob = json.load(open(path))
+        blob.pop("hero_iteration")
+        with open(path, "w") as fh:
+            json.dump(blob, fh)
+    for name in ("state.json", "metrics.json", "agent.pt"):
+        os.remove(os.path.join(directory, name))
+    if partial:
+        os.remove(os.path.join(directory, "labels.json"))
+    real = pipeline.generate_labels
+    calls = []
+
+    def labels(*args, **kwargs):
+        calls.append(True)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "generate_labels", labels)
+    run(cfg, lambda _: None, exp_dir)
+    assert calls == [True]
+    assert os.path.exists(os.path.join(directory, "labels.stale", "progress.json"))
+    assert json.load(open(os.path.join(directory, "labels.json")))["hero_iteration"] == 0
+
+
 # --------------------------------------- 3b: the held-out slice and the gap
 
 
@@ -716,7 +849,8 @@ def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, m
     from evaluation import pool_eval
     from pool_eval_pipeline import run_saved
 
-    cfg = copy.deepcopy(toy_config())
+    cfg = copy.deepcopy(toy_config(n_iterations=3))
+    cfg["embedding_net"]["max_iterations"] = 3
     cfg["game"]["players_range"] = [2, 2]
     cfg["game"]["stack_bb_range"] = [10, 10]
     cfg["pool_sampling"]["evaluation_weight"] = .5
@@ -726,17 +860,22 @@ def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, m
         "runout_samples": 2}
     measured, exp_dir = _run(tmp_path, cfg)
     states = [json.load(open(os.path.join(exp_dir, f"iter_{k:04d}", "state.json")))
-              for k in range(2)]
+              for k in range(3)]
     labels = [json.load(open(os.path.join(exp_dir, f"iter_{k:04d}", "labels.json")))
-              for k in range(2)]
-    for k in range(2):
+              for k in range(3)]
+    for k in range(3):
         feedback = states[k]["evaluation_feedback"]
-        assert feedback["source"] == "training/warm"
-        assert feedback["applied"] is True
-        assert feedback["by_member"]
-        assert states[k]["sampler"]["evaluation"]["last_iteration"] == k
+        if k % 2 == 0:
+            assert feedback["source"] == "training/warm"
+            assert feedback["applied"] is True
+            assert feedback["by_member"]
+            assert states[k]["sampler"]["evaluation"]["last_iteration"] == k
+        else:
+            assert feedback is None
+            for key in ("hands", "bb", "evaluation"):
+                assert states[k]["sampler"][key] == labels[k]["sampler"][key]
         assert measured[k]["pool_evaluation"]["training_distribution"] == labels[k]["pool_distribution"]
-        assert labels[k]["sampler"]["evaluation"]["last_iteration"] == k - 1
+        assert labels[k]["sampler"]["evaluation"]["last_iteration"] == [-1, 0, 0][k]
     for member, result in states[0]["evaluation_feedback"]["by_member"].items():
         i = int(member)
         assert labels[1]["pool_distribution"]["evaluation_bb_per_100"][i] == result["bb_per_100"]
@@ -745,11 +884,11 @@ def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, m
 
     # Even with feedback enabled in the config, standalone evaluation cannot
     # rewrite the training sampler or consume another observation.
-    state_path = os.path.join(exp_dir, "iter_0001", "state.json")
+    state_path = os.path.join(exp_dir, "iter_0002", "state.json")
     before = open(state_path, "rb").read()
     standalone = copy.deepcopy(cfg)
     standalone["pool_evaluation"]["run"] = "standalone"
-    run_saved(standalone, exp_dir, 1, log=lambda _: None)
+    run_saved(standalone, exp_dir, 2, log=lambda _: None)
     assert open(state_path, "rb").read() == before
 
     # Simulate a crash after feedback was computed but before its atomic commit.
@@ -757,7 +896,7 @@ def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, m
     real_commit = pipeline.atomic_json
     def interrupt(path, payload):
         if str(path) == state_path:
-            assert payload["sampler"]["evaluation"]["last_iteration"] == 1
+            assert payload["sampler"]["evaluation"]["last_iteration"] == 2
             raise RuntimeError("interrupted before sampler commit")
         return real_commit(path, payload)
     monkeypatch.setattr(pipeline, "atomic_json", interrupt)
@@ -768,9 +907,9 @@ def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, m
     assert not os.path.exists(state_path)
     monkeypatch.setattr(pipeline, "atomic_json", real_commit)
     run(cfg, lambda _: None, exp_dir)
-    assert json.load(open(state_path)) == states[1]
+    assert json.load(open(state_path)) == states[2]
     assert run(cfg, lambda _: None, exp_dir) == []
-    assert json.load(open(state_path)) == states[1]
+    assert json.load(open(state_path)) == states[2]
 
 
 # -------------------------------------------------- 5: the CLAUDE.md §1 rule

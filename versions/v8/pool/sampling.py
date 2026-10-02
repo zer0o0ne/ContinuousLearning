@@ -65,9 +65,10 @@ would not notice that it had stopped beating it. The same smearing also destroys
 the `PLAN_PIPELINE.md` R2 diagnostic, which reads fictitious-play cycling off
 exactly these scores.
 
-`end_iteration` therefore scales both accumulators by `result_decay` at every
-iteration boundary, giving an effective window of roughly
-`hands_per_iteration / (1 - result_decay)` hands. Two properties make this the
+`end_iteration` therefore scales both accumulators by `result_decay` whenever
+the loop accepts PFSP feedback (even iterations in the paired schedule), giving
+an effective window of roughly `hands_per_update / (1 - result_decay)` hands.
+Two properties make this the
 right shape rather than a patch:
 
 * the mean of a member nobody sampled this iteration is **unchanged** —
@@ -205,8 +206,8 @@ class PoolSampler:
     def end_iteration(self):
         """Age the accumulated results by `result_decay` (§8's iteration boundary).
 
-        Called once per iteration of the outer loop, by the loop — the sampler
-        has no notion of an iteration of its own. See the module docstring for
+        Called by the loop on even iterations; odd sibling training freezes
+        PFSP evidence. The sampler has no iteration counter. See the docstring for
         why forgetting is required rather than optional.
         """
         self._hands *= self.result_decay

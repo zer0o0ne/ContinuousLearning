@@ -10,7 +10,7 @@ iteration k:
   B  play, fit vectors, label hero's decisions                (§8 lines 1–4, train/generate.py)
   C  train the agent on all but `heldout_fraction` of them    (§6.2)
   D  measure the oracle gap on the held-out slice, warm and cold  (§8)
-  E  age the PFSP results and append the agent to the pool    (§4.4, §4.1)
+  E  update/age PFSP on even iterations; append every agent to the pool
 ```
 
 Only the last two lines are new logic; the rest is composition, and deliberately
@@ -21,9 +21,11 @@ distribution the agent trains on and the one anything else measures drift apart.
 scratch, and a v7 pool member — named by the `agent_init` section, which is
 deliberately *not* part of `bootstrap` — sits in hero's seat, so the labelled
 states come from a competent policy instead of a random walk. From iteration 1
-hero is the agent and the labels are on-policy. Everything else about iteration 0
-is ordinary, including that its training continues into iteration 1's rather than
-being restarted (§8, `train/agent_train.py`).
+hero is the agent and the labels are on-policy. Later iterations train in pairs:
+iterations 1 and 2 both start from agent0, 3 and 4 from agent2, and so on. The
+odd checkpoint joins the pool before its sibling trains, but its collection
+results and evaluation do not update or decay PFSP. The even checkpoint is the
+next pair's starting policy. Iteration 0 keeps its ordinary PFSP update.
 
 **The embedding network is the first phase, not a later one** (§8: "can be
 trained before any v8 agent exists, on hands played by pool members among
@@ -670,10 +672,6 @@ def run(config, log, exp_dir):
             device, seed, embed_net=vintages[k])
         pool += members
         descriptors += desc
-    if start:
-        agent_net.load_state_dict(torch.load(
-            os.path.join(_iter_dir(exp_dir, start - 1), "agent.pt"),
-            map_location=device, weights_only=False)["model_state_dict"])
     latest_emb = max((j for j in range(start + 1)
                       if os.path.exists(os.path.join(_iter_dir(exp_dir, j),
                                                      "embedding.pt"))),
@@ -697,6 +695,16 @@ def run(config, log, exp_dir):
         os.makedirs(it_dir, exist_ok=True)
         log(f"[{TAG}] ===== iteration {k}: pool {len(pool)} members =====")
         timings = {}
+
+        # Both siblings start from the preceding even checkpoint. Restore
+        # before collection as well as training: this is also the policy that
+        # continues hero's oracle rollouts. The frozen pool copy is available
+        # both in a continuous run and after rebuilding the pool on resume.
+        hero_iteration = (k - 1 if k % 2 else k - 2) if k else None
+        if hero_iteration is not None:
+            parent = pool[n_pool0 + hero_iteration * agent_variants]
+            agent_net.load_state_dict(parent.net.state_dict())
+            log(f"[{TAG}] hero and trainable weights from agent{hero_iteration}")
 
         sampler = PoolSampler(len(pool), config["pool_sampling"],
                               np.random.default_rng([seed, k, 7]))
@@ -731,7 +739,7 @@ def run(config, log, exp_dir):
         # §6.1 / §5.6: the agent starts from the trunk phase A just trained.
         # Here and not before the loop, because the embedding network has to be
         # trained first; only at iteration 0, because every later iteration
-        # continues the agent §8 already produced; and only when this iteration
+        # starts from its pair's parent; and only when this iteration
         # has no agent on disk, because a resumed run loads that one instead.
         agent_path = os.path.join(it_dir, "agent.pt")
         if (k == 0 and train_cfg.get("warm_start_trunk", False)
@@ -742,11 +750,12 @@ def run(config, log, exp_dir):
         labels_path = os.path.join(it_dir, "labels.json")
         blob = _read_json(labels_path) if os.path.exists(labels_path) else None
         if (blob is not None
-                and (blob["manifest"].get("range_model") != RANGE_MODEL
+                and (blob.get("hero_iteration", k - 1 if k else None) != hero_iteration
+                     or blob["manifest"].get("range_model") != RANGE_MODEL
                      or blob["manifest"].get("q_estimator") !=
                      estimator_signature(oracle_cfg, emb_cfg))
                 and not os.path.exists(agent_path)):
-            log(f"[{TAG}] labels use an incompatible Q estimator; rebuilding "
+            log(f"[{TAG}] labels use a different hero or Q estimator; rebuilding "
                 "this unfinished iteration and keeping the old shards aside")
             blob = None
         if blob is not None:
@@ -772,11 +781,16 @@ def run(config, log, exp_dir):
                  "driver_batch_size": int(config["driver_batch_size"]),
                  "labels_per_shard": int(config["labels_per_shard"]),
                  "game": game, "embedding_net": emb_cfg,
-                 "oracle": oracle_cfg},
+                 "oracle": oracle_cfg,
+                 # Only rewound iterations differ from legacy collection.
+                 # Include their parent in the partial-shard identity too;
+                 # unchanged odd/initial phases can reuse legacy artefacts.
+                 **({"hero_iteration": hero_iteration} if k and k % 2 == 0 else {})},
                 os.path.join(it_dir, "labels"), log)
             timings["labels"] = time.perf_counter() - t0
             manifest = {**manifest, "stats": asdict(manifest["stats"])}
             _write_json(labels_path, {"manifest": manifest,
+                                      "hero_iteration": hero_iteration,
                                       "sampler": sampler.state_dict(),
                                       "pool_distribution": sampler.distribution(),
                                       "timings": timings})
@@ -813,6 +827,7 @@ def run(config, log, exp_dir):
             timings["agent"] = time.perf_counter() - t0
             torch.save({"model_state_dict": agent_net.state_dict(),
                         "config": config, "iteration": k, "history": history,
+                        "hero_iteration": hero_iteration,
                         "q_estimator": manifest.get("q_estimator", "legacy")},
                        agent_path)
 
@@ -875,11 +890,16 @@ def run(config, log, exp_dir):
         metrics_all.append(metrics)
 
         # ----------------------------------------- E: results, decay, the pool
-        for member, result in manifest["results"].items():
-            sampler.update(int(member), float(result["hero_bb"]),
-                           int(result["n_hands"]))
-        sampler.end_iteration()
-        feedback = apply_evaluation_feedback(sampler, evaluation, k, log)
+        feedback = None
+        if k % 2 == 0:
+            for member, result in manifest["results"].items():
+                sampler.update(int(member), float(result["hero_bb"]),
+                               int(result["n_hands"]))
+            sampler.end_iteration()
+            feedback = apply_evaluation_feedback(sampler, evaluation, k, log)
+        else:
+            log(f"[{TAG}] odd checkpoint: PFSP results, decay and evaluation "
+                "feedback unchanged")
         new_members, new_desc = agent_variant_members(
             frozen_agent_net(agent_net.state_dict(), config, game, device), k,
             config, game, device, seed,

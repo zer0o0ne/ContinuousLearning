@@ -468,6 +468,10 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     signature = _play_signature(sessions, seed_base, R, hands_per_session,
                                 pool_mode, pool_window)
     signature["q_estimator"] = estimator_signature(cfg.get("oracle", {}), emb_cfg)
+    if "hero_iteration" in cfg:
+        # A rewound hero changes both collection and rollout continuation,
+        # even when the sampled opponents and every random seed are identical.
+        signature["hero_iteration"] = int(cfg["hero_iteration"])
     played, done = _resume_state(out_dir, signature, log)
     first_hand = _first_hands(done, len(sessions), hands_per_session)
 

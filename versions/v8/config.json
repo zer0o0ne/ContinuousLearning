@@ -5,6 +5,7 @@
  "out_dir": "../../data/v8",
  "n_iterations": 30,
  "n_sessions": 100,
+ "n_sessions_first_iteration": 500,
  "hands_per_session": 400,
  "labels_per_shard": 1200,
  "driver_batch_size": 2048,
@@ -89,16 +90,29 @@
   }
  },
  "style": {
-  "uncond_scale": 1.0,
-  "position_scale": 0.5,
-  "street_scale": 0.5,
+  "augmentation_zero_iteration": 22,
+  "uncond_scale": [
+   10.0,
+   5.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "position_scale": 0,
+  "street_scale": [
+   4.0,
+   25.0,
+   3.0,
+   7.0,
+   1.0
+  ],
   "log_temperature_range": [
    -0.7,
    0.7
   ],
   "uniform_mix_range": [
    0.0,
-   0.25
+   0.0
   ],
   "agent_variants": 1
  },

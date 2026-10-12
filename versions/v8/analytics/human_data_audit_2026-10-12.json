@@ -1,0 +1,348 @@
+{
+  "method": "Read all raw TXT/ZIP files; deduplicate by hand ID within cohort; exclude all IDs with conflicting versions in existing source index. Known cards from dealt/shows/summary; no hidden-card imputation. Structural audit, not full engine replay.",
+  "linus": {
+    "counts": {
+      "files": 89,
+      "text_members": 89,
+      "raw_records": 49346,
+      "hands": 49342,
+      "player_hands": 215433,
+      "dealt_lines": 0,
+      "hands_with_dealt": 0,
+      "hands_with_any_known_cards": 23699,
+      "known_player_hands": 28947,
+      "showdown_hands": 7209,
+      "ante_hands": 4805,
+      "hands_with_rake": 1715,
+      "missing_summary": 0,
+      "missing_pot_rake": 0,
+      "multiple_runouts": 351,
+      "straddle_hands": 0,
+      "known_player_hands_collected_pot": 24189,
+      "target_hands": 49183,
+      "target_known_hands": 7959,
+      "target_known_hands_collected_pot": 6567,
+      "target_showdown_hands": 7182,
+      "actions": 354919,
+      "target_actions": 87961,
+      "known_player_hands_folded": 0,
+      "target_known_hands_folded": 0,
+      "known_card_actions": 85564,
+      "target_known_card_actions": 23590,
+      "excluded_ambiguous_hands": 2,
+      "duplicate_records": 2,
+      "unique_hands_including_ambiguous": 49344,
+      "unique_player_names": 104,
+      "distinct_tables": 55,
+      "distinct_timestamps": 47146,
+      "elapsed_seconds": 3.3
+    },
+    "histograms": {
+      "big_blinds": {
+        "200.0": 10373,
+        "400.0": 682,
+        "100.0": 36892,
+        "2000.0": 88,
+        "600.0": 907,
+        "1000.0": 400
+      },
+      "players_per_hand": {
+        "2": 12541,
+        "3": 3487,
+        "4": 5062,
+        "5": 10007,
+        "6": 18108,
+        "7": 137
+      },
+      "known_players_per_hand": {
+        "0": 25643,
+        "1": 18501,
+        "2": 5149,
+        "3": 48,
+        "4": 1
+      },
+      "stack_bb_player_hands": {
+        "100_200": 151944,
+        "200_300": 37261,
+        "over_300": 18933,
+        "50_100": 6481,
+        "10_50": 811,
+        "under_10": 3
+      },
+      "actions_by_street": {
+        "PREFLOP": 222390,
+        "FLOP": 64126,
+        "TURN": 40309,
+        "RIVER": 28094
+      },
+      "actions_by_kind": {
+        "raises": 57538,
+        "calls": 44926,
+        "checks": 59652,
+        "bets": 34375,
+        "folds": 158428
+      },
+      "target_actions_by_street": {
+        "PREFLOP": 50496,
+        "FLOP": 17969,
+        "TURN": 11400,
+        "RIVER": 8096
+      },
+      "target_actions_by_kind": {
+        "calls": 12881,
+        "checks": 16802,
+        "bets": 10195,
+        "raises": 15200,
+        "folds": 32883
+      },
+      "known_card_actions_by_street": {
+        "PREFLOP": 29059,
+        "FLOP": 23519,
+        "TURN": 18075,
+        "RIVER": 14911
+      },
+      "known_card_actions_by_kind": {
+        "calls": 19575,
+        "checks": 28104,
+        "bets": 16517,
+        "raises": 21368
+      },
+      "target_known_card_actions_by_street": {
+        "PREFLOP": 7909,
+        "FLOP": 6470,
+        "TURN": 5023,
+        "RIVER": 4188
+      },
+      "target_known_card_actions_by_kind": {
+        "calls": 5469,
+        "checks": 7705,
+        "raises": 5558,
+        "bets": 4858
+      }
+    },
+    "examples": {
+      "known_cards": {
+        "hand": 330007030,
+        "path": "/Users/zer0o0ne/Documents/Poker/data/raw/linus/CoinPoker/NLH-Holdem/100-200/2025-11-18_llinusllove_CoinPoker_NLH-Holdem_100-200.txt",
+        "member": "",
+        "known": [
+          "asianflushie"
+        ]
+      }
+    },
+    "top_timestamp_counts": [
+      [
+        "2026/06/07 12:18:45",
+        20
+      ],
+      [
+        "2026/06/07 12:07:53",
+        19
+      ],
+      [
+        "2026/04/19 06:36:07",
+        15
+      ]
+    ],
+    "integrity": {
+      "counts": {
+        "hands": 49342,
+        "summary_only_card_pairs": 0,
+        "shown_summary_card_conflicts": 0,
+        "missing_collected_line": 0,
+        "multi_runout_hands": 351,
+        "payout_sum_mismatch_over_003": 0,
+        "single_runout_payout_sum_mismatch_over_003": 0,
+        "single_runout_hands_checked": 48991,
+        "mismatch_with_ante": 0,
+        "mismatch_with_allin": 0,
+        "elapsed_s": 1.8
+      },
+      "examples": [],
+      "extra_summary_fields": []
+    }
+  },
+  "field-nl100-500": {
+    "counts": {
+      "files": 99,
+      "text_members": 11686,
+      "raw_records": 2376697,
+      "hands": 2103142,
+      "player_hands": 11186400,
+      "dealt_lines": 0,
+      "hands_with_dealt": 0,
+      "hands_with_any_known_cards": 583568,
+      "known_player_hands": 792109,
+      "showdown_hands": 330854,
+      "ante_hands": 2103037,
+      "hands_with_rake": 2103142,
+      "missing_summary": 0,
+      "missing_pot_rake": 0,
+      "multiple_runouts": 0,
+      "straddle_hands": 2713,
+      "known_player_hands_collected_pot": 599633,
+      "actions": 17506174,
+      "known_card_actions": 2829941,
+      "known_player_hands_folded": 0,
+      "excluded_ambiguous_hands": 19244,
+      "duplicate_records": 254311,
+      "unique_hands_including_ambiguous": 2122386,
+      "unique_player_names": 7778,
+      "distinct_tables": 7386,
+      "distinct_timestamps": 178040,
+      "elapsed_seconds": 171.0
+    },
+    "histograms": {
+      "big_blinds": {
+        "1.0": 961148,
+        "2.0": 753677,
+        "5.0": 388317
+      },
+      "players_per_hand": {
+        "6": 1239835,
+        "5": 536230,
+        "4": 171168,
+        "3": 69750,
+        "2": 86159
+      },
+      "known_players_per_hand": {
+        "2": 201191,
+        "1": 378762,
+        "0": 1519574,
+        "3": 3505,
+        "4": 101,
+        "5": 8,
+        "6": 1
+      },
+      "stack_bb_player_hands": {
+        "100_200": 8722859,
+        "200_300": 1012969,
+        "50_100": 896513,
+        "10_50": 273912,
+        "under_10": 3442,
+        "over_300": 276705
+      },
+      "actions_by_street": {
+        "PREFLOP": 11715812,
+        "FLOP": 2843051,
+        "TURN": 1789569,
+        "RIVER": 1157742
+      },
+      "actions_by_kind": {
+        "raises": 2565418,
+        "folds": 8741458,
+        "calls": 2085238,
+        "bets": 1470061,
+        "checks": 2643999
+      },
+      "known_card_actions_by_street": {
+        "PREFLOP": 872477,
+        "FLOP": 767621,
+        "TURN": 642522,
+        "RIVER": 547321
+      },
+      "known_card_actions_by_kind": {
+        "raises": 550389,
+        "calls": 734387,
+        "bets": 500594,
+        "checks": 1044571
+      }
+    },
+    "examples": {
+      "known_cards": {
+        "hand": 123535001102,
+        "path": "/Users/zer0o0ne/Documents/Poker/data/raw/field-nl100-500/2026-10-08_CPH2N_NL-HH-_SH_UUZUR971/2026-09-01_CPH2N_NL100_SH_HMSXIKB194.zip",
+        "member": "hhd_100_COIP31st1235350_2026-08-31.txt",
+        "known": [
+          "better1980",
+          "PashaLevo"
+        ]
+      }
+    },
+    "top_timestamp_counts": [
+      [
+        "2026/09/02 21:33:03",
+        53
+      ],
+      [
+        "2026/09/28 19:27:16",
+        45
+      ],
+      [
+        "2026/09/02 23:00:48",
+        43
+      ]
+    ],
+    "integrity": {
+      "counts": {
+        "hands": 2103142,
+        "summary_only_card_pairs": 252714,
+        "shown_summary_card_conflicts": 0,
+        "missing_collected_line": 0,
+        "multi_runout_hands": 0,
+        "payout_sum_mismatch_over_003": 16943,
+        "single_runout_payout_sum_mismatch_over_003": 16943,
+        "single_runout_hands_checked": 2103142,
+        "mismatch_with_ante": 16838,
+        "mismatch_with_allin": 2039,
+        "elapsed_s": 91.0
+      },
+      "examples": [
+        {
+          "hand": 123535001102,
+          "path": "/Users/zer0o0ne/Documents/Poker/data/raw/field-nl100-500/2026-10-08_CPH2N_NL-HH-_SH_UUZUR971/2026-09-01_CPH2N_NL100_SH_HMSXIKB194.zip",
+          "member": "hhd_100_COIP31st1235350_2026-08-31.txt",
+          "total_pot": 243.56,
+          "rake": 5.1,
+          "collected_sum": 342.98,
+          "difference": 104.52
+        },
+        {
+          "hand": 124361200471,
+          "path": "/Users/zer0o0ne/Documents/Poker/data/raw/field-nl100-500/2026-10-08_CPH2N_NL-HH-_SH_UUZUR971/2026-09-01_CPH2N_NL100_SH_HMSXIKB194.zip",
+          "member": "hhd_100_COIP31st1243612_2026-09-01.txt",
+          "total_pot": 208.8,
+          "rake": 5.1,
+          "collected_sum": 203.54,
+          "difference": -0.16
+        },
+        {
+          "hand": 123535000890,
+          "path": "/Users/zer0o0ne/Documents/Poker/data/raw/field-nl100-500/2026-10-08_CPH2N_NL-HH-_SH_UUZUR971/2026-09-01_CPH2N_NL100_SH_HMSXIKB194.zip",
+          "member": "hhd_100__ANTE_COIP31st1235350_2026-08-31.txt",
+          "total_pot": 13.84,
+          "rake": 0.79,
+          "collected_sum": 12.22,
+          "difference": -0.83
+        },
+        {
+          "hand": 123535000891,
+          "path": "/Users/zer0o0ne/Documents/Poker/data/raw/field-nl100-500/2026-10-08_CPH2N_NL-HH-_SH_UUZUR971/2026-09-01_CPH2N_NL100_SH_HMSXIKB194.zip",
+          "member": "hhd_100__ANTE_COIP31st1235350_2026-08-31.txt",
+          "total_pot": 3.46,
+          "rake": 0.1,
+          "collected_sum": 1.69,
+          "difference": -1.67
+        }
+      ],
+      "extra_summary_fields": []
+    }
+  },
+  "scope": {
+    "read_only_sources": true,
+    "full_raw_scan": true,
+    "hu_coverage_not_assessed_as_deficiency": true,
+    "full_action_by_action_engine_replay": false,
+    "corpus_counts_include_payout_inconsistencies": true
+  },
+  "current_structure_hand_parser": {
+    "summary_only_card_pairs_missed_field": 252714,
+    "verified_example_hand": "123818200165",
+    "verified_player": "WoollyPaws",
+    "raw_cards": [
+      "9c",
+      "Js"
+    ],
+    "parsed_cards": null
+  }
+}

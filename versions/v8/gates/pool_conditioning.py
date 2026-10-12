@@ -87,9 +87,9 @@ def load_checkpoints(config, game, device, log):
     nobody can interpret later.
     """
     pc = config["pool_conditioning"]
-    agent_ckpt = torch.load(pc["agent_checkpoint"], map_location=device,
+    agent_ckpt = torch.load(pc["agent_checkpoint"], map_location="cpu",
                             weights_only=False)
-    embed_ckpt = torch.load(pc["embedding_checkpoint"], map_location=device,
+    embed_ckpt = torch.load(pc["embedding_checkpoint"], map_location="cpu",
                             weights_only=False)
     for what, ckpt in (("agent", agent_ckpt), ("embedding", embed_ckpt)):
         trained = ckpt.get("config", {})
@@ -117,7 +117,8 @@ def load_checkpoints(config, game, device, log):
     embed_net = OpponentEmbeddingNet(
         config["embedding_net"], int(game["n_actions"]),
         int(game["max_players"]),
-        n_members=int(state["embeddings.weight"].shape[0])).to(device)
+        n_members=int(state["embeddings.weight"].shape[0]),
+        table_max_players=int(game["players_range"][1])).to(device)
     embed_net.load_state_dict(state)
     embed_net.eval()
     for p in embed_net.parameters():

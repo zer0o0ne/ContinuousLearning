@@ -442,6 +442,8 @@ def action_values_batch(requests, driver, pool, cfg, posterior_cache=None):
         share = elapsed * (n / len(specs)) if specs else 0.0
         out.append(_label_q(plan, played[offset:offset + n],
                             plan.prepared + share))
+        played[offset:offset + n] = [None] * n
+        plan.specs.clear()
         offset += n
     assert offset == len(specs), (
         f"{offset} of {len(specs)} rollout hands were claimed by a label")

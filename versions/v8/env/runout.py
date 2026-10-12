@@ -245,7 +245,9 @@ def _flush(batch):
     scored = scored.numpy()
     at = 0
     for (hand, turn, _known, holes, comps), block in batch:
-        hand._scores[(hand.key, int(turn))] = scored[at:at + len(block)].reshape(
+        # A small cached street must not pin the full concatenated batch after
+        # its other hands have finished and their cache entries were evicted.
+        hand._scores[(hand.key, int(turn))] = scored[at:at + len(block)].copy().reshape(
             len(comps), len(holes))
         at += len(block)
     assert at == len(scored), f"{at} of {len(scored)} ranked rows were claimed"

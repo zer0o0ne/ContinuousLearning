@@ -32,10 +32,10 @@ import torch
 
 INT, FLOAT, BOOL = "i", "f", "b"
 
-# A v8 hand cannot produce more events than this: `max_actions_for(9) = 62`
-# decisions plus one terminal event per seat. It bounds the slab, and `pack`
-# refuses loudly rather than writing past it.
-MAX_EVENTS_PER_HAND = 80
+# v8 tokens need <= max_actions_for(9) + 9 rows. A vendored v7 request
+# contains BOTH pre-decision and post-action snapshots plus the initial one:
+# <= 2 * max_actions_for(9) + 1 = 125. `pack` refuses overflow explicitly.
+MAX_EVENTS_PER_HAND = 128
 
 
 def v7_fields(max_players, n_actions):
@@ -81,8 +81,7 @@ def token_fields(max_players, n_actions, d_emb):
         ("emb", d_emb, FLOAT),
         # §5.7 — what the range head reads. `seat_emb` is every seat's vector
         # and not only the acting one, so it is `max_players` times as wide as
-        # `emb`; the slab is a shared mapping and pages a run never touches are
-        # never backed, so the width costs address space rather than memory.
+        # `emb`. These buffers are materialised shared-memory allocations.
         ("own_hole", 2, INT),
         ("seat_slot", max_players, INT),
         ("seat_member", max_players, INT),
@@ -103,13 +102,13 @@ class Slab:
 
     Sized for the largest request either kind can make: a policy query covers at
     most `max_rows` situations (a driver batch, or a posterior's combos) and a
-    v7 sequence at most `MAX_EVENTS_PER_HAND` events. The memory is a shared
-    mapping, so pages the run never touches are never backed.
+    v7 sequence at most `max_events` events. The caller bounds it by the
+    largest table allowed in the current run.
     """
 
-    def __init__(self, max_rows, specs, n_actions_out):
+    def __init__(self, max_rows, specs, n_actions_out, *, max_events=MAX_EVENTS_PER_HAND):
         self.max_rows = int(max_rows)
-        self.max_cells = self.max_rows * MAX_EVENTS_PER_HAND
+        self.max_cells = self.max_rows * int(max_events)
         widths = [_widths(f) for f in specs]
         self.ints = torch.zeros(self.max_cells * max(w[INT] for w in widths),
                                 dtype=torch.int64)

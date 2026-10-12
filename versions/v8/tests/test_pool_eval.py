@@ -229,6 +229,33 @@ def test_changed_training_weights_cannot_reuse_completed_units(tmp_path):
                  training_distribution=changed)
 
 
+def test_chunked_plans_preserve_decks_and_do_not_retain_finished_batches(tmp_path, monkeypatch):
+    import weakref
+    cfg, pool, desc, candidates = setup()
+    settings = pool_eval.configuration(cfg)
+    reference = pool_eval._plan(settings, cfg["game"], 0, "current", "warm", 7,
+                                list(range(len(pool))))
+    chunks = [u for lo in (0, 3, 6) for u in pool_eval._plan(
+        settings, cfg["game"], 0, "current", "warm", min(3, 7 - lo),
+        list(range(len(pool))), start=lo)]
+    for a, b in zip(reference, chunks):
+        for key in a:
+            np.testing.assert_array_equal(a[key], b[key])
+    refs = []
+    real = pool_eval._play_units
+
+    def play_chunk(units, *args, **kwargs):
+        assert all(ref() is None for ref in refs), "finished evaluation decks retained"
+        assert len(units) <= settings["blocks_per_batch"]
+        refs[:] = [weakref.ref(deck) for unit in units for deck in unit["decks"]]
+        return real(units, *args, **kwargs)
+
+    monkeypatch.setattr(pool_eval, "_play_units", play_chunk)
+    evaluate(pool, desc, candidates, cfg, tmp_path, 0, 8,
+             training_distribution=distribution(cfg, pool))
+    assert refs and all(ref() is None for ref in refs)
+
+
 @pytest.mark.parametrize("all_hands", [False, True])
 def test_truncated_hands_are_discarded_in_pairs_and_resume(tmp_path, monkeypatch, all_hands):
     cfg, pool, desc, candidates = setup(3)

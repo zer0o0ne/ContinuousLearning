@@ -28,7 +28,7 @@ from nets.tokeniser import SituationTokeniser
 class HandEncoder(nn.Module):
     """(B, T, d_model) hidden states for a batch of tokenised hands."""
 
-    def __init__(self, cfg, n_actions, max_players):
+    def __init__(self, cfg, n_actions, max_players, *, table_max_players=None):
         super().__init__()
         d_model = cfg["d_model"]
         d_emb = cfg["d_emb"]
@@ -76,10 +76,11 @@ class HandEncoder(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(qwen, layer_idx=i) for i in range(n_layers)])
         self.norm = Qwen3RMSNorm(d_model, eps=qwen.rms_norm_eps)
-        self.range_head = (RangeHead(cfg, d_model, d_emb, max_players)
+        self.range_head = (RangeHead(cfg, d_model, d_emb, max_players,
+                                     table_max_players=table_max_players)
                            if self.range_enabled else None)
 
-    def forward(self, batch, emb, seat_emb=None):
+    def forward(self, batch, emb, seat_emb=None, *, return_range=True):
         """`(hidden, range_logits)` — one causal pass over each hand.
 
         `hidden` is (B, T, d_model). `range_logits` is (A, 1326) over the active
@@ -108,6 +109,7 @@ class HandEncoder(nn.Module):
             "the range head needs every seat's vector at every token; the "
             "network that owns this encoder builds it (§5.7)")
         x = run(self.layers[:self.range_layer], x)
-        range_logits, x = self.range_head(x, batch, seat_emb)
+        range_logits, x = self.range_head(x, batch, seat_emb,
+                                          return_range=return_range)
         x = run(self.layers[self.range_layer:], x)
         return self.norm(x), range_logits

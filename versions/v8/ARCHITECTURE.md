@@ -521,6 +521,40 @@ street, plus `T` and `λ`. The categorisation is v7's `resolve_actions`, reused 
 vendored `modifiers.py`. A style draw is free — no extra forward, no extra parameters — so the
 opponent space is continuous and effectively infinite, which is the answer to §11.3.
 
+Training also draws a fresh augmentation independently for each pool player's
+seat in each hand. `style.augmentation_zero_iteration = K` sets its probability
+to `1 - k / K` for zero-based iterations `0 <= k < K`, and
+exactly zero from `K` onward. Missing or zero `K` disables it; `config.json`
+uses 29, the last iteration of its 30-iteration run. Only the probability
+decays: selected styles retain the configured full strength.
+
+Each bias scale accepts either one scalar or five category scales in the order
+fold / call / small raise / big raise / all-in. The main config uses
+`uncond_scale: [500, 500, 0, 0, 0]`, position/street scales of 0.5,
+`log_temperature_range: [-0.3, 0.3]` and no uniform mix. This deliberately
+strong draw was calibrated for about 60% argmax changes on the initial regular
+pool, with approximately neutral mean raise probability. It does not preserve
+each archetype's aggression: passive members become more aggressive and
+aggressive members more passive. Neural pool members have a different logit
+scale, so neither the 60% rate nor aggression neutrality is guaranteed for them.
+
+Both embedding-corpus self-play and label collection use this schedule. The
+current training hero is excluded; all seats in corpus self-play qualify.
+The hand stores compact per-seat 32-vectors, reused unchanged by posterior
+queries, range targets, replay and every oracle continuation, including workers.
+Repeated seats of one member draw independently. Permanent member identities
+and styles stay intact: biases add, temperatures multiply, and uniform masses
+combine as `1 - (1 - base_lambda) * (1 - augmentation_lambda)`. Evaluation does
+not attach draws. A session's fitted embedding therefore describes a player
+averaged over the hand-level augmentations while the schedule is active.
+
+`n_sessions_first_iteration` overrides label collection's `n_sessions` only at
+iteration 0 (defaults to `n_sessions` when absent). The main config uses 500
+sessions initially and 100 thereafter, each of 400 hands. Hand seed ranges
+reserve the larger count on every iteration, keeping label and embedding
+corpora disjoint even after the session count drops. This setting is separate
+from the existing `embedding_net.first_corpus_sessions`.
+
 **Degenerate strategies (`degenerate.py`, §4.1).** always-fold, always-call, always-min-raise,
 maniac, nit. They emit finite-scale logits rather than one-hots so a style draw can still move
 them. The nit's strength test is a hole-card lookup, not an equity evaluation — §4.2 drops
@@ -1708,11 +1742,52 @@ and under the owner decision of 2026-08-19 (`CONCEPT.md` §5.4) hero's tokens ha
 agent's reserved row `len(pool₀) + k`. Stamping it is S9's job, and it is the one place where a
 wrong index would be read as a different player rather than raised as an error.
 
-**Untested here.** Everything above has run at four sessions of six hands with two rollout
-samples per action, on CPU. The memory profile at real scale is a hypothesis: the phase holds
-every played record and every stored prefix until the labelling pass ends, which at §13's 10⁵
-labels per iteration is order a gigabyte and fine, and at 10⁶ is not — if the loop ever wants
-that many, generation has to be chunked, and it is the caller's `n_sessions` that chunks it.
+**Memory ownership (2026-10-12).** Models and embedding generations stay resident in the
+pool. Data has a shorter lifetime:
+
+| Data | Last consumer and release point |
+|---|---|
+| Embedding corpus records and range dictionaries | One session is range-labelled, tokenised, then cleared. Training retains only the current token corpus. |
+| Collected label-source records | Hands with no usable hero decision are dropped before labelling. With workers, the parent clears its histories after spawn; each worker clears a hand after its final label. Sequential labelling does the same. |
+| Recorded hero prefixes | Popped on consumption, including rejected labels. Valid prefixes/ranges live only until their shard is written. |
+| Results awaiting ordering | Per-worker credits cover computation, IPC and the reorder dictionary together: at most `max(labels_per_shard, oracle.labels_per_batch)` labels per worker. Credits return after ordered consumption. |
+| Posterior and range trackers | One hand; cleared when its last chunk finishes. |
+| Runout rank matrices | Each cache entry owns its own array; a small survivor no longer pins the whole concatenated ranking batch. The driver evicts completed hands' entries. |
+| Fit/training batches, losses and gradients | Dropped/cleared between steps. Optimiser states are local to one fit or training phase. |
+| Training labels | Released before the oracle gap. Held-out observations are copied out of shard-backed views and discard range supervision, which the metric does not read. Completed training/metrics load no shards on resume; metrics-only resume reads one shard at a time. |
+| Pool-evaluation decks and seeds | Only the current `blocks_per_batch` chunk is materialised; completed chunks are dropped. Unit summaries remain for the final statistics. |
+| Checkpoint tensors and IPC resources | Checkpoints stage on CPU and are released after loading; workers, queues, pipes and shared slabs are closed on completion or failure. |
+
+Collection still retains the current unlabelled corpus: fitting needs preceding hands,
+and labelling needs the remaining source records and exact hero observations. Training
+retains its current random-access token dataset. Their size scales with the configured
+corpus; neither is an allocation that can be discarded while its consumers remain.
+Regular opponents' board-strength caches remain bounded by `max_boards`; preflop tables
+and combo-index buffers are reusable model inputs.
+
+The range head's working player axis is `game.players_range[1]`, independently of the
+observation/checkpoint capacity `game.max_players`. Learned seat-table shapes are unchanged,
+so existing checkpoints load strictly. At inference and vector fitting, detached range
+predictions build no unused autograd branch and range logits are released before injection
+and the upper trunk. Range supervision still receives the full graph during training.
+Shared transport capacity also follows the configured table maximum, including **two v7
+snapshots per decision**; ordinary v8 tokens and v7 events have different length bounds.
+
+`[memory]` JSON log entries appear at phase boundaries, after each shard, and after a label
+completes if the preceding log is at least a minute old: Linux parent
+and worker RSS/PSS, CPU peak RSS, CUDA allocated/reserved and peaks, plus label/reorder
+counts. On macOS the standard-library CPU counter is peak RSS only. Phase boundaries run
+GC and release unused CUDA allocator blocks; shard logging does not flush the allocator.
+Reported RSS/PSS and CUDA figures are separate accounting views, not an additive total.
+
+CPU ownership tests use weak references across three iterations, training steps, shard
+writes and evaluation chunks. They also check bounded worker results, sequential/parallel
+label parity, input/parameter gradients and strict checkpoint loading at 2, 6 and 9 seats.
+An isolated CPU range-head profile with the standard dimensions and `B=16, T=20` measured
+peak temporary allocation above its pre-existing tensors of 42,166,480 bytes at width 9
+and 9,434,480 bytes at width 2; maximum output difference was `7.15e-7`. This is a CPU
+measurement of the head, **not** a measured full-pipeline or Spark memory reduction.
+Production CUDA peaks and host allocator behaviour must be checked using the new logs.
 
 ---
 

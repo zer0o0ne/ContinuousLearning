@@ -142,6 +142,62 @@ def test_more_workers_than_sessions_still_labels_everything(tmp_path_factory):
     assert len(labels) == len(expected) > 0
 
 
+def test_parent_releases_source_records_and_bounds_out_of_order_results(tmp_path, monkeypatch):
+    import weakref
+    import oracle.parallel as parallel
+
+    refs, depths = [], []
+    cfg = _parallel_cfg(2, n_sessions=4, hands=5)
+    cfg["labels_per_shard"] = 1
+    cfg["oracle"]["labels_per_batch"] = 3  # Chunk larger than the shard/credit request.
+    cfg["embedding_net"]["range_enabled"] = True
+    cfg["game"] = dict(cfg["game"], players_range=[2, 2])
+    spawn, collect, drain = (train.generate.spawn_workers, train.generate.collect,
+                             parallel.drain_results)
+    allocate = parallel.Slab
+    _agent, event_sequences = _v7_seqs(4)
+
+    def checked_slab(rows, specs, n_out, **kwargs):
+        slab = allocate(rows, specs, n_out, **kwargs)
+        # A v7 history emits an initial event and pre/post snapshots for
+        # decisions. At the HU cap that can be 41 events, not 22 v8 tokens.
+        sequences = [event_sequences[0][:1] * 41] * rows
+        payload = extract_event_tensors(sequences, MAX_PLAYERS)
+        slab.pack(v7_fields(MAX_PLAYERS, N_ACTIONS), payload,
+                  int(payload["card_ids"].shape[0]))
+        return slab
+
+    def spawning(*args, **kwargs):
+        sessions = args[2]
+        refs.extend(weakref.ref(r) for s in sessions for r in s.records if r is not None)
+        return spawn(*args, **kwargs)
+
+    def collecting(*args, **kwargs):
+        assert refs and all(r() is None for r in refs)
+        return collect(*args, **kwargs)
+
+    def draining(q, into):
+        result = drain(q, into)
+        depths.append(len(into))
+        assert len(into) <= 2 * 3
+        return result
+
+    monkeypatch.setattr(train.generate, "spawn_workers", spawning)
+    monkeypatch.setattr(train.generate, "collect", collecting)
+    monkeypatch.setattr(parallel, "drain_results", draining)
+    monkeypatch.setattr(parallel, "Slab", checked_slab)
+    two, labels = _run(tmp_path / "par", cfg=cfg, hero=_scripted_hero())
+    cfg["oracle"]["n_workers"] = 0
+    one, expected = _run(tmp_path / "seq", cfg=cfg, hero=_scripted_hero())
+    assert two["n_labels"] == one["n_labels"] > 0
+    assert depths and max(depths) > 0
+    for a, b in zip(labels, expected):
+        np.testing.assert_array_equal(a["q"], b["q"])
+        for field in ("token", "seat", "combo", "weight"):
+            np.testing.assert_array_equal(getattr(a["tokens"].ranges, field),
+                                          getattr(b["tokens"].ranges, field))
+
+
 def test_a_parallel_run_resumes_without_replaying_a_labelled_hand(
         tmp_path_factory, monkeypatch):
     """Resume, through the workers: the same label set, and no hand dealt twice.
@@ -270,6 +326,20 @@ def test_a_v7_payload_survives_the_slab_unchanged():
     out = slab.unpack(fields, cells, (cells,))
     for name, _cols, _dtype in fields:
         assert torch.equal(out[name], payload[name]), name
+
+
+def test_default_slab_fits_the_full_ring_snapshot_limit():
+    agent, seqs = _v7_seqs(4)
+    # 62 decisions can leave 125 snapshots. This guards the difference
+    # between v7 event sequences and v8's one-token-per-decision format.
+    payload = extract_event_tensors([seqs[0][:1] * 125], agent.max_players)
+    fields = v7_fields(agent.max_players, agent.n_actions)
+    slab = Slab(1, [fields], agent.n_actions)
+    cells = int(payload["card_ids"].shape[0])
+    slab.pack(fields, payload, cells)
+    unpacked = slab.unpack(fields, cells, (cells,))
+    for name, _cols, _dtype in fields:
+        assert torch.equal(unpacked[name], payload[name])
 
 
 def test_a_forward_through_the_slab_is_the_forward_without_it():

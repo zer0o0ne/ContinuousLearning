@@ -77,23 +77,25 @@ import torch
 from agent.policy import AgentPoolMember, FrozenAgentMember
 from env.driver import LockstepDriver
 from env.session import (assert_seeds_stay_distinct, build_sessions,
-                         hand_seed_bases, phase_hands, play)
+                         hand_seed_bases, label_session_count, phase_hands, play)
 from evaluation.identity import atomic_json
 from gates.g1 import _stack_bucket
 from nets.agent_net import AgentNet
 from nets.embedding_net import OpponentEmbeddingNet
 from nets.features import collate
 from pool.build import build_pool
+from pool.augmentation import (augment_sessions, augmentation_probability,
+                               augmentation_signature)
 from pool.sampling import PoolSampler
 from pool.style import StyleParams, sample_style
 from train.agent_train import (seat_embeddings, token_embeddings,
                                train_agent)
-from oracle.ranges import label_ranges
+from oracle.ranges import RangeStats, label_ranges
 from oracle.rollout import RANGE_MODEL, estimator_signature
 from train.embed_train import train_embedding_net
 from train.generate import generate_labels, load_shard
 from train.targets import ev_loss_budget, normalised_q, policy_target
-from utils import Logger, progress, resolve_device
+from utils import Logger, memory_checkpoint, progress, resolve_device
 
 TAG = "loop"
 
@@ -206,13 +208,14 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log,
     bar = progress(total=len(labels), desc=f"gap:{mode}", unit="label")
     for lo in range(0, len(labels), int(batch_hands)):
         chunk = labels[lo:lo + int(batch_hands)]
-        batch = collate([lab["tokens"] for lab in chunk], device=device)
+        batch = collate([lab["tokens"] for lab in chunk], device=device,
+                        include_ranges=False)
         tables = torch.as_tensor(
             np.stack([np.asarray(lab["embeddings"], dtype=np.float32)
                       for lab in chunk]), device=device)
         if cold:
             tables = torch.zeros_like(tables)
-        logits, _range = net.logits_and_range(
+        logits = net(
             batch, token_embeddings(tables, batch["slot"], net.d_emb),
             seat_embeddings(tables, batch["seat_slot"]))
         idx = torch.arange(len(chunk), device=logits.device)
@@ -221,6 +224,7 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log,
         logp = torch.log_softmax(
             logits.masked_fill(~legal, float("-inf")), dim=-1)
         logp = logp.double().cpu().numpy()
+        del batch, tables, logits, idx, last, legal
 
         for j, lab in enumerate(chunk):
             mask = np.asarray(lab["legal"], dtype=bool)
@@ -233,6 +237,7 @@ def oracle_gap(net, labels, temperature, divisor, batch_hands, device, log,
             rows.append({**terms, "num_players": int(lab["num_players"]),
                          "stack_bb": int(lab["stack_bb"])})
         bar.update(len(chunk))
+        del chunk, logp
     bar.close()
 
     def summarise(subset):
@@ -347,7 +352,8 @@ def warm_start_trunk(agent_net, embed_net, log):
 def frozen_agent_net(state_dict, config, game, device):
     """A past agent's network: loaded, frozen, and never trained again."""
     net = AgentNet(config["embedding_net"], int(game["n_actions"]),
-                   int(game["max_players"])).to(device)
+                   int(game["max_players"]),
+                   table_max_players=int(game["players_range"][1])).to(device)
     net.load_state_dict(state_dict)
     net.eval()
     for p in net.parameters():
@@ -367,7 +373,8 @@ def frozen_embedding_net(state_dict, config, game, device):
     net = OpponentEmbeddingNet(
         config["embedding_net"], int(game["n_actions"]),
         int(game["max_players"]),
-        n_members=int(state_dict["embeddings.weight"].shape[0])).to(device)
+        n_members=int(state_dict["embeddings.weight"].shape[0]),
+        table_max_players=int(game["players_range"][1])).to(device)
     net.load_state_dict(state_dict)
     net.eval()
     for p in net.parameters():
@@ -399,7 +406,7 @@ def embedding_vintages(exp_dir, upto, config, game, device, enabled, log):
             continue
         if latest not in cache:
             cache[latest] = frozen_embedding_net(
-                torch.load(latest, map_location=device,
+                torch.load(latest, map_location="cpu",
                            weights_only=False)["model_state_dict"],
                 config, game, device)
         out[k] = cache[latest]
@@ -443,22 +450,34 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
         int(emb_cfg["corpus_hands_per_session"]),
         seed_base=hand_seed_bases(it_seed, phase_hands(config))[0]["corpus"],
         tag="corpus", sampler=corpus_sampler)
+    augment_sessions(sessions, config.get("style", {}), iteration)
     driver = LockstepDriver(pool, int(game["n_actions"]))
     play(driver, sessions, int(config["driver_batch_size"]), log, "corpus")
     # §5.7 — the belief targets, once over the corpus and never inside the
     # training loop, exactly where `label_showdowns` sits for the same reason.
-    if emb_cfg.get("range_enabled", False):
-        rstats = label_ranges(
-            sessions, pool, int(game["n_actions"]),
+    rstats = RangeStats()
+
+    def prepare_session(session):
+        if not emb_cfg.get("range_enabled", False):
+            return
+        rstats.merge(label_ranges(
+            [session], pool, int(game["n_actions"]),
             floor=float(config.get("oracle", {}).get("likelihood_floor", 1e-6)),
             prune=float(emb_cfg.get("range_prune_threshold", 0.0)),
-            desc="ranges")
+            show_progress=False))
+
+    torch.manual_seed(it_seed + 500_000)
+    # Prepare one session, tokenise it and immediately release its raw history.
+    # Dense dictionaries of all corpus ranges never coexist with all tokens.
+    history = train_embedding_net(
+        embed_net, sessions, emb_cfg, game, device, log,
+        it_seed + 500_000, iteration=iteration, release_sessions=True,
+        prepare_session=prepare_session)
+    if emb_cfg.get("range_enabled", False):
         log(f"[{TAG}] §5.7 ranges: {rstats.emitted} targets, "
             f"{rstats.forwards} forwards, {rstats.dropped:.1f} total mass "
             f"pruned, {rstats.collapsed} supports collapsed")
-    torch.manual_seed(it_seed + 500_000)
-    return train_embedding_net(embed_net, sessions, emb_cfg, game, device, log,
-                               it_seed + 500_000, iteration=iteration)
+    return history
 
 
 def build_targets(labels, loss, temperature, divisor, iteration=0):
@@ -560,6 +579,7 @@ def pool_evaluation(pool, descriptors, agent_net, embed_net, measured_config,
         previous = torch.load(os.path.join(_iter_dir(exp_dir, reference), "agent.pt"),
                               map_location="cpu", weights_only=False)
         old_config = previous.get("config") or config
+        del previous
         old_embedding = base.embed_net
         if cfg["warm_sessions"] and old_embedding is None:
             paths = [os.path.join(_iter_dir(exp_dir, k), "embedding.pt")
@@ -568,7 +588,7 @@ def pool_evaluation(pool, descriptors, agent_net, embed_net, measured_config,
             if path is None:
                 raise ValueError("Previous checkpoint has no embedding generation for warm evaluation")
             old_embedding = frozen_embedding_net(
-                torch.load(path, map_location=device, weights_only=False)["model_state_dict"],
+                torch.load(path, map_location="cpu", weights_only=False)["model_state_dict"],
                 old_config, game, device)
         old = FrozenAgentMember(f"agent{reference}", game["n_actions"], base.net,
                                  game["max_players"], device, embed_net=old_embedding)
@@ -602,6 +622,7 @@ def run(config, log, exp_dir):
 
     emb_cfg = config["embedding_net"]
     style_cfg = config.get("style", {})
+    augmentation_probability(style_cfg, 0)  # validate before expensive phases
     train_cfg = dict(config["agent_train"])
     oracle_cfg = config["oracle"]
     temperature = oracle_cfg["temperature"]
@@ -646,10 +667,12 @@ def run(config, log, exp_dir):
     torch.manual_seed(seed)
     embed_net = OpponentEmbeddingNet(emb_cfg, int(game["n_actions"]),
                                      int(game["max_players"]),
-                                     n_members=n_members).to(device)
+                                     n_members=n_members,
+                                     table_max_players=int(game["players_range"][1])).to(device)
     torch.manual_seed(seed + 1)
     agent_net = AgentNet(emb_cfg, int(game["n_actions"]),
-                         int(game["max_players"])).to(device)
+                         int(game["max_players"]),
+                         table_max_players=int(game["players_range"][1])).to(device)
     log(f"[{TAG}] embedding network "
         f"{sum(p.numel() for p in embed_net.parameters())/1e6:.2f}M, agent "
         f"{sum(p.numel() for p in agent_net.parameters())/1e6:.2f}M parameters")
@@ -665,13 +688,14 @@ def run(config, log, exp_dir):
                                   conditioned, log)
     for k in range(start):
         it_dir = _iter_dir(exp_dir, k)
-        state = torch.load(os.path.join(it_dir, "agent.pt"), map_location=device,
+        state = torch.load(os.path.join(it_dir, "agent.pt"), map_location="cpu",
                            weights_only=False)["model_state_dict"]
         members, desc = agent_variant_members(
             frozen_agent_net(state, config, game, device), k, config, game,
             device, seed, embed_net=vintages[k])
         pool += members
         descriptors += desc
+        del state
     latest_emb = max((j for j in range(start + 1)
                       if os.path.exists(os.path.join(_iter_dir(exp_dir, j),
                                                      "embedding.pt"))),
@@ -679,7 +703,7 @@ def run(config, log, exp_dir):
     if latest_emb is not None:
         embed_net.load_state_dict(torch.load(
             os.path.join(_iter_dir(exp_dir, latest_emb), "embedding.pt"),
-            map_location=device, weights_only=False)["model_state_dict"])
+            map_location="cpu", weights_only=False)["model_state_dict"])
     if start:
         log(f"[{TAG}] resuming at iteration {start}: pool is {len(pool)} "
             f"members, embedding network from iteration {latest_emb}")
@@ -688,12 +712,16 @@ def run(config, log, exp_dir):
     # on a resume it is the generation the restored network belongs to, which is
     # the one the last past agent already carries.
     vintage = vintages.get(start - 1) if start else None
+    del vintages
 
     metrics_all = []
     for k in range(start, n_iterations):
         it_dir = _iter_dir(exp_dir, k)
         os.makedirs(it_dir, exist_ok=True)
         log(f"[{TAG}] ===== iteration {k}: pool {len(pool)} members =====")
+        augmentation = augmentation_signature(style_cfg, k)
+        log(f"[{TAG}] per-hand pool style augmentation probability "
+            f"{augmentation_probability(style_cfg, k):.6f}")
         timings = {}
 
         # Both siblings start from the preceding even checkpoint. Restore
@@ -718,7 +746,7 @@ def run(config, log, exp_dir):
         if k % retrain_every == 0:
             if os.path.exists(emb_path):
                 embed_net.load_state_dict(torch.load(
-                    emb_path, map_location=device,
+                    emb_path, map_location="cpu",
                     weights_only=False)["model_state_dict"])
                 log(f"[{TAG}] embedding network restored from {emb_path}")
             else:
@@ -735,6 +763,8 @@ def run(config, log, exp_dir):
             if conditioned:
                 vintage = frozen_embedding_net(embed_net.state_dict(), config,
                                                game, device)
+
+        memory_checkpoint(log, f"it{k}:before_labels", device, release=True)
 
         # §6.1 / §5.6: the agent starts from the trunk phase A just trained.
         # Here and not before the loop, because the embedding network has to be
@@ -753,9 +783,11 @@ def run(config, log, exp_dir):
                 and (blob.get("hero_iteration", k - 1 if k else None) != hero_iteration
                      or blob["manifest"].get("range_model") != RANGE_MODEL
                      or blob["manifest"].get("q_estimator") !=
-                     estimator_signature(oracle_cfg, emb_cfg))
+                     estimator_signature(oracle_cfg, emb_cfg)
+                     or blob["manifest"].get("style_augmentation") != augmentation
+                     or blob["manifest"]["n_sessions"] != label_session_count(config, k))
                 and not os.path.exists(agent_path)):
-            log(f"[{TAG}] labels use a different hero or Q estimator; rebuilding "
+            log(f"[{TAG}] label collection settings changed; rebuilding "
                 "this unfinished iteration and keeping the old shards aside")
             blob = None
         if blob is not None:
@@ -776,7 +808,9 @@ def run(config, log, exp_dir):
                 LockstepDriver(pool, int(game["n_actions"])), pool, sampler,
                 embed_net, hero_factory(k, agent_net, init_member, game, device),
                 {"seed": _iteration_seed(seed, k),
+                 "iteration": k, "style": style_cfg,
                  "n_sessions": int(config["n_sessions"]),
+                 "n_sessions_first_iteration": label_session_count(config, 0),
                  "hands_per_session": int(config["hands_per_session"]),
                  "driver_batch_size": int(config["driver_batch_size"]),
                  "labels_per_shard": int(config["labels_per_shard"]),
@@ -795,20 +829,26 @@ def run(config, log, exp_dir):
                                       "pool_distribution": sampler.distribution(),
                                       "timings": timings})
 
-        labels = [lab for path in manifest["shards"] for lab in load_shard(path)]
-        assert len(labels) == manifest["n_labels"], (
-            f"{len(labels)} labels on disk, manifest says "
-            f"{manifest['n_labels']}")
+        memory_checkpoint(log, f"it{k}:labels_done", device, release=True)
+        # Only training needs the full corpus. A resumed measurement streams
+        # one shard at a time below; a completed measurement reads no labels.
+        labels = None
+        if not os.path.exists(agent_path):
+            labels = [lab for path in manifest["shards"] for lab in load_shard(path)]
+            assert len(labels) == manifest["n_labels"], (
+                f"{len(labels)} labels on disk, manifest says "
+                f"{manifest['n_labels']}")
         train_idx, held_idx = split_heldout(
-            len(labels), train_cfg.get("heldout_fraction", 0.0), seed, k)
+            manifest["n_labels"], train_cfg.get("heldout_fraction", 0.0), seed, k)
 
         # ------------------------------------------------------ C: the agent
         measured_config = config
         if os.path.exists(agent_path):
-            checkpoint = torch.load(agent_path, map_location=device,
+            checkpoint = torch.load(agent_path, map_location="cpu",
                                     weights_only=False)
             agent_net.load_state_dict(checkpoint["model_state_dict"])
             measured_config = checkpoint.get("config") or config
+            del checkpoint
             log(f"[{TAG}] agent restored from {agent_path}")
             history = None
         else:
@@ -824,12 +864,15 @@ def run(config, log, exp_dir):
             else:
                 history = []
                 log(f"[{TAG}] no valid training labels; keeping the agent weights for iteration {k}")
+            del picked
             timings["agent"] = time.perf_counter() - t0
             torch.save({"model_state_dict": agent_net.state_dict(),
                         "config": config, "iteration": k, "history": history,
                         "hero_iteration": hero_iteration,
                         "q_estimator": manifest.get("q_estimator", "legacy")},
                        agent_path)
+
+        memory_checkpoint(log, f"it{k}:agent_done", device, release=True)
 
         training_distribution = load_training_distribution(measured_config, labels_path, len(pool))
         if blob is not None:
@@ -838,6 +881,7 @@ def run(config, log, exp_dir):
         # ------------------------------------------------- D: the oracle gap
         metrics_path = os.path.join(it_dir, "metrics.json")
         if os.path.exists(metrics_path):
+            del labels
             metrics = _read_json(metrics_path)
         else:
             t0 = time.perf_counter()
@@ -846,16 +890,31 @@ def run(config, log, exp_dir):
             measured_train = measured_config["agent_train"]
             measured_oracle = measured_config["oracle"]
             train_idx, held_idx = split_heldout(
-                len(labels), measured_train.get("heldout_fraction", 0.0),
+                manifest["n_labels"], measured_train.get("heldout_fraction", 0.0),
                 int(measured_config.get("seed", 0)), k)
-            held = [labels[i] for i in held_idx]
+            # Shard fields are numpy views: retaining even one held-out label
+            # otherwise pins every backing array of its entire shard.
+            if labels is not None:
+                for i in held_idx:
+                    labels[i]["tokens"].ranges = None
+                held = copy.deepcopy([labels[i] for i in held_idx])
+            else:
+                held, offset = [], 0
+                for path in manifest["shards"]:
+                    shard = load_shard(path, include_ranges=False)
+                    indices = held_idx[(held_idx >= offset) & (held_idx < offset + len(shard))]
+                    held.extend(copy.deepcopy([shard[i - offset] for i in indices]))
+                    offset += len(shard)
+                    del shard, indices
+                assert offset == manifest["n_labels"]
+            del labels
             gap_args = (agent_net, held, measured_oracle["temperature"],
                         measured_oracle.get("divisor", "pot_plus_bet"),
                         int(measured_train["batch_hands"]), device, log)
             metrics = {
                 "iteration": k,
                 "n_pool": len(pool),
-                "n_labels": len(labels),
+                "n_labels": manifest["n_labels"],
                 "n_train": int(len(train_idx)),
                 "loss": measured_train.get("loss", "kl"),
                 "temperature": measured_oracle["temperature"],
@@ -871,8 +930,11 @@ def run(config, log, exp_dir):
             timings["gap"] = time.perf_counter() - t0
             metrics["timings"] = timings
             _write_json(metrics_path, metrics)
+            del held, gap_args
         log(f"[{TAG}] " + winrate_line(metrics.get("gap", {}),
                                        metrics.get("gap_cold", {})))
+        del train_idx, held_idx
+        memory_checkpoint(log, f"it{k}:gap_done", device, release=True)
 
         # The mixture stays fixed throughout evaluation. Only after completion
         # can training/warm results feed the next iteration's PFSP state.
@@ -914,6 +976,7 @@ def run(config, log, exp_dir):
         log(f"[{TAG}] iteration {k} done in "
             f"{sum(timings.values()):.1f}s ({timings}); pool is now "
             f"{len(pool)} members")
+        memory_checkpoint(log, f"it{k}:done", device, release=True)
 
     _write_json(os.path.join(exp_dir, "report.json"),
                 {"config": config, "pool": descriptors,

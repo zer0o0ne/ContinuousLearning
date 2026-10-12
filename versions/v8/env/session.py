@@ -102,17 +102,24 @@ class Session:
 HAND_PHASES = ("labels", "corpus")
 
 
+def label_session_count(cfg, iteration):
+    """Iteration 0 may collect more labels than the subsequent iterations."""
+    return int(cfg.get("n_sessions_first_iteration", cfg["n_sessions"])
+               if iteration == 0 else cfg["n_sessions"])
+
+
 def phase_hands(cfg):
     """Reserve enough hand seeds for each phase on any iteration.
 
-    The corpus may have different first and later session counts. Reserve
+    Labels and corpus may have different first and later session counts. Reserve
     their maximum to keep a fixed stride and disjoint seeds across iterations.
     """
     emb = cfg["embedding_net"]
     corpus_sessions = max(int(emb["corpus_sessions"]),
                           int(emb.get("first_corpus_sessions", emb["corpus_sessions"])))
     return {
-        "labels": int(cfg["n_sessions"]) * int(cfg["hands_per_session"]),
+        "labels": max(label_session_count(cfg, 0), label_session_count(cfg, 1))
+                  * int(cfg["hands_per_session"]),
         "corpus": corpus_sessions * int(emb["corpus_hands_per_session"]),
     }
 

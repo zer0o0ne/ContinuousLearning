@@ -34,21 +34,22 @@ from nets.trunk import HandEncoder
 class AgentNet(nn.Module):
     """(B, n_actions) logits at each hand's last real token."""
 
-    def __init__(self, cfg, n_actions, max_players):
+    def __init__(self, cfg, n_actions, max_players, *, table_max_players=None):
         super().__init__()
         self.d_model = cfg["d_model"]
         self.d_emb = cfg["d_emb"]
         self.n_actions = n_actions
         self.max_players = max_players
 
-        self.encoder = HandEncoder(cfg, n_actions, max_players)
+        self.encoder = HandEncoder(cfg, n_actions, max_players,
+                                   table_max_players=table_max_players)
         self.action_out = nn.Linear(self.d_model, n_actions)
 
     def forward(self, batch, emb, seat_emb=None):
         """(B, n_actions) logits. See `logits_and_range` for the §5.7 head."""
-        return self.logits_and_range(batch, emb, seat_emb)[0]
+        return self.logits_and_range(batch, emb, seat_emb, return_range=False)[0]
 
-    def logits_and_range(self, batch, emb, seat_emb=None):
+    def logits_and_range(self, batch, emb, seat_emb=None, *, return_range=True):
         """`(action logits, range logits)` — the second is `None` with §5.7 off.
 
         The agent carries no head of its own for the belief: the head is in the
@@ -56,7 +57,8 @@ class AgentNet(nn.Module):
         already trained and this network inherits it with the rest of the
         encoder rather than starting a second one from scratch.
         """
-        hidden, range_logits = self.encoder(batch, emb, seat_emb)
+        hidden, range_logits = self.encoder(batch, emb, seat_emb,
+                                            return_range=return_range)
         mask = batch["mask"]
         lengths = mask.sum(dim=1).long()
         assert int(lengths.min()) > 0, (

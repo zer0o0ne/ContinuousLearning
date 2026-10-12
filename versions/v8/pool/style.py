@@ -136,20 +136,37 @@ class StyleParams:
         return b
 
     def apply(self, logits, legal, contexts):
-        """(B, n_actions) played distribution. `legal` is a boolean mask."""
-        n_actions = logits.shape[1]
-        bias = self.category_bias(contexts) @ category_matrix(n_actions)
+        """Played distribution, including any hand-owned training augmentation.
 
-        z = (logits + bias) / self.temperature
+        Biases add, temperatures multiply, and uniform masses combine as
+        ``1 - (1 - base_mix) * (1 - augmentation_mix)``. An identity draw is
+        neutral; the member's permanent style is never mutated or replaced.
+        """
+        n_actions = logits.shape[1]
+        category_bias = self.category_bias(contexts)
+        temperature = np.full((len(contexts), 1), self.temperature, dtype=np.float64)
+        uniform_mix = np.full((len(contexts), 1), self.uniform_mix, dtype=np.float64)
+        for i, ctx in enumerate(contexts):
+            aug = getattr(ctx, "style_augmentation", None)
+            if aug is None:
+                continue
+            category_bias[i] += aug[:5] + aug[10 + 5 * ctx.turn:15 + 5 * ctx.turn]
+            if position_bucket(ctx.acting_pos, ctx.num_players):
+                category_bias[i] += aug[5:10]
+            temperature[i, 0] *= aug[30]
+            uniform_mix[i, 0] += (1.0 - uniform_mix[i, 0]) * aug[31]
+        bias = category_bias @ category_matrix(n_actions)
+
+        z = (logits + bias) / temperature
         z = np.where(legal, z, -np.inf)
         z = z - z.max(axis=1, keepdims=True)
         p = np.exp(z)
         p /= p.sum(axis=1, keepdims=True)
 
-        if self.uniform_mix > 0.0:
+        if np.any(uniform_mix > 0.0):
             counts = legal.sum(axis=1, keepdims=True)
             uniform = legal.astype(np.float64) / np.maximum(counts, 1)
-            p = (1.0 - self.uniform_mix) * p + self.uniform_mix * uniform
+            p = (1.0 - uniform_mix) * p + uniform_mix * uniform
         return p
 
 
@@ -161,7 +178,9 @@ def sample_style(rng, cfg):
 
     ``uncond_scale``, ``position_scale``, ``street_scale``
         standard deviations of the zero-mean Gaussian each bias block is drawn
-        from, in logit units;
+        from, in logit units. A scalar applies to all categories; a five-vector
+        gives fold / call / small raise / big raise / all-in separate scales
+        (broadcast over the four streets for ``street_scale``);
     ``log_temperature_range``
         ``T = exp(U(lo, hi))`` — symmetric in log space, so sharpening and
         flattening are equally likely;

@@ -91,7 +91,8 @@ def pool_by_key(hidden, key, mask, n_keys):
 class OpponentEmbeddingNet(nn.Module):
     """Per-hand encoder + per-player embedding table + amortised head."""
 
-    def __init__(self, cfg, n_actions, max_players, n_members):
+    def __init__(self, cfg, n_actions, max_players, n_members, *,
+                 table_max_players=None):
         super().__init__()
         d_model = cfg["d_model"]
         d_emb = cfg["d_emb"]
@@ -103,7 +104,8 @@ class OpponentEmbeddingNet(nn.Module):
         self.n_members = n_members
 
         # §5.1/§5.2 trunk, shared as code with the agent (OI-4, `nets/trunk.py`).
-        self.encoder = HandEncoder(cfg, n_actions, max_players)
+        self.encoder = HandEncoder(cfg, n_actions, max_players,
+                                   table_max_players=table_max_players)
         self.action_out = nn.Linear(d_model, n_actions)
         # §5.1a — the two showdown heads. Read only on terminal tokens.
         self.showdown_strength_out = nn.Linear(d_model, 1)
@@ -157,7 +159,7 @@ class OpponentEmbeddingNet(nn.Module):
 
     def hidden(self, batch, emb, seat_emb=None):
         """(B, T, d_model) — one causal pass over each hand independently."""
-        return self.encoder(batch, emb, seat_emb)[0]
+        return self.encoder(batch, emb, seat_emb, return_range=False)[0]
 
     def hidden_and_range(self, batch, emb, seat_emb):
         """`(hidden, range logits)` — the §5.7 head's output alongside it."""
@@ -285,12 +287,14 @@ class OpponentEmbeddingNet(nn.Module):
                 parts["range_ce"] = ce
                 parts["range_kl"] = kl
                 total = total + weights.get("range", 0.0) * loss
+        del range_logits
 
         # §5.6 — the poker prior. In training only, never in the §5.5 fit.
         strength = self.strength_loss(hidden, batch)
         if strength is not None:
             parts["own_strength_mse"] = float(strength.detach())
             total = total + weights.get("strength", 0.0) * strength
+        del hidden
 
         amortised_weight = weights.get("amortised", 0.0)
         if amortised_weight > 0.0:
@@ -393,6 +397,8 @@ def fit_embeddings(net, batch, n_slots, steps, lr, reg, init=None,
             loss = loss + reg * vectors.pow(2).sum(-1).mean()
             loss.backward()
             opt.step()
+            del loss, _parts
+            opt.zero_grad(set_to_none=True)
     finally:
         for p, flag in zip(net.parameters(), was_trainable):
             p.requires_grad_(flag)

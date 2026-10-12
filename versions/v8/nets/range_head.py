@@ -117,15 +117,20 @@ class _CrossBlock(nn.Module):
         qh = self._heads(self.q_proj(h))
         kh = self._heads(self.k_proj(kvn))
         vh = self._heads(self.v_proj(kvn))
+        del h, kvn
         if rope_q is not None:
             cos_q, sin_q = rope_q
             cos_k, sin_k = rope_kv
             qh, _ = apply_rotary_pos_emb(qh, qh, cos_q, sin_q)
+            del _
             kh, _ = apply_rotary_pos_emb(kh, kh, cos_k, sin_k)
+            del _
         out = F.scaled_dot_product_attention(qh, kh, vh,
                                              attn_mask=attn_mask.unsqueeze(1))
+        del qh, kh, vh
         out = out.transpose(1, 2).reshape(B, Lq, -1)
         q = q + self.o_proj(out)
+        del out
         return q + self.ff(self.norm_ff(q))
 
 
@@ -137,7 +142,7 @@ class RangeHead(nn.Module):
     on blocked combos; `hidden` is the trunk states with the belief injected.
     """
 
-    def __init__(self, cfg, d_model, d_emb, max_players):
+    def __init__(self, cfg, d_model, d_emb, max_players, *, table_max_players=None):
         super().__init__()
         d_range = cfg.get("d_range", d_model)
         n_heads = cfg.get("range_heads", cfg["n_heads"])
@@ -146,7 +151,12 @@ class RangeHead(nn.Module):
         assert n_blocks >= 1, "a range head with no block predicts nothing"
 
         self.d_range = d_range
-        self.max_players = max_players
+        # Keep learned seat tables checkpoint-compatible; only working tensors
+        # use the configured table size, not the observation format's capacity.
+        self.max_players = int(max_players if table_max_players is None
+                               else table_max_players)
+        if not 2 <= self.max_players <= max_players:
+            raise ValueError("table_max_players must fit the observation's max_players")
         self.pos_embed = nn.Embedding(max_players, d_range)
         self.q_in = nn.Linear(d_model + d_emb, d_range)
         self.blocks = nn.ModuleList(
@@ -168,7 +178,7 @@ class RangeHead(nn.Module):
             num_key_value_heads=n_heads, head_dim=d_range // n_heads,
             max_position_embeddings=cfg.get("max_decisions", 64)))
 
-    def forward(self, hidden, batch, seat_emb):
+    def forward(self, hidden, batch, seat_emb, *, return_range=True):
         """`(logits, hidden')` — the belief, and the trunk states it went into.
 
         `logits` has one row per entry of `batch["act_idx"]`, in that order.
@@ -176,11 +186,43 @@ class RangeHead(nn.Module):
         act = batch["act_idx"]
         B, T, d_model = hidden.shape
         P = self.max_players
+        if bool((batch["num_players"] > P).any()):
+            raise ValueError("a table exceeds the range head's configured player limit")
         if act.numel() == 0:
             # No live opponent anywhere in the batch — a corpus of walkovers is
             # a legitimate batch, not an error. Nothing to predict, and the
             # identity to inject.
-            return hidden.new_zeros((0, N_COMBOS)), hidden
+            return (hidden.new_zeros((0, N_COMBOS)) if return_range else None), hidden
+        b, t, s = act[:, 0], act[:, 1], act[:, 2]
+
+        # Beliefs are detached before injection. When no range loss is read
+        # (inference, vector fitting, amortised pass), their autograd graph has
+        # no consumer. Avoid building it, and drop logits before the upper trunk.
+        with torch.set_grad_enabled(torch.is_grad_enabled() and return_range):
+            logits = self._predict(hidden, batch, seat_emb)
+        with torch.no_grad():
+            probs = torch.softmax(logits, dim=-1)
+        if not return_range:
+            logits = None
+        kv = hidden.new_zeros((B, T, P, d_model))
+        kv[b, t, s] = self.value_in(probs) + self.pos_out(s)
+        del probs
+        active = batch["active"][:, :, :P]
+        seats = active.reshape(B * T, P).clone()
+        seats[:, 0] |= ~seats.any(dim=-1)
+        injected = self.inject(hidden.reshape(B * T, 1, d_model),
+                               kv.reshape(B * T, P, d_model),
+                               seats.reshape(B * T, 1, P))
+        del kv, seats
+        injected = injected.reshape(B, T, d_model)
+        keep = active.any(dim=-1, keepdim=True)
+        return logits, torch.where(keep, injected, hidden)
+
+    def _predict(self, hidden, batch, seat_emb):
+        """Range-only temporaries die before belief injection starts."""
+        B, T, _ = hidden.shape
+        P = self.max_players
+        act = batch["act_idx"]
         b, t, s = act[:, 0], act[:, 1], act[:, 2]
 
         # ---- queries: who (the seat's position embedding and that seat's
@@ -199,8 +241,8 @@ class RangeHead(nn.Module):
         causal = (pos.unsqueeze(1) >= pos.unsqueeze(0))            # (T, T)
         allow = (causal.unsqueeze(1)                                # (T,1,T)
                  & (batch["mask"] > 0).unsqueeze(1).unsqueeze(1))   # (B,1,1,T)
-        allow = allow & batch["active"].unsqueeze(-1)               # (B,T,P,T)
-        allow = allow.reshape(B, T * P, T).clone()
+        allow = allow & batch["active"][:, :, :P].unsqueeze(-1)     # (B,T,P,T)
+        allow = allow.reshape(B, T * P, T)
         allow[:, :, 0] |= ~allow.any(dim=-1)
 
         pos_q = pos.repeat_interleave(P).unsqueeze(0).expand(B, -1)
@@ -212,24 +254,12 @@ class RangeHead(nn.Module):
                     rope_kv=(cos_k, sin_k))
 
         q = q.reshape(B, T, P, self.d_range)[b, t, s]
+        del allow, cos_q, sin_q, cos_k, sin_k, pos_q, kv_pos, causal
         logits = self.combo_out(self.norm_out(q))
+        del q
         blocked = combo_block_mask(batch)[b, t]
         logits = logits.masked_fill(~blocked, float("-inf"))
-
-        # ---- back into the trunk. The value is the probability vector,
-        # detached: the layers above consume a belief they cannot bend, and the
-        # head is trained by its own target alone.
-        probs = torch.softmax(logits, dim=-1).detach()
-        kv = hidden.new_zeros((B, T, P, d_model))
-        kv[b, t, s] = self.value_in(probs) + self.pos_out(s)
-        seats = batch["active"].reshape(B * T, P).clone()
-        seats[:, 0] |= ~seats.any(dim=-1)
-        injected = self.inject(hidden.reshape(B * T, 1, d_model),
-                               kv.reshape(B * T, P, d_model),
-                               seats.reshape(B * T, 1, P))
-        injected = injected.reshape(B, T, d_model)
-        keep = batch["active"].any(dim=-1, keepdim=True)
-        return logits, torch.where(keep, injected, hidden)
+        return logits
 
 
 def range_loss(logits, batch):

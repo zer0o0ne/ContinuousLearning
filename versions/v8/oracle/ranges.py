@@ -297,7 +297,8 @@ def hand_ranges(record, observer_pos, pool, n_actions, floor=1e-6, prune=0.0,
     return out, tracker.stats
 
 
-def label_ranges(sessions, pool, n_actions, floor=1e-6, prune=0.0, desc=None):
+def label_ranges(sessions, pool, n_actions, floor=1e-6, prune=0.0, desc=None,
+                 *, show_progress=True):
     """§5.7 targets over a whole corpus, in the shape `Session.tokens` reads.
 
     The same place in the pipeline as `env.showdown.label_showdowns`, and for
@@ -319,7 +320,8 @@ def label_ranges(sessions, pool, n_actions, floor=1e-6, prune=0.0, desc=None):
 
     total = sum(len(s.records) for s in sessions)
     stats = RangeStats()
-    bar = progress(total=total, desc=desc or "ranges", unit="hand")
+    bar = progress(total=total, desc=desc or "ranges", unit="hand",
+                   disable=not show_progress)
     for session in sessions:
         session.ranges = []
         for h, record in enumerate(session.records):

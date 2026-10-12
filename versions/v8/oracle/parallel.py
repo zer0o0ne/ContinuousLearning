@@ -61,7 +61,7 @@ import numpy as np
 import torch
 
 from agent.policy import AgentPoolMember, FrozenAgentMember
-from env.driver import LockstepDriver
+from env.driver import LockstepDriver, max_actions_for
 from nets.features import derived_masks
 from oracle.ranges import label_range_target
 from oracle.rollout import action_values_batch
@@ -339,7 +339,9 @@ class ForwardServer:
         if not self.active:
             return False
         ready = wait([self.conns[w] for w in sorted(self.active)],
-                     timeout=POLL_SECONDS)
+                     # Workers can be waiting for result credits rather than
+                     # a model reply; drain those promptly even with no pipe I/O.
+                     timeout=min(POLL_SECONDS, 0.1))
         if not ready:
             drain()
             self._check_alive()
@@ -355,6 +357,7 @@ class ForwardServer:
             logits = self.runners[key].run(slab, cells, shape, extra)
             rows, cols = logits.shape
             slab.out[:rows, :cols].copy_(logits)
+            del logits
             self.requests += 1
             self.rows += int(rows)
             conn.send(True)
@@ -373,7 +376,7 @@ class ForwardServer:
 
 def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
                  hero_plain, hero_rec, pool_slots, n_actions, ocfg, seed, R,
-                 slab, conn, result_q):
+                 slab, conn, result_q, credits):
     """Label every decision in `todo`. Runs in its own process, CPU only."""
     torch.set_num_threads(1)
     client = ForwardClient(slab, conn)
@@ -387,8 +390,19 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
     current = (None, None)
     posterior_cache = PosteriorCache()
     range_cache = ocfg.range_cache()
+    last_decision = {(i, h): d for _pos, i, h, d in todo}
+    for i, session in session_of.items():
+        session.specs.clear()  # Each remaining record already owns its spec.
+        for h in range(len(session.records)):
+            if (i, h) not in last_decision:
+                session.records[h] = None
     try:
         for chunk in label_chunks(todo, R, ocfg.labels_per_batch):
+            # A fast later session must not accumulate the rest of the corpus
+            # in the parent's reorder buffer. Credits are returned on consume,
+            # not merely when a result is taken off the IPC queue.
+            for _ in chunk:
+                credits.acquire()
             i, h = chunk[0][1], chunk[0][2]
             block = h // R
             if (i, block) != current:
@@ -408,8 +422,18 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
                 ranges = label_range_target(range_cache, session_of[_i],
                                             h_, d_, play_pool, n_actions)
                 result_q.put((pos, q, legal, stats, ranges))
+                if d_ == last_decision[(_i, h_)]:
+                    session_of[_i].records[h_] = None
+            del answers, q, legal, stats, ranges
+            if chunk[-1][3] == last_decision[(chunk[-1][1], chunk[-1][2])]:
+                posterior_cache.clear()
+                if range_cache is not None:
+                    range_cache.clear()
     finally:
         client.done()
+        conn.close()
+        result_q.close()
+        result_q.join_thread()
 
 
 # ------------------------------------------------------------- orchestration
@@ -451,7 +475,7 @@ def _amp_of(agent):
 
 def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
                   hero_spec, hero_plain, hero_rec, pool_slots, runners, game,
-                  ocfg, seed, R, log):
+                  ocfg, seed, R, log, *, max_pending=1200):
     """Start `n_workers` label workers over a session-strided partition.
 
     Sessions rather than decisions, because a worker then reads only its own
@@ -462,14 +486,15 @@ def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
     import multiprocessing as mp
 
     ctx = mp.get_context("spawn")
-    result_q = ctx.Queue()
+    max_pending = max(int(max_pending), int(ocfg.labels_per_batch))
+    result_q = ctx.Queue(maxsize=n_workers * max_pending)
+    credits = [ctx.BoundedSemaphore(max_pending) for _ in range(n_workers)]
     # A worker is one core's worth of Python. numpy's BLAS does not read
     # `torch.set_num_threads`, and it picks its thread count up from the
     # environment at import — which under `spawn` is this process's environment
     # as of `start()`. Left alone, N workers each open a pool the width of the
     # machine and 20 cores get several hundred threads to schedule.
     inherited = {k: os.environ.get(k) for k in _BLAS_VARS}
-    os.environ.update({k: "1" for k in _BLAS_VARS})
     rows = slab_rows(ocfg.batch_hands, ocfg.max_combos)
     specs = [v7_fields(int(game["max_players"]), int(game["n_actions"]))]
     specs += [r.fields for r in runners.values()]
@@ -479,37 +504,53 @@ def spawn_workers(n_workers, todo, sessions, block_vectors, pool_spec,
 
     owners = {i: i % n_workers for i in range(len(sessions))}
     procs, conns, slabs = [], [], []
-    for w in range(n_workers):
-        mine = [t for t in todo if owners[t[1]] == w]
-        session_of = {i: sessions[i] for i in range(len(sessions))
-                      if owners[i] == w}
-        vectors = {i: block_vectors[i] for i in session_of}
-        slab = Slab(rows, specs, n_out)
-        parent_conn, child_conn = ctx.Pipe(duplex=True)
-        p = ctx.Process(
-            target=_worker_main,
-            args=(w, mine, session_of, vectors, pool_spec, hero_spec,
-                  hero_plain, hero_rec, pool_slots, int(game["n_actions"]),
-                  ocfg, seed, R, slab, child_conn, result_q),
-            daemon=True)
-        p.start()
-        child_conn.close()
-        procs.append(p)
-        conns.append(parent_conn)
-        slabs.append(slab)
-        log(f"[labels] worker {w}: {len(mine)} labels over "
-            f"{len(session_of)} sessions (pid {p.pid})")
-    for key, value in inherited.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
+    table_max = int(game["players_range"][1])
+    os.environ.update({k: "1" for k in _BLAS_VARS})
+    try:
+        for w in range(n_workers):
+            mine = [t for t in todo if owners[t[1]] == w]
+            session_of = {i: sessions[i] for i in range(len(sessions))
+                          if owners[i] == w}
+            vectors = {i: block_vectors[i] for i in session_of}
+            slab = Slab(rows, specs, n_out,
+                        max_events=max(max_actions_for(table_max) + table_max,
+                                       2 * max_actions_for(table_max) + 1))
+            parent_conn, child_conn = ctx.Pipe(duplex=True)
+            conns.append(parent_conn)
+            slabs.append(slab)
+            p = ctx.Process(
+                target=_worker_main,
+                args=(w, mine, session_of, vectors, pool_spec, hero_spec,
+                      hero_plain, hero_rec, pool_slots, int(game["n_actions"]),
+                      ocfg, seed, R, slab, child_conn, result_q, credits[w]),
+                daemon=True)
+            try:
+                p.start()
+            finally:
+                child_conn.close()
+            procs.append(p)
+            log(f"[labels] worker {w}: {len(mine)} labels over "
+                f"{len(session_of)} sessions (pid {p.pid})")
+    except BaseException:
+        join_workers(procs, log)
+        for conn in conns:
+            conn.close()
+        result_q.close()
+        result_q.join_thread()
+        raise
+    finally:
+        for key, value in inherited.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     log(f"[labels] {n_workers} slabs of {slabs[0].nbytes() / 1e6:.0f} MB "
         f"shared memory, {rows} rows each")
-    return procs, conns, slabs, result_q
+    return procs, conns, slabs, result_q, credits
 
 
-def collect(server, result_q, procs, todo, start, consume, log, results=None):
+def collect(server, result_q, procs, todo, start, consume, log, results=None,
+            credits=None):
     """Serve the workers and hand finished labels to `consume` in todo order.
 
     Workers own strided sessions, so labels come back out of order; the parent
@@ -529,7 +570,7 @@ def collect(server, result_q, procs, todo, start, consume, log, results=None):
     while True:
         alive = server.poll(drain)
         drain()
-        next_pos = _consume_prefix(results, next_pos, todo, consume)
+        next_pos = _consume_prefix(results, next_pos, todo, consume, credits)
         if not alive:
             break
 
@@ -543,18 +584,20 @@ def collect(server, result_q, procs, todo, start, consume, log, results=None):
             _check_exited(procs)
             continue
         results[int(pos)] = (q, legal, stats, ranges)
-        next_pos = _consume_prefix(results, next_pos, todo, consume)
+        next_pos = _consume_prefix(results, next_pos, todo, consume, credits)
     assert not results, (
         f"{len(results)} labels came back for positions nobody asked for")
     log(f"[labels] server: {server.requests} forwards, {server.rows} rows")
     return next_pos
 
 
-def _consume_prefix(results, next_pos, todo, consume):
+def _consume_prefix(results, next_pos, todo, consume, credits=None):
     while next_pos in results:
         q, legal, stats, ranges = results.pop(next_pos)
         i, h, d = todo[next_pos]
         consume(next_pos, i, h, d, q, legal, stats, ranges)
+        if credits is not None:
+            credits[i % len(credits)].release()
         next_pos += 1
     return next_pos
 
@@ -596,6 +639,11 @@ def join_workers(procs, log):
             p.join(timeout=POLL_SECONDS)
         elif p.exitcode != 0:
             bad.append((w, p.exitcode))
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=POLL_SECONDS)
+        if not p.is_alive():
+            p.close()
     if stragglers:
         log(f"[labels] WARNING: terminated worker(s) {stragglers} still "
             f"waiting on the server")

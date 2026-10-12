@@ -141,6 +141,34 @@ def test_the_loop_runs_and_writes_every_artefact(tmp_path):
         assert m["gap_cold"]["overall"]["ev_gap_greedy"] >= -1e-12
 
 
+def test_previous_labels_are_released_before_collecting_next_iteration(
+        tmp_path, monkeypatch):
+    import gc
+    import weakref
+
+    token_refs = []
+    real_load = pipeline.load_shard
+    real_generate = pipeline.generate_labels
+    collections = []
+
+    def load(path):
+        labels = real_load(path)
+        token_refs.extend(weakref.ref(lab["tokens"]) for lab in labels)
+        return labels
+
+    def generate(*args, **kwargs):
+        gc.collect()
+        collections.append(len(token_refs))
+        assert all(ref() is None for ref in token_refs), (
+            "the next iteration must not retain the previous training corpus")
+        return real_generate(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "load_shard", load)
+    monkeypatch.setattr(pipeline, "generate_labels", generate)
+    _run(tmp_path)
+    assert len(collections) == 2 and collections[1] > 0
+
+
 @pytest.mark.parametrize("floor_fraction", [0.0, 0.25, 1.0])
 def test_embedding_corpus_uses_pfsp_for_every_seat_without_changing_label_sampler(
         monkeypatch, floor_fraction):

@@ -399,7 +399,7 @@ def empty_batch(B, T, n_actions, max_players):
     }
 
 
-def collate(hands, device="cpu"):
+def collate(hands, device="cpu", *, include_ranges=True):
     """Pad a list of `HandTokens` into one batch of tensors.
 
     Hands are the batch dimension, not a sequence — that is what the
@@ -421,7 +421,8 @@ def collate(hands, device="cpu"):
         out["mask"][b, :t] = 1.0
 
     out.update(derived_masks(out))
-    out.update(range_batch(hands, out))
+    if include_ranges:
+        out.update(range_batch(hands, out))
     return {k: v.to(device) for k, v in out.items()}
 
 

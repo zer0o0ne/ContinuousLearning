@@ -44,7 +44,7 @@ from utils import progress
 
 
 def train_embedding_net(net, sessions, cfg, game, device, log, seed,
-                        iteration=0):
+                        iteration=0, *, release_sessions=False, prepare_session=None):
     """§5.4 baseline: no inner loop, table and transformer trained jointly.
 
     `iteration` selects the step count and nothing else: `first_retrain_steps`
@@ -56,8 +56,22 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
     n_actions = game["n_actions"]
 
     corpus = []
+    bar = progress(total=sum(len(s.records) for s in sessions),
+                   desc="corpus targets/tokens", unit="hand")
     for s in sessions:
+        if prepare_session is not None:
+            prepare_session(s)
         corpus.extend(t for t in s.tokens(max_players, n_actions) if len(t) > 0)
+        bar.update(len(s.records))
+        if release_sessions:
+            # The pipeline owns these sessions exclusively. Tokenisation copied
+            # their arrays; do not keep records and sparse targets alongside it.
+            s.records.clear()
+            s.ranges.clear()
+            s.specs.clear()
+    bar.close()
+    if release_sessions:
+        sessions.clear()
     n_decision = sum(int((t.token_type == TOKEN_DECISION).sum()) for t in corpus)
     n_showdown = sum(int((t.token_type == TOKEN_SHOWDOWN).sum()) for t in corpus)
     # §5.6: a corpus whose records were never labelled carries no strength
@@ -83,11 +97,12 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
     net.train()
     history = []
     for step in progress(range(1, steps + 1), desc="train", unit="step"):
+        opt.zero_grad(set_to_none=True)
         pick = rng.choice(len(corpus), size=batch_hands, replace=False)
         batch = collate([corpus[i] for i in pick], device=device)
         total, parts = net.loss_terms(batch, weights)
 
-        opt.zero_grad(set_to_none=True)
+        del batch  # Needed backward tensors are owned by autograd itself.
         total.backward()
         if cfg.get("grad_clip"):
             torch.nn.utils.clip_grad_norm_(net.parameters(), cfg["grad_clip"])
@@ -98,5 +113,7 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
             log(f"[train] step {step}/{steps} "
                 + " ".join(f"{k}={v:.4f}" for k, v in parts.items()))
             history.append({"step": step, **parts})
+        del total, parts
+        opt.zero_grad(set_to_none=True)
     net.eval()
     return history

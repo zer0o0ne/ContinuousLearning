@@ -84,13 +84,14 @@ is bit-identical to the one that would have been computed without one.
 import io
 import json
 import os
+import time
 import zipfile
 from dataclasses import fields, replace
 
 import numpy as np
 
 from env.session import (Session, build_sessions, hand_seed_bases,
-                         phase_hands, play)
+                         label_session_count, phase_hands, play)
 from nets.embedding_net import fit_embeddings, loss_weights
 from oracle.parallel import (ForwardServer, collect, join_workers,
                              runner_table, spawn_workers, worker_count)
@@ -102,7 +103,8 @@ from oracle.rollout import (RANGE_MODEL, LabelStats, OracleConfig,
                             action_values_batch, estimator_signature)
 from agent.policy import FrozenAgentMember
 from pool.base import PoolMember
-from utils import progress
+from pool.augmentation import augment_sessions, augmentation_signature
+from utils import memory_checkpoint, progress
 
 TAG = "labels"
 HERO_SLOT = 0
@@ -247,16 +249,18 @@ def _shard_arrays(labels):
             [getattr(t, name) for t in tokens], axis=0)
     out.update(_range_arrays(tokens))
 
-    tables, index = [], []
+    tables, index, table_index = [], [], {}
     for lab in labels:
-        table = lab["embeddings"]
-        for k, seen in enumerate(tables):
-            if seen is table:
-                index.append(k)
-                break
-        else:
-            index.append(len(tables))
+        table = np.asarray(lab["embeddings"])
+        # Indexing the observer row creates a new view for every label. Python
+        # identity would write the same table once per label, despite sharing
+        # exactly the same memory. Preserve that sharing through the shard.
+        key = (table.__array_interface__["data"][0], table.shape,
+               table.strides, table.dtype.str)
+        if key not in table_index:
+            table_index[key] = len(tables)
             tables.append(table)
+        index.append(table_index[key])
     out["emb_index"] = np.asarray(index, dtype=np.int64)
     out["emb_tables"] = np.stack(tables).astype(np.float32)
 
@@ -292,7 +296,7 @@ def _range_arrays(tokens):
     return out
 
 
-def load_shard(path):
+def load_shard(path, *, include_ranges=True):
     """The labels of one shard, in the order they were written.
 
     Each entry is the dict `generate_labels` wrote: `tokens` (a `HandTokens`
@@ -301,9 +305,11 @@ def load_shard(path):
     `embeddings` table in force when hero acted, and the table metadata.
     """
     with np.load(path) as z:
-        data = {k: z[k] for k in z.files}
+        data = {k: z[k] for k in z.files if include_ranges or not k.startswith("rng_")}
     offsets = data["tok_offsets"]
-    tables = data["emb_tables"]
+    # Reuse a single view per stored table, including when a held-out subset
+    # is copied out of the shard. A fresh view per label defeats deepcopy's memo.
+    tables = list(data["emb_tables"])
     labels = []
     for i in range(len(offsets) - 1):
         lo, hi = int(offsets[i]), int(offsets[i + 1])
@@ -357,13 +363,14 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
             on change every `R` hands. At iteration 0 the factory ignores both
             arguments and returns the pool member of §7.1; from iteration 1 it
             returns an `AgentPoolMember` over the current network.
-        cfg: `seed`, `n_sessions`, `hands_per_session`, `driver_batch_size`,
-            `labels_per_shard`, and the `game`, `embedding_net` and `oracle`
-            sections of §8.1.
+        cfg: `seed`, `iteration` (zero-based), `n_sessions`, optional
+            `n_sessions_first_iteration`, `hands_per_session`, `driver_batch_size`,
+            `labels_per_shard`, and `game`, `embedding_net`, `oracle`, `style`.
         out_dir: directory the shards are written into.
         log: a `Logger`.
     """
     game = cfg["game"]
+    iteration = cfg.get("iteration", 0)
     emb_cfg = cfg["embedding_net"]
     # The §8.1 `oracle` section also carries the §6.2 EV divisor and
     # temperature. Those belong to the *target*, which is built from `q` where
@@ -400,7 +407,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     # the two phases cannot disagree about who owns which seeds (`env/session`).
     seed_base = hand_seed_bases(int(cfg["seed"]), phase_hands(cfg))[0]["labels"]
     sessions = build_sessions(rng, list(range(len(pool))), game,
-                              int(cfg["n_sessions"]), hands_per_session,
+                              label_session_count(cfg, iteration), hands_per_session,
                               seed_base=seed_base, tag=TAG)
 
     # `build_sessions` draws its members uniformly and those draws are dropped:
@@ -459,6 +466,9 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                       else slots[sos[seat]])
                 for seat in range(s.num_players)]
 
+    style_cfg = cfg.get("style", {})
+    augment_sessions(sessions, style_cfg, iteration, exclude_slot=HERO_SLOT)
+
     # What an earlier call to this phase left behind, read before a single hand
     # is played: the corpus it played (`played`) and how far into the hands it
     # got labelling (`done`). Both are `None` for a fresh directory, and for one
@@ -468,6 +478,8 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     signature = _play_signature(sessions, seed_base, R, hands_per_session,
                                 pool_mode, pool_window)
     signature["q_estimator"] = estimator_signature(cfg.get("oracle", {}), emb_cfg)
+    augmentation = augmentation_signature(style_cfg, iteration)
+    signature["style_augmentation"] = augmentation
     if "hero_iteration" in cfg:
         # A rewound hero changes both collection and rollout continuation,
         # even when the sampled opponents and every random seed are identical.
@@ -497,6 +509,8 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                 emb_cfg, weights, max_players, n_actions, R, device, cfg, log,
                 first_hand=first_hand, vectors=block_vectors,
                 pool_slots=pool_slots)
+        memory_checkpoint(log, "labels:played", device, release=True,
+                          source_hands=sum(r is not None for s in sessions for r in s.records))
         manifest = _label_sessions(
             driver, play_pool, sessions, hero_plain, hero_rec, block_vectors,
             agent_member, ocfg, R, max_players, cfg, out_dir, done, log,
@@ -507,6 +521,8 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     manifest["n_hands"] = n_hands
     manifest["range_model"] = RANGE_MODEL
     manifest["q_estimator"] = signature["q_estimator"]
+    if augmentation is not None:
+        manifest["style_augmentation"] = augmentation
     return manifest
 
 
@@ -656,6 +672,8 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
             for s, blk in zip(played, blocks):
                 s.records.extend(blk.records)
             bar.update(sum(len(blk.specs) for blk in blocks))
+            del blk
+        del blocks, played
 
         if b + 1 == n_blocks or not fitting:
             continue
@@ -678,6 +696,7 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                 weights=weights)
             tables = np.zeros((n_obs, max_players, d_emb), dtype=np.float32)
             tables[0] = _pad_vectors(fitted.cpu().numpy(), max_players, d_emb)
+            del fitted, batch, observed
             # Each past agent reads its own tablemates through the network of
             # its own generation, over the hands *it* saw — one tokenisation and
             # one forward per conditioned seat, no gradient step.
@@ -950,18 +969,35 @@ def _label_in_parallel(n_workers, todo, consume, sessions, play_pool,
     runners, pool_spec, hero_spec = runner_table(
         mirror_pool, prototype, cfg["game"], _device_of(play_pool), log)
 
-    procs, conns, slabs, result_q = spawn_workers(
+    procs, conns, slabs, result_q, credits = spawn_workers(
         n_workers, [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)],
         sessions, block_vectors, pool_spec, hero_spec, hero_plain, hero_rec,
-        pool_slots, runners, cfg["game"], ocfg, int(cfg["seed"]), R, log)
+        pool_slots, runners, cfg["game"], ocfg, int(cfg["seed"]), R, log,
+        max_pending=int(cfg["labels_per_shard"]))
     server = ForwardServer(runners, slabs, conns, procs, log)
+    # Spawn has serialized each worker's disjoint history. The parent now only
+    # needs recorded hero tokens and session metadata, not a second history.
+    for session in sessions:
+        session.records.clear()
+        session.specs.clear()
+        session.ranges.clear()
+    memory_checkpoint(log, "labels:workers_started", _device_of(play_pool),
+                      workers=len(procs), source_hands_parent=0,
+                      pending_limit_per_worker=max(int(cfg["labels_per_shard"]),
+                                                   int(ocfg.labels_per_batch)))
     try:
         done = collect(server, result_q, procs, todo, 0, consume, log,
-                       results=results)
+                       results=results, credits=credits)
         assert done == len(todo), (
             f"the workers returned {done} of {len(todo)} labels")
     finally:
         join_workers(procs, log)
+        for conn in conns:
+            conn.close()
+        result_q.close()
+        result_q.join_thread()
+        slabs.clear()
+        runners.clear()
 
 
 def _device_of(play_pool):
@@ -998,7 +1034,25 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                   if pool_slots is None else pool_slots)
     hands_per_session = int(cfg["hands_per_session"])
     n_hands = len(sessions) * hands_per_session
+    device = _device_of(play_pool)
     todo = _hero_decisions(sessions, hero_rec)
+    needed = {(sessions[i].idx, h, d) for i, h, d in todo}
+    for rec in hero_rec:
+        for member_idx in rec:
+            seen = play_pool[member_idx].seen
+            for key in list(seen):
+                if key not in needed:
+                    del seen[key]  # Truncated hands have no labels to consume.
+    del needed
+    needed_hands = {(i, h) for i, h, _d in todo}
+    for i, session in enumerate(sessions):
+        # Every surviving record owns its spec; unlabelled/truncated hands
+        # have no consumer after collection and result aggregation.
+        session.specs.clear()
+        for h in range(len(session.records)):
+            if (i, h) not in needed_hands:
+                session.records[h] = None
+    del needed_hands
     log(f"[{TAG}] {len(todo)} hero decisions to label")
 
     per_shard = int(cfg["labels_per_shard"])
@@ -1027,6 +1081,15 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     # between hold no decision of hero's, so there is nothing there to label.
     next_hand = [hand_of[p + 1] if p + 1 < len(todo) else n_hands
                  for p in range(len(todo))]
+    last_memory = time.monotonic()
+
+    def report_memory(phase, decisions):
+        nonlocal last_memory
+        memory_checkpoint(log, phase, device,
+                          shards=len(shards), labels=n_labels,
+                          remaining_decisions=len(todo) - (decisions - decisions_done),
+                          held_for_ordering=buffered() if buffered is not None else 0)
+        last_memory = time.monotonic()
 
     def flush(hands, decisions):
         """A shard, then the note that says the shard is safely on disk.
@@ -1048,6 +1111,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                        "seconds": seconds,
                        "collision_sum": collision_sum,
                        "collision_n": collision_n}, fh)
+        report_memory("labels:shard", decisions)
 
     # `initial` and not `bar.update(start)`: the skipped labels were done by an
     # earlier run and must not be counted as having taken this run's zero
@@ -1085,9 +1149,12 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             bar.set_postfix_str(f"{buffered()} held for ordering",
                                 refresh=False)
 
+        # Each observation is consumed once. Transfer it to the shard buffer
+        # so flushing the shard releases both the prefix and its range target.
+        # Dropped labels must release their observations too.
+        hero_seat = s.seat_of_slot(HERO_SLOT, h)
+        tokens = play_pool[hero_rec[i][hero_seat]].seen.pop((s.idx, h, d))
         if np.isfinite(q[legal]).all():
-            hero_seat = s.seat_of_slot(HERO_SLOT, h)
-            tokens = play_pool[hero_rec[i][hero_seat]].seen[(s.idx, h, d)]
             # §5.7 — the belief the label was taken under, attached to the very
             # tokens the agent will be trained on. `None` with the head off.
             if ranges is not None:
@@ -1110,6 +1177,12 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             dropped += 1
         if len(buffer) >= per_shard and ends_hand[pos]:
             flush(next_hand[pos], decisions_done + pos + 1)
+        if ends_hand[pos] and s.records:
+            s.records[h] = None
+            if s.specs:
+                s.specs[h] = None
+        if time.monotonic() - last_memory >= 60:
+            report_memory("labels:progress", decisions_done + pos + 1)
 
     # Rollouts get averaged and corpus hands do not, so the variance-reduced
     # value belongs to the labelling driver and to nothing else. The parallel
@@ -1130,7 +1203,7 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             current = (None, None)
             posterior_cache = PosteriorCache()
             range_cache = ocfg.range_cache()
-            pending = [(pos, i, h, d) for pos, (i, h, d) in enumerate(todo)]
+            pending = ((pos, i, h, d) for pos, (i, h, d) in enumerate(todo))
             for chunk in label_chunks(pending, R, ocfg.labels_per_batch):
                 i, h = chunk[0][1], chunk[0][2]
                 block = h // R
@@ -1152,6 +1225,11 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                     consume(pos, i, h, d, q, legal, stats,
                             label_range_target(range_cache, sessions[i], h, d,
                                                play_pool, driver.n_actions))
+                del answers, q, legal, stats
+                if ends_hand[chunk[-1][0]]:
+                    posterior_cache.clear()
+                    if range_cache is not None:
+                        range_cache.clear()
     finally:
         driver.runout = saved_runout
     flush(n_hands, decisions_done + len(todo))

@@ -166,6 +166,35 @@ def _run(tmp_path, cfg=None, wrap=None, seed=0, hero=None, pool=None,
     return manifest, labels
 
 
+def test_written_observations_are_released_before_the_next_shard(
+        tmp_path, monkeypatch):
+    import gc
+    import weakref
+
+    written = []
+    real_arrays = train.generate._shard_arrays
+    shard_sizes = []
+
+    def arrays(labels):
+        gc.collect()
+        assert all(ref() is None for ref in written), (
+            "a persisted shard must not keep its observations alive")
+        written.extend(weakref.ref(lab["tokens"]) for lab in labels)
+        shard_sizes.append(len(labels))
+        return real_arrays(labels)
+
+    monkeypatch.setattr(train.generate, "_shard_arrays", arrays)
+    cfg = _cfg(n_sessions=2, hands=6)
+    cfg["labels_per_shard"] = 2
+    cfg["embedding_net"]["range_enabled"] = True
+    manifest, labels = _run(tmp_path, cfg=cfg)
+    gc.collect()
+    assert len(shard_sizes) > 1
+    assert sum(shard_sizes) == manifest["n_labels"] == len(labels)
+    assert all(ref() is None for ref in written)
+    assert all(lab["tokens"].ranges is not None for lab in labels)
+
+
 # ------------------------------------------------------- 1: the move itself
 
 
@@ -909,12 +938,18 @@ def _shard_bytes(manifest):
 
 def _capture_sessions(monkeypatch):
     """The session objects the phase played, with their records."""
+    from dataclasses import replace
+
     held = []
     real = train.generate._play_sessions
 
     def spy(driver, play_pool, sessions, *args, **kwargs):
-        held.append(sessions)
-        return real(driver, play_pool, sessions, *args, **kwargs)
+        result = real(driver, play_pool, sessions, *args, **kwargs)
+        # Labelling releases consumed records. Keep the played history the
+        # assertion needs without retaining it in the production sessions.
+        held.append([replace(s, specs=list(s.specs), records=list(s.records))
+                     for s in sessions])
+        return result
 
     monkeypatch.setattr(train.generate, "_play_sessions", spy)
     return held

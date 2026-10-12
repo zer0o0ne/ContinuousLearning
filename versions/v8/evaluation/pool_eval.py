@@ -240,10 +240,11 @@ def _rng(cfg, iteration, benchmark, mode, block):
         [int(cfg["seed"]), int(iteration), int(block), int.from_bytes(name[:8], "big")]))
 
 
-def _plan(cfg, game, iteration, benchmark, mode, count, member_ids, probabilities=None):
+def _plan(cfg, game, iteration, benchmark, mode, count, member_ids, probabilities=None,
+          *, start=0, deal=True):
     units = []
     hands = 1 if mode == "cold" else int(cfg["warm_hands_per_session"])
-    for block in range(count):
+    for block in range(start, start + count):
         rng = _rng(cfg, iteration, benchmark, mode, block)
         n = int(rng.integers(game["players_range"][0], game["players_range"][1] + 1))
         stack = int(rng.integers(game["stack_bb_range"][0], game["stack_bb_range"][1] + 1))
@@ -251,12 +252,15 @@ def _plan(cfg, game, iteration, benchmark, mode, count, member_ids, probabilitie
             raise ValueError("Training benchmark requires the label collection probabilities")
         opponents = [int(x) for x in rng.choice(
             member_ids, n - 1, replace=benchmark == "training", p=probabilities)]
+        unit = {"block": block, "players": n, "stack_bb": stack,
+                "opponents": opponents, "length": hands}
+        units.append(unit)
+        if not deal:
+            continue
         # Three separate streams; no seed is derived from realised game cards.
         streams = np.random.SeedSequence(rng.integers(0, 2**32, 4).tolist()).spawn(3)
         cards, actions, auxiliary = [np.random.default_rng(s) for s in streams]
-        units.append({"block": block, "players": n, "stack_bb": stack,
-                      "opponents": opponents, "length": hands,
-                      "decks": [cards.permutation(52) for _ in range(hands)],
+        unit.update({"decks": [cards.permutation(52) for _ in range(hands)],
                       "actions": actions.integers(0, 2**63, size=hands),
                       "auxiliary": auxiliary.integers(0, 2**63, size=hands)})
     return units
@@ -296,6 +300,8 @@ def _fit(lane, pool, candidates, config, cfg, hand):
                     lr=emb_cfg["fit_lr"], reg=emb_cfg["fit_reg"],
                     weights=loss_weights(emb_cfg))
                 lane.tables[0] = _pad_vectors(vectors.cpu().numpy(), max_players, net.d_emb)
+                del vectors, batch
+            del tokens
 
 
 def _play_units(units, pool, candidates, config, cfg, mode, bar):
@@ -418,15 +424,21 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, bootstra
                          config["embedding_net"], cfg, iteration, bootstrap_size, probabilities)
     check_identity(out_dir, identity)
     modes = [("cold", int(cfg["cold_blocks"])), ("warm", int(cfg["warm_sessions"]))]
+    width = int(cfg["blocks_per_batch"])
     jobs = []
+    total = 0
     for benchmark in cfg["benchmarks"]:
         ids = list(range(len(pool)))
         for mode, count in modes:
             if count:
-                units = _plan(cfg, config["game"], iteration, benchmark, mode, count, ids,
-                              probabilities if benchmark == "training" else None)
-                jobs.append((benchmark, mode, units))
-    total = sum(2*u["players"]*u["length"] for _, _, us in jobs for u in us)
+                jobs.append((benchmark, mode, count))
+                # Count work without retaining the decks of every future job.
+                for lo in range(0, count, width):
+                    total += sum(2*u["players"]*u["length"] for u in _plan(
+                        cfg, config["game"], iteration, benchmark, mode,
+                        min(width, count - lo), ids,
+                        probabilities if benchmark == "training" else None,
+                        start=lo, deal=False))
     bar = progress(total=total, desc="pool evaluation", unit="hand")
     report = {"version": VERSION, "run": cfg["run"], "iteration": iteration,
               "candidates": [c.member.name for c in candidates],
@@ -445,21 +457,25 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, bootstra
     for net in networks.values():
         net.eval()
     try:
-        for benchmark, mode, units in jobs:
+        for benchmark, mode, count in jobs:
             directory = out_dir / benchmark / mode
             directory.mkdir(parents=True, exist_ok=True)
-            rows, pending = [], []
-            for unit in units:
-                path = directory / f"{unit['block']:08d}.json"
-                if path.exists():
-                    row = json.loads(path.read_text())
-                    rows.append(row)
-                    bar.update(row["attempted_hands"])
-                else:
-                    pending.append(unit)
-            width = int(cfg["blocks_per_batch"])
-            for lo in range(0, len(pending), width):
-                chunk = pending[lo:lo+width]
+            rows = []
+            for lo in range(0, count, width):
+                chunk = []
+                for block in range(lo, min(lo + width, count)):
+                    path = directory / f"{block:08d}.json"
+                    if path.exists():
+                        row = json.loads(path.read_text())
+                        rows.append(row)
+                        bar.update(row["attempted_hands"])
+                    else:
+                        chunk.extend(_plan(cfg, config["game"], iteration, benchmark,
+                                           mode, 1, ids,
+                                           probabilities if benchmark == "training" else None,
+                                           start=block))
+                if not chunk:
+                    continue
                 t0 = time.perf_counter()
                 completed = _play_units(chunk, pool, candidates, config, cfg, mode, bar)
                 elapsed = time.perf_counter() - t0
@@ -468,6 +484,7 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, bootstra
                     row["seconds"] = elapsed * row["attempted_hands"] / n_hands
                     atomic_json(directory / f"{row['block']:08d}.json", row)
                     rows.append(row)
+                del chunk, completed
             rows.sort(key=lambda r: r["block"])
             summary = summarise(rows, cfg["confidence"], cfg["target_halfwidth_bb100"])
             summary["unit"] = "complete_session" if mode == "warm" else "duplicate_block"
@@ -480,6 +497,7 @@ def evaluate(pool, descriptors, candidates, config, out_dir, iteration, bootstra
                 for i in sorted({i for r in rows for i in r["opponents"]})}
             summary["opponent_note"] = "Hero return conditional on this opponent being seated; multiway rows overlap."
             report["benchmarks"].setdefault(benchmark, {})[mode] = summary
+            del rows
             chosen = summary["cv"] if summary["cv"] is not None else summary["raw"]
             log(f"[pool-eval] {benchmark}/{mode}: discarded {summary['discarded_hands']} "
                 f"paired hands ({summary['truncated_hands']} hit the action cap) "

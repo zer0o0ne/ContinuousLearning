@@ -189,6 +189,7 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
     history = []
     for step in progress(range(1, steps + 1),
                          desc=f"agent it{iteration}", unit="step"):
+        opt.zero_grad(set_to_none=True)
         pick = rng.choice(n, size=batch_hands, replace=False)
         batch = collate([hands[i] for i in pick], device=device)
         tables = torch.as_tensor(
@@ -218,7 +219,9 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         if scored is not None:
             loss = loss + w_range * scored[0]
 
-        opt.zero_grad(set_to_none=True)
+        # Autograd keeps exactly the tensors backward needs. Do not also pin
+        # the entire collated input and the large range logits until opt.step.
+        del batch, tables, logits, range_logits, rows, last, legal, target
         loss.backward()
         if cfg.get("grad_clip"):
             torch.nn.utils.clip_grad_norm_(net.parameters(), cfg["grad_clip"])
@@ -236,5 +239,7 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
             log(f"[agent] step {step}/{steps} "
                 + " ".join(f"{k}={v:.4f}" for k, v in row.items()
                            if k != "step"))
+        del loss, scored
+        opt.zero_grad(set_to_none=True)
     net.eval()
     return history

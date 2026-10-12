@@ -202,11 +202,13 @@ def load_networks(config, device, log, need_embedding):
     ev = config["evaluation"]
     agent_net = None
     if hero_is_the_agent(config):
-        agent_state = torch.load(ev["agent_checkpoint"], map_location=device,
+        agent_state = torch.load(ev["agent_checkpoint"], map_location="cpu",
                                  weights_only=False)["model_state_dict"]
         agent_net = AgentNet(config["embedding_net"], int(game["n_actions"]),
-                             int(game["max_players"])).to(device)
+                             int(game["max_players"]),
+                             table_max_players=int(game["players_range"][1])).to(device)
         agent_net.load_state_dict(agent_state)
+        del agent_state
         agent_net.eval()
         log(f"[{TAG}] agent from {ev['agent_checkpoint']}")
 
@@ -216,13 +218,15 @@ def load_networks(config, device, log, need_embedding):
             "the warm run fits an opponent vector (§5.5) and needs the "
             "embedding network that defines the objective; set "
             "`evaluation.embedding_checkpoint` or turn `evaluation.warm` off")
-        state = torch.load(ev["embedding_checkpoint"], map_location=device,
+        state = torch.load(ev["embedding_checkpoint"], map_location="cpu",
                            weights_only=False)["model_state_dict"]
         embed_net = OpponentEmbeddingNet(
             config["embedding_net"], int(game["n_actions"]),
             int(game["max_players"]),
-            n_members=int(state["embeddings.weight"].shape[0])).to(device)
+            n_members=int(state["embeddings.weight"].shape[0]),
+            table_max_players=int(game["players_range"][1])).to(device)
         embed_net.load_state_dict(state)
+        del state
         embed_net.eval()
         log(f"[{TAG}] embedding network from {ev['embedding_checkpoint']}")
     return agent_net, embed_net

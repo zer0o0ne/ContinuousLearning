@@ -80,6 +80,9 @@ class HandSpec:
     # Auxiliary card integration, independent of the deck/action streams.
     # Oracle alternatives for one outer sample share this seed.
     runout_seed: int = None
+    # Per-seat style draws made once for the source hand. `replace` keeps
+    # these intact when the oracle changes its deck and action RNG seeds.
+    style_augmentations: np.ndarray = None
 
 
 @dataclass
@@ -139,6 +142,11 @@ class DecisionContext:
     @property
     def num_players(self):
         return self.record.spec.num_players
+
+    @property
+    def style_augmentation(self):
+        styles = self.record.spec.style_augmentations
+        return None if styles is None else styles[self.acting_pos]
 
     @property
     def big_blind(self):
@@ -265,6 +273,10 @@ class LockstepDriver:
                        disable=desc is None)
 
         while cursor < len(pending_specs) or live:
+            # Previous round's policy groups may reference finished states.
+            # Drop them before refilling and running the next forward wave.
+            queries, forced, free, by_member = [], [], [], {}
+            finished, group, state, ctx = [], None, None, None
             while len(live) < batch_size and cursor < len(pending_specs):
                 idx, spec = pending_specs[cursor]
                 cursor += 1
@@ -331,6 +343,7 @@ class LockstepDriver:
                     f"expected {(len(group), self.n_actions)}")
                 for row, (state, ctx) in enumerate(group):
                     self._apply(state, ctx, probs[row], member_idx)
+                del probs
 
         bar.close()
         return records

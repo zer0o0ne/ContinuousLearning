@@ -692,6 +692,7 @@ def run(config, log, out_dir):
     net = OpponentEmbeddingNet(
         config["embedding_net"], game["n_actions"], game["max_players"],
         n_members=len(all_members),
+        table_max_players=int(game["players_range"][1]),
     ).to(device)
     n_params = sum(p.numel() for p in net.parameters())
     log(f"embedding network: {n_params/1e6:.2f}M parameters")

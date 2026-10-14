@@ -1,5 +1,5 @@
 {
- "experiment": "run4",
+ "experiment": "run5",
  "seed": 7,
  "device": "auto",
  "out_dir": "../../data/v8",
@@ -247,7 +247,7 @@
  "agent_train": {
   "loss": "soft_q",
   "steps": 4000,
-  "first_iteration_steps": 10000,
+  "first_iteration_steps": 40000,
   "warm_start_trunk": true,
   "batch_hands": 128,
   "lr": 3e-05,

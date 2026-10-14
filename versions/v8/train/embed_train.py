@@ -40,11 +40,12 @@ import torch
 from nets.embedding_net import loss_weights
 from nets.features import TOKEN_DECISION, TOKEN_SHOWDOWN, collate
 from train.agent_train import steps_for_iteration
-from utils import progress
+from utils import memory_checkpoint, progress
 
 
 def train_embedding_net(net, sessions, cfg, game, device, log, seed,
-                        iteration=0, *, release_sessions=False, prepare_session=None):
+                        iteration=0, *, release_sessions=False, prepare_session=None,
+                        store=None):
     """§5.4 baseline: no inner loop, table and transformer trained jointly.
 
     `iteration` selects the step count and nothing else: `first_retrain_steps`
@@ -55,31 +56,41 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
     max_players = game["max_players"]
     n_actions = game["n_actions"]
 
-    corpus = []
+    corpus = [] if store is None else store.sequence("embedding_tokens")
+    n_decision = n_showdown = n_strength = 0
     bar = progress(total=sum(len(s.records) for s in sessions),
                    desc="corpus targets/tokens", unit="hand")
     for s in sessions:
         if prepare_session is not None:
             prepare_session(s)
-        corpus.extend(t for t in s.tokens(max_players, n_actions) if len(t) > 0)
+        for t in s.tokens(max_players, n_actions, stream=True):
+            if not len(t):
+                continue
+            n_decision += int((t.token_type == TOKEN_DECISION).sum())
+            n_showdown += int((t.token_type == TOKEN_SHOWDOWN).sum())
+            n_strength += int((t.own_strength >= 0).sum())
+            corpus.append(t)
+        t = None
         bar.update(len(s.records))
         if release_sessions:
             # The pipeline owns these sessions exclusively. Tokenisation copied
             # their arrays; do not keep records and sparse targets alongside it.
-            s.records.clear()
-            s.ranges.clear()
-            s.specs.clear()
+            for data in (s.records, s.ranges, s.specs):
+                if hasattr(data, "release"):
+                    data.release()
+                else:
+                    data.clear()
     bar.close()
     if release_sessions:
         sessions.clear()
-    n_decision = sum(int((t.token_type == TOKEN_DECISION).sum()) for t in corpus)
-    n_showdown = sum(int((t.token_type == TOKEN_SHOWDOWN).sum()) for t in corpus)
     # §5.6: a corpus whose records were never labelled carries no strength
     # target at all, and the head would then train on nothing while the loss
     # curve looked fine. The count says so out loud instead.
-    n_strength = sum(int((t.own_strength >= 0).sum()) for t in corpus)
     log(f"[train] corpus: {len(corpus)} hands, {n_decision} decision tokens, "
         f"{n_showdown} showdown tokens, {n_strength} strength targets")
+    if store is not None:
+        memory_checkpoint(log, f"it{iteration}:embedding_tokens_on_disk", device,
+                          corpus_hands=len(corpus))
     if not corpus:
         log("[train] no complete corpus hands; skipping embedding update")
         net.eval()

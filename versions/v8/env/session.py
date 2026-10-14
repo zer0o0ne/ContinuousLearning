@@ -61,7 +61,7 @@ class Session:
         return [(seat + hand_idx) % self.num_players
                 for seat in range(self.num_players)]
 
-    def tokens(self, max_players, n_actions, observer_slot=0, window=None):
+    def tokens(self, max_players, n_actions, observer_slot=0, window=None, *, stream=False):
         """Token sequences of every hand, from slot `observer_slot`'s view.
 
         Slot 0 is hero's, and `observer_slot=0, window=None` is what every
@@ -82,19 +82,20 @@ class Session:
         no use for them.
         """
         lo = 0 if window is None else max(0, len(self.records) - int(window))
-        out = []
-        for h in range(lo, len(self.records)):
-            if self.records[h] is None or self.records[h].truncated:
-                continue
-            out.append(hand_tokens(
-                self.records[h],
-                observer_pos=self.seat_of_slot(observer_slot, h),
-                slot_of_seat=self.slot_of_seat(h),
-                max_players=max_players, n_actions=n_actions,
-                ranges=(self.ranges[h]
-                        if self.ranges and observer_slot == 0 else None),
-            ))
-        return out
+        def rows():
+            for h in range(lo, len(self.records)):
+                record = self.records[h]
+                if record is None or record.truncated:
+                    continue
+                yield hand_tokens(
+                    record,
+                    observer_pos=self.seat_of_slot(observer_slot, h),
+                    slot_of_seat=self.slot_of_seat(h),
+                    max_players=max_players, n_actions=n_actions,
+                    ranges=(self.ranges[h]
+                            if self.ranges and observer_slot == 0 else None),
+                )
+        return rows() if stream else list(rows())
 
 
 # The phases of one iteration that deal hands, in the order their seed ranges
@@ -172,7 +173,7 @@ def raise_sizes_from(game):
 
 
 def build_sessions(rng, member_ids, game, n_sessions, hands_per_session,
-                   seed_base, tag, *, sampler=None):
+                   seed_base, tag, *, sampler=None, store=None):
     """Uniform table sizes and stacks, with optional sampling of all seats.
 
     Without `sampler`, members are uniform and distinct (the G1 corpus).
@@ -204,6 +205,8 @@ def build_sessions(rng, member_ids, game, n_sessions, hands_per_session,
                 f"{num_players}-handed session")
         session = Session(idx=s, num_players=num_players, stack_bb=stack_bb,
                           members=members)
+        if store is not None:
+            session.specs = store.sequence(f"specs:{s}")
         for h in range(hands_per_session):
             seat_members = [members[(seat + h) % num_players]
                             for seat in range(num_players)]
@@ -219,13 +222,41 @@ def build_sessions(rng, member_ids, game, n_sessions, hands_per_session,
     return sessions
 
 
-def play(driver, sessions, batch_size, log, tag, bar=True):
+def play(driver, sessions, batch_size, log, tag, bar=True, *, store=None):
     """Play every hand of every session in lock-step, then hand them back.
 
     `bar=False` suppresses the driver's progress bar, for a caller that plays
     the corpus in several calls and carries its own global bar over the whole
     job — one bar, never one per call (`CLAUDE.md` §5).
     """
+    if store is not None:
+        # Store the flattened order on disk too; materialising it would bring
+        # every HandSpec back into RAM before the driver's first batch.
+        specs = store.sequence(f"play:{tag}")
+        specs.extend(spec for s in sessions for spec in s.specs)
+        offsets = np.concatenate([[0], np.cumsum([len(s.specs) for s in sessions])])
+        for s in sessions:
+            s.records = store.sequence(f"records:{tag}:{s.idx}")
+            s.records.extend(None for _ in range(len(s.specs)))
+        counts = [0, 0, 0, 0]
+
+        def completed(items):
+            records = [r for _, r in items]
+            counts[1] += label_showdowns(records, desc=None)
+            for index, record in items:
+                si = int(np.searchsorted(offsets, index, side="right") - 1)
+                sessions[si].records[index - int(offsets[si])] = record
+                counts[0] += 0 if record.truncated else len(record.decisions)
+                counts[2] += int(bool(record.showdown) and not record.truncated)
+                counts[3] += int(record.truncated)
+
+        log(f"[{tag}] playing {len(specs)} hands over {len(sessions)} sessions to disk")
+        driver.run(specs, batch_size=batch_size,
+                   desc=f"play:{tag}" if bar else None, on_complete=completed)
+        specs.release()
+        log(f"[{tag}] {counts[0]} decisions, {counts[1]} reveals over "
+            f"{counts[2]} showdown hands, {counts[3]} truncated")
+        return counts[0]
     specs = [spec for s in sessions for spec in s.specs]
     log(f"[{tag}] playing {len(specs)} hands over {len(sessions)} sessions")
     records = driver.run(specs, batch_size=batch_size,

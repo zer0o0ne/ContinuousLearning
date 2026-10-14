@@ -483,10 +483,10 @@ def _played_hands(monkeypatch):
     seen = []
     real = train.generate.play
 
-    def spy(driver, sessions, batch_size, log, tag, bar=True):
+    def spy(driver, sessions, batch_size, log, tag, bar=True, **kwargs):
         seen.extend((int(s.idx), int(spec.meta["hand"]))
                     for s in sessions for spec in s.specs)
-        return real(driver, sessions, batch_size, log, tag, bar=bar)
+        return real(driver, sessions, batch_size, log, tag, bar=bar, **kwargs)
 
     monkeypatch.setattr(train.generate, "play", spy)
     return seen
@@ -637,15 +637,9 @@ def test_a_resume_holds_when_the_corpus_no_longer_replays_the_same_way(
 
 
 def _assert_relabelled_from_scratch(out_dir, cfg, fresh_dir, stale_before):
-    """The phase set the directory aside and produced a from-scratch label set.
-
-    Two halves, and both matter: the old directory is still there under
-    `.stale` (its shards cost hours and are not this code's to delete), and what
-    the phase wrote is bit-for-bit what a run into an empty directory writes —
-    nothing of the old set was spliced into it.
-    """
+    """Discard incompatible data and reproduce a fresh run without splicing."""
     aside = out_dir.parent / (out_dir.name + ".stale")
-    assert json.loads((aside / "progress.json").read_text()) == stale_before
+    assert not aside.exists(), "incompatible data must be deleted"
 
     manifest = json.loads((out_dir / "progress.json").read_text())
     assert manifest["hands_done"] == manifest["n_hands"]
@@ -834,20 +828,17 @@ def test_a_directory_whose_corpus_was_not_kept_starts_over(tmp_path,
     _assert_relabelled_from_scratch(out_dir, cfg, tmp_path / "fresh", stale)
 
 
-def test_a_second_stale_directory_does_not_overwrite_the_first(tmp_path,
-                                                               monkeypatch):
-    """Set-aside names are derived and not timestamped, so two failures in the
-    same place must not land on the same name — the first one's labels would be
-    gone, which is the thing setting them aside was for."""
+def test_repeated_incompatible_runs_do_not_accumulate_stale_data(tmp_path):
+    """Each replacement deletes the old corpus instead of filling the disk."""
     out_dir = tmp_path / "labels"
     _run(out_dir, cfg=_cfg(n_sessions=4, hands=6))
     _run(out_dir, cfg=_cfg(n_sessions=3, hands=6))
     _run(out_dir, cfg=_cfg(n_sessions=2, hands=6))
 
-    first = json.loads((tmp_path / "labels.stale" / "progress.json").read_text())
-    second = json.loads(
-        (tmp_path / "labels.stale.1" / "progress.json").read_text())
-    assert first["n_hands"] != second["n_hands"]
+    assert not list(tmp_path.glob("labels.stale*"))
+    current = json.loads((out_dir / "progress.json").read_text())
+    assert current["n_hands"] == 12
+
 
 
 # --------------- 8: a past agent in the pool that reads its tablemates
@@ -1127,9 +1118,9 @@ def test_a_directory_labelled_under_the_other_setting_is_set_aside(
     off = _cfg(n_sessions=4, hands=6)
     _run(out_dir, cfg=off, pool=pool,
          sampler=_AgentAlwaysSampler(len(pool), len(pool) - 1, seed=off["seed"]))
-    assert (tmp_path / "labels.stale").exists(), (
-        "a directory played with the pool conditioned was resumed into with it "
-        "off")
+    assert not (tmp_path / "labels.stale").exists()
+    played = json.loads((out_dir / "play.json").read_text())
+    assert played["pool_agent_vectors"] == "zero", "the incompatible play cache survived"
 
 
 def test_a_conditioned_run_resumes_into_the_run_it_would_have_been(

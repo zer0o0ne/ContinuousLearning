@@ -176,7 +176,7 @@ def test_augmented_labels_match_in_workers_and_resume(tmp_path):
     # Turning it off must invalidate the partial/full play cache too.
     cfg["iteration"] = 10
     plain, _ = _run(tmp_path / "par", cfg=cfg, hero=_scripted_hero())
-    assert (tmp_path / "par.stale" / "play.json").exists()
+    assert not (tmp_path / "par.stale").exists()
     assert plain.get("style_augmentation") is None
     play = json.loads((tmp_path / "par" / "play.json").read_text())
     assert play["style_augmentation"] is None
@@ -244,7 +244,7 @@ def test_changed_augmentation_and_first_session_count_rebuild_untrained_labels(t
     manifest = json.loads((iteration / "labels.json").read_text())["manifest"]
     assert manifest["n_sessions"] == 3
     assert manifest["style_augmentation"] == augmentation_signature(cfg["style"], 0)
-    assert (iteration / "labels.stale" / "progress.json").exists()
+    assert not (iteration / "labels.stale").exists()
 
 
 def test_partial_augmented_labels_resume_byte_for_byte(tmp_path, monkeypatch):

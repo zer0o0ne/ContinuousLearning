@@ -124,7 +124,7 @@ def test_the_loop_runs_and_writes_every_artefact(tmp_path):
         for name in ("labels.json", "agent.pt", "metrics.json", "state.json",
                      "embedding.pt"):
             assert os.path.exists(os.path.join(it, name)), f"iter {k}: {name}"
-        assert os.listdir(os.path.join(it, "labels")), "no shards written"
+        assert not os.path.exists(os.path.join(it, "labels")), "consumed shards were retained"
     assert os.path.exists(os.path.join(exp_dir, "report.json"))
 
     for k, m in enumerate(metrics):
@@ -151,8 +151,8 @@ def test_previous_labels_are_released_before_collecting_next_iteration(
     real_generate = pipeline.generate_labels
     collections = []
 
-    def load(path):
-        labels = real_load(path)
+    def load(path, **kwargs):
+        labels = real_load(path, **kwargs)
         token_refs.extend(weakref.ref(lab["tokens"]) for lab in labels)
         return labels
 
@@ -398,6 +398,7 @@ def test_even_iteration_resume_restores_the_parent_for_collection_and_training(
 
 
 @pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_even_iteration_rebuilds_labels_from_the_legacy_previous_hero(
         tmp_path, monkeypatch, partial):
     cfg = _paired_config(n_iterations=3)
@@ -425,7 +426,7 @@ def test_even_iteration_rebuilds_labels_from_the_legacy_previous_hero(
     monkeypatch.setattr(pipeline, "generate_labels", labels)
     run(cfg, lambda _: None, exp_dir)
     assert calls == [True]
-    assert os.path.exists(os.path.join(directory, "labels.stale", "progress.json"))
+    assert not os.path.exists(os.path.join(directory, "labels.stale"))
     assert json.load(open(os.path.join(directory, "labels.json")))["hero_iteration"] == 0
 
 
@@ -510,6 +511,7 @@ def test_no_heldout_means_no_gap_rather_than_a_gap_on_training_data(tmp_path):
                                           metrics[0]["gap_cold"])
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_phase_d_scores_the_agent_with_the_fitted_vectors_and_with_zero(tmp_path):
     """§12's cold/warm pair, on the held-out slice instead of on Slumbot.
 
@@ -621,6 +623,7 @@ def _artefacts(exp_dir):
 
 @pytest.mark.parametrize("temperature", [0.5, {"initial_ev_loss_bb": 1.0}])
 @pytest.mark.parametrize("loss", ["soft_q", "kl"])
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_resume_from_an_interrupted_phase_reproduces_an_uninterrupted_run(
         tmp_path, temperature, loss):
     """A crash during agent training must cost the training, not the labels."""
@@ -715,6 +718,7 @@ def test_resume_after_pfsp_embedding_corpus_preserves_label_draws(tmp_path, monk
             assert a[name] == b[name], name
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_scheduled_gap_uses_the_cycle_and_regap_uses_the_checkpoint_config(tmp_path):
     from regap import regap_iteration
 
@@ -750,6 +754,7 @@ def test_scheduled_gap_uses_the_cycle_and_regap_uses_the_checkpoint_config(tmp_p
     assert resumed[-1]["temperature"] == cfg["oracle"]["temperature"]
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_untrained_legacy_labels_are_set_aside_before_training(tmp_path):
     cfg = toy_config(n_iterations=1)
     _, exp_dir = _run(tmp_path, cfg)
@@ -764,10 +769,11 @@ def test_untrained_legacy_labels_are_set_aside_before_training(tmp_path):
     for name in ("state.json", "metrics.json", "agent.pt"):
         os.remove(os.path.join(it, name))
     metrics = run(cfg, lambda _m: None, exp_dir)
-    assert os.path.exists(os.path.join(it, "labels.stale", "progress.json"))
+    assert not os.path.exists(os.path.join(it, "labels.stale"))
     assert metrics[0]["range_model"] == "all_seats_reach_v2"
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_estimator_config_change_rebuilds_untrained_labels(tmp_path):
     cfg = toy_config(n_iterations=1)
     _, exp_dir = _run(tmp_path, cfg)
@@ -781,7 +787,7 @@ def test_estimator_config_change_rebuilds_untrained_labels(tmp_path):
     after = json.load(open(os.path.join(it, "labels.json")))["manifest"]
     assert before["q_estimator"]["runout_samples"] == 16
     assert after["q_estimator"]["runout_samples"] == 3
-    assert os.path.exists(os.path.join(it, "labels.stale", "progress.json"))
+    assert not os.path.exists(os.path.join(it, "labels.stale"))
     state = torch.load(os.path.join(it, "agent.pt"), weights_only=False)
     assert state["q_estimator"] == after["q_estimator"] == metrics[0]["q_estimator"]
 
@@ -873,6 +879,7 @@ def test_legacy_training_distribution_uses_labels_state_before_result_update(tmp
     assert restored == expected
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, monkeypatch):
     from evaluation import pool_eval
     from pool_eval_pipeline import run_saved
@@ -943,6 +950,7 @@ def test_evaluation_feedback_changes_next_iteration_and_commits_once(tmp_path, m
 # -------------------------------------------------- 5: the CLAUDE.md §1 rule
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_table_size_and_stack_depth_span_their_full_ranges_unweighted(tmp_path):
     """The exact multiset, from the sessions the loop says it played."""
     cfg = toy_config(n_iterations=2, n_sessions=40)
@@ -1239,6 +1247,7 @@ def test_a_resumed_run_gives_every_past_agent_the_same_generation(
                 f"the resumed run gave iteration {k} another generation")
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_the_whole_loop_runs_with_the_pool_reading_its_tablemates(tmp_path):
     """End to end with the switch on: three iterations, every artefact written.
 

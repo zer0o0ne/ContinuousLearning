@@ -68,6 +68,7 @@ import argparse
 import copy
 import json
 import os
+import shutil
 import time
 from dataclasses import asdict
 
@@ -94,6 +95,7 @@ from oracle.ranges import RangeStats, label_ranges
 from oracle.rollout import RANGE_MODEL, estimator_signature
 from train.embed_train import train_embedding_net
 from train.generate import generate_labels, load_shard
+from train.storage import DiskStore, DatasetView, disk_labels
 from train.targets import ev_loss_budget, normalised_q, policy_target
 from utils import Logger, memory_checkpoint, progress, resolve_device
 
@@ -433,6 +435,14 @@ def hero_factory(iteration, agent_net, init_member, game, device):
 
 def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
                     sampler):
+    with DiskStore(os.path.join(config.get("out_dir") or "../../data/v8",
+                               config.get("experiment", "scratch"))) as store:
+        return _embedding_phase(embed_net, pool, config, game, device, log,
+                                seed, iteration, sampler, store)
+
+
+def _embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
+                     sampler, store):
     """§5.4 training over a fresh PFSP corpus of pool self-play (phase A)."""
     emb_cfg = config["embedding_net"]
     it_seed = _iteration_seed(seed, iteration)
@@ -449,10 +459,13 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
         list(range(len(pool))), game, n_sessions,
         int(emb_cfg["corpus_hands_per_session"]),
         seed_base=hand_seed_bases(it_seed, phase_hands(config))[0]["corpus"],
-        tag="corpus", sampler=corpus_sampler)
+        tag="corpus", sampler=corpus_sampler, store=store)
     augment_sessions(sessions, config.get("style", {}), iteration)
     driver = LockstepDriver(pool, int(game["n_actions"]))
-    play(driver, sessions, int(config["driver_batch_size"]), log, "corpus")
+    play(driver, sessions, int(config["driver_batch_size"]), log, "corpus", store=store)
+    memory_checkpoint(log, f"it{iteration}:corpus_on_disk", device,
+                      corpus_hands=sum(len(s.records) for s in sessions),
+                      scratch_bytes=os.path.getsize(store.path))
     # §5.7 — the belief targets, once over the corpus and never inside the
     # training loop, exactly where `label_showdowns` sits for the same reason.
     rstats = RangeStats()
@@ -464,7 +477,7 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
             [session], pool, int(game["n_actions"]),
             floor=float(config.get("oracle", {}).get("likelihood_floor", 1e-6)),
             prune=float(emb_cfg.get("range_prune_threshold", 0.0)),
-            show_progress=False))
+            show_progress=False, store=store))
 
     torch.manual_seed(it_seed + 500_000)
     # Prepare one session, tokenise it and immediately release its raw history.
@@ -472,7 +485,7 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
     history = train_embedding_net(
         embed_net, sessions, emb_cfg, game, device, log,
         it_seed + 500_000, iteration=iteration, release_sessions=True,
-        prepare_session=prepare_session)
+        prepare_session=prepare_session, store=store)
     if emb_cfg.get("range_enabled", False):
         log(f"[{TAG}] §5.7 ranges: {rstats.emitted} targets, "
             f"{rstats.forwards} forwards, {rstats.dropped:.1f} total mass "
@@ -480,22 +493,97 @@ def embedding_phase(embed_net, pool, config, game, device, log, seed, iteration,
     return history
 
 
-def build_targets(labels, loss, temperature, divisor, iteration=0):
+def build_targets(labels, loss, temperature, divisor, iteration=0, *, out=None):
     """One target row per label — a distribution under `kl`, an EV under `soft_q`.
 
     §6.2's two losses consume different payloads and `train/targets.py` builds
     both out of one normalisation, so the branch is here and nowhere else.
     """
-    out = []
-    for lab in labels:
+    if not labels:
+        return np.zeros((0, 0))
+    if out is None:
+        out = np.empty((len(labels), len(labels[0]["q"])), dtype=np.float64)
+    for i, lab in enumerate(progress(labels, desc="targets", unit="label")):
         args = (lab["q"], np.asarray(lab["legal"], dtype=bool), lab["pot_bb"],
                 lab["facing_bet_bb"])
         if loss == "kl":
-            out.append(policy_target(*args, temperature=temperature,
-                                     divisor=divisor, iteration=iteration))
+            out[i] = policy_target(*args, temperature=temperature,
+                                   divisor=divisor, iteration=iteration)
         else:
-            out.append(normalised_q(*args, divisor=divisor))
-    return np.stack(out) if out else np.zeros((0, 0))
+            out[i] = normalised_q(*args, divisor=divisor)
+    return out
+
+
+def train_shards(net, manifest, train_idx, cfg, temperature, divisor, device,
+                 log, seed, iteration, directory):
+    """Keep the global sampling order; materialise only a shard or a batch."""
+    if not len(train_idx):
+        log(f"[{TAG}] no valid training labels; keeping the agent weights for iteration {iteration}")
+        return []
+    with DiskStore(directory) as store:
+        labels = disk_labels(store, manifest["shards"], load_shard)
+        assert len(labels) == manifest["n_labels"]
+        picked = DatasetView(labels, train_idx)
+        targets = np.lib.format.open_memmap(
+            os.path.join(os.path.dirname(store.path), "targets.npy"), mode="w+",
+            dtype=np.float64, shape=(len(picked), net.n_actions))
+        try:
+            build_targets(picked, cfg.get("loss", "kl"), temperature, divisor,
+                          iteration, out=targets)
+            return train_agent(net, picked.column("tokens"), targets,
+                               picked.column("embeddings"), cfg, device, log,
+                               seed=seed, iteration=iteration, label_data=picked)
+        finally:
+            # Drop our reference; an exception traceback can still own a NumPy
+            # view. Forcibly closing its mmap would make traceback inspection
+            # unsafe. The scratch file is unlinked by DiskStore either way.
+            del targets
+
+
+def measure_shards(net, manifest, held_idx, oracle, train_cfg, device, log,
+                   iteration, directory):
+    with DiskStore(directory) as store:
+        held = store.sequence("heldout")
+        offset = 0
+        for path in progress(manifest["shards"], desc="index heldout", unit="shard"):
+            shard = load_shard(path, include_ranges=False)
+            indices = held_idx[(held_idx >= offset) & (held_idx < offset + len(shard))]
+            held.extend(shard[int(i) - offset] for i in indices)
+            offset += len(shard)
+            del shard, indices
+        assert offset == manifest["n_labels"]
+        args = (net, held, oracle["temperature"], oracle.get("divisor", "pot_plus_bet"),
+                int(train_cfg["batch_hands"]), device, log)
+        return (oracle_gap(*args, iteration=iteration),
+                oracle_gap(*args, cold=True, iteration=iteration))
+
+
+def cleanup_iteration_data(directory, log):
+    """The checkpoint and both gaps are the last consumers of label shards.
+
+    Keep manifests and sampler/results metadata for resume and reporting. Never
+    delete a partial iteration's durable labels: they are its recovery point.
+    """
+    for entry in os.scandir(directory):
+        suffix = entry.name.removeprefix("labels.stale")
+        if (entry.name.startswith("labels.stale")
+                and (not suffix or (suffix.startswith(".") and suffix[1:].isdigit()))
+                and entry.is_dir(follow_symlinks=False)):
+            shutil.rmtree(entry.path)
+            log(f"[{TAG}] removed incompatible label data: {entry.path}")
+    if not all(os.path.isfile(os.path.join(directory, name))
+               for name in ("agent.pt", "metrics.json")):
+        return
+    path = os.path.join(directory, "labels")
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+        log(f"[{TAG}] removed consumed label data: {path}")
+    labels_path = os.path.join(directory, "labels.json")
+    if os.path.isfile(labels_path):
+        saved = _read_json(labels_path)
+        if not saved["manifest"].get("data_released"):
+            saved["manifest"]["data_released"] = True
+            atomic_json(labels_path, saved)
 
 
 def split_heldout(n, fraction, seed, iteration):
@@ -688,6 +776,7 @@ def run(config, log, exp_dir):
                                   conditioned, log)
     for k in range(start):
         it_dir = _iter_dir(exp_dir, k)
+        cleanup_iteration_data(it_dir, log)
         state = torch.load(os.path.join(it_dir, "agent.pt"), map_location="cpu",
                            weights_only=False)["model_state_dict"]
         members, desc = agent_variant_members(
@@ -756,7 +845,8 @@ def run(config, log, exp_dir):
                 timings["embedding"] = time.perf_counter() - t0
                 torch.save({"model_state_dict": embed_net.state_dict(),
                             "config": config, "iteration": k,
-                            "history": history}, emb_path)
+                            "history": history}, emb_path + ".tmp")
+                os.replace(emb_path + ".tmp", emb_path)
             # The generation every agent trained from here on belongs to. Taken
             # after the retrain and kept frozen: the live network keeps moving,
             # and a past agent must read the weights it was trained against.
@@ -788,7 +878,7 @@ def run(config, log, exp_dir):
                      or blob["manifest"]["n_sessions"] != label_session_count(config, k))
                 and not os.path.exists(agent_path)):
             log(f"[{TAG}] label collection settings changed; rebuilding "
-                "this unfinished iteration and keeping the old shards aside")
+                "this unfinished iteration and discarding incompatible shards")
             blob = None
         if blob is not None:
             sampler.load_state_dict(blob["sampler"])
@@ -830,14 +920,6 @@ def run(config, log, exp_dir):
                                       "timings": timings})
 
         memory_checkpoint(log, f"it{k}:labels_done", device, release=True)
-        # Only training needs the full corpus. A resumed measurement streams
-        # one shard at a time below; a completed measurement reads no labels.
-        labels = None
-        if not os.path.exists(agent_path):
-            labels = [lab for path in manifest["shards"] for lab in load_shard(path)]
-            assert len(labels) == manifest["n_labels"], (
-                f"{len(labels)} labels on disk, manifest says "
-                f"{manifest['n_labels']}")
         train_idx, held_idx = split_heldout(
             manifest["n_labels"], train_cfg.get("heldout_fraction", 0.0), seed, k)
 
@@ -854,23 +936,16 @@ def run(config, log, exp_dir):
         else:
             t0 = time.perf_counter()
             torch.manual_seed(_iteration_seed(seed, k))
-            picked = [labels[i] for i in train_idx]
-            if picked:
-                history = train_agent(
-                    agent_net, [lab["tokens"] for lab in picked],
-                    build_targets(picked, loss, temperature, divisor, iteration=k),
-                    [lab["embeddings"] for lab in picked], train_cfg, device, log,
-                    seed=_iteration_seed(seed, k), iteration=k)
-            else:
-                history = []
-                log(f"[{TAG}] no valid training labels; keeping the agent weights for iteration {k}")
-            del picked
+            history = train_shards(
+                agent_net, manifest, train_idx, train_cfg, temperature, divisor,
+                device, log, _iteration_seed(seed, k), k, it_dir)
             timings["agent"] = time.perf_counter() - t0
             torch.save({"model_state_dict": agent_net.state_dict(),
                         "config": config, "iteration": k, "history": history,
                         "hero_iteration": hero_iteration,
                         "q_estimator": manifest.get("q_estimator", "legacy")},
-                       agent_path)
+                       agent_path + ".tmp")
+            os.replace(agent_path + ".tmp", agent_path)
 
         memory_checkpoint(log, f"it{k}:agent_done", device, release=True)
 
@@ -881,7 +956,6 @@ def run(config, log, exp_dir):
         # ------------------------------------------------- D: the oracle gap
         metrics_path = os.path.join(it_dir, "metrics.json")
         if os.path.exists(metrics_path):
-            del labels
             metrics = _read_json(metrics_path)
         else:
             t0 = time.perf_counter()
@@ -892,25 +966,9 @@ def run(config, log, exp_dir):
             train_idx, held_idx = split_heldout(
                 manifest["n_labels"], measured_train.get("heldout_fraction", 0.0),
                 int(measured_config.get("seed", 0)), k)
-            # Shard fields are numpy views: retaining even one held-out label
-            # otherwise pins every backing array of its entire shard.
-            if labels is not None:
-                for i in held_idx:
-                    labels[i]["tokens"].ranges = None
-                held = copy.deepcopy([labels[i] for i in held_idx])
-            else:
-                held, offset = [], 0
-                for path in manifest["shards"]:
-                    shard = load_shard(path, include_ranges=False)
-                    indices = held_idx[(held_idx >= offset) & (held_idx < offset + len(shard))]
-                    held.extend(copy.deepcopy([shard[i - offset] for i in indices]))
-                    offset += len(shard)
-                    del shard, indices
-                assert offset == manifest["n_labels"]
-            del labels
-            gap_args = (agent_net, held, measured_oracle["temperature"],
-                        measured_oracle.get("divisor", "pot_plus_bet"),
-                        int(measured_train["batch_hands"]), device, log)
+            gap, gap_cold = measure_shards(
+                agent_net, manifest, held_idx, measured_oracle, measured_train,
+                device, log, k, it_dir)
             metrics = {
                 "iteration": k,
                 "n_pool": len(pool),
@@ -924,17 +982,17 @@ def run(config, log, exp_dir):
                 "q_estimator": manifest.get("q_estimator", "legacy"),
                 "gap_units": "dimensionless_normalised_oracle_q",
                 "label_stats": manifest["stats"],
-                "gap": oracle_gap(*gap_args, iteration=k),
-                "gap_cold": oracle_gap(*gap_args, cold=True, iteration=k),
+                "gap": gap,
+                "gap_cold": gap_cold,
             }
             timings["gap"] = time.perf_counter() - t0
             metrics["timings"] = timings
-            _write_json(metrics_path, metrics)
-            del held, gap_args
+            atomic_json(metrics_path, metrics)
         log(f"[{TAG}] " + winrate_line(metrics.get("gap", {}),
                                        metrics.get("gap_cold", {})))
         del train_idx, held_idx
         memory_checkpoint(log, f"it{k}:gap_done", device, release=True)
+        cleanup_iteration_data(it_dir, log)
 
         # The mixture stays fixed throughout evaluation. Only after completion
         # can training/warm results feed the next iteration's PFSP state.
@@ -948,7 +1006,7 @@ def run(config, log, exp_dir):
             timings["pool_evaluation"] = time.perf_counter() - t0
             metrics["pool_evaluation"] = evaluation
             metrics["timings"] = timings
-            _write_json(metrics_path, metrics)
+            atomic_json(metrics_path, metrics)
         metrics_all.append(metrics)
 
         # ----------------------------------------- E: results, decay, the pool

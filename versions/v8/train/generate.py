@@ -84,6 +84,7 @@ is bit-identical to the one that would have been computed without one.
 import io
 import json
 import os
+import shutil
 import time
 import zipfile
 from dataclasses import fields, replace
@@ -105,6 +106,7 @@ from agent.policy import FrozenAgentMember
 from pool.base import PoolMember
 from pool.augmentation import augment_sessions, augmentation_signature
 from utils import memory_checkpoint, progress
+from train.storage import DiskStore
 
 TAG = "labels"
 HERO_SLOT = 0
@@ -340,6 +342,13 @@ def load_shard(path, *, include_ranges=True):
 
 def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                     out_dir, log):
+    with DiskStore(os.path.dirname(os.path.abspath(out_dir))) as store:
+        return _generate_labels(driver, pool, sampler, embed_net, agent_member,
+                                cfg, out_dir, log, store)
+
+
+def _generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
+                     out_dir, log, store):
     """Play sessions, fit opponent embeddings, label hero's decisions, write shards.
 
     Returns a manifest dict: shard paths, label count, aggregate `LabelStats`,
@@ -408,7 +417,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
     seed_base = hand_seed_bases(int(cfg["seed"]), phase_hands(cfg))[0]["labels"]
     sessions = build_sessions(rng, list(range(len(pool))), game,
                               label_session_count(cfg, iteration), hands_per_session,
-                              seed_base=seed_base, tag=TAG)
+                              seed_base=seed_base, tag=TAG, store=store)
 
     # `build_sessions` draws its members uniformly and those draws are dropped:
     # who sits at the table is the sampler's decision (§4.4), and the table
@@ -465,6 +474,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                 else (s.members[sos[seat]] if slots[sos[seat]] is None
                       else slots[sos[seat]])
                 for seat in range(s.num_players)]
+            s.specs[h] = spec
 
     style_cfg = cfg.get("style", {})
     augment_sessions(sessions, style_cfg, iteration, exclude_slot=HERO_SLOT)
@@ -494,7 +504,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
             block_vectors = _play_sessions(
                 driver, play_pool, sessions, hero_rec, agent_member, embed_net,
                 emb_cfg, weights, max_players, n_actions, R, device, cfg, log,
-                pool_slots=pool_slots)
+                pool_slots=pool_slots, store=store)
             results = _results_by_member(sessions)
             n_hands = sum(len(s.records) for s in sessions)
             _write_play(out_dir, signature, block_vectors, results, n_hands)
@@ -508,7 +518,7 @@ def generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                 driver, play_pool, sessions, hero_rec, agent_member, embed_net,
                 emb_cfg, weights, max_players, n_actions, R, device, cfg, log,
                 first_hand=first_hand, vectors=block_vectors,
-                pool_slots=pool_slots)
+                pool_slots=pool_slots, store=store)
         memory_checkpoint(log, "labels:played", device, release=True,
                           source_hands=sum(r is not None for s in sessions for r in s.records))
         manifest = _label_sessions(
@@ -598,7 +608,7 @@ def _seat_conditioned(play_pool, hero_slots, session, block_vectors, block,
 def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
                    embed_net, emb_cfg, weights, max_players, n_actions, R,
                    device, cfg, log, first_hand=None, vectors=None,
-                   pool_slots=None):
+                   pool_slots=None, store=None):
     """Play every session in blocks of `R` hands, refitting between blocks.
 
     Returns, per session, the embedding table in force during each block. The
@@ -635,11 +645,14 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
     # job; a refresh swaps the member inside them, so nothing hero saw in an
     # earlier block is thrown away with the vectors that produced it.
     for s, rec, start in zip(sessions, hero_rec, first_hand):
-        s.records = [None] * start
+        s.records = [] if store is None else store.sequence(f"source:{s.idx}")
+        s.records.extend(None for _ in range(start))
         for seat in range(s.num_players):
             play_pool[rec[seat]] = _ObservedHero(
                 None, _slot_of_seat_at(s.num_players, seat), max_players,
                 n_actions, seat)
+            if store is not None:
+                play_pool[rec[seat]].seen = store.mapping(f"seen:{s.idx}:{seat}")
 
     # One bar over every hand of the job. The refit between blocks is not a
     # hand and does not advance it — but it is minutes of silence, and a bar
@@ -668,9 +681,11 @@ def _play_sessions(driver, play_pool, sessions, hero_rec, agent_member,
 
         if blocks:
             play(driver, blocks, int(cfg["driver_batch_size"]), log,
-                 f"{TAG}:block{b}", bar=False)
+                 f"{TAG}:block{b}", bar=False, store=store)
             for s, blk in zip(played, blocks):
                 s.records.extend(blk.records)
+                if store is not None:
+                    blk.records.release()
             bar.update(sum(len(blk.specs) for blk in blocks))
             del blk
         del blocks, played
@@ -781,25 +796,11 @@ def _write_play(out_dir, signature, block_vectors, results, n_hands):
 
 
 def _set_aside(out_dir, why, log):
-    """Move a labels directory that cannot be resumed out of the way.
-
-    Refusing to splice two label sets is right; killing the run over it is not.
-    The stale directory is *renamed*, never deleted: its shards are real labels
-    that cost real time, and it is not this function's call to destroy them. The
-    name is derived, not timestamped, so the same failure lands in the same place
-    on a rerun.
-    """
-    for n in range(1000):
-        aside = f"{out_dir}.stale" + (f".{n}" if n else "")
-        if not os.path.exists(aside):
-            break
-    else:                                       # pragma: no cover - 1000 stales
-        raise AssertionError(f"{out_dir}: too many set-aside directories")
-    os.rename(out_dir, aside)
+    """Discard incompatible working data; it has no consumer in this run."""
+    shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
-    log(f"[{TAG}] WARNING: cannot resume — {why}. The old directory is kept at "
-        f"{aside} and this phase starts from the first hand. Delete it once you "
-        f"are sure you do not want those labels.")
+    log(f"[{TAG}] cannot resume — {why}. Removed incompatible label data; "
+        "restarting collection.")
 
 
 def _read_json(path):
@@ -1048,7 +1049,10 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     for i, session in enumerate(sessions):
         # Every surviving record owns its spec; unlabelled/truncated hands
         # have no consumer after collection and result aggregation.
-        session.specs.clear()
+        if hasattr(session.specs, "release"):
+            session.specs.release()
+        else:
+            session.specs.clear()
         for h in range(len(session.records)):
             if (i, h) not in needed_hands:
                 session.records[h] = None
@@ -1218,14 +1222,16 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                     _seat_conditioned(play_pool, (hero_plain[i],), sessions[i],
                                       block_vectors[i], block, agent_member,
                                       pool_slots[i])
+                requests = _label_requests(chunk, sessions, hero_plain, cfg["seed"])
                 answers = action_values_batch(
-                    _label_requests(chunk, sessions, hero_plain, cfg["seed"]),
+                    requests,
                     driver, play_pool, ocfg, posterior_cache=posterior_cache)
-                for (pos, i, h, d), (q, legal, stats) in zip(chunk, answers):
+                for (pos, i, h, d), (q, legal, stats), request in zip(chunk, answers, requests):
                     consume(pos, i, h, d, q, legal, stats,
                             label_range_target(range_cache, sessions[i], h, d,
-                                               play_pool, driver.n_actions))
-                del answers, q, legal, stats
+                                               play_pool, driver.n_actions,
+                                               record=request[0]))
+                del answers, q, legal, stats, requests, request
                 if ends_hand[chunk[-1][0]]:
                     posterior_cache.clear()
                     if range_cache is not None:

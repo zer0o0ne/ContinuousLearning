@@ -410,21 +410,23 @@ def _worker_main(worker, todo, session_of, block_vectors, pool_spec, hero_spec,
                 _seat_conditioned(play_pool, (hero_plain[i], hero_rec[i]),
                                   session_of[i], block_vectors[i], block,
                                   hero_factory, pool_slots[i])
+            requests = _label_requests(chunk, session_of, hero_plain, seed)
             answers = action_values_batch(
-                _label_requests(chunk, session_of, hero_plain, seed),
+                requests,
                 driver, play_pool, ocfg,
                 posterior_cache=posterior_cache)
-            for (pos, _i, h_, d_), (q, legal, stats) in zip(chunk, answers):
+            for (pos, _i, h_, d_), (q, legal, stats), request in zip(chunk, answers, requests):
                 # §5.7 — the belief at the labelled decision, computed in the
                 # worker where the pool forwards already live. Doing it in the
                 # parent would serialise ~1200 policy rows per label behind the
                 # inference server, which is the one process that must not wait.
                 ranges = label_range_target(range_cache, session_of[_i],
-                                            h_, d_, play_pool, n_actions)
+                                            h_, d_, play_pool, n_actions,
+                                            record=request[0])
                 result_q.put((pos, q, legal, stats, ranges))
                 if d_ == last_decision[(_i, h_)]:
                     session_of[_i].records[h_] = None
-            del answers, q, legal, stats, ranges
+            del answers, q, legal, stats, ranges, requests, request
             if chunk[-1][3] == last_decision[(chunk[-1][1], chunk[-1][2])]:
                 posterior_cache.clear()
                 if range_cache is not None:

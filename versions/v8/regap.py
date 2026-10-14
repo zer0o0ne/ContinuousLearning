@@ -35,9 +35,8 @@ import os
 import torch
 
 from pipeline import (GAP_KEYS, _iter_dir, _read_json, _write_json,
-                      frozen_agent_net, oracle_gap, split_heldout,
+                      frozen_agent_net, measure_shards, split_heldout,
                       winrate_line)
-from train.generate import load_shard
 from utils import Logger, resolve_device
 
 
@@ -63,11 +62,12 @@ def regap_iteration(config, exp_dir, iteration, device, log):
         return None
 
     manifest = _read_json(labels_path)["manifest"]
-    labels = [lab for path in manifest["shards"] for lab in load_shard(path)]
-    assert len(labels) == manifest["n_labels"], (
-        f"{len(labels)} labels on disk, manifest says {manifest['n_labels']}")
+    if manifest.get("data_released"):
+        log(f"[regap] iteration {iteration}: consumed shards were deleted; "
+            "returning saved metrics without recomputation")
+        return _read_json(os.path.join(it_dir, "metrics.json"))
 
-    ckpt = torch.load(agent_path, map_location=device, weights_only=False)
+    ckpt = torch.load(agent_path, map_location="cpu", weights_only=False)
     run_config = ckpt.get("config") or config
     for section, key in (("oracle", "temperature"), ("oracle", "divisor"),
                          ("agent_train", "heldout_fraction"), (None, "seed")):
@@ -82,17 +82,15 @@ def regap_iteration(config, exp_dir, iteration, device, log):
     train_cfg = run_config["agent_train"]
     oracle_cfg = run_config["oracle"]
     _train_idx, held_idx = split_heldout(
-        len(labels), train_cfg.get("heldout_fraction", 0.0),
+        manifest["n_labels"], train_cfg.get("heldout_fraction", 0.0),
         int(run_config.get("seed", 0)), iteration)
 
     net = frozen_agent_net(ckpt["model_state_dict"], run_config,
                            run_config["game"], device)
-    gap_args = (net, [labels[i] for i in held_idx],
-                oracle_cfg["temperature"],
-                oracle_cfg.get("divisor", "pot_plus_bet"),
-                int(train_cfg["batch_hands"]), device, log)
-    gaps = {"gap": oracle_gap(*gap_args, iteration=iteration),
-            "gap_cold": oracle_gap(*gap_args, cold=True, iteration=iteration)}
+    del ckpt
+    warm, cold = measure_shards(net, manifest, held_idx, oracle_cfg, train_cfg,
+                               device, log, iteration, it_dir)
+    gaps = {"gap": warm, "gap_cold": cold}
 
     metrics_path = os.path.join(it_dir, "metrics.json")
     metrics = _read_json(metrics_path) if os.path.exists(metrics_path) else {}

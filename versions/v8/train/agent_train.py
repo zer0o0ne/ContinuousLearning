@@ -102,7 +102,7 @@ def seat_embeddings(tables, seat_slot):
 
 
 def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
-                iteration=0):
+                iteration=0, *, label_data=None):
     """One training cycle of the agent (§6.2). Trains `net` in place.
 
     Args:
@@ -143,31 +143,26 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
         f"({net.max_players}, {net.d_emb}); got "
         f"{np.asarray(embeddings[0]).shape}")
 
-    legal_last = np.stack([h.legal[-1] for h in hands])
-    assert all(int(h.action[-1]) == -1 for h in hands), (
-        "a labelled hand must end in the pending token of the decision the "
-        "label is about (§9) — a hand whose last token carries an action is "
-        "one the agent has already been told the answer to")
     loss_name = cfg.get("loss", "kl")
     assert loss_name in ("kl", "soft_q"), (
         f"unknown loss {loss_name!r}; choices are 'kl' and 'soft_q' (§6.2)")
-    if loss_name == "kl":
-        assert np.allclose(targets.sum(axis=1), 1.0, atol=1e-9), (
-            "every target must be a distribution")
-    else:
-        assert np.isfinite(targets).all(), (
-            "a normalised EV must be finite — `nan` marks illegal actions and "
-            "`train.targets.normalised_q` zeroes them")
-        temperatures = np.array([
-            decision_temperature(cfg["temperature"], h.legal[-1],
-                                 h.scalars[-1, 1], h.scalars[-1, 2],
-                                 cfg.get("divisor", "pot_plus_bet"), iteration)
-            for h in hands])
+    temperatures = np.empty(n, dtype=np.float64) if loss_name == "soft_q" else None
+    for i in progress(range(n), desc="validate labels", unit="label"):
+        h, target = hands[i], targets[i]
+        assert int(h.action[-1]) == -1, "a labelled hand must end in the pending token"
+        assert not (target * ~h.legal[-1]).any(), "a target carries an illegal action"
+        if loss_name == "kl":
+            assert np.allclose(target.sum(), 1.0, atol=1e-9), "every target must be a distribution"
+        else:
+            assert np.isfinite(target).all(), "a normalised EV must be finite"
+            temperatures[i] = decision_temperature(
+                cfg["temperature"], h.legal[-1], h.scalars[-1, 1], h.scalars[-1, 2],
+                cfg.get("divisor", "pot_plus_bet"), iteration)
+    del h, target
+    if loss_name == "soft_q":
         budget = ev_loss_budget(cfg["temperature"], iteration)
         log(f"[agent] temperature {temperatures.min():.6g}.."
             f"{temperatures.max():.6g}, local entropy EV budget BB: {budget}")
-    assert not (targets * ~legal_last).any(), (
-        "a target carries a value on an action the environment called illegal")
 
     steps = steps_for_iteration(cfg, iteration)
     batch_hands = min(int(cfg["batch_hands"]), n)
@@ -191,10 +186,16 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
                          desc=f"agent it{iteration}", unit="step"):
         opt.zero_grad(set_to_none=True)
         pick = rng.choice(n, size=batch_hands, replace=False)
-        batch = collate([hands[i] for i in pick], device=device)
+        # Read each sampled label once. The same global indices/RNG are used
+        # for RAM fixtures and disk data; no shard-local sampling bias.
+        selected = None if label_data is None else [label_data[int(i)] for i in pick]
+        batch = collate([hands[i] for i in pick] if selected is None else
+                        [lab["tokens"] for lab in selected], device=device)
         tables = torch.as_tensor(
-            np.stack([np.asarray(embeddings[i], dtype=np.float32)
-                      for i in pick]), device=device)
+            np.stack([np.asarray(table, dtype=np.float32) for table in
+                      ([embeddings[i] for i in pick] if selected is None else
+                       [lab["embeddings"] for lab in selected])]), device=device)
+        del selected
         tables = embedding_dropout(tables, p_drop, generator=gen)
         logits, range_logits = net.logits_and_range(
             batch, token_embeddings(tables, batch["slot"], net.d_emb),

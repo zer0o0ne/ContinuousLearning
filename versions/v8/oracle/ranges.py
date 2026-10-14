@@ -298,7 +298,7 @@ def hand_ranges(record, observer_pos, pool, n_actions, floor=1e-6, prune=0.0,
 
 
 def label_ranges(sessions, pool, n_actions, floor=1e-6, prune=0.0, desc=None,
-                 *, show_progress=True):
+                 *, show_progress=True, store=None):
     """§5.7 targets over a whole corpus, in the shape `Session.tokens` reads.
 
     The same place in the pipeline as `env.showdown.label_showdowns`, and for
@@ -323,7 +323,8 @@ def label_ranges(sessions, pool, n_actions, floor=1e-6, prune=0.0, desc=None,
     bar = progress(total=total, desc=desc or "ranges", unit="hand",
                    disable=not show_progress)
     for session in sessions:
-        session.ranges = []
+        session.ranges = ([] if store is None else
+                          store.sequence(f"ranges:{session.idx}"))
         for h, record in enumerate(session.records):
             if record is None or record.truncated:
                 session.ranges.append({})
@@ -339,7 +340,8 @@ def label_ranges(sessions, pool, n_actions, floor=1e-6, prune=0.0, desc=None,
     return stats
 
 
-def label_range_target(cache, session, hand_idx, decision_idx, pool, n_actions):
+def label_range_target(cache, session, hand_idx, decision_idx, pool, n_actions,
+                       *, record=None):
     """The §5.7 target of one labelled decision, keyed as `hand_tokens` wants.
 
     A label's tokens are the hand truncated at `decision_idx` with one pending
@@ -357,7 +359,8 @@ def label_range_target(cache, session, hand_idx, decision_idx, pool, n_actions):
     """
     if cache is None:
         return None
-    record = session.records[hand_idx]
+    if record is None:
+        record = session.records[hand_idx]
     observer_pos = session.seat_of_slot(0, hand_idx)
     targets, _rows = cache.target(record, observer_pos, pool, n_actions,
                                   decision_idx)

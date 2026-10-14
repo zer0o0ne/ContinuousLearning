@@ -245,7 +245,7 @@ class LockstepDriver:
         self.n_actions = n_actions
         self.runout = runout
 
-    def run(self, specs, batch_size=None, desc=None):
+    def run(self, specs, batch_size=None, desc=None, *, on_complete=None):
         """Play every spec. Returns `HandRecord`s in spec order.
 
         `batch_size` caps how many hands are in flight at once; `1` is the
@@ -260,8 +260,7 @@ class LockstepDriver:
             batch_size = len(specs)
         batch_size = max(1, int(batch_size))
 
-        records = [None] * len(specs)
-        pending_specs = list(enumerate(specs))
+        records = [None] * len(specs) if on_complete is None else None
         cursor = 0
         live = []
         # Ranking matrices, shared by every hand in flight that was dealt the
@@ -272,13 +271,13 @@ class LockstepDriver:
         bar = progress(total=len(specs), desc=desc, unit="hand",
                        disable=desc is None)
 
-        while cursor < len(pending_specs) or live:
+        while cursor < len(specs) or live:
             # Previous round's policy groups may reference finished states.
             # Drop them before refilling and running the next forward wave.
             queries, forced, free, by_member = [], [], [], {}
             finished, group, state, ctx = [], None, None, None
-            while len(live) < batch_size and cursor < len(pending_specs):
-                idx, spec = pending_specs[cursor]
+            while len(live) < batch_size and cursor < len(specs):
+                idx, spec = cursor, specs[cursor]
                 cursor += 1
                 live.append(self._start(idx, spec, scores))
 
@@ -289,8 +288,11 @@ class LockstepDriver:
                     queries.append((state, ctx))
 
             finished = [s for s in live if s["done"]]
-            for state in finished:
-                records[state["idx"]] = self._finish(state)
+            if on_complete is None:
+                for state in finished:
+                    records[state["idx"]] = self._finish(state)
+            elif finished:
+                on_complete([(state["idx"], self._finish(state)) for state in finished])
             bar.update(len(finished))
             live = [s for s in live if not s["done"]]
             if scores is not None and finished:

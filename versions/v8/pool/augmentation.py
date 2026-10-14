@@ -57,6 +57,7 @@ def augment_sessions(sessions, style_cfg, iteration, *, exclude_slot=None):
         for h, spec in enumerate(session.specs):
             spec.style_augmentations = None
             if probability == 0.0:
+                session.specs[h] = spec
                 continue
             for seat, slot in enumerate(session.slot_of_seat(h)):
                 if slot == exclude_slot:
@@ -67,3 +68,4 @@ def augment_sessions(sessions, style_cfg, iteration, *, exclude_slot=None):
                 if spec.style_augmentations is None:
                     spec.style_augmentations = np.tile(identity, (spec.num_players, 1))
                 spec.style_augmentations[seat] = sample_style(rng, style_cfg).to_list()
+            session.specs[h] = spec

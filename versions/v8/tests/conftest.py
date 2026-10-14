@@ -27,3 +27,10 @@ def _seed_rngs():
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
+
+
+@pytest.fixture
+def retain_label_fixture(monkeypatch):
+    """Keep labels only in mathematical tests that inspect them after training."""
+    import pipeline
+    monkeypatch.setattr(pipeline, "cleanup_iteration_data", lambda *_: None)

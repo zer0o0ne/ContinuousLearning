@@ -353,6 +353,7 @@ def test_the_agent_reads_the_same_head_at_its_pending_decision():
 # ------------------------------------------------------ end to end, §5.7 on
 
 
+@pytest.mark.usefixtures("retain_label_fixture")
 def test_a_whole_iteration_runs_with_the_range_head_on(tmp_path):
     """The loop with §5.7 enabled: corpus targets, label targets, both losses.
 

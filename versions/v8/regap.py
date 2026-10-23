@@ -63,8 +63,6 @@ def regap_iteration(config, exp_dir, iteration, device, log):
 
     manifest = _read_json(labels_path)["manifest"]
     if manifest.get("data_released"):
-        log(f"[regap] iteration {iteration}: consumed shards were deleted; "
-            "returning saved metrics without recomputation")
         return _read_json(os.path.join(it_dir, "metrics.json"))
 
     ckpt = torch.load(agent_path, map_location="cpu", weights_only=False)

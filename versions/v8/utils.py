@@ -1,9 +1,6 @@
 import os
 import sys
 import gc
-import json
-import multiprocessing
-import resource
 from datetime import datetime
 
 import torch
@@ -84,48 +81,14 @@ def resolve_device(requested="auto"):
     return torch.device("cpu")
 
 
-def memory_checkpoint(log, phase, device="cpu", *, release=False, **counts):
-    """Phase/shard memory accounting; release allocator caches only at boundaries.
-
-    Linux RSS includes shared mappings. PSS apportions them, so parent RSS
-    and worker RSS are reported separately and are never added to CUDA usage.
-    On macOS only process peak RSS is available through the standard library.
-    """
+def release_memory(device="cpu"):
+    """Release unused memory at phase boundaries without diagnostic output."""
     device = torch.device(device)
     cuda = device.type == "cuda" and torch.cuda.is_initialized()
-    if release:
-        gc.collect()
-        if cuda:
-            torch.cuda.empty_cache()
-    row = {"phase": phase, "pid": os.getpid(), **counts}
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    row["cpu_peak_mib"] = round(peak / (1024**2 if sys.platform == "darwin" else 1024), 2)
-    for label, pids in (("parent", [os.getpid()]),
-                        ("workers", [p.pid for p in multiprocessing.active_children()])):
-        rss, pss, found = 0, 0, False
-        for pid in pids:
-            try:
-                with open(f"/proc/{pid}/smaps_rollup") as fh:
-                    fields = {line.split()[0]: int(line.split()[1])
-                              for line in fh if line.startswith(("Rss:", "Pss:"))}
-                rss += fields["Rss:"]
-                pss += fields["Pss:"]
-                found = True
-            except (OSError, KeyError):
-                continue  # Process exited, or this host has no procfs.
-        if found:
-            row[f"{label}_rss_mib"] = round(rss / 1024, 2)
-            row[f"{label}_pss_mib"] = round(pss / 1024, 2)
+    gc.collect()
     if cuda:
-        for key, reader in (("allocated", torch.cuda.memory_allocated),
-                            ("reserved", torch.cuda.memory_reserved),
-                            ("peak_allocated", torch.cuda.max_memory_allocated),
-                            ("peak_reserved", torch.cuda.max_memory_reserved)):
-            row[f"cuda_{key}_mib"] = round(reader(device) / 1024**2, 2)
-        if release:
-            torch.cuda.reset_peak_memory_stats(device)
-    log("[memory] " + json.dumps(row, sort_keys=True))
-    return row
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
 
 
 class Logger:

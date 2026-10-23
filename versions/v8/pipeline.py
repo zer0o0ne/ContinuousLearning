@@ -97,7 +97,7 @@ from train.embed_train import train_embedding_net
 from train.generate import generate_labels, load_shard
 from train.storage import DiskStore, DatasetView, disk_labels
 from train.targets import ev_loss_budget, normalised_q, policy_target
-from utils import Logger, memory_checkpoint, progress, resolve_device
+from utils import Logger, progress, release_memory, resolve_device
 
 TAG = "loop"
 
@@ -463,9 +463,6 @@ def _embedding_phase(embed_net, pool, config, game, device, log, seed, iteration
     augment_sessions(sessions, config.get("style", {}), iteration)
     driver = LockstepDriver(pool, int(game["n_actions"]))
     play(driver, sessions, int(config["driver_batch_size"]), log, "corpus", store=store)
-    memory_checkpoint(log, f"it{iteration}:corpus_on_disk", device,
-                      corpus_hands=sum(len(s.records) for s in sessions),
-                      scratch_bytes=os.path.getsize(store.path))
     # §5.7 — the belief targets, once over the corpus and never inside the
     # training loop, exactly where `label_showdowns` sits for the same reason.
     rstats = RangeStats()
@@ -503,7 +500,7 @@ def build_targets(labels, loss, temperature, divisor, iteration=0, *, out=None):
         return np.zeros((0, 0))
     if out is None:
         out = np.empty((len(labels), len(labels[0]["q"])), dtype=np.float64)
-    for i, lab in enumerate(progress(labels, desc="targets", unit="label")):
+    for i, lab in enumerate(labels):
         args = (lab["q"], np.asarray(lab["legal"], dtype=bool), lab["pot_bb"],
                 lab["facing_bet_bb"])
         if loss == "kl":
@@ -545,7 +542,7 @@ def measure_shards(net, manifest, held_idx, oracle, train_cfg, device, log,
     with DiskStore(directory) as store:
         held = store.sequence("heldout")
         offset = 0
-        for path in progress(manifest["shards"], desc="index heldout", unit="shard"):
+        for path in manifest["shards"]:
             shard = load_shard(path, include_ranges=False)
             indices = held_idx[(held_idx >= offset) & (held_idx < offset + len(shard))]
             held.extend(shard[int(i) - offset] for i in indices)
@@ -570,14 +567,12 @@ def cleanup_iteration_data(directory, log):
                 and (not suffix or (suffix.startswith(".") and suffix[1:].isdigit()))
                 and entry.is_dir(follow_symlinks=False)):
             shutil.rmtree(entry.path)
-            log(f"[{TAG}] removed incompatible label data: {entry.path}")
     if not all(os.path.isfile(os.path.join(directory, name))
                for name in ("agent.pt", "metrics.json")):
         return
     path = os.path.join(directory, "labels")
     if os.path.isdir(path):
         shutil.rmtree(path)
-        log(f"[{TAG}] removed consumed label data: {path}")
     labels_path = os.path.join(directory, "labels.json")
     if os.path.isfile(labels_path):
         saved = _read_json(labels_path)
@@ -854,7 +849,7 @@ def run(config, log, exp_dir):
                 vintage = frozen_embedding_net(embed_net.state_dict(), config,
                                                game, device)
 
-        memory_checkpoint(log, f"it{k}:before_labels", device, release=True)
+        release_memory(device)
 
         # §6.1 / §5.6: the agent starts from the trunk phase A just trained.
         # Here and not before the loop, because the embedding network has to be
@@ -919,7 +914,7 @@ def run(config, log, exp_dir):
                                       "pool_distribution": sampler.distribution(),
                                       "timings": timings})
 
-        memory_checkpoint(log, f"it{k}:labels_done", device, release=True)
+        release_memory(device)
         train_idx, held_idx = split_heldout(
             manifest["n_labels"], train_cfg.get("heldout_fraction", 0.0), seed, k)
 
@@ -947,7 +942,7 @@ def run(config, log, exp_dir):
                        agent_path + ".tmp")
             os.replace(agent_path + ".tmp", agent_path)
 
-        memory_checkpoint(log, f"it{k}:agent_done", device, release=True)
+        release_memory(device)
 
         training_distribution = load_training_distribution(measured_config, labels_path, len(pool))
         if blob is not None:
@@ -991,7 +986,7 @@ def run(config, log, exp_dir):
         log(f"[{TAG}] " + winrate_line(metrics.get("gap", {}),
                                        metrics.get("gap_cold", {})))
         del train_idx, held_idx
-        memory_checkpoint(log, f"it{k}:gap_done", device, release=True)
+        release_memory(device)
         cleanup_iteration_data(it_dir, log)
 
         # The mixture stays fixed throughout evaluation. Only after completion
@@ -1034,7 +1029,7 @@ def run(config, log, exp_dir):
         log(f"[{TAG}] iteration {k} done in "
             f"{sum(timings.values()):.1f}s ({timings}); pool is now "
             f"{len(pool)} members")
-        memory_checkpoint(log, f"it{k}:done", device, release=True)
+        release_memory(device)
 
     _write_json(os.path.join(exp_dir, "report.json"),
                 {"config": config, "pool": descriptors,

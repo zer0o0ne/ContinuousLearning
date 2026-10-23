@@ -105,7 +105,7 @@ from oracle.rollout import (RANGE_MODEL, LabelStats, OracleConfig,
 from agent.policy import FrozenAgentMember
 from pool.base import PoolMember
 from pool.augmentation import augment_sessions, augmentation_signature
-from utils import memory_checkpoint, progress
+from utils import progress, release_memory
 from train.storage import DiskStore
 
 TAG = "labels"
@@ -519,8 +519,7 @@ def _generate_labels(driver, pool, sampler, embed_net, agent_member, cfg,
                 emb_cfg, weights, max_players, n_actions, R, device, cfg, log,
                 first_hand=first_hand, vectors=block_vectors,
                 pool_slots=pool_slots, store=store)
-        memory_checkpoint(log, "labels:played", device, release=True,
-                          source_hands=sum(r is not None for s in sessions for r in s.records))
+        release_memory(device)
         manifest = _label_sessions(
             driver, play_pool, sessions, hero_plain, hero_rec, block_vectors,
             agent_member, ocfg, R, max_players, cfg, out_dir, done, log,
@@ -982,10 +981,6 @@ def _label_in_parallel(n_workers, todo, consume, sessions, play_pool,
         session.records.clear()
         session.specs.clear()
         session.ranges.clear()
-    memory_checkpoint(log, "labels:workers_started", _device_of(play_pool),
-                      workers=len(procs), source_hands_parent=0,
-                      pending_limit_per_worker=max(int(cfg["labels_per_shard"]),
-                                                   int(ocfg.labels_per_batch)))
     try:
         done = collect(server, result_q, procs, todo, 0, consume, log,
                        results=results, credits=credits)
@@ -1035,7 +1030,6 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                   if pool_slots is None else pool_slots)
     hands_per_session = int(cfg["hands_per_session"])
     n_hands = len(sessions) * hands_per_session
-    device = _device_of(play_pool)
     todo = _hero_decisions(sessions, hero_rec)
     needed = {(sessions[i].idx, h, d) for i, h, d in todo}
     for rec in hero_rec:
@@ -1085,15 +1079,6 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
     # between hold no decision of hero's, so there is nothing there to label.
     next_hand = [hand_of[p + 1] if p + 1 < len(todo) else n_hands
                  for p in range(len(todo))]
-    last_memory = time.monotonic()
-
-    def report_memory(phase, decisions):
-        nonlocal last_memory
-        memory_checkpoint(log, phase, device,
-                          shards=len(shards), labels=n_labels,
-                          remaining_decisions=len(todo) - (decisions - decisions_done),
-                          held_for_ordering=buffered() if buffered is not None else 0)
-        last_memory = time.monotonic()
 
     def flush(hands, decisions):
         """A shard, then the note that says the shard is safely on disk.
@@ -1115,7 +1100,6 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
                        "seconds": seconds,
                        "collision_sum": collision_sum,
                        "collision_n": collision_n}, fh)
-        report_memory("labels:shard", decisions)
 
     # `initial` and not `bar.update(start)`: the skipped labels were done by an
     # earlier run and must not be counted as having taken this run's zero
@@ -1185,8 +1169,6 @@ def _label_sessions(driver, play_pool, sessions, hero_plain, hero_rec,
             s.records[h] = None
             if s.specs:
                 s.specs[h] = None
-        if time.monotonic() - last_memory >= 60:
-            report_memory("labels:progress", decisions_done + pos + 1)
 
     # Rollouts get averaged and corpus hands do not, so the variance-reduced
     # value belongs to the labelling driver and to nothing else. The parallel

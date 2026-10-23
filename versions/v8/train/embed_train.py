@@ -40,7 +40,7 @@ import torch
 from nets.embedding_net import loss_weights
 from nets.features import TOKEN_DECISION, TOKEN_SHOWDOWN, collate
 from train.agent_train import steps_for_iteration
-from utils import memory_checkpoint, progress
+from utils import progress
 
 
 def train_embedding_net(net, sessions, cfg, game, device, log, seed,
@@ -58,8 +58,6 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
 
     corpus = [] if store is None else store.sequence("embedding_tokens")
     n_decision = n_showdown = n_strength = 0
-    bar = progress(total=sum(len(s.records) for s in sessions),
-                   desc="corpus targets/tokens", unit="hand")
     for s in sessions:
         if prepare_session is not None:
             prepare_session(s)
@@ -71,7 +69,6 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
             n_strength += int((t.own_strength >= 0).sum())
             corpus.append(t)
         t = None
-        bar.update(len(s.records))
         if release_sessions:
             # The pipeline owns these sessions exclusively. Tokenisation copied
             # their arrays; do not keep records and sparse targets alongside it.
@@ -80,7 +77,6 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
                     data.release()
                 else:
                     data.clear()
-    bar.close()
     if release_sessions:
         sessions.clear()
     # §5.6: a corpus whose records were never labelled carries no strength
@@ -88,9 +84,6 @@ def train_embedding_net(net, sessions, cfg, game, device, log, seed,
     # curve looked fine. The count says so out loud instead.
     log(f"[train] corpus: {len(corpus)} hands, {n_decision} decision tokens, "
         f"{n_showdown} showdown tokens, {n_strength} strength targets")
-    if store is not None:
-        memory_checkpoint(log, f"it{iteration}:embedding_tokens_on_disk", device,
-                          corpus_hands=len(corpus))
     if not corpus:
         log("[train] no complete corpus hands; skipping embedding update")
         net.eval()

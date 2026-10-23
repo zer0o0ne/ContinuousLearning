@@ -1778,8 +1778,8 @@ PFSP results, metrics, and pool evaluation artefacts remain. Completed iteration
 are also cleaned on resume. Incompatible partial label data is discarded rather
 than accumulated in `.stale` directories. Checkpoints and metrics commit via
 rename before deletion; a crash between deletion and `state.json` commit resumes
-without rereading labels. After deletion, `regap.py` returns saved metrics and
-explicitly reports that no recomputation was possible.
+without rereading labels. After deletion, `regap.py` returns saved metrics without
+recomputation.
 
 Regular opponents' board-strength caches remain bounded by `max_boards`; preflop tables
 and combo-index buffers are reusable model inputs.
@@ -1792,12 +1792,8 @@ and the upper trunk. Range supervision still receives the full graph during trai
 Shared transport capacity also follows the configured table maximum, including **two v7
 snapshots per decision**; ordinary v8 tokens and v7 events have different length bounds.
 
-`[memory]` JSON log entries appear at phase boundaries, after each shard, and after a label
-completes if the preceding log is at least a minute old: Linux parent
-and worker RSS/PSS, CPU peak RSS, CUDA allocated/reserved and peaks, plus label/reorder
-counts. On macOS the standard-library CPU counter is peak RSS only. Phase boundaries run
-GC and release unused CUDA allocator blocks; shard logging does not flush the allocator.
-Reported RSS/PSS and CUDA figures are separate accounting views, not an additive total.
+Phase boundaries run GC and release unused CUDA allocator blocks silently.
+Memory diagnostics and scratch-storage progress bars are not emitted.
 
 CPU ownership tests use weak references across three iterations, training steps, shard
 writes and evaluation chunks. They also check bounded worker results, sequential/parallel
@@ -1806,7 +1802,7 @@ An isolated CPU range-head profile with the standard dimensions and `B=16, T=20`
 peak temporary allocation above its pre-existing tensors of 42,166,480 bytes at width 9
 and 9,434,480 bytes at width 2; maximum output difference was `7.15e-7`. This is a CPU
 measurement of the head, **not** a measured full-pipeline or Spark memory reduction.
-Production CUDA peaks and host allocator behaviour must be checked using the new logs.
+Production CUDA peaks and host allocator behaviour require measurement on the Spark.
 
 ---
 

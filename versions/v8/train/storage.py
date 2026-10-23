@@ -216,9 +216,8 @@ class DatasetView(Sequence):
 
 def disk_labels(store, paths, load):
     """Import existing portable NPZ shards one at a time, preserving row order."""
-    from utils import progress
     data = store.sequence("labels")
-    for path in progress(paths, desc="index labels", unit="shard"):
+    for path in paths:
         shard = load(path)
         data.extend(shard)
         del shard

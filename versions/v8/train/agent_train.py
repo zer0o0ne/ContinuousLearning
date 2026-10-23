@@ -147,7 +147,7 @@ def train_agent(net, hands, targets, embeddings, cfg, device, log, seed,
     assert loss_name in ("kl", "soft_q"), (
         f"unknown loss {loss_name!r}; choices are 'kl' and 'soft_q' (§6.2)")
     temperatures = np.empty(n, dtype=np.float64) if loss_name == "soft_q" else None
-    for i in progress(range(n), desc="validate labels", unit="label"):
+    for i in range(n):
         h, target = hands[i], targets[i]
         assert int(h.action[-1]) == -1, "a labelled hand must end in the pending token"
         assert not (target * ~h.legal[-1]).any(), "a target carries an illegal action"

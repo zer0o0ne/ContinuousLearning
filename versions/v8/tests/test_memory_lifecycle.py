@@ -5,7 +5,6 @@ be measured on the Spark; CPU tests pin which objects may survive each phase.
 """
 
 import gc
-import json
 import weakref
 
 import numpy as np
@@ -232,12 +231,24 @@ def test_resuming_completed_metrics_does_not_load_training_shards(tmp_path, monk
     assert len(result) == 1
 
 
-def test_memory_log_is_machine_readable_and_names_real_counters():
-    from utils import memory_checkpoint
-    lines = []
-    counters = memory_checkpoint(lines.append, "test", "cpu", release=True,
-                                 held_for_ordering=7)
-    assert json.loads(lines[0].removeprefix("[memory] ")) == counters
-    assert counters["cpu_peak_mib"] > 0
-    assert counters["held_for_ordering"] == 7
-    assert not any(k.startswith("cuda_") for k in counters)
+def test_phase_cleanup_reclaims_cycles_without_logging(capsys):
+    from utils import release_memory
+
+    class Cycle:
+        pass
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        value = Cycle()
+        value.self = value
+        ref = weakref.ref(value)
+        del value
+        assert ref() is not None
+        release_memory("cpu")
+        assert ref() is None
+        captured = capsys.readouterr()
+        assert not captured.out and not captured.err
+    finally:
+        if was_enabled:
+            gc.enable()
